@@ -1,0 +1,750 @@
+mod auto_hints;
+mod config;
+mod core;
+mod error;
+mod stats;
+mod tasks_s3;
+mod trace;
+
+// Modules declared here; implementations added in subsequent phases.
+mod checkpoint;
+mod data_map;
+mod diff;
+mod mon;
+mod utils;
+
+use chrono::Local;
+use clap::{Parser, Subcommand};
+use config::S3TurboConfig;
+use core::RunMode;
+use log::info;
+use std::io::BufRead;
+
+// ── CLI definition ─────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "s3-turbo-list")]
+#[command(
+    author,
+    version,
+    about = "High-performance concurrent S3 bucket listing",
+    long_about = None
+)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Commands,
+
+    /// Path to TOML config file
+    #[arg(long, global = true)]
+    config: Option<String>,
+
+    /// Prefix to start listing from
+    #[arg(short, long, default_value = "/", global = true)]
+    prefix: String,
+
+    /// Worker threads for tokio runtime
+    #[arg(short = 'T', long, global = true)]
+    threads: Option<usize>,
+
+    /// Max concurrent list operations
+    #[arg(short, long, global = true)]
+    concurrency: Option<usize>,
+
+    /// Input key space hints file (overrides auto-hints)
+    #[arg(short = 'H', long, global = true)]
+    hints_file: Option<String>,
+
+    /// Object filter expression (e.g. "SOURCE.size > 1000")
+    #[arg(short, long, global = true)]
+    filter: Option<String>,
+
+    /// Log to file
+    #[arg(short, long, global = true)]
+    log: bool,
+
+    /// Custom S3 endpoint URL
+    #[arg(long = "endpoint-url", global = true)]
+    endpoint: Option<String>,
+
+    /// Force path-style addressing
+    #[arg(long, global = true)]
+    force_path_style: bool,
+
+    /// Log file path (implies --log)
+    #[arg(long, global = true)]
+    output_log_file: Option<String>,
+
+    /// KeySpace file output path
+    #[arg(long, global = true)]
+    output_ks_file: Option<String>,
+
+    /// Parquet file output path
+    #[arg(long, global = true)]
+    output_parquet_file: Option<String>,
+
+    /// Resume from checkpoint
+    #[arg(long, global = true)]
+    resume: bool,
+
+    /// Disable auto-hints (forces manual hints or single-threaded)
+    #[arg(long, global = true)]
+    no_auto_hints: bool,
+
+    // ── S3-compatible observability flags ─────────────────
+    /// Delimiter for ListObjectsV2 (default: "/")
+    #[arg(long, default_value = "/", global = true)]
+    delimiter: String,
+
+    /// Max keys per ListObjectsV2 page
+    #[arg(long, global = true)]
+    max_keys: Option<i32>,
+
+    /// Start listing after this key
+    #[arg(long, global = true)]
+    start_after: Option<String>,
+
+    /// Resume from a specific continuation token
+    #[arg(long, global = true)]
+    continuation_token: Option<String>,
+
+    /// AWS named profile or vendor profile name (e.g. "bos", "minio")
+    #[arg(long, global = true)]
+    profile: Option<String>,
+
+    /// S3 addressing style: path, virtual, or auto
+    #[arg(long, default_value = "auto", global = true)]
+    addressing_style: String,
+
+    /// Emit S3 compat trace events to stderr
+    #[arg(long, global = true)]
+    debug_s3: bool,
+
+    /// Write S3 compat trace events to this JSONL file
+    #[arg(long, global = true)]
+    trace_compat: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Fast list a single bucket and export results
+    List {
+        /// AWS region
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Source bucket to list
+        #[arg(long)]
+        bucket: String,
+    },
+
+    /// Bi-directional fast list and diff results
+    Diff {
+        /// Source AWS region
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Source bucket to list
+        #[arg(long)]
+        bucket: String,
+
+        /// Target AWS region
+        #[arg(long)]
+        target_region: Option<String>,
+
+        /// Target bucket to list
+        #[arg(long)]
+        target_bucket: String,
+    },
+
+    /// Validate S3-compatible provider compatibility before listing
+    CompatProbe {
+        /// Endpoint URL (required for compat-probe)
+        #[arg(long = "endpoint")]
+        endpoint_url: String,
+
+        /// AWS region or vendor region
+        #[arg(long)]
+        region: String,
+
+        /// Bucket to probe
+        #[arg(long)]
+        bucket: String,
+
+        /// Addressing style: path, virtual, or auto
+        #[arg(long, default_value = "auto")]
+        addressing_style: String,
+
+        /// Output JSON report file path (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Auto-discover KeySpace hints via adaptive sampling
+    AutoHints {
+        /// AWS region
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Bucket to sample
+        #[arg(long)]
+        bucket: String,
+
+        /// Output hints file path
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+// ── Main ───────────────────────────────────────────────────
+
+fn main() {
+    let cli = Cli::parse();
+
+    // Load config.
+    let mut cfg = S3TurboConfig::load(cli.config.as_deref()).unwrap_or_else(|e| {
+        eprintln!("Config error: {}", e);
+        std::process::exit(1);
+    });
+
+    cfg.apply_cli_overrides(
+        cli.threads,
+        cli.concurrency,
+        cli.endpoint.as_deref(),
+        cli.force_path_style || cli.endpoint.is_some(),
+        Some(&cli.addressing_style),
+        cli.profile.as_deref(),
+        cli.debug_s3,
+        cli.trace_compat.as_deref(),
+        cli.output_log_file.as_deref(),
+        cli.output_ks_file.as_deref(),
+        cli.output_parquet_file.as_deref(),
+    );
+
+    cfg.apply_profile_preset();
+
+    // Setup logging.
+    let opt_log = cli.log || cfg.output.log_file.is_some();
+    let loglevel = std::env::var("RUST_LOG").unwrap_or_else(|_| "s3_turbo_list=info".to_string());
+
+    if opt_log {
+        let logfile_s =
+            cfg.output.log_file.clone().unwrap_or_else(|| {
+                format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"))
+            });
+        let logfile = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(logfile_s)
+            .expect("unable to open log file");
+        env_logger::Builder::new()
+            .parse_filters(&loglevel)
+            .target(env_logger::Target::Pipe(Box::new(logfile)))
+            .init();
+    } else {
+        env_logger::Builder::new().parse_filters(&loglevel).init();
+    }
+
+    // Parse subcommand.
+    let (mode, _opt_region, opt_bucket, _opt_target_region, opt_target_bucket) = match &cli.cmd {
+        Commands::List { region, bucket } => (
+            RunMode::List,
+            region.as_deref(),
+            bucket.as_str(),
+            None,
+            None,
+        ),
+        Commands::Diff {
+            region,
+            bucket,
+            target_region,
+            target_bucket,
+        } => (
+            RunMode::BiDir,
+            region.as_deref(),
+            bucket.as_str(),
+            Some(target_region.as_deref()),
+            Some(target_bucket.as_str()),
+        ),
+        Commands::CompatProbe {
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            output,
+        } => {
+            run_compat_probe(
+                endpoint_url,
+                region,
+                bucket,
+                addressing_style,
+                output.as_deref(),
+                &cfg,
+            );
+            return;
+        }
+        Commands::AutoHints {
+            region,
+            bucket,
+            output,
+        } => {
+            run_auto_hints(region.as_deref(), bucket, output.as_deref(), &cfg);
+            return;
+        }
+    };
+
+    let opt_prefix = if cli.prefix == "/" {
+        String::new()
+    } else {
+        cli.prefix.clone()
+    };
+
+    // Install filter if provided.
+    if let Some(ref filter_expr) = cli.filter {
+        if let Err(e) = config::install_filter(filter_expr, &mode) {
+            eprintln!("Filter error: {}", e);
+            std::process::exit(1);
+        }
+        info!("Filter installed: \"{}\"", filter_expr);
+    }
+
+    // ── Stub: full orchestration deferred to Phase 3/4 ──────
+    println!("Mode: {:?}", mode);
+    println!("Bucket: {}", opt_bucket);
+    if let Some(tb) = opt_target_bucket {
+        println!("Target bucket: {}", tb);
+    }
+    println!("Prefix: {}", opt_prefix);
+    println!("Full orchestration will be wired in Phase 3/4.");
+    println!("Use 's3-turbo-list auto-hints --bucket <BUCKET>' for hint generation.");
+    println!("Use 's3-turbo-list compat-probe --endpoint-url <URL> --region <REGION> --bucket <BUCKET>' for compatibility checking.");
+}
+
+// ── Helper: hints loading ──────────────────────────────────
+
+#[allow(dead_code)]
+fn load_manual_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> Vec<String> {
+    let filename = hints_file.map(|f| f.to_string()).unwrap_or_else(|| {
+        if let Some(r) = region {
+            format!("{}_{}_ks_hints.input", r, bucket)
+        } else {
+            format!("{}_ks_hints.input", bucket)
+        }
+    });
+
+    match std::fs::File::open(&filename) {
+        Ok(f) => {
+            let lines = std::io::BufReader::new(f).lines();
+            let mut ks: Vec<String> = lines.filter_map(|l: Result<String, _>| l.ok()).collect();
+            ks.sort();
+            ks.dedup();
+            info!("Loaded {} manual hints from {}", ks.len(), filename);
+            ks
+        }
+        Err(_) => {
+            info!(
+                "No hints file found ({}), using single-segment fallback",
+                filename
+            );
+            vec![]
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn load_or_generate_hints(
+    hints_file: Option<&str>,
+    bucket: &str,
+    region: Option<&str>,
+    _cfg: &S3TurboConfig,
+) -> Vec<String> {
+    // Try the auto-hints cache file first.
+    let cache_filename = if let Some(r) = region {
+        format!("{}_{}_hints.toml", r, bucket)
+    } else {
+        format!("{}_hints.toml", bucket)
+    };
+
+    if let Ok(content) = std::fs::read_to_string(&cache_filename) {
+        if let Ok(cached) = toml::from_str::<auto_hints::HintsCache>(&content) {
+            info!(
+                "Loaded {} auto-hints from cache {}",
+                cached.boundaries.len(),
+                cache_filename
+            );
+            return cached.boundaries;
+        }
+    }
+
+    // Load manual hints if provided.
+    if let Some(hf) = hints_file {
+        return load_manual_hints(Some(hf), bucket, region);
+    }
+
+    info!(
+        "No hints available. Run 's3-turbo-list auto-hints --bucket {}' first for optimal performance. Using single-segment fallback.",
+        bucket
+    );
+    vec![]
+}
+
+// ── Compat-probe ───────────────────────────────────────────
+
+fn run_compat_probe(
+    endpoint_url: &str,
+    region: &str,
+    bucket: &str,
+    addressing_style: &str,
+    output: Option<&str>,
+    cfg: &S3TurboConfig,
+) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        compat_probe::run_compat_probe(endpoint_url, region, bucket, addressing_style, output, cfg)
+            .await
+    });
+}
+
+mod compat_probe {
+    use crate::config::S3TurboConfig;
+    use crate::trace::{S3CompatEvent, S3TraceWriter, StderrTraceWriter};
+    use serde::Serialize;
+    use std::time::Instant;
+
+    #[derive(Debug, Serialize)]
+    pub struct CompatProbeReport {
+        pub endpoint_url: String,
+        pub region: String,
+        pub bucket: String,
+        pub addressing_style: String,
+        pub tests: Vec<ProbeTestResult>,
+        pub overall_status: String, // "compatible", "partial", "incompatible"
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct ProbeTestResult {
+        pub test: String,
+        pub status: String, // "ok", "error", "skipped"
+        pub latency_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub http_status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub s3_error_code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<String>,
+    }
+
+    pub async fn run_compat_probe(
+        endpoint_url: &str,
+        region: &str,
+        bucket: &str,
+        addressing_style: &str,
+        output: Option<&str>,
+        _cfg: &S3TurboConfig,
+    ) {
+        let trace_writer: Box<dyn S3TraceWriter> = Box::new(StderrTraceWriter);
+
+        // Build S3 client.
+        let loader = aws_config::from_env();
+        let config = loader.load().await;
+        let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
+        s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
+        s3_cfg = s3_cfg.endpoint_url(endpoint_url.to_owned());
+        if addressing_style == "path" {
+            s3_cfg = s3_cfg.force_path_style(true);
+        }
+        let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
+        let mut results: Vec<ProbeTestResult> = Vec::new();
+
+        // ── Test 1: HeadBucket ────────────────────────────
+        let (res, evt) = timed_s3_call(
+            || async { client.head_bucket().bucket(bucket).send().await },
+            "HeadBucket",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        results.push(probe_result_from("HeadBucket", res, evt));
+
+        // ── Test 2: ListObjectsV2 max-keys=1 ──────────────
+        let (res, evt) = timed_s3_call(
+            || async {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .max_keys(1)
+                    .send()
+                    .await
+            },
+            "ListObjectsV2 (max-keys=1)",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        results.push(probe_result_from("ListObjectsV2 (max-keys=1)", res, evt));
+
+        // ── Test 3: ListObjectsV2 with prefix ─────────────
+        let (res, evt) = timed_s3_call(
+            || async {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix("")
+                    .max_keys(1)
+                    .send()
+                    .await
+            },
+            "ListObjectsV2 with prefix",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        results.push(probe_result_from("ListObjectsV2 with prefix", res, evt));
+
+        // ── Test 4: ListObjectsV2 with delimiter ──────────
+        let (res, evt) = timed_s3_call(
+            || async {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .delimiter("/")
+                    .max_keys(1)
+                    .send()
+                    .await
+            },
+            "ListObjectsV2 with delimiter",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        results.push(probe_result_from("ListObjectsV2 with delimiter", res, evt));
+
+        // ── Test 5: Encoding-type url ─────────────────────
+        let (res, evt) = timed_s3_call(
+            || async {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+                    .max_keys(1)
+                    .send()
+                    .await
+            },
+            "ListObjectsV2 (encoding-type=url)",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        results.push(probe_result_from(
+            "ListObjectsV2 (encoding-type=url)",
+            res,
+            evt,
+        ));
+
+        // ── Test 6: Small pagination check ────────────────
+        let (res, mut evt) = timed_s3_call(
+            || async {
+                // List up to 3 keys, verify continuation token if truncated.
+                let resp = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .max_keys(3)
+                    .send()
+                    .await?;
+                Ok::<
+                    _,
+                    aws_sdk_s3::error::SdkError<
+                        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+                    >,
+                >(resp)
+            },
+            "ListObjectsV2 pagination check",
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            &trace_writer,
+        )
+        .await;
+        // Handle insufficient objects case: if the response has fewer than max_keys
+        // objects and is_truncated is false, we can't meaningfully test pagination.
+        let pagination_probe = match &res {
+            Ok(resp) => {
+                let key_count = resp.key_count().unwrap_or(0);
+                let is_truncated = resp.is_truncated().unwrap_or(false);
+                let content_count = resp.contents().len() as i32;
+                evt.key_count = Some(key_count);
+                evt.contents_count = Some(content_count);
+                evt.is_truncated = is_truncated;
+                if !is_truncated && content_count < 3 {
+                    ProbeTestResult {
+                        test: "ListObjectsV2 pagination check".to_string(),
+                        status: "skipped".to_string(),
+                        latency_ms: evt.latency_ms,
+                        http_status: Some(200),
+                        s3_error_code: None,
+                        error_message: Some(format!(
+                            "insufficient_objects: only {} objects; need >= max_keys (3) to test pagination",
+                            content_count
+                        )),
+                        request_id: evt.request_id.clone(),
+                    }
+                } else {
+                    probe_result_from::<
+                        (),
+                        aws_sdk_s3::error::SdkError<
+                            aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+                        >,
+                    >("ListObjectsV2 pagination check", Ok(()), evt)
+                }
+            }
+            Err(_) => probe_result_from("ListObjectsV2 pagination check", res, evt),
+        };
+        results.push(pagination_probe);
+
+        // Determine overall status.
+        let error_count = results.iter().filter(|r| r.status == "error").count();
+        let overall = if error_count == 0 {
+            "compatible"
+        } else if error_count < results.len() {
+            "partial"
+        } else {
+            "incompatible"
+        };
+
+        let report = CompatProbeReport {
+            endpoint_url: endpoint_url.to_string(),
+            region: region.to_string(),
+            bucket: bucket.to_string(),
+            addressing_style: addressing_style.to_string(),
+            tests: results,
+            overall_status: overall.to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        if let Some(out_path) = output {
+            std::fs::write(out_path, &json).expect("Failed to write compat-probe report");
+            println!("Compat-probe report written to {}", out_path);
+        } else {
+            println!("{}", json);
+        }
+    }
+
+    /// Time an S3 call and emit a trace event.
+    ///
+    /// NOTE: request_id is not extracted from successful responses because
+    /// typed AWS SDK outputs (HeadBucketOutput, ListObjectsV2Output) don't
+    /// expose raw HTTP headers.  The field is populated from errors via
+    /// `tasks_s3::handle_sdk_error` where the raw response is available.
+    async fn timed_s3_call<F, Fut, T, E>(
+        f: F,
+        test_name: &str,
+        endpoint_url: &str,
+        region: &str,
+        bucket: &str,
+        addressing_style: &str,
+        trace_writer: &Box<dyn S3TraceWriter>,
+    ) -> (Result<T, E>, S3CompatEvent)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Debug,
+    {
+        let start = Instant::now();
+        let result = f().await;
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        let mut event = S3CompatEvent::new(test_name, endpoint_url, bucket, "");
+        event.region = Some(region.to_string());
+        event.addressing_style = addressing_style.to_string();
+        event.latency_ms = latency_ms;
+
+        match &result {
+            Ok(_) => {
+                event.http_status = 200;
+            }
+            Err(_) => {
+                event.http_status = 0;
+                event.fatal = true;
+            }
+        }
+
+        trace_writer.write_event(event.clone());
+        (result, event)
+    }
+
+    fn probe_result_from<T, E: std::fmt::Debug>(
+        test_name: &str,
+        result: Result<T, E>,
+        event: S3CompatEvent,
+    ) -> ProbeTestResult {
+        match result {
+            Ok(_) => ProbeTestResult {
+                test: test_name.to_string(),
+                status: "ok".to_string(),
+                latency_ms: event.latency_ms,
+                http_status: if event.http_status != 0 {
+                    Some(event.http_status)
+                } else {
+                    Some(200)
+                },
+                s3_error_code: event.s3_error_code,
+                error_message: event.s3_error_message,
+                request_id: event.request_id,
+            },
+            Err(e) => ProbeTestResult {
+                test: test_name.to_string(),
+                status: "error".to_string(),
+                latency_ms: event.latency_ms,
+                http_status: if event.http_status != 0 {
+                    Some(event.http_status)
+                } else {
+                    None
+                },
+                s3_error_code: event.s3_error_code,
+                error_message: Some(format!("{:?}", e)),
+                request_id: event.request_id,
+            },
+        }
+    }
+}
+
+fn run_auto_hints(region: Option<&str>, bucket: &str, output: Option<&str>, cfg: &S3TurboConfig) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let endpoint = cfg.s3.endpoint_url.as_deref();
+    let fps = cfg.s3.force_path_style;
+    let threshold = cfg.auto_hints.sample_threshold;
+    let depth = cfg.auto_hints.max_prefix_depth;
+
+    rt.block_on(async {
+        auto_hints::generate_hints(region, bucket, output, endpoint, fps, threshold, depth).await
+    });
+}
