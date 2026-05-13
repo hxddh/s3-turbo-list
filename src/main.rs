@@ -17,8 +17,10 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use config::S3TurboConfig;
 use core::RunMode;
-use log::info;
+use log::{error, info};
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ── CLI definition ─────────────────────────────────────────
 
@@ -207,6 +209,8 @@ fn main() {
         std::process::exit(1);
     });
 
+    cfg.apply_profile_preset();
+
     cfg.apply_cli_overrides(
         cli.threads,
         cli.concurrency,
@@ -220,8 +224,6 @@ fn main() {
         cli.output_ks_file.as_deref(),
         cli.output_parquet_file.as_deref(),
     );
-
-    cfg.apply_profile_preset();
 
     // Setup logging.
     let opt_log = cli.log || cfg.output.log_file.is_some();
@@ -247,7 +249,7 @@ fn main() {
     }
 
     // Parse subcommand.
-    let (mode, _opt_region, opt_bucket, _opt_target_region, opt_target_bucket) = match &cli.cmd {
+    let (mode, opt_region, opt_bucket, opt_target_region, opt_target_bucket) = match &cli.cmd {
         Commands::List { region, bucket } => (
             RunMode::List,
             region.as_deref(),
@@ -309,16 +311,170 @@ fn main() {
         info!("Filter installed: \"{}\"", filter_expr);
     }
 
-    // ── Stub: full orchestration deferred to Phase 3/4 ──────
-    println!("Mode: {:?}", mode);
-    println!("Bucket: {}", opt_bucket);
-    if let Some(tb) = opt_target_bucket {
-        println!("Target bucket: {}", tb);
-    }
-    println!("Prefix: {}", opt_prefix);
-    println!("Full orchestration will be wired in Phase 3/4.");
-    println!("Use 's3-turbo-list auto-hints --bucket <BUCKET>' for hint generation.");
-    println!("Use 's3-turbo-list compat-probe --endpoint-url <URL> --region <REGION> --bucket <BUCKET>' for compatibility checking.");
+    // ── Phase 3: orchestration wiring ───────────────────────
+    let g_tasks_count = if mode == RunMode::BiDir { 4 } else { 3 }; // list + data_map + mon (+right list)
+
+    let dt_str = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let region_prefix = opt_region.map(|r| format!("{}_", r)).unwrap_or_default();
+
+    // Setup Ctrl-C handler
+    let quit = Arc::new(AtomicBool::new(false));
+    let q = quit.clone();
+    ctrlc::set_handler(move || {
+        q.store(true, Ordering::SeqCst);
+    })
+    .expect("failed to set ctrl-c signal handler");
+
+    // Build runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(cfg.runtime.worker_threads)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let g_state = core::GlobalState::new(quit, g_tasks_count);
+        let mut set = tokio::task::JoinSet::new();
+        let concurrency = cfg.runtime.max_concurrency;
+        let channel_capacity = cfg.channel.capacity;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
+            channel_capacity,
+        );
+
+        // ── Create trace writer ──────────────────────────────
+        use crate::trace::S3TraceWriter;
+        let (file_writer, _debug_writer) =
+            trace::create_trace_writer(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3);
+        let trace_writer: Option<Arc<dyn S3TraceWriter>> = Some(Arc::from(file_writer));
+
+        // ── Load or generate KeySpace hints ─────────────────
+        let ks_hints = if cli.no_auto_hints {
+            load_manual_hints(cli.hints_file.as_deref(), opt_bucket, opt_region)
+        } else {
+            load_or_generate_hints(cli.hints_file.as_deref(), opt_bucket, opt_region, &cfg)
+        };
+
+        let ks_list: Vec<String> = ks_hints;
+        let hints = core::KeySpaceHints::new_from(&ks_list);
+        let hints_count = hints.total_count();
+
+        info!("S3 Turbo List v{} starting:", env!("CARGO_PKG_VERSION"));
+        info!(
+            "  mode {:?}, threads {}, concurrency {}, channel cap {}",
+            mode, cfg.runtime.worker_threads, concurrency, channel_capacity
+        );
+        info!(
+            "  bucket {}, prefix '{}', {} key-space segments",
+            opt_bucket, opt_prefix, hints_count
+        );
+        if let Some(ep) = &cfg.s3.endpoint_url {
+            info!("  endpoint: {}", ep);
+        }
+
+        // ── Spawn list task (left) ──────────────────────────
+        let prefix = opt_prefix.clone();
+        let dir = if mode == RunMode::BiDir {
+            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE
+        } else {
+            core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE
+        };
+        let s3_cfg = cfg.s3.clone();
+        let task_ctx = core::S3TaskContext::new(
+            opt_bucket,
+            opt_region,
+            cfg.s3.endpoint_url.as_deref(),
+            cfg.s3.force_path_style,
+            &s3_cfg,
+            tx.clone(),
+            dir,
+            g_state.clone(),
+            trace_writer.clone(),
+            &cfg.s3.addressing_style.to_string(),
+            cfg.s3.profile.as_deref(),
+            Some(&cli.delimiter),
+            cli.max_keys,
+        );
+        set.spawn(async move {
+            tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
+        });
+
+        // ── Spawn list task (right) if diff mode ────────────
+        if mode == RunMode::BiDir {
+            let prefix = opt_prefix.clone();
+            let target_region = opt_target_region.and_then(|inner| inner);
+            let target_bucket = opt_target_bucket.expect("target_bucket required for diff mode");
+            let target_ks: Vec<String> = vec![];
+            let target_hints = core::KeySpaceHints::new_from(&target_ks);
+
+            let task_ctx = core::S3TaskContext::new(
+                target_bucket,
+                target_region,
+                cfg.s3.endpoint_url.as_deref(),
+                cfg.s3.force_path_style,
+                &cfg.s3,
+                tx.clone(),
+                core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                g_state.clone(),
+                trace_writer.clone(),
+                &cfg.s3.addressing_style.to_string(),
+                cfg.s3.profile.as_deref(),
+                Some(&cli.delimiter),
+                cli.max_keys,
+            );
+            set.spawn(async move {
+                tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, target_hints).await
+            });
+        }
+
+        // ── Spawn data map task ─────────────────────────────
+        let filename_ks = cfg
+            .output
+            .ks_file
+            .clone()
+            .unwrap_or_else(|| format!("{}_{}_{}.ks", region_prefix, opt_bucket, dt_str));
+        let filename_output = cfg.output.parquet_file.clone().unwrap_or_else(|| {
+            if mode == RunMode::List {
+                format!("{}_{}_{}.parquet", region_prefix, opt_bucket, dt_str)
+            } else {
+                let tr = opt_target_region.and_then(|r| r).unwrap_or("");
+                let tb = opt_target_bucket.unwrap_or("");
+                format!(
+                    "{}_{}_{}_{}_{}.parquet",
+                    region_prefix, opt_bucket, tr, tb, dt_str
+                )
+            }
+        });
+
+        let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
+        set.spawn(async move {
+            data_map::data_map_task(data_map_ctx, &filename_ks, &filename_output).await
+        });
+
+        // ── Spawn monitor task ──────────────────────────────
+        let mon_ctx = core::MonContext::new(g_state.clone());
+        set.spawn(async move { mon::mon_task(mon_ctx).await });
+
+        // Wait for all tasks — log any panics.
+        while let Some(result) = set.join_next().await {
+            if let Err(e) = result {
+                error!("Task panicked: {}", e);
+                if e.is_cancelled() {
+                    info!("Task was cancelled (abort or shutdown)");
+                } else if let Ok(panic_msg) = e.try_into_panic() {
+                    let msg: String = panic_msg
+                        .downcast_ref::<&str>()
+                        .map(|s: &&str| s.to_string())
+                        .or_else(|| panic_msg.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<unknown panic>".to_string());
+                    error!("Task panic message: {}", msg);
+                }
+            }
+        }
+        info!("All tasks completed.");
+    });
+
+    rt.shutdown_background();
 }
 
 // ── Helper: hints loading ──────────────────────────────────
