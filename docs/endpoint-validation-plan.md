@@ -216,7 +216,7 @@ print(t.to_pandas().head())
 **Expect**:
 - `Rows` ≥ 18 (or however many objects created)
 - Schema contains: `Key`, `Size`, `LastModified`, `ETag`, `DiffFlag`
-- All `DiffFlag` = 0 (list mode, no diff)
+- All `DiffFlag` = 1 (list mode — all objects are left-side present; 0 used only in diff mode)
 
 **Failure interpretation**:
 - 0 rows → prefix mismatch, check prefix syntax
@@ -310,6 +310,9 @@ $BIN list \
 **Expect**: All trace events show `"max_keys":2`. Pagination works correctly — all objects listed despite small page size.
 
 #### A.3.5 start_after
+
+`--start-after` is wired into the S3 ListObjectsV2 `start-after` parameter.
+When set, listing begins after the specified key (lexicographic).
 
 ```bash
 $BIN list \
@@ -483,6 +486,9 @@ $BIN list \
 **Expect**:
 - If MinIO is configured for virtual-host style: works, trace shows `"addressing_style":"virtual"`
 - If not: DNS error or connection refused — trace shows error event with `fatal: true`
+- **Note**: virtual-hosted style may succeed against MinIO depending on version and
+  server configuration. This is environment-dependent and does not imply virtual-hosted
+  will work against BOS.
 
 #### A.5.2 Path style (explicit)
 
