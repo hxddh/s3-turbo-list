@@ -50,6 +50,12 @@ independent segments, runs them in parallel, and assembles the result.
 | **Diff mode** | Bi-directional diff between two buckets with per-object DiffFlag. Equal rows optionally included. |
 | **Endpoint validation workflow** | Compat-probe → listing → trace review. Documented in `docs/validation-results/`. |
 
+## Installation
+
+Download the binary for your platform from the GitHub release, verify it with `SHA256SUMS`, install it into your `PATH`, then configure an AWS-compatible profile.
+
+See [INSTALL.md](INSTALL.md) for platform-specific installation and AWS S3 / BOS / MinIO configuration examples.
+
 ## Quick start
 
 ### Build
@@ -167,8 +173,6 @@ diagnostics, or controlled validation:
 s3-turbo-list list --region bj --bucket my-bos-bucket \
   --profile bos
 ```
-
-See [Known limitations](#known-limitations) for BOS caveats.
 
 ### Trace / debug
 
@@ -330,7 +334,7 @@ the following fields:
 |---|---|---|---|
 | **AWS S3** (`us-east-2`) | ✅ Validated | path, virtual-hosted | Full compatibility. Baseline reference. |
 | **MinIO** (v2025-09-07) | ✅ Validated | path, virtual-hosted | Full compatibility. Local and remote. |
-| **BOS** (Baidu Object Storage) | ✅ Validated | virtual-hosted (recommended), path (legacy/diagnostic) | **Known pagination issue** — see below. |
+| **BOS** (Baidu Object Storage) | ✅ Validated | virtual-hosted (recommended), path (legacy/diagnostic) | See `docs/validation-results/` for endpoint-specific details. |
 
 Validation details:
 - [`docs/validation-results/final-validation-summary-20260514.md`](docs/validation-results/final-validation-summary-20260514.md)
@@ -340,19 +344,12 @@ Validation details:
 
 ## Known limitations
 
-1. **BOS hinted multi-segment authoritative scans should wait for a BOS-side
-   ListObjectsV2 compatibility fix.**  When a ListObjectsV2 request includes
-   both `start-after` and `continuation-token`, BOS restarts the listing from
-   `start-after` instead of resuming from the continuation token.  This only
-   affects hinted multi-segment scans; single-segment listings (no hints or
-   empty hints) work correctly on BOS.
-
-2. **Hinted multi-segment diff paired coordination is deferred.**  Diff mode
+1. **Hinted multi-segment diff paired coordination is deferred.**  Diff mode
    has been validated for single-segment operations (no hints).  Multi-segment
    diff coordination across left/right segment pairs is planned but not yet
    implemented.
 
-3. **Release build on Ubuntu 20.04 arm64 may require an `aws-lc-sys` workaround**
+2. **Release build on Ubuntu 20.04 arm64 may require an `aws-lc-sys` workaround**
    documented in [`BUILD.md`](BUILD.md).  The `aws-lc-sys` crate detects a
    known GCC < 10 memcmp bug on aarch64 and aborts the build.  Workarounds:
    use clang, GCC 10+, or disable ASM.  Debug builds are unaffected.
