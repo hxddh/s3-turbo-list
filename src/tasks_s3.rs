@@ -390,6 +390,8 @@ fn emit_trace_compat(
     } else {
         Some(start_after.to_string())
     };
+    event.delimiter = ctx.delimiter.clone();
+    event.max_keys = ctx.max_keys;
     event.retry_attempt = retry_attempt;
     event.latency_ms = latency_ms;
     event.http_status = http_status;
