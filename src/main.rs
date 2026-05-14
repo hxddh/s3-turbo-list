@@ -505,8 +505,9 @@ fn main() {
         });
 
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
+        let is_diff = mode == RunMode::BiDir;
         set.spawn(async move {
-            data_map::data_map_task(data_map_ctx, &filename_ks, &filename_output).await
+            data_map::data_map_task(data_map_ctx, &filename_ks, &filename_output, is_diff).await
         });
 
         // ── Spawn monitor task ──────────────────────────────

@@ -143,6 +143,94 @@ fn test_object_map_dedup_same_side() {
     assert_eq!(obj_map.get_count(), 1);
 }
 
+// ── Diff mode output includes Equal rows ──────────────────
+
+#[tokio::test]
+async fn test_diff_mode_includes_equal_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("diff_output.parquet");
+    let ks_path = dir.path().join("diff_ks.csv");
+
+    let map = PrefixMap::new();
+
+    // Equal object (left then right, same size and etag) → DiffFlag=0
+    {
+        let key = ObjectKey::from("common/same.txt");
+        let (prefix, name) = key.decode();
+        let etag = [1u8; 16];
+        let left = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 300, etag);
+        map.bulk_insert(&prefix, vec![(name.clone(), left)]);
+        let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 300, etag);
+        map.bulk_insert(&prefix, vec![(name.clone(), right)]);
+    }
+
+    // Left-only object → DiffFlag=1
+    {
+        let key = ObjectKey::from("common/left_only.txt");
+        let (prefix, name) = key.decode();
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [1u8; 16]);
+        map.bulk_insert(&prefix, vec![(name, props)]);
+    }
+
+    // Right-only object → DiffFlag=2
+    {
+        let key = ObjectKey::from("common/right_only.txt");
+        let (prefix, name) = key.decode();
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 200, [1u8; 16]);
+        map.bulk_insert(&prefix, vec![(name, props)]);
+    }
+
+    // Dump with include_equal = true (diff mode).
+    {
+        let file = tokio::fs::File::create(&parquet_path).await.unwrap();
+        let buf_writer = tokio::io::BufWriter::new(file);
+        let mut writer = AsyncParquetOutput::new(buf_writer, ks_path.to_str().unwrap());
+        map.dump(&mut writer, true).await;
+        writer.close().await;
+    }
+
+    // Read back and verify DiffFlag distribution.
+    let std_file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.collect();
+    let total_rows: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "expected 3 rows (equal + left-only + right-only)"
+    );
+
+    let mut flags_seen = std::collections::HashSet::new();
+    for batch in &batches {
+        let batch = batch.as_ref().unwrap();
+        let col = batch
+            .column(4) // DiffFlag
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .unwrap();
+        for i in 0..col.len() {
+            let flag = col.value(i);
+            eprintln!("  row {}: DiffFlag={}", i, flag);
+            flags_seen.insert(flag);
+        }
+    }
+    eprintln!("Flags seen: {:?}", flags_seen);
+    assert!(
+        flags_seen.contains(&0),
+        "DiffFlag=0 (Equal) missing from output"
+    );
+    assert!(
+        flags_seen.contains(&1),
+        "DiffFlag=1 (Left-only) missing from output"
+    );
+    assert!(
+        flags_seen.contains(&2),
+        "DiffFlag=2 (Right-only) missing from output"
+    );
+}
+
 // ── Parquet output schema verification ────────────────────
 
 #[tokio::test]

@@ -138,6 +138,20 @@ pub struct ObjectProps {
 }
 
 impl ObjectProps {
+    /// Create a new ObjectProps with OPEN status and the given direction flags.
+    /// For use in tests and when constructing objects programmatically.
+    pub fn new_open(dir: u8, size: u64, etag: [u8; 16]) -> Self {
+        Self {
+            flags: dir,
+            status: OBJECT_PROPS_STATUS_OPEN,
+            pad: 0,
+            etag_parts: 0,
+            last_modified: 0,
+            size,
+            etag_md5: etag,
+        }
+    }
+
     pub fn set_dir(&mut self, dir: u8) {
         self.flags |= dir;
     }

@@ -169,14 +169,18 @@ impl ObjectMap {
 
 // ── Data map task (consumer) ───────────────────────────────
 
-pub async fn data_map_task(mut ctx: DataMapContext, filename_ks: &str, filename_output: &str) {
+pub async fn data_map_task(
+    mut ctx: DataMapContext,
+    filename_ks: &str,
+    filename_output: &str,
+    include_equal: bool,
+) {
     ctx.start();
     ctx.g_state.wait_to_start().await;
 
     info!("Data Map Task — started");
 
     let map = PrefixMap::new();
-    let include_equal = false;
     let mut last_ts = epoch_secs();
 
     loop {
