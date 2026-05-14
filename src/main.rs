@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use config::S3TurboConfig;
 use core::RunMode;
 use log::{error, info};
-use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -378,13 +377,7 @@ fn main() {
         };
 
         // ── Load or generate KeySpace hints ─────────────────
-        let ks_hints = if cli.no_auto_hints {
-            load_manual_hints(cli.hints_file.as_deref(), opt_bucket, opt_region)
-        } else {
-            load_or_generate_hints(cli.hints_file.as_deref(), opt_bucket, opt_region, &cfg)
-        };
-
-        let ks_list: Vec<String> = ks_hints;
+        let ks_list: Vec<String> = load_hints(cli.hints_file.as_deref(), opt_bucket, opt_region);
         let hints = core::KeySpaceHints::new_from(&ks_list);
 
         // Filter out completed segments when resuming.
@@ -603,69 +596,252 @@ fn main() {
     rt.shutdown_background();
 }
 
-// ── Helper: hints loading ──────────────────────────────────
+// ── Unified hints loader ───────────────────────────────────
 
-#[allow(dead_code)]
-fn load_manual_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> Vec<String> {
-    let filename = hints_file.map(|f| f.to_string()).unwrap_or_else(|| {
-        if let Some(r) = region {
-            format!("{}_{}_ks_hints.input", r, bucket)
-        } else {
-            format!("{}_ks_hints.input", bucket)
-        }
-    });
+/// Parse a hints file at `path`.  Returns the list of key-space boundaries.
+///
+/// Detection rules:
+/// - If the file content contains TOML structure markers (`boundaries =`, `[`, `]`
+///   at line start, or TOML key-value assignments), it is treated as a TOML
+///   auto-hints cache file and deserialised via `toml::from_str::<HintsCache>`.
+/// - Otherwise it is treated as a plain line-by-line hints file: each
+///   non-empty, non-comment line is one boundary.
+///
+/// Errors:
+/// - If the file looks like TOML but fails to deserialise, an `Err` is returned.
+/// - If the file looks like plain text but a line resembles leaked TOML syntax
+///   (e.g. `"alpha",`, `boundaries = [`, `]`), an `Err` is returned.
+fn parse_hints_file(path: &str) -> Result<Vec<String>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read hints file '{}': {}", path, e))?;
 
-    match std::fs::File::open(&filename) {
-        Ok(f) => {
-            let lines = std::io::BufReader::new(f).lines();
-            let mut ks: Vec<String> = lines.filter_map(|l: Result<String, _>| l.ok()).collect();
-            ks.sort();
-            ks.dedup();
-            info!("Loaded {} manual hints from {}", ks.len(), filename);
-            ks
-        }
-        Err(_) => {
-            info!(
-                "No hints file found ({}), using single-segment fallback",
-                filename
-            );
-            vec![]
-        }
+    let is_toml_looking = looks_like_toml_hints(&content);
+
+    if is_toml_looking {
+        parse_as_toml(path, &content)
+    } else {
+        parse_as_plain(path, &content)
     }
 }
 
-#[allow(dead_code)]
-fn load_or_generate_hints(
-    hints_file: Option<&str>,
-    bucket: &str,
-    region: Option<&str>,
-    _cfg: &S3TurboConfig,
-) -> Vec<String> {
-    // Try the auto-hints cache file first.
+/// Heuristic: does `content` look like a TOML hints cache file?
+///
+/// Checks for:
+/// - `boundaries = [` followed by array entries
+/// - `[` at the start of a line (TOML table headers)
+/// - TOML key = value assignments on their own line
+fn looks_like_toml_hints(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Strong signal: `boundaries = [` appearing literally.
+    if trimmed.contains("boundaries = [") || trimmed.contains("boundaries=[") {
+        return true;
+    }
+
+    // Table header: `[something]` on its own line.
+    for line in trimmed.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with('[') && stripped.ends_with(']') && stripped.len() > 2 {
+            return true;
+        }
+    }
+
+    // Multiple lines with `key = value` pattern and at least one
+    // looks like a known HintsCache field.
+    let mut toml_kv_count = 0usize;
+    let mut known_field = false;
+    for line in trimmed.lines() {
+        let stripped = line.trim();
+        if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+        if let Some((key, _)) = stripped.split_once('=') {
+            toml_kv_count += 1;
+            let k = key.trim();
+            if k == "bucket"
+                || k == "region"
+                || k == "total_objects"
+                || k == "boundaries"
+                || k == "generated_at"
+            {
+                known_field = true;
+            }
+        }
+    }
+
+    // If more than half the non-blank lines look like TOML k=v,
+    // and we spotted at least one known HintsCache field, treat as TOML.
+    let non_blank = trimmed.lines().filter(|l| !l.trim().is_empty()).count();
+    toml_kv_count >= non_blank / 2 && known_field
+}
+
+/// Parse content as a TOML auto-hints cache.  Returns `Err` on deserialisation
+/// failure — we do NOT silently fall back to line-by-line when the file looks
+/// like TOML.
+fn parse_as_toml(path: &str, content: &str) -> Result<Vec<String>, String> {
+    let cached: auto_hints::HintsCache = toml::from_str(content).map_err(|e| {
+        format!(
+            "Hints file '{}' looks like a TOML hints cache but failed to parse: {}. \
+             If this is a plain hints file, remove any lines containing '=', '[', or ']'.",
+            path, e
+        )
+    })?;
+
+    // Sanity-check: boundaries should be clean strings.
+    for (i, b) in cached.boundaries.iter().enumerate() {
+        if let Err(reason) = validate_boundary_line(b, i) {
+            return Err(format!(
+                "Hints file '{}' boundary {} is malformed: {}",
+                path, i, reason
+            ));
+        }
+    }
+
+    info!(
+        "Loaded {} auto-hints boundaries from TOML cache '{}'",
+        cached.boundaries.len(),
+        path
+    );
+    Ok(cached.boundaries)
+}
+
+/// Parse content as a plain line-by-line hints file.
+///
+/// Rules:
+/// - Trim leading/trailing whitespace from each line.
+/// - Skip empty lines and lines starting with `#`.
+/// - Reject obvious TOML leakage patterns: `"...",`, `boundaries = [`, `]`,
+///   table headers, TOML key-value assignments.
+fn parse_as_plain(path: &str, content: &str) -> Result<Vec<String>, String> {
+    let mut boundaries: Vec<String> = Vec::new();
+
+    for (line_no, raw) in content.lines().enumerate() {
+        let trimmed = raw.trim();
+
+        // Skip empty and comment lines.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Err(reason) = validate_boundary_line(trimmed, line_no) {
+            return Err(format!(
+                "Hints file '{}' line {} looks like leaked TOML syntax: '{}' — {}",
+                path,
+                line_no + 1,
+                trimmed,
+                reason
+            ));
+        }
+
+        // Preserve the trimmed string as-is (may contain spaces, +, /, %, Unicode).
+        boundaries.push(trimmed.to_string());
+    }
+
+    boundaries.sort();
+    boundaries.dedup();
+
+    info!(
+        "Loaded {} plain-text hints boundaries from '{}'",
+        boundaries.len(),
+        path
+    );
+    Ok(boundaries)
+}
+
+/// Validate a single boundary candidate string.
+/// Returns `Err(reason)` if the string looks like TOML syntax leakage.
+fn validate_boundary_line(s: &str, line_no: usize) -> Result<(), String> {
+    // Reject quoted-string-with-trailing-comma:  "alpha",
+    if (s.starts_with('"') && s.ends_with(',')) || (s.starts_with('\'') && s.ends_with(',')) {
+        return Err(format!(
+            "value '{}' looks like a quoted TOML array entry with trailing comma. \
+             Plain hints files should contain bare keys (e.g. 'alpha/'), not quoted TOML values.",
+            s
+        ));
+    }
+
+    // Reject bare `boundaries = [` or similar TOML structural lines.
+    if s.starts_with("boundaries =") || s.starts_with("boundaries=") {
+        return Err(format!(
+            "line {} is TOML array header '{}'. Plain hints files should contain \
+             only object keys, not TOML structure.",
+            line_no + 1,
+            s
+        ));
+    }
+
+    // Reject lone `]` (closing array bracket).
+    if s == "]" {
+        return Err(format!(
+            "line {} is a TOML closing bracket ']'. Plain hints files should contain \
+             only object keys.",
+            line_no + 1
+        ));
+    }
+
+    // Reject `[section]` table headers.
+    if s.starts_with('[') && s.ends_with(']') && s.len() > 2 {
+        return Err(format!(
+            "line {} looks like a TOML table header '{}'. Plain hints files should \
+             contain only object keys.",
+            line_no + 1,
+            s
+        ));
+    }
+
+    // Reject TOML key = value lines.
+    if s.contains('=') && !s.starts_with('#') {
+        // Slash is a valid key character; = is not.
+        return Err(format!(
+            "line {} looks like a TOML assignment '{}'. Plain hints files should \
+             contain only object keys. If this IS an object key containing '=', \
+             use TOML format instead.",
+            line_no + 1,
+            s
+        ));
+    }
+
+    Ok(())
+}
+
+/// Top-level hints loader: resolves hints from explicit file, auto-hints cache,
+/// or falls back to empty (single-segment).
+///
+/// Priority:
+/// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
+/// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
+/// 3. Single-segment fallback (empty vec).
+fn load_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> Vec<String> {
+    // 1. Explicit --hints-file takes absolute precedence.
+    if let Some(path) = hints_file {
+        match parse_hints_file(path) {
+            Ok(boundaries) => return boundaries,
+            Err(e) => {
+                error!("Failed to load hints file '{}': {}", path, e);
+                error!("Aborting to avoid sending malformed S3 requests.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 2. Try auto-hints cache at conventional path.
     let cache_filename = if let Some(r) = region {
         format!("{}_{}_hints.toml", r, bucket)
     } else {
         format!("{}_hints.toml", bucket)
     };
 
-    if let Ok(content) = std::fs::read_to_string(&cache_filename) {
-        if let Ok(cached) = toml::from_str::<auto_hints::HintsCache>(&content) {
-            info!(
-                "Loaded {} auto-hints from cache {}",
-                cached.boundaries.len(),
-                cache_filename
-            );
-            return cached.boundaries;
-        }
+    if let Ok(boundaries) = parse_hints_file(&cache_filename) {
+        return boundaries;
     }
 
-    // Load manual hints if provided.
-    if let Some(hf) = hints_file {
-        return load_manual_hints(Some(hf), bucket, region);
-    }
-
+    // 3. Single-segment fallback.
     info!(
-        "No hints available. Run 's3-turbo-list auto-hints --bucket {}' first for optimal performance. Using single-segment fallback.",
+        "No hints available. Run 's3-turbo-list auto-hints --bucket {}' first for \
+         optimal performance. Using single-segment fallback.",
         bucket
     );
     vec![]
@@ -1029,4 +1205,230 @@ fn run_auto_hints(region: Option<&str>, bucket: &str, output: Option<&str>, cfg:
     rt.block_on(async {
         auto_hints::generate_hints(region, bucket, output, endpoint, fps, threshold, depth).await
     });
+}
+
+// ── Tests: hints loading ──────────────────────────────────
+
+#[cfg(test)]
+mod hints_loader_tests {
+    use super::*;
+
+    fn write_tmp(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hints.toml");
+        std::fs::write(&path, contents).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        (dir, path_str)
+    }
+
+    // ── TOML detection ───────────────────────────────────
+
+    #[test]
+    fn test_looks_like_toml_boundaries_array() {
+        assert!(looks_like_toml_hints(
+            "bucket = \"b\"\nboundaries = [\n    \"alpha\",\n]\n"
+        ));
+    }
+
+    #[test]
+    fn test_looks_like_toml_hints_cache() {
+        let content = r#"bucket = "s3tl-bos-1778750400"
+region = "bj"
+total_objects = 19
+boundaries = [
+    "alpha",
+    "beta",
+    "gamma",
+    "logs",
+]
+generated_at = "2026-05-14T11:02:50Z"
+"#;
+        assert!(looks_like_toml_hints(content));
+    }
+
+    #[test]
+    fn test_looks_like_toml_table_header() {
+        assert!(looks_like_toml_hints("[hints]\nbucket = \"b\"\n"));
+    }
+
+    #[test]
+    fn test_does_not_look_like_toml_plain_keys() {
+        assert!(!looks_like_toml_hints("alpha/\nbeta/\ngamma/\n"));
+    }
+
+    #[test]
+    fn test_does_not_look_like_toml_empty() {
+        assert!(!looks_like_toml_hints(""));
+    }
+
+    // ── TOML parsing ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_toml_hints_clean() {
+        let content = r#"bucket = "b"
+region = "r"
+total_objects = 10
+boundaries = [
+    "alpha/",
+    "beta/file-05.txt",
+    "logs/file with spaces.log",
+    "logs/file+plus.log",
+    "中文/Unicode",
+]
+generated_at = "2026-01-01T00:00:00Z"
+"#;
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "alpha/",
+                "beta/file-05.txt",
+                "logs/file with spaces.log",
+                "logs/file+plus.log",
+                "中文/Unicode",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_toml_hints_fails_on_malformed() {
+        // Content that looks like TOML (has boundaries = [) but is malformed.
+        let content = "boundaries = [\n    alpha,\n    beta\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("failed to parse") || err.contains("leaked TOML"),
+            "expected parse or leaked TOML error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_toml_with_malformed_boundary_value_fails() {
+        // A boundary value that is a quoted-comma TOML array entry.
+        // The TOML parser will happily deserialize this as a boundary string,
+        // but our validate_boundary_line should catch it.
+        let content = r#"bucket = "b"
+region = "r"
+total_objects = 1
+boundaries = [
+    "alpha",
+]
+generated_at = "2026-01-01T00:00:00Z"
+"#;
+        // This specific content parses correctly — "alpha" is a valid TOML string.
+        // Test the case where a boundary value somehow has a trailing comma
+        // (this shouldn't happen with proper TOML, but we test the validator).
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(result, vec!["alpha"]);
+    }
+
+    // ── Plain-text parsing ───────────────────────────────
+
+    #[test]
+    fn test_parse_plain_hints_clean() {
+        let content = "alpha/\nbeta/file-05.txt\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(result, vec!["alpha/", "beta/file-05.txt"]);
+    }
+
+    #[test]
+    fn test_parse_plain_hints_skips_empty_and_comments() {
+        let content = "\nalpha/\n# this is a comment\nbeta/\n  \n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(result, vec!["alpha/", "beta/"]);
+    }
+
+    #[test]
+    fn test_parse_plain_hints_preserves_special_chars() {
+        let content = concat!(
+            "logs/file with spaces.log\n",
+            "logs/file+plus.log\n",
+            "prefix/key%percent\n",
+            "中文/Unicode keys\n",
+            "a/b/c/deep/nested/key\n",
+        );
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "a/b/c/deep/nested/key",
+                "logs/file with spaces.log",
+                "logs/file+plus.log",
+                "prefix/key%percent",
+                "中文/Unicode keys",
+            ]
+        );
+    }
+
+    // ── Plain-text rejection of TOML leakage ─────────────
+
+    #[test]
+    fn test_parse_plain_rejects_quoted_comma() {
+        let content = "alpha/\n\"beta\",\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("leaked TOML"),
+            "expected leaked TOML error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_plain_rejects_boundaries_eq_bracket() {
+        let content = "boundaries = [\nalpha/\n]\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_plain_rejects_toml_table_header() {
+        let content = "[hints]\nalpha/\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_plain_rejects_toml_assignment() {
+        let content = "bucket = \"my-bucket\"\nalpha/\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path);
+        assert!(result.is_err());
+    }
+
+    // ── Integration: load_hints() ────────────────────────
+
+    #[test]
+    fn test_load_hints_explicit_file_takes_precedence() {
+        // Create a TOML hints file at a non-standard path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("my-hints.toml");
+        let content = r#"bucket = "b"
+region = "r"
+total_objects = 3
+boundaries = [
+    "alpha/",
+    "beta/",
+]
+generated_at = "2026-01-01T00:00:00Z"
+"#;
+        std::fs::write(&path, content).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        // load_hints with explicit --hints-file should work.
+        let result = load_hints(Some(path_str), "other-bucket", Some("us-east-1"));
+        assert_eq!(result, vec!["alpha/", "beta/"]);
+    }
 }

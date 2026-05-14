@@ -709,8 +709,67 @@ pub struct KeySpaceHints {
     done: Vec<KeySpacePair>,
 }
 
+/// Defence-in-depth: log a warning for every boundary that looks like leaked
+/// TOML syntax.  The hints loader should already reject these, but this guard
+/// catches any path that reaches `new_from` with raw TOML still present.
+fn warn_on_suspicious_boundaries(hints: &[String]) {
+    for (i, b) in hints.iter().enumerate() {
+        // Leading whitespace that isn't a legitimate key character.
+        if b.starts_with(' ') || b.starts_with('\t') {
+            log::warn!(
+                "KeySpaceHints boundary {} has leading whitespace: '{}'. \
+                 This will be sent verbatim as an S3 start_after value and may \
+                 cause request failures.",
+                i,
+                b
+            );
+        }
+        // Trailing comma — classic TOML array entry leakage.
+        if b.ends_with(',') {
+            log::warn!(
+                "KeySpaceHints boundary {} ends with a comma: '{}'. \
+                 This looks like leaked TOML array syntax.",
+                i,
+                b
+            );
+        }
+        // Surrounded by quotes — another TOML leakage pattern.
+        if (b.starts_with('"') && b.ends_with('"')) || (b.starts_with('\'') && b.ends_with('\'')) {
+            log::warn!(
+                "KeySpaceHints boundary {} is quoted: '{}'. \
+                 This looks like leaked TOML string syntax.",
+                i,
+                b
+            );
+        }
+        // TOML array-open or array-close.
+        if b == "[" || b == "]" {
+            log::warn!(
+                "KeySpaceHints boundary {} is a TOML bracket: '{}'. \
+                 This will produce invalid S3 start_after values.",
+                i,
+                b
+            );
+        }
+        // TOML key = value assignment.
+        if b.contains('=') {
+            log::warn!(
+                "KeySpaceHints boundary {} contains '=': '{}'. \
+                 This looks like a TOML assignment line, not an object key.",
+                i,
+                b
+            );
+        }
+    }
+}
+
 impl KeySpaceHints {
     pub fn new_from(hints: &[String]) -> Self {
+        // Defensive validation: warn on any boundary that looks like leaked TOML
+        // syntax.  The hints loader should already have rejected these, but this
+        // guard catches any path that bypasses the loader.
+        warn_on_suspicious_boundaries(hints);
+
         let mut v = VecDeque::new();
         if hints.is_empty() {
             // No hints → single segment covering everything.
@@ -819,6 +878,80 @@ mod tests {
         assert_eq!(p2.end, None);
 
         assert!(hints.next().is_none());
+    }
+
+    #[test]
+    fn test_key_space_hints_start_after_clean() {
+        // Verify that generated start_after values are the exact boundary
+        // strings — no leading whitespace, no quotes, no trailing commas.
+        let boundaries = vec![
+            "alpha/".to_string(),
+            "beta/file-05.txt".to_string(),
+            "logs/file with spaces.log".to_string(),
+            "logs/file+plus.log".to_string(),
+            "中文/Unicode".to_string(),
+        ];
+        let mut hints = KeySpaceHints::new_from(&boundaries);
+
+        // Segment 0: "" → "alpha/"
+        let p0 = hints.next().unwrap();
+        assert_eq!(p0.start, "");
+        assert_eq!(p0.end.as_deref(), Some("alpha/"));
+
+        // Segment 1: "alpha/" → "beta/file-05.txt"
+        let p1 = hints.next().unwrap();
+        assert_eq!(p1.start, "alpha/");
+        assert_eq!(p1.end.as_deref(), Some("beta/file-05.txt"));
+
+        // Segment 2: "beta/file-05.txt" → "logs/file with spaces.log"
+        let p2 = hints.next().unwrap();
+        assert_eq!(p2.start, "beta/file-05.txt");
+        assert_eq!(p2.end.as_deref(), Some("logs/file with spaces.log"));
+
+        // Segment 3: "logs/file with spaces.log" → "logs/file+plus.log"
+        let p3 = hints.next().unwrap();
+        assert_eq!(p3.start, "logs/file with spaces.log");
+        assert_eq!(p3.end.as_deref(), Some("logs/file+plus.log"));
+
+        // Segment 4: "logs/file+plus.log" → "中文/Unicode"
+        let p4 = hints.next().unwrap();
+        assert_eq!(p4.start, "logs/file+plus.log");
+        assert_eq!(p4.end.as_deref(), Some("中文/Unicode"));
+
+        // Segment 5: "中文/Unicode" → (none)
+        let p5 = hints.next().unwrap();
+        assert_eq!(p5.start, "中文/Unicode");
+        assert_eq!(p5.end, None);
+
+        assert!(hints.next().is_none());
+    }
+
+    #[test]
+    fn test_key_space_hints_with_special_chars_preserved() {
+        // Verify spaces, +, /, %, Chinese/Unicode are preserved.
+        let boundaries = vec![
+            "a b/key.log".to_string(),
+            "a+b/key.log".to_string(),
+            "a%b/key.log".to_string(),
+            "中文/key.log".to_string(),
+        ];
+        let mut hints = KeySpaceHints::new_from(&boundaries);
+
+        let p = hints.next().unwrap();
+        assert_eq!(p.start, "");
+        assert_eq!(p.end.as_deref(), Some("a b/key.log"));
+
+        let p = hints.next().unwrap();
+        assert_eq!(p.start, "a b/key.log");
+        assert_eq!(p.end.as_deref(), Some("a+b/key.log"));
+
+        let p = hints.next().unwrap();
+        assert_eq!(p.start, "a+b/key.log");
+        assert_eq!(p.end.as_deref(), Some("a%b/key.log"));
+
+        let p = hints.next().unwrap();
+        assert_eq!(p.start, "a%b/key.log");
+        assert_eq!(p.end.as_deref(), Some("中文/key.log"));
     }
 
     #[test]
