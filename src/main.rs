@@ -209,6 +209,7 @@ fn main() {
         cli.profile.as_deref(),
         cli.debug_s3,
         cli.trace_compat.as_deref(),
+        cli.start_after.as_deref(),
         cli.output_log_file.as_deref(),
         cli.output_ks_file.as_deref(),
         cli.output_parquet_file.as_deref(),
@@ -438,6 +439,7 @@ fn main() {
             cfg.s3.profile.as_deref(),
             Some(&cli.delimiter),
             cli.max_keys,
+            cfg.s3.start_after.as_deref(),
             left_checkpoint.clone(),
         );
         set.spawn(async move {
@@ -472,6 +474,7 @@ fn main() {
                 cfg.s3.profile.as_deref(),
                 Some(&cli.delimiter),
                 cli.max_keys,
+                cfg.s3.start_after.as_deref(),
                 right_cp.clone(),
             );
             set.spawn(async move {
@@ -558,6 +561,32 @@ fn main() {
                     };
                     journal.save(cp_path);
                     last_checkpoint_save = std::time::Instant::now();
+                }
+            }
+        }
+
+        // ── Final checkpoint save on successful completion ─
+        if cli.resume {
+            if let Some(ref cp_path) = checkpoint_path_opt {
+                let mut completed: Vec<usize> = left_checkpoint.lock().unwrap().clone();
+                if let Some(ref right_cp) = right_checkpoint {
+                    completed.extend(right_cp.lock().unwrap().clone());
+                }
+                if !completed.is_empty() {
+                    let journal = checkpoint::CheckpointJournal {
+                        bucket: opt_bucket.to_string(),
+                        prefix: opt_prefix.clone(),
+                        total_segments: hints_count,
+                        completed_indices: completed,
+                        last_updated: chrono::Local::now().to_rfc3339(),
+                        identity: Some(current_identity.clone()),
+                    };
+                    journal.save(cp_path);
+                    info!(
+                        "Final checkpoint saved: {}/{} segments completed",
+                        journal.completed_indices.len(),
+                        journal.total_segments
+                    );
                 }
             }
         }

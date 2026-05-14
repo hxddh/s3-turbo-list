@@ -115,7 +115,8 @@ async fn flat_list_run_to_complete(
     start: &str,
     until: Option<&str>,
 ) {
-    let mut start_after = start.to_string();
+    // If the CLI provided --start-after, it overrides the segment's start.
+    let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(ctx, prefix, &start_after, until, retry_attempt).await {

@@ -70,6 +70,10 @@ pub struct S3Config {
     pub debug_s3: bool,
     #[serde(default)]
     pub trace_compat: Option<String>,
+    /// CLI `--start-after` override — if set, listing begins after this key
+    /// regardless of hint-segment boundaries.
+    #[serde(default)]
+    pub start_after: Option<String>,
 }
 
 impl Default for S3Config {
@@ -85,6 +89,7 @@ impl Default for S3Config {
             profile: None,
             debug_s3: false,
             trace_compat: None,
+            start_after: None,
         }
     }
 }
@@ -297,6 +302,9 @@ impl S3TurboConfig {
         if other.s3.trace_compat.is_some() {
             self.s3.trace_compat = other.s3.trace_compat;
         }
+        if other.s3.start_after.is_some() {
+            self.s3.start_after = other.s3.start_after;
+        }
         self.runtime.worker_threads = other.runtime.worker_threads;
         self.runtime.max_concurrency = other.runtime.max_concurrency;
         self.output.row_group_size = other.output.row_group_size;
@@ -331,6 +339,7 @@ impl S3TurboConfig {
         profile: Option<&str>,
         debug_s3: bool,
         trace_compat: Option<&str>,
+        start_after: Option<&str>,
         log_file: Option<&str>,
         ks_file: Option<&str>,
         parquet_file: Option<&str>,
@@ -360,6 +369,9 @@ impl S3TurboConfig {
         }
         if let Some(tc) = trace_compat {
             self.s3.trace_compat = Some(tc.to_string());
+        }
+        if let Some(sa) = start_after {
+            self.s3.start_after = Some(sa.to_string());
         }
         if let Some(lf) = log_file {
             self.output.log_file = Some(lf.to_string());
@@ -582,6 +594,7 @@ profile = "bos"
             Some("test-profile"),
             true,
             Some("/tmp/trace.jsonl"),
+            Some("after-key"),
             Some("log.txt"),
             Some("ks.csv"),
             Some("out.parquet"),
@@ -597,6 +610,7 @@ profile = "bos"
         assert_eq!(config.s3.profile.as_deref(), Some("test-profile"));
         assert!(config.s3.debug_s3);
         assert_eq!(config.s3.trace_compat.as_deref(), Some("/tmp/trace.jsonl"));
+        assert_eq!(config.s3.start_after.as_deref(), Some("after-key"));
         assert_eq!(config.output.log_file.as_deref(), Some("log.txt"));
         assert_eq!(config.output.ks_file.as_deref(), Some("ks.csv"));
         assert_eq!(config.output.parquet_file.as_deref(), Some("out.parquet"));

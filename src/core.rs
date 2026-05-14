@@ -505,6 +505,9 @@ pub struct S3TaskContext {
     pub profile: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
+    /// CLI `--start-after` override — if set, the first segment uses this
+    /// instead of the hint-segment start.
+    pub start_after: Option<String>,
     pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -523,6 +526,7 @@ impl S3TaskContext {
         profile: Option<&str>,
         delimiter: Option<&str>,
         max_keys: Option<i32>,
+        start_after: Option<&str>,
         checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     ) -> Self {
         let loader = aws_config::from_env()
@@ -572,6 +576,7 @@ impl S3TaskContext {
             profile: profile.map(|p| p.to_string()),
             delimiter: delimiter.map(|d| d.to_string()),
             max_keys,
+            start_after: start_after.map(|s| s.to_string()),
             checkpoint_completed,
         }
     }
