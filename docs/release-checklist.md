@@ -2,11 +2,23 @@
 
 Follow these steps to publish a release of s3-turbo-list.
 
+## 0. Environment check
+
+Run the release environment checker first:
+
+```bash
+./scripts/check-release-env.sh
+```
+
+It prints OS, architecture, Rust toolchain, C compilers, git state,
+and warns if an `aws-lc-sys` release build workaround is needed.
+
 ## 1. Local pre-release checks
 
 - [ ] Working tree clean (`git status --short` empty).
 - [ ] On the correct branch (typically `master`).
 - [ ] All commits intended for this release are present.
+- [ ] `scripts/check-release-env.sh` reports no blockers.
 
 ## 2. Secret scan
 
@@ -57,31 +69,25 @@ python3 -m py_compile examples/inspect-trace.py
 
 ## 6. Release build
 
-```bash
-# Standard release build
-cargo build --release
-
-# On Ubuntu 20.04 arm64, use the aws-lc-sys workaround:
-# export CC=clang && cargo build --release
-# See BUILD.md for details.
-```
-
-## 7. Binary naming
-
-Copy the release binary with a versioned name:
+Use the release build script (see [`docs/build-release.md`](build-release.md)):
 
 ```bash
-VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-cp target/release/s3-turbo-list "s3-turbo-list-${VERSION}-${OS}-${ARCH}"
+# Standard build
+BUILD_MODE=default ./scripts/build-release.sh
+
+# On Ubuntu 20.04 arm64, use a workaround:
+BUILD_MODE=clang   ./scripts/build-release.sh   # if clang is installed
+BUILD_MODE=gcc10   ./scripts/build-release.sh   # if gcc-10 is installed
+BUILD_MODE=no-asm  ./scripts/build-release.sh   # fallback (no ASM)
 ```
 
-## 8. Checksum
+The script handles binary naming, checksum generation, and `--help`/`--version`
+verification automatically.  Output lands in `dist/`.
 
-```bash
-sha256sum "s3-turbo-list-${VERSION}-${OS}-${ARCH}" > "s3-turbo-list-${VERSION}-${OS}-${ARCH}.sha256"
-```
+- [ ] Binary at `dist/s3-turbo-list-<version>-<os>-<arch>` exists.
+- [ ] `dist/s3-turbo-list-<version>-<os>-<arch>.sha256` exists.
+- [ ] `./dist/<binary> --help` runs successfully.
+- [ ] `./dist/<binary> --version` prints the correct version.
 
 ## 9. GitHub private repo dry run
 
