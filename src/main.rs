@@ -370,9 +370,11 @@ fn main() {
 
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
-        let (file_writer, _debug_writer) =
-            trace::create_trace_writer(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3);
-        let trace_writer: Option<Arc<dyn S3TraceWriter>> = Some(Arc::from(file_writer));
+        let trace_writer: Option<Arc<dyn S3TraceWriter>> = {
+            let writer =
+                trace::create_trace_writer(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3);
+            Some(Arc::from(writer))
+        };
 
         // ── Load or generate KeySpace hints ─────────────────
         let ks_hints = if cli.no_auto_hints {
@@ -512,6 +514,10 @@ fn main() {
         if mode == RunMode::BiDir {
             diff::init_diff_state();
         }
+
+        // Drop the original sender so the channel closes when all list tasks
+        // finish (each list task clones tx; this drops the last reference).
+        drop(tx);
 
         // Wait for all tasks — save checkpoints on segment completion.
         let mut last_checkpoint_save = std::time::Instant::now();

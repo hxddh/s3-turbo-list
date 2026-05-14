@@ -32,29 +32,30 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — started", ctx.s3_bucket_name);
     tokio::task::yield_now().await;
 
-    let mut joins: Vec<tokio::task::JoinHandle<Option<usize>>> = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
     let mut last_ts = epoch_secs();
 
     loop {
         // Fill up to concurrency limit.
-        while joins.len() < flat_concurrency {
+        while set.len() < flat_concurrency {
             if let Some(pair) = hints.next() {
                 let task_ctx = ctx.clone();
                 let start_prefix = start_prefix.to_string();
                 let index = pair.index;
+                let start = pair.start;
+                let end = pair.end;
 
-                let h = tokio::task::spawn(async move {
-                    let (start, end) = pair.to_task_input();
-                    flat_list_run_to_complete(&task_ctx, &start_prefix, start, end).await;
-                    Some(index)
+                set.spawn(async move {
+                    let end_ref: Option<&str> = end.as_deref();
+                    flat_list_run_to_complete(&task_ctx, &start_prefix, &start, end_ref).await;
+                    index
                 });
-                joins.push(h);
             } else {
                 break;
             }
         }
 
-        if joins.is_empty() {
+        if set.is_empty() {
             ctx.complete();
             info!("Flat List S3 Task — {} — completed", ctx.s3_bucket_name);
             tokio::time::sleep(Duration::from_secs(
@@ -64,44 +65,40 @@ async fn flat_reactor_task(
             break;
         }
 
-        // Poll completed tasks.
-        let mut waiting = Vec::new();
-        while let Some(h) = joins.pop() {
-            if h.is_finished() {
-                match h.await {
-                    Ok(Some(index)) => {
-                        hints.finish(index);
-                        ctx.checkpoint_completed.lock().unwrap().push(index);
-                    }
-                    Ok(None) => { /* task aborted */ }
-                    Err(e) => {
-                        error!("Task join error: {:?}", e);
-                    }
-                }
-            } else {
-                waiting.push(h);
+        // Await-driven polling: wait for the next segment to complete,
+        // with a heartbeat timeout so logs stay fresh.
+        let heartbeat_dur = Duration::from_secs(core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS);
+        match tokio::time::timeout(heartbeat_dur, set.join_next()).await {
+            Ok(Some(Ok(index))) => {
+                hints.finish(index);
+                ctx.checkpoint_completed.lock().unwrap().push(index);
             }
-        }
-        joins = waiting;
-
-        // Heartbeat.
-        let now = epoch_secs();
-        if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
-            info!(
-                "Flat List S3 Task — {} — heartbeat, {} segments in-flight, {} done, {} remaining",
-                ctx.s3_bucket_name,
-                joins.len(),
-                hints.done_count(),
-                hints.len(),
-            );
-            last_ts = now;
+            Ok(Some(Err(e))) => {
+                error!("Task join error: {:?}", e);
+            }
+            Ok(None) => {
+                // All tasks drained — should not happen while !set.is_empty().
+                break;
+            }
+            Err(_elapsed) => {
+                // Timeout — emit heartbeat.
+                let now = epoch_secs();
+                if now - last_ts >= core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
+                    info!(
+                        "Flat List S3 Task — {} — heartbeat, {} segments in-flight, {} done, {} remaining",
+                        ctx.s3_bucket_name,
+                        set.len(),
+                        hints.done_count(),
+                        hints.len(),
+                    );
+                    last_ts = now;
+                }
+            }
         }
 
         // Handle global quit.
         if ctx.is_quit() {
-            while let Some(h) = joins.pop() {
-                h.abort();
-            }
+            set.abort_all();
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
         }

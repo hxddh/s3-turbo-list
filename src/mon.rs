@@ -14,6 +14,13 @@ pub async fn mon_task(ctx: MonContext) {
             return;
         }
 
+        // Exit when all worker tasks (list + data_map) have finished.
+        if !ctx.g_state.all_list_tasks_is_running() {
+            ctx.complete();
+            info!("Mon Task — all list tasks completed, exiting");
+            return;
+        }
+
         let tracker_stats = format!("{}", &*ctx.get_tracker());
         if !tracker_stats.is_empty() {
             info!("Mon Task — http status: {}", tracker_stats);
