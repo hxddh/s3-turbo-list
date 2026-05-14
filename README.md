@@ -137,20 +137,38 @@ s3-turbo-list list --bucket my-bucket \
 #   profile = "minio"
 ```
 
-### BOS (Baidu Object Storage) with path-style
+### BOS (Baidu Object Storage)
+
+BOS recommends bucket virtual hosting (`bucket.s3.<region>.bcebos.com`).
+s3-turbo-list supports this with virtual-hosted addressing:
 
 ```bash
+# Virtual-hosted (recommended for BOS)
 s3-turbo-list list --region bj --bucket my-bos-bucket \
   --endpoint-url https://s3.bj.bcebos.com \
-  --force-path-style
+  --addressing-style virtual
+```
 
-# Or use the vendor profile preset:
+> **Note on `--profile bos`:** The built-in `bos` profile preset currently
+> defaults to path-style addressing for legacy compatibility.  Override it
+> with `--addressing-style virtual` to use the recommended virtual-hosted
+> mode:
+>
+> ```bash
+> s3-turbo-list list --region bj --bucket my-bos-bucket \
+>   --profile bos --addressing-style virtual
+> ```
+
+Path-style is supported but intended only for legacy compatibility,
+diagnostics, or controlled validation:
+
+```bash
+# Path-style (legacy / diagnostic only)
 s3-turbo-list list --region bj --bucket my-bos-bucket \
   --profile bos
 ```
 
-The `bos` profile preset automatically sets `endpoint_url` and path-style
-addressing.  See [Known limitations](#known-limitations) for BOS caveats.
+See [Known limitations](#known-limitations) for BOS caveats.
 
 ### Trace / debug
 
@@ -312,7 +330,7 @@ the following fields:
 |---|---|---|---|
 | **AWS S3** (`us-east-2`) | ✅ Validated | path, virtual-hosted | Full compatibility. Baseline reference. |
 | **MinIO** (v2025-09-07) | ✅ Validated | path, virtual-hosted | Full compatibility. Local and remote. |
-| **BOS** (Baidu Object Storage) | ✅ Validated | path (primary), virtual-hosted (unexpected) | **Known pagination issue** — see below. |
+| **BOS** (Baidu Object Storage) | ✅ Validated | virtual-hosted (recommended), path (legacy/diagnostic) | **Known pagination issue** — see below. |
 
 Validation details:
 - [`docs/validation-results/final-validation-summary-20260514.md`](docs/validation-results/final-validation-summary-20260514.md)
