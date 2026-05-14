@@ -210,6 +210,7 @@ impl CheckpointJournal {
     }
 
     /// Create a new checkpoint journal for a run.
+    #[allow(dead_code)] // Phase 5: used when creating fresh checkpoints (non-resume runs)
     pub fn new(
         bucket: &str,
         prefix: &str,

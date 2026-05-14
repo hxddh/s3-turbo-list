@@ -15,6 +15,7 @@ impl HttpStatusCodeTracker {
 
     /// Increment the counter for a status code. Uses entry API to
     /// prevent lost updates when two callers race on a first-seen code.
+    #[allow(dead_code)] // Phase 5: async variant retained for future async callers
     pub async fn inc(&self, code: u16) {
         self.inc_sync(code);
     }

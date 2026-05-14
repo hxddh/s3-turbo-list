@@ -472,6 +472,7 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
     )))
 }
 
+#[allow(dead_code)] // Phase 5: standalone convenience wrapper
 pub fn compile_filter(expr: &str) -> Result<ObjectFilter, String> {
     build_filter_engine(expr, None)
 }

@@ -73,22 +73,26 @@ impl FlatRuntimeError {
         self.errno < ERROR_NO_BUCKET
     }
 
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn errno(&self) -> u8 {
         self.errno
     }
 
     /// Returns the HTTP status code, or 0 if not set.
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn http_status_code(&self) -> u16 {
         self.http_status_code
     }
 
     /// Attach an HTTP status code for diagnostics.
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn with_http_status_code(mut self, code: u16) -> Self {
         self.http_status_code = code;
         self
     }
 
     /// Attach an HTTP status code AND record it in the global tracker.
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn with_http_status_code_tracker(
         mut self,
         code: u16,
@@ -124,11 +128,13 @@ impl FlatRuntimeError {
     }
 
     /// Returns `true` if this error is retryable (errno < 0x10).
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn is_retryable(&self) -> bool {
         self.errno < ERROR_NO_BUCKET
     }
 
     /// Returns `true` if this error is fatal (errno >= 0x10).
+    #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn is_fatal(&self) -> bool {
         self.errno >= ERROR_NO_BUCKET
     }
@@ -159,6 +165,7 @@ impl std::error::Error for FlatRuntimeError {}
 // ── Error code → name mapping ─────────────────────────────
 
 /// Return a human-readable S3 error classification for logging/trace.
+#[allow(dead_code)] // Phase 5: used in log/trace formatting
 pub fn errno_to_name(errno: u8) -> &'static str {
     match errno {
         ERROR_S3_NEXT_STREAM_TIMEOUT => "StreamTimeout",
@@ -291,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_flat_error_display() {
-        let err = FlatRuntimeError::new(
+        let _err = FlatRuntimeError::new(
             ERROR_NO_BUCKET,
             "The bucket does not exist".into(),
             "/".into(),

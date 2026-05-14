@@ -57,6 +57,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         &self.ks_path
     }
 
+    #[allow(dead_code)] // Phase 5: used in monitoring and streaming row-group flushes
     pub fn total_rows(&self) -> usize {
         self.total_rows
     }
@@ -100,6 +101,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
     }
 
     /// Flush the in-progress row group (streaming — keeps memory bounded).
+    #[allow(dead_code)] // Phase 5: used in streaming row-group flushes
     pub async fn flush_row_group(&mut self) {
         if let Err(e) = self.writer.flush().await {
             warn!("Parquet flush error: {}", e);
