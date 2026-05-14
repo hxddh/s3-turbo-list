@@ -1,2 +1,35 @@
 /target
 *.rmeta
+
+# Build artifacts
+dist/
+
+# Example / validation output
+artifacts/
+*.parquet
+*.ks
+*.jsonl
+*.log
+
+# Environment and credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Temporary validation output
+/tmp/s3tl-validation-*/
+
+# Benchmark output
+/bench-results/
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
