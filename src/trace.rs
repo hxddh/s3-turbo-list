@@ -355,7 +355,6 @@ mod tests {
 
     #[test]
     fn test_composite_trace_writer_fans_to_both() {
-        use std::io::Write;
         // Capture stderr by swapping it out.
         // Simpler: test with two files.
         let dir = tempfile::tempdir().unwrap();
