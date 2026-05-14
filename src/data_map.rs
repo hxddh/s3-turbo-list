@@ -180,15 +180,17 @@ pub async fn data_map_task(mut ctx: DataMapContext, filename_ks: &str, filename_
     let mut last_ts = epoch_secs();
 
     loop {
-        match ctx.data_map_channel.try_recv() {
-            Ok(batch) => {
+        let recv_result = ctx.data_map_channel.recv().await;
+
+        match recv_result {
+            Some(batch) => {
                 for (key, props) in batch {
                     let (prefix, name) = key.decode();
                     map.bulk_insert(&prefix, vec![(name, props)]);
                 }
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            None => {
+                // Channel disconnected — flush accumulated data before exit.
                 info!("Data Map Task — channel disconnected, writing output");
                 write_output(&map, filename_ks, filename_output, include_equal).await;
                 ctx.complete();
@@ -201,7 +203,14 @@ pub async fn data_map_task(mut ctx: DataMapContext, filename_ks: &str, filename_
             write_output(&map, filename_ks, filename_output, include_equal).await;
             ctx.complete();
             return;
-        } else if !ctx.all_list_tasks_is_running() && !has_pending_data(&ctx) {
+        } else if !ctx.all_list_tasks_is_running() {
+            // All list tasks done — drain any remaining pending data, then write output.
+            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+                for (key, props) in batch {
+                    let (prefix, name) = key.decode();
+                    map.bulk_insert(&prefix, vec![(name, props)]);
+                }
+            }
             info!("Data Map Task — all list tasks done, writing output");
             write_output(&map, filename_ks, filename_output, include_equal).await;
             ctx.complete();
@@ -212,14 +221,9 @@ pub async fn data_map_task(mut ctx: DataMapContext, filename_ks: &str, filename_
         let now = epoch_secs();
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
             info!("Data Map Task — {}", map);
-            tokio::task::yield_now().await;
             last_ts = now;
         }
     }
-}
-
-fn has_pending_data(ctx: &DataMapContext) -> bool {
-    !ctx.data_map_channel.is_empty()
 }
 
 async fn write_output(map: &PrefixMap, ks: &str, output: &str, include_equal: bool) {
