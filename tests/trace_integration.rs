@@ -142,10 +142,9 @@ fn test_create_trace_writer_with_file() {
     let path = dir.path().join("trace.jsonl");
     let path_str = path.to_str().unwrap();
 
-    let (fw, dw) = create_trace_writer(Some(path_str), false);
+    let w = create_trace_writer(Some(path_str), false);
 
-    fw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-    dw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
+    w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
 
     // File writer should have written a line.
     let content = std::fs::read_to_string(path_str).unwrap();
@@ -161,8 +160,7 @@ fn test_create_trace_writer_debug_s3_combo() {
     let path = dir.path().join("trace.jsonl");
     let path_str = path.to_str().unwrap();
 
-    let (fw, dw) = create_trace_writer(Some(path_str), true);
-    fw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-    dw.write_event(S3CompatEvent::new("Y", "e", "b", "/"));
+    let w = create_trace_writer(Some(path_str), true);
+    w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
     // No panic = success.
 }

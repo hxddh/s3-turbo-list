@@ -163,6 +163,42 @@ impl S3TraceWriter for StderrTraceWriter {
     }
 }
 
+// ── CompositeTraceWriter ───────────────────────────────────
+
+/// Fans events out to multiple underlying writers.
+/// Used when both `--debug-s3` and `--trace-compat` are set.
+pub struct CompositeTraceWriter {
+    writers: Vec<Box<dyn S3TraceWriter>>,
+}
+
+impl CompositeTraceWriter {
+    pub fn new() -> Self {
+        Self {
+            writers: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, writer: Box<dyn S3TraceWriter>) {
+        self.writers.push(writer);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.writers.is_empty()
+    }
+}
+
+impl S3TraceWriter for CompositeTraceWriter {
+    fn write_event(&self, event: S3CompatEvent) {
+        if self.writers.len() == 1 {
+            self.writers[0].write_event(event);
+        } else {
+            for writer in &self.writers {
+                writer.write_event(event.clone());
+            }
+        }
+    }
+}
+
 // ── NoopTraceWriter ────────────────────────────────────────
 
 /// Silent writer — used when tracing is disabled.
@@ -174,26 +210,27 @@ impl S3TraceWriter for NoopTraceWriter {
 
 // ── Convenience constructors ───────────────────────────────
 
-/// Create a [`JsonlTraceWriter`] if `path` is `Some`, otherwise create a
-/// [`NoopTraceWriter`].  Panics if file creation fails.
-pub fn create_trace_writer(
-    trace_compat: Option<&str>,
-    debug_s3: bool,
-) -> (Box<dyn S3TraceWriter>, Box<dyn S3TraceWriter>) {
-    let file_writer: Box<dyn S3TraceWriter> = match trace_compat {
-        Some(path) => {
-            Box::new(JsonlTraceWriter::new(path).expect("failed to create trace-compat file"))
-        }
-        None => Box::new(NoopTraceWriter),
-    };
+/// Create a unified trace writer that combines file and/or stderr outputs.
+/// Returns a single [`Box<dyn S3TraceWriter>`] that fans events to all
+/// enabled outputs.  Panics if file creation fails.
+pub fn create_trace_writer(trace_compat: Option<&str>, debug_s3: bool) -> Box<dyn S3TraceWriter> {
+    let mut composite = CompositeTraceWriter::new();
 
-    let debug_writer: Box<dyn S3TraceWriter> = if debug_s3 {
-        Box::new(StderrTraceWriter)
-    } else {
+    if let Some(path) = trace_compat {
+        composite.push(Box::new(
+            JsonlTraceWriter::new(path).expect("failed to create trace-compat file"),
+        ));
+    }
+
+    if debug_s3 {
+        composite.push(Box::new(StderrTraceWriter));
+    }
+
+    if composite.is_empty() {
         Box::new(NoopTraceWriter)
-    };
-
-    (file_writer, debug_writer)
+    } else {
+        Box::new(composite)
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -301,20 +338,58 @@ mod tests {
     #[test]
     fn test_create_trace_writer_combinations() {
         // No tracing
-        let (fw, dw) = create_trace_writer(None, false);
-        fw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-        dw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
+        let w = create_trace_writer(None, false);
+        w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         // just should not panic
 
         // File only
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.jsonl");
         let p_str = p.to_str().unwrap();
-        let (fw, _dw) = create_trace_writer(Some(p_str), false);
-        fw.write_event(S3CompatEvent::new("X", "e", "b", "/"));
+        let w = create_trace_writer(Some(p_str), false);
+        w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         assert!(std::fs::read_to_string(p_str)
             .unwrap()
             .contains("\"operation\":\"X\""));
+    }
+
+    #[test]
+    fn test_composite_trace_writer_fans_to_both() {
+        use std::io::Write;
+        // Capture stderr by swapping it out.
+        // Simpler: test with two files.
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.jsonl");
+        let p2 = dir.path().join("b.jsonl");
+        let w = {
+            let mut c = CompositeTraceWriter::new();
+            c.push(Box::new(
+                JsonlTraceWriter::new(p1.to_str().unwrap()).unwrap(),
+            ));
+            c.push(Box::new(
+                JsonlTraceWriter::new(p2.to_str().unwrap()).unwrap(),
+            ));
+            Box::new(c) as Box<dyn S3TraceWriter>
+        };
+        w.write_event(S3CompatEvent::new("HeadBucket", "http://x", "b", "/"));
+        let a = std::fs::read_to_string(&p1).unwrap();
+        let b = std::fs::read_to_string(&p2).unwrap();
+        assert!(a.contains("\"operation\":\"HeadBucket\""));
+        assert_eq!(a, b, "Both files should receive identical events");
+    }
+
+    #[test]
+    fn test_create_trace_writer_both_outputs() {
+        // File + debug: both should receive events.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        let p_str = p.to_str().unwrap();
+        let w = create_trace_writer(Some(p_str), true);
+        w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
+        assert!(std::fs::read_to_string(p_str)
+            .unwrap()
+            .contains("\"operation\":\"X\""));
+        // stderr was also written — we just verify the composite didn't panic.
     }
 
     #[test]
