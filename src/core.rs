@@ -542,6 +542,15 @@ impl S3TaskContext {
                     .connect_timeout(std::time::Duration::from_secs(
                         s3_config.connect_timeout_secs,
                     ))
+                    .operation_timeout(std::time::Duration::from_secs(
+                        s3_config.operation_timeout_secs,
+                    ))
+                    .read_timeout(std::time::Duration::from_secs(
+                        s3_config.operation_timeout_secs,
+                    ))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(
+                        s3_config.operation_timeout_secs,
+                    ))
                     .build(),
             );
 

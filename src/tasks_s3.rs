@@ -158,8 +158,12 @@ async fn flat_list(
         .s3_client
         .list_objects_v2()
         .bucket(&ctx.s3_bucket_name)
-        .prefix(prefix)
-        .start_after(start_after);
+        .prefix(prefix);
+
+    // Only set start_after when non-empty.
+    if !start_after.is_empty() {
+        request = request.start_after(start_after);
+    }
 
     if let Some(ref delim) = ctx.delimiter {
         request = request.delimiter(delim);
@@ -180,7 +184,6 @@ async fn flat_list(
 
     loop {
         let timeout_dur = Duration::from_secs(5); // operation_timeout_secs
-
         let page_start = Instant::now();
         let res = timeout_at(Instant::now() + timeout_dur, stream.next()).await;
         let latency_ms = page_start.elapsed().as_millis() as u64;
