@@ -212,6 +212,7 @@ async fn flat_list(
                     None,
                     true,
                     false,
+                    None,
                 );
 
                 return Err(FlatRuntimeError::new(
@@ -241,6 +242,7 @@ async fn flat_list(
                     Some(0),
                     false,
                     false,
+                    None,
                 );
                 break;
             }
@@ -286,6 +288,7 @@ async fn flat_list(
                     Some(cp_count),
                     false,
                     false,
+                    None,
                 );
 
                 let mut batch: Vec<(ObjectKey, ObjectProps)> = Vec::new();
@@ -373,6 +376,7 @@ fn emit_trace_compat(
     common_prefixes_count: Option<i32>,
     retryable: bool,
     fatal: bool,
+    truncated_raw_body: Option<String>,
 ) {
     let writer = match &ctx.trace_writer {
         Some(w) => w,
@@ -402,6 +406,7 @@ fn emit_trace_compat(
     event.key_count = key_count;
     event.contents_count = contents_count;
     event.common_prefixes_count = common_prefixes_count;
+    event.truncated_raw_body = truncated_raw_body;
 
     writer.write_event(event);
 }
@@ -460,6 +465,7 @@ fn handle_sdk_error(
                 None,
                 retryable,
                 fatal,
+                body_excerpt.clone(),
             );
 
             error!(
@@ -525,6 +531,7 @@ fn handle_sdk_error(
                 None,
                 retryable,
                 false,
+                None,
             );
 
             Err(FlatRuntimeError::new(
@@ -556,6 +563,7 @@ fn handle_sdk_error(
                 None,
                 false,
                 false,
+                None,
             );
 
             Err(FlatRuntimeError::new(
