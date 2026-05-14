@@ -69,7 +69,10 @@ async fn flat_reactor_task(
         while let Some(h) = joins.pop() {
             if h.is_finished() {
                 match h.await {
-                    Ok(Some(index)) => hints.finish(index),
+                    Ok(Some(index)) => {
+                        hints.finish(index);
+                        ctx.checkpoint_completed.lock().unwrap().push(index);
+                    }
                     Ok(None) => { /* task aborted */ }
                     Err(e) => {
                         error!("Task join error: {:?}", e);

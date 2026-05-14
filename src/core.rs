@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::sync::Barrier;
@@ -497,6 +498,7 @@ pub(crate) struct S3TaskContext {
     pub profile: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
+    pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
 }
 
 impl S3TaskContext {
@@ -514,6 +516,7 @@ impl S3TaskContext {
         profile: Option<&str>,
         delimiter: Option<&str>,
         max_keys: Option<i32>,
+        checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     ) -> Self {
         let loader = aws_config::from_env()
             .retry_config(
@@ -562,6 +565,7 @@ impl S3TaskContext {
             profile: profile.map(|p| p.to_string()),
             delimiter: delimiter.map(|d| d.to_string()),
             max_keys,
+            checkpoint_completed,
         }
     }
 

@@ -333,6 +333,41 @@ fn main() {
         .unwrap();
 
     rt.block_on(async {
+        // ── Checkpoint journal (resume mode) ──────────────────
+        let checkpoint_path_opt = if cli.resume {
+            Some(checkpoint::checkpoint_path(opt_bucket, opt_region))
+        } else {
+            None
+        };
+
+        // Build the current run identity for checkpoint verification.
+        let current_identity = checkpoint::CheckpointIdentity::new(
+            opt_bucket,
+            opt_region,
+            &opt_prefix,
+            Some(&cli.delimiter),
+            cli.max_keys,
+            cfg.s3.profile.as_deref(),
+            Some(&cfg.s3.addressing_style.to_string()),
+            Some(if mode == RunMode::BiDir {
+                "bidir"
+            } else {
+                "list"
+            }),
+        );
+
+        let checkpoint_journal = checkpoint_path_opt
+            .as_deref()
+            .and_then(|p| checkpoint::CheckpointJournal::load_and_verify(p, &current_identity));
+
+        if let Some(ref cj) = checkpoint_journal {
+            info!(
+                "Resuming checkpoint: {} of {} segments completed",
+                cj.completed_indices.len(),
+                cj.total_segments
+            );
+        }
+
         let g_state = core::GlobalState::new(quit, g_tasks_count);
         let mut set = tokio::task::JoinSet::new();
         let concurrency = cfg.runtime.max_concurrency;
@@ -357,6 +392,20 @@ fn main() {
 
         let ks_list: Vec<String> = ks_hints;
         let hints = core::KeySpaceHints::new_from(&ks_list);
+
+        // Filter out completed segments when resuming.
+        let hints = if let Some(ref cj) = checkpoint_journal {
+            let remaining_boundaries = cj.filter_uncompleted(&ks_list);
+            let filtered = core::KeySpaceHints::new_from(&remaining_boundaries);
+            info!(
+                "Resume: {} segments filtered, {} remaining",
+                ks_list.len() + 1 - remaining_boundaries.len(),
+                filtered.total_count()
+            );
+            filtered
+        } else {
+            hints
+        };
         let hints_count = hints.total_count();
 
         info!("S3 Turbo List v{} starting:", env!("CARGO_PKG_VERSION"));
@@ -379,6 +428,8 @@ fn main() {
         } else {
             core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE
         };
+        let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let s3_cfg = cfg.s3.clone();
         let task_ctx = core::S3TaskContext::new(
             opt_bucket,
@@ -394,18 +445,23 @@ fn main() {
             cfg.s3.profile.as_deref(),
             Some(&cli.delimiter),
             cli.max_keys,
+            left_checkpoint.clone(),
         );
         set.spawn(async move {
             tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
         });
 
         // ── Spawn list task (right) if diff mode ────────────
-        if mode == RunMode::BiDir {
+        let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = if mode == RunMode::BiDir
+        {
             let prefix = opt_prefix.clone();
             let target_region = opt_target_region.and_then(|inner| inner);
             let target_bucket = opt_target_bucket.expect("target_bucket required for diff mode");
             let target_ks: Vec<String> = vec![];
             let target_hints = core::KeySpaceHints::new_from(&target_ks);
+
+            let right_cp: Arc<std::sync::Mutex<Vec<usize>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
 
             let task_ctx = core::S3TaskContext::new(
                 target_bucket,
@@ -421,11 +477,15 @@ fn main() {
                 cfg.s3.profile.as_deref(),
                 Some(&cli.delimiter),
                 cli.max_keys,
+                right_cp.clone(),
             );
             set.spawn(async move {
                 tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, target_hints).await
             });
-        }
+            Some(right_cp)
+        } else {
+            None
+        };
 
         // ── Spawn data map task ─────────────────────────────
         let filename_ks = cfg
@@ -455,7 +515,13 @@ fn main() {
         let mon_ctx = core::MonContext::new(g_state.clone());
         set.spawn(async move { mon::mon_task(mon_ctx).await });
 
-        // Wait for all tasks — log any panics.
+        // ── Diff mode lifecycle ───────────────────────────
+        if mode == RunMode::BiDir {
+            diff::init_diff_state();
+        }
+
+        // Wait for all tasks — save checkpoints on segment completion.
+        let mut last_checkpoint_save = std::time::Instant::now();
         while let Some(result) = set.join_next().await {
             if let Err(e) = result {
                 error!("Task panicked: {}", e);
@@ -469,8 +535,39 @@ fn main() {
                         .unwrap_or_else(|| "<unknown panic>".to_string());
                     error!("Task panic message: {}", msg);
                 }
+                // Propagate panic as failure — exit with non-zero code.
+                g_state.quit();
+            }
+
+            // Save checkpoint progress periodically (every 30s or on state change).
+            if cli.resume
+                && last_checkpoint_save.elapsed().as_secs() >= 30
+                && g_state.all_list_tasks_is_running()
+            {
+                if let Some(ref cp_path) = checkpoint_path_opt {
+                    let mut completed: Vec<usize> = left_checkpoint.lock().unwrap().clone();
+                    if let Some(ref right_cp) = right_checkpoint {
+                        completed.extend(right_cp.lock().unwrap().clone());
+                    }
+                    let journal = checkpoint::CheckpointJournal {
+                        bucket: opt_bucket.to_string(),
+                        prefix: opt_prefix.clone(),
+                        total_segments: hints_count,
+                        completed_indices: completed,
+                        last_updated: chrono::Local::now().to_rfc3339(),
+                        identity: Some(current_identity.clone()),
+                    };
+                    journal.save(cp_path);
+                    last_checkpoint_save = std::time::Instant::now();
+                }
             }
         }
+
+        // ── Diff mode completion notice ────────────────────
+        if mode == RunMode::BiDir {
+            info!("{}", diff::diff_complete_notice());
+        }
+
         info!("All tasks completed.");
     });
 
