@@ -1,17 +1,6 @@
-mod auto_hints;
-mod config;
-mod core;
-mod error;
-mod stats;
-mod tasks_s3;
-mod trace;
-
-// Modules declared here; implementations added in subsequent phases.
-mod checkpoint;
-mod data_map;
-mod diff;
-mod mon;
-mod utils;
+// All modules exported from the library crate (src/lib.rs).
+// The binary uses `s3_turbo_list::...` paths to avoid module duplication.
+use s3_turbo_list::{auto_hints, checkpoint, config, core, data_map, diff, mon, tasks_s3, trace};
 
 use chrono::Local;
 use clap::{Parser, Subcommand};
@@ -315,7 +304,9 @@ fn main() {
     let g_tasks_count = if mode == RunMode::BiDir { 4 } else { 3 }; // list + data_map + mon (+right list)
 
     let dt_str = Local::now().format("%Y%m%d%H%M%S").to_string();
-    let region_prefix = opt_region.map(|r| format!("{}_", r)).unwrap_or_default();
+    let region_prefix: std::borrow::Cow<'_, str> = opt_region
+        .map(|r: &str| format!("{}_", r).into())
+        .unwrap_or_default();
 
     // Setup Ctrl-C handler
     let quit = Arc::new(AtomicBool::new(false));
@@ -455,8 +446,10 @@ fn main() {
         let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = if mode == RunMode::BiDir
         {
             let prefix = opt_prefix.clone();
-            let target_region = opt_target_region.and_then(|inner| inner);
-            let target_bucket = opt_target_bucket.expect("target_bucket required for diff mode");
+            let target_region: Option<&str> =
+                opt_target_region.and_then(|inner: Option<&str>| inner);
+            let target_bucket: &str =
+                opt_target_bucket.expect("target_bucket required for diff mode");
             let target_ks: Vec<String> = vec![];
             let target_hints = core::KeySpaceHints::new_from(&target_ks);
 

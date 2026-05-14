@@ -12,8 +12,10 @@ use tokio::sync::Barrier;
 
 // ── Constants ──────────────────────────────────────────────
 
+#[allow(dead_code)] // Phase 5: used in size formatting
 pub(crate) const KB: usize = 1024;
 pub(crate) const MB: usize = 1_048_576;
+#[allow(dead_code)] // Phase 5: reserved for future size formatting
 pub(crate) const GB: usize = 1_073_741_824;
 
 pub(crate) const DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS: u64 = 5;
@@ -22,6 +24,7 @@ pub(crate) const DEFAULT_TASK_COMPLETE_QUIT_WAIT_SECS: u64 = 1;
 // ── ObjectProps: bit-flag state machine ────────────────────
 
 const OBJECT_PROPS_FLAG_S3_GP_BUCKET: u8 = 0b1;
+#[allow(dead_code)] // Phase 5: reserved for S3 directory bucket support
 const OBJECT_PROPS_FLAG_S3_DIR_BUCKET: u8 = 0b10;
 const OBJECT_PROPS_FLAG_DIR_LEFT: u8 = 0b1000_0000;
 const OBJECT_PROPS_FLAG_DIR_RIGHT: u8 = 0b0100_0000;
@@ -35,12 +38,12 @@ const OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL: u8 = 2;
 const OBJECT_PROPS_STATUS_ETAG_NOT_MATCH: u8 = 3;
 const OBJECT_PROPS_STATUS_FILTER_OUT: u8 = 4;
 
-pub(crate) const S3_TASK_CONTEXT_DIR_LEFT: u8 = OBJECT_PROPS_FLAG_DIR_LEFT;
-pub(crate) const S3_TASK_CONTEXT_DIR_RIGHT: u8 = OBJECT_PROPS_FLAG_DIR_RIGHT;
-pub(crate) const S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE: u8 = OBJECT_PROPS_FLAG_DIR_LEFT;
-pub(crate) const S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE: u8 =
+pub const S3_TASK_CONTEXT_DIR_LEFT: u8 = OBJECT_PROPS_FLAG_DIR_LEFT;
+pub const S3_TASK_CONTEXT_DIR_RIGHT: u8 = OBJECT_PROPS_FLAG_DIR_RIGHT;
+pub const S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE: u8 = OBJECT_PROPS_FLAG_DIR_LEFT;
+pub const S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE: u8 =
     OBJECT_PROPS_FLAG_DIR_LEFT | OBJECT_PROPS_FLAG_DIFF_MODE;
-pub(crate) const S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE: u8 =
+pub const S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE: u8 =
     OBJECT_PROPS_FLAG_DIR_RIGHT | OBJECT_PROPS_FLAG_DIFF_MODE;
 
 /// Global filter engine (initialised once from config or CLI).
@@ -49,7 +52,7 @@ pub(crate) static OBJECT_FILTER: OnceLock<ObjectFilter> = OnceLock::new();
 // ── RunMode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RunMode {
+pub enum RunMode {
     List,
     BiDir,
 }
@@ -95,6 +98,7 @@ impl ObjectKey {
         self.0.as_str()
     }
 
+    #[allow(dead_code)] // Phase 5: used in serialisation/encoding paths
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
@@ -123,11 +127,12 @@ pub struct ObjectProps {
     #[serde(skip)]
     pub(crate) status: u8,
     #[serde(skip)]
+    #[allow(dead_code)] // Phase 5: alignment padding for cache-line behaviour
     pub(crate) pad: u16,
     #[serde(skip)]
     pub(crate) etag_parts: u32,
-    pub(crate) last_modified: u64,
-    pub(crate) size: u64,
+    pub last_modified: u64,
+    pub size: u64,
     #[serde(skip)]
     pub(crate) etag_md5: [u8; 16],
 }
@@ -303,7 +308,7 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
 
 // ── ObjectFilter ───────────────────────────────────────────
 
-pub(crate) struct ObjectFilter {
+pub struct ObjectFilter {
     /// A compiled predicate that returns `Some(bool)` or `None` on error.
     predicate: Box<dyn Fn(&ObjectProps, Option<&ObjectProps>) -> Option<bool> + Send + Sync>,
 }
@@ -322,6 +327,7 @@ impl ObjectFilter {
         Self { predicate }
     }
 
+    #[allow(dead_code)] // Phase 5: legacy stub; real compile in config::compile_filter_with_mode
     pub fn compile(expr: &str) -> Result<Self, String> {
         // Deferred to Phase 2 (config) — for now a no-op filter.
         // The full Rhai-based filter engine from s3-fast-list will be wired
@@ -338,7 +344,7 @@ impl ObjectFilter {
 // ── Task rendezvous ────────────────────────────────────────
 
 #[derive(Clone)]
-struct TaskRendezvous {
+pub(crate) struct TaskRendezvous {
     barrier: Arc<Barrier>,
 }
 
@@ -368,7 +374,7 @@ pub struct GlobalState {
     pub task_next_stream_timeout_count: Arc<AtomicUsize>,
     pub s3_client_timeout_count: Arc<AtomicUsize>,
     pub s3_client_generic_error_count: Arc<AtomicUsize>,
-    pub task_rendez: TaskRendezvous,
+    pub(crate) task_rendez: TaskRendezvous,
 }
 
 impl GlobalState {
@@ -470,6 +476,7 @@ impl GlobalState {
     pub fn data_map_task_complete(&self) {
         self.complete(TASK_STATUS_BIT_DATA_MAP);
     }
+    #[allow(dead_code)] // Phase 5: used in task-coordination diagnostics
     pub fn data_map_task_is_running(&self) -> bool {
         self.is_running(TASK_STATUS_BIT_DATA_MAP)
     }
@@ -484,7 +491,7 @@ impl GlobalState {
 // ── S3TaskContext ──────────────────────────────────────────
 
 #[derive(Clone)]
-pub(crate) struct S3TaskContext {
+pub struct S3TaskContext {
     pub s3_bucket_name: String,
     pub s3_client: aws_sdk_s3::Client,
     pub data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
@@ -588,7 +595,7 @@ impl S3TaskContext {
 
 // ── DataMapContext ─────────────────────────────────────────
 
-pub(crate) struct DataMapContext {
+pub struct DataMapContext {
     pub data_map_channel: mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
     pub g_state: GlobalState,
 }
@@ -622,7 +629,7 @@ impl DataMapContext {
 
 // ── MonContext ─────────────────────────────────────────────
 
-pub(crate) struct MonContext {
+pub struct MonContext {
     pub g_state: GlobalState,
 }
 
@@ -714,6 +721,7 @@ impl KeySpaceHints {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+    #[allow(dead_code)] // Phase 5: used in integration tests
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -726,6 +734,7 @@ impl KeySpaceHints {
     }
 
     /// Return completed segments for checkpoint persistence.
+    #[allow(dead_code)] // Phase 5: used in integration tests
     pub fn completed_indices(&self) -> Vec<usize> {
         self.done.iter().map(|p| p.index).collect()
     }
