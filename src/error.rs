@@ -69,8 +69,11 @@ impl FlatRuntimeError {
     }
 
     /// Returns `true` if this error is transient and the operation should be retried.
+    /// Stream timeouts are excluded — the paginator state is not recoverable after a
+    /// `stream.next()` timeout, so re-creating the paginator and retrying will hit the
+    /// same timeout repeatedly.
     pub fn continue_on_error(&self) -> bool {
-        self.errno < ERROR_NO_BUCKET
+        self.errno < ERROR_NO_BUCKET && self.errno != ERROR_S3_NEXT_STREAM_TIMEOUT
     }
 
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
@@ -130,13 +133,13 @@ impl FlatRuntimeError {
     /// Returns `true` if this error is retryable (errno < 0x10).
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn is_retryable(&self) -> bool {
-        self.errno < ERROR_NO_BUCKET
+        self.continue_on_error()
     }
 
     /// Returns `true` if this error is fatal (errno >= 0x10).
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn is_fatal(&self) -> bool {
-        self.errno >= ERROR_NO_BUCKET
+        !self.continue_on_error()
     }
 }
 
@@ -210,14 +213,28 @@ mod tests {
 
     #[test]
     fn test_flat_error_retryable() {
+        // Generic low error codes (not stream timeout) should be retryable.
+        let err = FlatRuntimeError::new(ERROR_S3_CLIENT_GENERIC, "generic".into(), "key-42".into());
+        assert!(err.continue_on_error());
+        assert!(err.is_retryable());
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn test_stream_timeout_is_non_retryable() {
+        // A stream timeout should NOT be retried — the paginator state is
+        // lost and a fresh paginator would hit the same timeout repeatedly.
         let err = FlatRuntimeError::new(
             ERROR_S3_NEXT_STREAM_TIMEOUT,
             "timeout".into(),
             "key-42".into(),
         );
-        assert!(err.continue_on_error());
-        assert!(err.is_retryable());
-        assert!(!err.is_fatal());
+        assert!(
+            !err.continue_on_error(),
+            "stream timeout must not be retryable"
+        );
+        assert!(!err.is_retryable());
+        assert!(err.is_fatal());
     }
 
     #[test]
