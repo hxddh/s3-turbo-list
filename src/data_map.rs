@@ -1,8 +1,9 @@
 use dashmap::DashMap;
 use log::info;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
@@ -14,6 +15,19 @@ const OUTPUT_FLAG_EQUAL: u8 = 0;
 const OUTPUT_FLAG_PLUS: u8 = 1;
 const OUTPUT_FLAG_MINUS: u8 = 2;
 const OUTPUT_FLAG_ASTRISK: u8 = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DumpStats {
+    pub parquet_rows: usize,
+    pub ks_entries: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OutputWriteStats {
+    pub parquet_rows: usize,
+    pub ks_entries: usize,
+    pub elapsed_secs: f64,
+}
 
 // ── PrefixMap: dashmap-based concurrent object store ───────
 
@@ -73,7 +87,7 @@ impl PrefixMap {
         &self,
         writer: &mut crate::utils::AsyncParquetOutput<W>,
         include_equal: bool,
-    ) {
+    ) -> DumpStats {
         let mut ks_entries: Vec<(String, usize)> = Vec::new();
 
         for entry in self.inner.iter() {
@@ -120,6 +134,11 @@ impl PrefixMap {
                 let _ = buf.write_all(line.as_bytes()).await;
             }
             let _ = buf.flush().await;
+        }
+
+        DumpStats {
+            parquet_rows: writer.total_rows(),
+            ks_entries: ks_entries.len(),
         }
     }
 }
@@ -184,21 +203,23 @@ pub async fn data_map_task(
 
     let map = PrefixMap::new();
     let mut last_ts = epoch_secs();
+    let started_at = Instant::now();
+    let mut received_batches = 0usize;
+    let mut received_objects = 0usize;
 
     loop {
         let recv_result = ctx.data_map_channel.recv().await;
 
         match recv_result {
             Some(batch) => {
-                for (key, props) in batch {
-                    let (prefix, name) = key.decode();
-                    map.bulk_insert(&prefix, vec![(name, props)]);
-                }
+                received_batches += 1;
+                received_objects += batch.len();
+                insert_batch_grouped(&map, batch);
             }
             None => {
                 // Channel disconnected — flush accumulated data before exit.
                 info!("Data Map Task — channel disconnected, writing output");
-                write_output(
+                let stats = write_output(
                     &map,
                     filename_ks,
                     filename_output,
@@ -206,6 +227,7 @@ pub async fn data_map_task(
                     &output_config,
                 )
                 .await;
+                log_data_map_final(&map, received_batches, received_objects, started_at, stats);
                 ctx.complete();
                 return;
             }
@@ -213,7 +235,7 @@ pub async fn data_map_task(
 
         if ctx.is_quit() {
             info!("Data Map Task — force quit, dumping");
-            write_output(
+            let stats = write_output(
                 &map,
                 filename_ks,
                 filename_output,
@@ -221,18 +243,18 @@ pub async fn data_map_task(
                 &output_config,
             )
             .await;
+            log_data_map_final(&map, received_batches, received_objects, started_at, stats);
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
             // All list tasks done — drain any remaining pending data, then write output.
             while let Ok(batch) = ctx.data_map_channel.try_recv() {
-                for (key, props) in batch {
-                    let (prefix, name) = key.decode();
-                    map.bulk_insert(&prefix, vec![(name, props)]);
-                }
+                received_batches += 1;
+                received_objects += batch.len();
+                insert_batch_grouped(&map, batch);
             }
             info!("Data Map Task — all list tasks done, writing output");
-            write_output(
+            let stats = write_output(
                 &map,
                 filename_ks,
                 filename_output,
@@ -240,6 +262,7 @@ pub async fn data_map_task(
                 &output_config,
             )
             .await;
+            log_data_map_final(&map, received_batches, received_objects, started_at, stats);
             ctx.complete();
             ctx.quit();
             return;
@@ -247,9 +270,27 @@ pub async fn data_map_task(
 
         let now = epoch_secs();
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
-            info!("Data Map Task — {}", map);
+            let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+            info!(
+                "Data Map Task — {}, received batches {}, received objects {}, {:.0} objects/sec",
+                map,
+                received_batches,
+                received_objects,
+                received_objects as f64 / elapsed
+            );
             last_ts = now;
         }
+    }
+}
+
+fn insert_batch_grouped(map: &PrefixMap, batch: Vec<(ObjectKey, ObjectProps)>) {
+    let mut grouped: HashMap<String, Vec<(ObjectName, ObjectProps)>> = HashMap::new();
+    for (key, props) in batch {
+        let (prefix, name) = key.decode();
+        grouped.entry(prefix).or_default().push((name, props));
+    }
+    for (prefix, items) in grouped {
+        map.bulk_insert(&prefix, items);
     }
 }
 
@@ -259,12 +300,13 @@ async fn write_output(
     output: &str,
     include_equal: bool,
     output_config: &OutputConfig,
-) {
+) -> Option<OutputWriteStats> {
+    let started_at = Instant::now();
     let output_file = match tokio::fs::File::create(output).await {
         Ok(f) => f,
         Err(e) => {
             log::error!("Failed to create output file {}: {}", output, e);
-            return;
+            return None;
         }
     };
     let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
@@ -275,8 +317,44 @@ async fn write_output(
         &output_config.compression,
         output_config.compression_level,
     );
-    map.dump(&mut parquet, include_equal).await;
+    let dump_stats = map.dump(&mut parquet, include_equal).await;
     parquet.close().await;
+    let stats = OutputWriteStats {
+        parquet_rows: dump_stats.parquet_rows,
+        ks_entries: dump_stats.ks_entries,
+        elapsed_secs: started_at.elapsed().as_secs_f64(),
+    };
+    info!(
+        "Data Map Task — wrote {} Parquet rows to '{}' and {} KS entries to '{}' in {:.3}s",
+        stats.parquet_rows, output, stats.ks_entries, ks, stats.elapsed_secs
+    );
+    Some(stats)
+}
+
+fn log_data_map_final(
+    map: &PrefixMap,
+    received_batches: usize,
+    received_objects: usize,
+    started_at: Instant,
+    write_stats: Option<OutputWriteStats>,
+) {
+    let (prefix_count, object_count) = map.get_stats();
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    info!(
+        "Data Map Task — complete: received batches {}, received objects {}, prefixes {}, objects {}, elapsed {:.3}s, {:.0} objects/sec",
+        received_batches,
+        received_objects,
+        prefix_count,
+        object_count,
+        elapsed,
+        received_objects as f64 / elapsed,
+    );
+    if let Some(stats) = write_stats {
+        info!(
+            "Data Map Task — output metrics: Parquet rows {}, KS entries {}, write elapsed {:.3}s",
+            stats.parquet_rows, stats.ks_entries, stats.elapsed_secs
+        );
+    }
 }
 
 fn epoch_secs() -> u64 {

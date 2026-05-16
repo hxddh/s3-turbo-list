@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-16
+
+### Added
+- `hints-validate` command for local TOML/plain-text hints inspection without making cloud requests.
+- Auto-hints bounded sampling via `--sample-limit` and `--max-pages`, with sampled-scan metadata written to TOML caches.
+- Runtime data-map metrics for received batches, received objects, prefix/object counts, throughput, Parquet rows, KS entries, and write elapsed time.
+- Example scripts for sampled auto-hints and hints validation.
+
+### Changed
+- Data-map ingestion now groups each received batch by prefix before calling `bulk_insert`, reducing hot-path per-object allocation and lookup overhead.
+- Auto-hints output now reports scan mode, scanned objects/pages, unique prefixes, boundary count, and preview boundaries.
+- Documentation refreshed for v0.1.3 large-run readiness work.
+
 ## [0.1.2] - 2026-05-16
 
 ### Added

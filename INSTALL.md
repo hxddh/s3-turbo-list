@@ -17,10 +17,10 @@ All release assets are published at the [GitHub releases page](https://github.co
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.2-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.2-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.2-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.2-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.3-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.3-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.3-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.3-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +56,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.2-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.2-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.3-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.3-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +65,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.2-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.2-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.3-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.3-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +78,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.2-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.2-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.2-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.3-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.3-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.3-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.2-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.2-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.2-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.3-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.3-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.3-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -281,6 +281,29 @@ s3-turbo-list list \
 TOML hints are parsed as TOML.  Plain line-by-line hints are also
 supported.  Malformed TOML-like hints fail before any S3 requests are
 sent — no partial work or wasted API calls.
+
+Validate a hints file locally:
+
+```bash
+s3-turbo-list hints-validate --hints-file ./hints.toml
+```
+
+For very large buckets, `auto-hints` can produce an estimated hints cache
+from a bounded sample:
+
+```bash
+s3-turbo-list auto-hints \
+  --bucket my-bucket \
+  --region us-east-1 \
+  --profile default \
+  --sample-limit 1000000 \
+  --max-pages 1000 \
+  --output ./hints.sampled.toml
+```
+
+In sampled mode, `total_objects` means sampled objects, not the full bucket
+total.  Use full-scan `auto-hints` when you need authoritative bucket-wide
+prefix statistics.
 
 ## Troubleshooting
 

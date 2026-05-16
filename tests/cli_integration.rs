@@ -70,3 +70,38 @@ fn test_cli_help_compat_probe() {
         "compat-probe help should mention 'compat'"
     );
 }
+
+#[test]
+fn test_cli_help_hints_validate() {
+    let (code, stdout, _stderr) = run_cli(&["hints-validate", "--help"]);
+    assert_eq!(code, 0, "cargo run -- hints-validate --help should exit 0");
+    assert!(
+        stdout.contains("--hints-file"),
+        "hints-validate help should contain '--hints-file'"
+    );
+}
+
+#[test]
+fn test_cli_hints_validate_plain_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hints.txt");
+    std::fs::write(&path, "alpha/\nbeta/\n").unwrap();
+
+    let (code, stdout, stderr) =
+        run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Boundary count"));
+    assert!(stdout.contains("2"));
+}
+
+#[test]
+fn test_cli_hints_validate_malformed_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hints.txt");
+    std::fs::write(&path, "boundaries = [\nalpha/\n]\n").unwrap();
+
+    let (code, _stdout, stderr) =
+        run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
+    assert_ne!(code, 0, "malformed hints should fail");
+    assert!(stderr.contains("Hints validation failed"));
+}

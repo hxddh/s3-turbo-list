@@ -43,6 +43,7 @@ boundaries = [
     "中文/",
 ]
 generated_at = "2026-05-14T12:00:00Z"
+scan_mode = "full"
 TOML_EOF
 
 echo "==> Created hints file: $OUTDIR/hints.toml"

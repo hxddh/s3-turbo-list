@@ -42,7 +42,7 @@ independent segments, runs them in parallel, and assembles the result.
 |---|---|
 | **ListObjectsV2 scanning** | High-performance concurrent listing via the S3 ListObjectsV2 API. |
 | **Multi-threaded / segmented listing** | Auto-discovered key-space hints split a bucket into parallel segments, or supply your own hints file. |
-| **Parquet output** | Results written to compressed Parquet (gzip level 6) — drop into any analytics tool. |
+| **Parquet output** | Results written to configurable compressed Parquet — drop into any analytics tool. |
 | **KS keyspace output** | Companion CSV showing per-prefix object counts. |
 | **Trace JSONL output** | Every S3 API call recorded as structured JSONL for observability and debugging. |
 | **Compat-probe** | Quick validation of any S3-compatible endpoint before full-scale work. |
@@ -242,11 +242,29 @@ boundaries = [
     "logs/",
 ]
 generated_at = "2026-05-14T12:00:00Z"
+scan_mode = "full"
 ```
 
 Generate hints automatically:
 ```bash
 s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
+```
+
+For very large buckets, generate an estimated hints file from a bounded sample:
+```bash
+s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
+  -o hints.sampled.toml \
+  --sample-limit 1000000 \
+  --max-pages 1000
+```
+
+In sampled mode, the TOML `total_objects` field is the sampled object count,
+not the full bucket total.  The cache also records `scan_mode`,
+`sampled_objects`, `sampled_pages`, `sample_limit`, and `max_pages`.
+
+Validate a hints file locally before a cloud run:
+```bash
+s3-turbo-list hints-validate --hints-file hints.toml
 ```
 
 Use a hints file:
@@ -351,7 +369,7 @@ Validation details:
 
 ## Validation status
 
-All validation is complete. 107/107 tests pass on a clean working tree.
+All validation is complete. 113/113 tests pass on a clean working tree.
 
 Validation covered three endpoints (MinIO, AWS S3, BOS) across 13+ test
 categories per endpoint: compat-probe, standard listing, prefix filter,
@@ -368,9 +386,10 @@ incompatibilities were documented.  Full details in
 | Priority | Item | Status |
 |---|---|---|
 | ✅ Done | README / docs polish | This document |
-| ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete — 107/107 tests |
+| ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete — 113/113 tests |
 | ✅ Done | Release packaging | v0.1.1+ multi-platform release assets published |
-| 🔜 Next | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
+| ✅ Done | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
+| ✅ Done | Large-run readiness | data_map batch insertion metrics, hints validation, sampled auto-hints |
 | 🔜 Next | Benchmark harness | Throughput benchmarks across endpoints |
 | 🔜 Next | CLI help polish | Expanded --help, man page, shell completions |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
