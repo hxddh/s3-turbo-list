@@ -91,6 +91,54 @@ else
   echo "$DIRTY"
 fi
 
+# ── Release consistency ───────────────────────────────────
+echo ""
+echo "--- Release Consistency ---"
+
+VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+TAG="v${VERSION}"
+CHECK_FAILED=0
+
+echo "version: $VERSION"
+echo "tag:     $TAG"
+
+check_contains() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qE "$pattern" "$file"; then
+    echo "ok:      $label"
+  else
+    echo "MISSING: $label"
+    CHECK_FAILED=1
+  fi
+}
+
+check_not_contains() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qE "$pattern" "$file"; then
+    echo "STALE:   $label"
+    CHECK_FAILED=1
+  else
+    echo "ok:      $label"
+  fi
+}
+
+check_contains "CHANGELOG.md" "^## \\[${VERSION//./\\.}\\]" "CHANGELOG section for $VERSION"
+check_contains "INSTALL.md" "s3-turbo-list-${VERSION}-linux-x86_64" "INSTALL linux x86_64 asset"
+check_contains "INSTALL.md" "s3-turbo-list-${VERSION}-linux-aarch64" "INSTALL linux aarch64 asset"
+check_contains "AGENTS.md" "Current release tag: \`${TAG}\`" "AGENTS current release tag"
+check_contains ".github/workflows/release-assets.yml" "default: '${TAG}'" "release workflow default tag"
+check_not_contains ".github/workflows/release-assets.yml" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+" "hard-coded versioned release asset names"
+
+if [ "$CHECK_FAILED" -ne 0 ]; then
+  echo ""
+  echo "ERROR: release consistency checks failed." >&2
+  exit 1
+fi
+
 # ── Output directories ─────────────────────────────────────
 echo ""
 echo "--- Output ---"

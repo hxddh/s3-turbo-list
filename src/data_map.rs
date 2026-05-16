@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
+use crate::config::OutputConfig;
 use crate::core::{self, DataMapContext, MatchResult, ObjectKey, ObjectName, ObjectProps};
 
 // ── Output direction flags ─────────────────────────────────
@@ -174,6 +175,7 @@ pub async fn data_map_task(
     filename_ks: &str,
     filename_output: &str,
     include_equal: bool,
+    output_config: OutputConfig,
 ) {
     ctx.start();
     ctx.g_state.wait_to_start().await;
@@ -196,7 +198,14 @@ pub async fn data_map_task(
             None => {
                 // Channel disconnected — flush accumulated data before exit.
                 info!("Data Map Task — channel disconnected, writing output");
-                write_output(&map, filename_ks, filename_output, include_equal).await;
+                write_output(
+                    &map,
+                    filename_ks,
+                    filename_output,
+                    include_equal,
+                    &output_config,
+                )
+                .await;
                 ctx.complete();
                 return;
             }
@@ -204,7 +213,14 @@ pub async fn data_map_task(
 
         if ctx.is_quit() {
             info!("Data Map Task — force quit, dumping");
-            write_output(&map, filename_ks, filename_output, include_equal).await;
+            write_output(
+                &map,
+                filename_ks,
+                filename_output,
+                include_equal,
+                &output_config,
+            )
+            .await;
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
@@ -216,7 +232,14 @@ pub async fn data_map_task(
                 }
             }
             info!("Data Map Task — all list tasks done, writing output");
-            write_output(&map, filename_ks, filename_output, include_equal).await;
+            write_output(
+                &map,
+                filename_ks,
+                filename_output,
+                include_equal,
+                &output_config,
+            )
+            .await;
             ctx.complete();
             ctx.quit();
             return;
@@ -230,7 +253,13 @@ pub async fn data_map_task(
     }
 }
 
-async fn write_output(map: &PrefixMap, ks: &str, output: &str, include_equal: bool) {
+async fn write_output(
+    map: &PrefixMap,
+    ks: &str,
+    output: &str,
+    include_equal: bool,
+    output_config: &OutputConfig,
+) {
     let output_file = match tokio::fs::File::create(output).await {
         Ok(f) => f,
         Err(e) => {
@@ -239,7 +268,13 @@ async fn write_output(map: &PrefixMap, ks: &str, output: &str, include_equal: bo
         }
     };
     let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
-    let mut parquet = crate::utils::AsyncParquetOutput::new(buf_writer, ks);
+    let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
+        buf_writer,
+        ks,
+        output_config.row_group_size,
+        &output_config.compression,
+        output_config.compression_level,
+    );
     map.dump(&mut parquet, include_equal).await;
     parquet.close().await;
 }

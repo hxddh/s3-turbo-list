@@ -4,8 +4,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
-use parquet::basic::{Compression, Encoding, GzipLevel};
+use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::{WriterProperties, WriterVersion};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
 
@@ -22,6 +23,16 @@ pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
 
 impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
     pub fn new(buf_wr: W, ks_path: &str) -> Self {
+        Self::new_with_options(buf_wr, ks_path, 10000, "gzip", 6)
+    }
+
+    pub fn new_with_options(
+        buf_wr: W,
+        ks_path: &str,
+        row_group_size: usize,
+        compression_name: &str,
+        compression_level: u32,
+    ) -> Self {
         let field_key = Field::new("Key", DataType::Utf8, false);
         let field_size = Field::new("Size", DataType::UInt64, false);
         let field_last_modified = Field::new("LastModified", DataType::UInt64, false);
@@ -36,10 +47,12 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             field_diff_flag,
         ]));
 
+        let compression = parse_compression(compression_name, compression_level);
         let writer_props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_encoding(Encoding::PLAIN)
-            .set_compression(Compression::GZIP(GzipLevel::try_new(6).unwrap()))
+            .set_compression(compression)
+            .set_max_row_group_size(row_group_size.max(1))
             .build();
 
         let writer =
@@ -113,5 +126,55 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             Ok(_) => info!("Parquet file written: {} rows", self.total_rows),
             Err(e) => warn!("Parquet close error: {}", e),
         }
+    }
+}
+
+fn parse_compression(name: &str, level: u32) -> Compression {
+    let normalized = name.trim().to_lowercase();
+    let spec = match normalized.as_str() {
+        "gzip" | "zstd" | "brotli" => format!("{}({})", normalized, level),
+        "uncompressed" | "snappy" | "lz4" | "lz4_raw" => normalized,
+        other => {
+            warn!(
+                "Unsupported Parquet compression '{}'; falling back to gzip({})",
+                other, level
+            );
+            format!("gzip({})", level)
+        }
+    };
+
+    Compression::from_str(&spec).unwrap_or_else(|e| {
+        warn!(
+            "Invalid Parquet compression setting '{}': {}; falling back to gzip(6)",
+            spec, e
+        );
+        Compression::from_str("gzip(6)").expect("gzip(6) must be a valid Parquet compression")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_compression;
+    use parquet::basic::Compression;
+
+    #[test]
+    fn test_parse_compression_gzip_level() {
+        assert!(matches!(parse_compression("gzip", 6), Compression::GZIP(_)));
+    }
+
+    #[test]
+    fn test_parse_compression_snappy_no_level() {
+        assert!(matches!(
+            parse_compression("snappy", 6),
+            Compression::SNAPPY
+        ));
+    }
+
+    #[test]
+    fn test_parse_compression_unknown_falls_back() {
+        assert!(matches!(
+            parse_compression("unknown", 6),
+            Compression::GZIP(_)
+        ));
     }
 }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-16
+
+### Added
+- Release consistency checks for versioned docs, changelog entries, release workflow defaults, and stale agent release guidance.
+- BOS guardrail warnings when `profile = "bos"` is combined with hinted multi-segment listing or auto-hints generation.
+- Compat-probe pagination verification now follows the first continuation token and records pagination metadata in the JSON report.
+
+### Changed
+- Release asset workflow now derives asset names from the input tag instead of hard-coding versioned filenames.
+- Compat-probe now uses configured S3 retry and timeout settings.
+- Parquet writer now honors output `row_group_size`, `compression`, and `compression_level` config values.
+- Documentation refreshed for the v0.1.2 release and current BOS virtual-hosted-first guidance.
+
 ## [0.1.1] - 2026-05-16
 
 ### Added

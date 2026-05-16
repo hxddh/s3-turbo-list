@@ -377,7 +377,12 @@ fn main() {
         };
 
         // ── Load or generate KeySpace hints ─────────────────
-        let ks_list: Vec<String> = load_hints(cli.hints_file.as_deref(), opt_bucket, opt_region);
+        let ks_list: Vec<String> = load_hints(
+            cli.hints_file.as_deref(),
+            opt_bucket,
+            opt_region,
+            cfg.s3.profile.as_deref(),
+        );
         let hints = core::KeySpaceHints::new_from(&ks_list);
 
         // Filter out completed segments when resuming.
@@ -499,8 +504,16 @@ fn main() {
 
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
         let is_diff = mode == RunMode::BiDir;
+        let output_config = cfg.output.clone();
         set.spawn(async move {
-            data_map::data_map_task(data_map_ctx, &filename_ks, &filename_output, is_diff).await
+            data_map::data_map_task(
+                data_map_ctx,
+                &filename_ks,
+                &filename_output,
+                is_diff,
+                output_config,
+            )
+            .await
         });
 
         // ── Spawn monitor task ──────────────────────────────
@@ -814,11 +827,19 @@ fn validate_boundary_line(s: &str, line_no: usize) -> Result<(), String> {
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
 /// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
 /// 3. Single-segment fallback (empty vec).
-fn load_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> Vec<String> {
+fn load_hints(
+    hints_file: Option<&str>,
+    bucket: &str,
+    region: Option<&str>,
+    profile: Option<&str>,
+) -> Vec<String> {
     // 1. Explicit --hints-file takes absolute precedence.
     if let Some(path) = hints_file {
         match parse_hints_file(path) {
-            Ok(boundaries) => return boundaries,
+            Ok(boundaries) => {
+                warn_bos_hinted_segments(profile, &boundaries);
+                return boundaries;
+            }
             Err(e) => {
                 error!("Failed to load hints file '{}': {}", path, e);
                 error!("Aborting to avoid sending malformed S3 requests.");
@@ -835,6 +856,7 @@ fn load_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> V
     };
 
     if let Ok(boundaries) = parse_hints_file(&cache_filename) {
+        warn_bos_hinted_segments(profile, &boundaries);
         return boundaries;
     }
 
@@ -845,6 +867,19 @@ fn load_hints(hints_file: Option<&str>, bucket: &str, region: Option<&str>) -> V
         bucket
     );
     vec![]
+}
+
+fn warn_bos_hinted_segments(profile: Option<&str>, boundaries: &[String]) {
+    if profile == Some("bos") && !boundaries.is_empty() {
+        log::warn!(
+            "BOS profile with hinted multi-segment listing detected ({} boundaries). \
+             BOS has a documented ListObjectsV2 start_after + continuation-token \
+             compatibility issue; hinted BOS scans are not authoritative until BOS \
+             fixes the service-side behavior. Use single-segment listing for \
+             authoritative BOS output.",
+            boundaries.len()
+        );
+    }
 }
 
 // ── Compat-probe ───────────────────────────────────────────
@@ -898,6 +933,14 @@ mod compat_probe {
         pub error_message: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub is_truncated: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub key_count: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub contents_count: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub next_continuation_token_present: Option<bool>,
     }
 
     pub async fn run_compat_probe(
@@ -906,12 +949,33 @@ mod compat_probe {
         bucket: &str,
         addressing_style: &str,
         output: Option<&str>,
-        _cfg: &S3TurboConfig,
+        cfg: &S3TurboConfig,
     ) {
         let trace_writer: Box<dyn S3TraceWriter> = Box::new(StderrTraceWriter);
 
         // Build S3 client.
-        let loader = aws_config::from_env();
+        let loader = aws_config::from_env()
+            .retry_config(
+                aws_config::retry::RetryConfig::standard()
+                    .with_max_attempts(cfg.s3.max_attempts)
+                    .with_initial_backoff(std::time::Duration::from_secs(
+                        cfg.s3.initial_backoff_secs,
+                    )),
+            )
+            .timeout_config(
+                aws_config::timeout::TimeoutConfigBuilder::new()
+                    .connect_timeout(std::time::Duration::from_secs(cfg.s3.connect_timeout_secs))
+                    .operation_timeout(std::time::Duration::from_secs(
+                        cfg.s3.operation_timeout_secs,
+                    ))
+                    .read_timeout(std::time::Duration::from_secs(
+                        cfg.s3.operation_timeout_secs,
+                    ))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(
+                        cfg.s3.operation_timeout_secs,
+                    ))
+                    .build(),
+            );
         let config = loader.load().await;
         let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
         s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
@@ -931,6 +995,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         results.push(probe_result_from("HeadBucket", res, evt));
@@ -951,6 +1016,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         results.push(probe_result_from("ListObjectsV2 (max-keys=1)", res, evt));
@@ -972,6 +1038,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         results.push(probe_result_from("ListObjectsV2 with prefix", res, evt));
@@ -993,6 +1060,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         results.push(probe_result_from("ListObjectsV2 with delimiter", res, evt));
@@ -1014,6 +1082,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         results.push(probe_result_from(
@@ -1045,6 +1114,7 @@ mod compat_probe {
             bucket,
             addressing_style,
             &trace_writer,
+            None,
         )
         .await;
         // Handle insufficient objects case: if the response has fewer than max_keys
@@ -1054,9 +1124,12 @@ mod compat_probe {
                 let key_count = resp.key_count().unwrap_or(0);
                 let is_truncated = resp.is_truncated().unwrap_or(false);
                 let content_count = resp.contents().len() as i32;
+                let next_token = resp.next_continuation_token().map(|t| t.to_string());
                 evt.key_count = Some(key_count);
                 evt.contents_count = Some(content_count);
                 evt.is_truncated = is_truncated;
+                evt.next_continuation_token = next_token.clone();
+                evt.next_continuation_token_present = Some(next_token.is_some());
                 if !is_truncated && content_count < 3 {
                     ProbeTestResult {
                         test: "ListObjectsV2 pagination check".to_string(),
@@ -1069,14 +1142,107 @@ mod compat_probe {
                             content_count
                         )),
                         request_id: evt.request_id.clone(),
+                        is_truncated: Some(is_truncated),
+                        key_count: Some(key_count),
+                        contents_count: Some(content_count),
+                        next_continuation_token_present: Some(false),
+                    }
+                } else if is_truncated {
+                    match next_token {
+                        Some(token) => {
+                            let (second_res, second_evt) = timed_s3_call(
+                                || {
+                                    let token_for_request = token.clone();
+                                    async move {
+                                        client
+                                            .list_objects_v2()
+                                            .bucket(bucket)
+                                            .max_keys(3)
+                                            .continuation_token(token_for_request)
+                                            .send()
+                                            .await
+                                    }
+                                },
+                                "ListObjectsV2 pagination check (page 2)",
+                                endpoint_url,
+                                region,
+                                bucket,
+                                addressing_style,
+                                &trace_writer,
+                                Some(&token),
+                            )
+                            .await;
+
+                            match second_res {
+                                Ok(second_resp) => {
+                                    let second_key_count = second_resp.key_count().unwrap_or(0);
+                                    let second_content_count = second_resp.contents().len() as i32;
+                                    ProbeTestResult {
+                                        test: "ListObjectsV2 pagination check".to_string(),
+                                        status: "ok".to_string(),
+                                        latency_ms: evt.latency_ms + second_evt.latency_ms,
+                                        http_status: Some(200),
+                                        s3_error_code: None,
+                                        error_message: Some(format!(
+                                            "page_1_keys={}, page_2_keys={}",
+                                            content_count, second_content_count
+                                        )),
+                                        request_id: second_evt.request_id.clone(),
+                                        is_truncated: Some(is_truncated),
+                                        key_count: Some(key_count + second_key_count),
+                                        contents_count: Some(content_count + second_content_count),
+                                        next_continuation_token_present: Some(true),
+                                    }
+                                }
+                                Err(e) => ProbeTestResult {
+                                    test: "ListObjectsV2 pagination check".to_string(),
+                                    status: "error".to_string(),
+                                    latency_ms: evt.latency_ms + second_evt.latency_ms,
+                                    http_status: if second_evt.http_status != 0 {
+                                        Some(second_evt.http_status)
+                                    } else {
+                                        None
+                                    },
+                                    s3_error_code: second_evt.s3_error_code,
+                                    error_message: Some(format!("page_2_error: {:?}", e)),
+                                    request_id: second_evt.request_id,
+                                    is_truncated: Some(is_truncated),
+                                    key_count: Some(key_count),
+                                    contents_count: Some(content_count),
+                                    next_continuation_token_present: Some(true),
+                                },
+                            }
+                        }
+                        None => ProbeTestResult {
+                            test: "ListObjectsV2 pagination check".to_string(),
+                            status: "error".to_string(),
+                            latency_ms: evt.latency_ms,
+                            http_status: Some(200),
+                            s3_error_code: None,
+                            error_message: Some(
+                                "is_truncated=true but next_continuation_token is absent"
+                                    .to_string(),
+                            ),
+                            request_id: evt.request_id.clone(),
+                            is_truncated: Some(is_truncated),
+                            key_count: Some(key_count),
+                            contents_count: Some(content_count),
+                            next_continuation_token_present: Some(false),
+                        },
                     }
                 } else {
-                    probe_result_from::<
-                        (),
-                        aws_sdk_s3::error::SdkError<
-                            aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
-                        >,
-                    >("ListObjectsV2 pagination check", Ok(()), evt)
+                    let mut result =
+                        probe_result_from::<
+                            (),
+                            aws_sdk_s3::error::SdkError<
+                                aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+                            >,
+                        >("ListObjectsV2 pagination check", Ok(()), evt);
+                    result.is_truncated = Some(is_truncated);
+                    result.key_count = Some(key_count);
+                    result.contents_count = Some(content_count);
+                    result.next_continuation_token_present = Some(false);
+                    result
                 }
             }
             Err(_) => probe_result_from("ListObjectsV2 pagination check", res, evt),
@@ -1125,6 +1291,7 @@ mod compat_probe {
         bucket: &str,
         addressing_style: &str,
         trace_writer: &Box<dyn S3TraceWriter>,
+        continuation_token: Option<&str>,
     ) -> (Result<T, E>, S3CompatEvent)
     where
         F: FnOnce() -> Fut,
@@ -1139,6 +1306,7 @@ mod compat_probe {
         event.region = Some(region.to_string());
         event.addressing_style = addressing_style.to_string();
         event.latency_ms = latency_ms;
+        event.continuation_token = continuation_token.map(|token| token.to_string());
 
         match &result {
             Ok(_) => {
@@ -1172,6 +1340,10 @@ mod compat_probe {
                 s3_error_code: event.s3_error_code,
                 error_message: event.s3_error_message,
                 request_id: event.request_id,
+                is_truncated: None,
+                key_count: None,
+                contents_count: None,
+                next_continuation_token_present: None,
             },
             Err(e) => ProbeTestResult {
                 test: test_name.to_string(),
@@ -1185,6 +1357,10 @@ mod compat_probe {
                 s3_error_code: event.s3_error_code,
                 error_message: Some(format!("{:?}", e)),
                 request_id: event.request_id,
+                is_truncated: None,
+                key_count: None,
+                contents_count: None,
+                next_continuation_token_present: None,
             },
         }
     }
@@ -1201,6 +1377,14 @@ fn run_auto_hints(region: Option<&str>, bucket: &str, output: Option<&str>, cfg:
     let fps = cfg.s3.force_path_style;
     let threshold = cfg.auto_hints.sample_threshold;
     let depth = cfg.auto_hints.max_prefix_depth;
+
+    if cfg.s3.profile.as_deref() == Some("bos") {
+        log::warn!(
+            "Generating hints for BOS is allowed, but hinted multi-segment BOS scans \
+             are not authoritative until BOS fixes its ListObjectsV2 start_after + \
+             continuation-token compatibility behavior."
+        );
+    }
 
     rt.block_on(async {
         auto_hints::generate_hints(region, bucket, output, endpoint, fps, threshold, depth).await
@@ -1428,7 +1612,7 @@ generated_at = "2026-01-01T00:00:00Z"
         let path_str = path.to_str().unwrap();
 
         // load_hints with explicit --hints-file should work.
-        let result = load_hints(Some(path_str), "other-bucket", Some("us-east-1"));
+        let result = load_hints(Some(path_str), "other-bucket", Some("us-east-1"), None);
         assert_eq!(result, vec!["alpha/", "beta/"]);
     }
 }

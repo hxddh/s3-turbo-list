@@ -369,7 +369,8 @@ incompatibilities were documented.  Full details in
 |---|---|---|
 | ✅ Done | README / docs polish | This document |
 | ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete — 107/107 tests |
-| 🔜 Next | Release packaging | Cross-compile static binary; publish |
+| ✅ Done | Release packaging | v0.1.1+ multi-platform release assets published |
+| 🔜 Next | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
 | 🔜 Next | Benchmark harness | Throughput benchmarks across endpoints |
 | 🔜 Next | CLI help polish | Expanded --help, man page, shell completions |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |

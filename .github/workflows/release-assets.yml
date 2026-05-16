@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.1'
+        default: 'v0.1.2'
 
 permissions:
   contents: write
@@ -20,14 +20,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - asset: s3-turbo-list-0.1.1-linux-x86_64
+          - platform: linux-x86_64
             runner: ubuntu-latest
-          - asset: s3-turbo-list-0.1.1-macos-aarch64
+          - platform: macos-aarch64
             runner: macos-15
-          - asset: s3-turbo-list-0.1.1-macos-x86_64
+          - platform: macos-x86_64
             runner: macos-15-intel
 
-    name: Build ${{ matrix.asset }}
+    name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -36,6 +36,15 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Derive release asset name
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          ASSET="s3-turbo-list-${VERSION}-${{ matrix.platform }}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+          echo "asset=${ASSET}"
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -51,25 +60,16 @@ jobs:
 
       - name: Rename and verify binary
         run: |
-          cp target/release/s3-turbo-list ${{ matrix.asset }}
-          chmod +x ${{ matrix.asset }}
-          ./${{ matrix.asset }} --version
-          ./${{ matrix.asset }} --help > help.txt
-
-      - name: Generate checksum
-        run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          cp target/release/s3-turbo-list "$ASSET"
+          chmod +x "$ASSET"
+          ./"$ASSET" --version
+          ./"$ASSET" --help > help.txt
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
-
-      - name: Upload checksum artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}.sha256
-          path: ${{ matrix.asset }}.sha256
+          name: ${{ matrix.platform }}
+          path: s3-turbo-list-*-${{ matrix.platform }}
 
   finalize:
     name: Finalize release assets
@@ -85,15 +85,19 @@ jobs:
       - name: Assemble flat asset directory
         run: |
           mkdir -p flat
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
 
           # Collect all new binaries from the build matrix
           find artifacts -type f -name 's3-turbo-list-*' ! -name '*.sha256' -exec cp {} flat/ \;
 
-          # Download existing linux-aarch64 asset from the release
+          # Download existing linux-aarch64 asset from the release. On this
+          # project the arm64 Linux asset is built on the Oracle arm host and
+          # uploaded before this workflow fills in the remaining platforms.
           gh release download "${{ inputs.tag }}" \
             --repo hxddh/s3-turbo-list \
             --dir flat \
-            --pattern 's3-turbo-list-0.1.1-linux-aarch64'
+            --pattern "s3-turbo-list-${VERSION}-linux-aarch64"
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -118,9 +122,7 @@ jobs:
         run: |
           cd flat
           gh release upload "${{ inputs.tag }}" \
-            s3-turbo-list-0.1.1-linux-x86_64 \
-            s3-turbo-list-0.1.1-macos-aarch64 \
-            s3-turbo-list-0.1.1-macos-x86_64 \
+            s3-turbo-list-* \
             SHA256SUMS \
             --repo hxddh/s3-turbo-list \
             --clobber

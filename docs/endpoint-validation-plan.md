@@ -88,9 +88,8 @@ max_concurrency = 50
 ```toml
 [s3]
 endpoint_url = "https://s3.bj.bcebos.com"
-addressing_style = "path"
+addressing_style = "virtual"
 profile = "bos"
-force_path_style = true
 max_attempts = 5
 initial_backoff_secs = 5
 connect_timeout_secs = 10
@@ -1455,25 +1454,27 @@ $BIN list \
   --prefix "/" \
   --max-keys 2 \
   --threads 2 --concurrency 2 \
-  --trace-compat "$VALDIR/artifacts/bos-virtual-fail.jsonl" \
-  --output-parquet-file "$VALDIR/artifacts/scratch-bos-virt.parquet" 2>&1 || true
+  --trace-compat "$VALDIR/artifacts/bos-path-diagnostic.jsonl" \
+  --output-parquet-file "$VALDIR/artifacts/scratch-bos-path.parquet"
 
 python3 -c "
 import json
-with open('$VALDIR/artifacts/bos-virtual-fail.jsonl') as f:
+seen = False
+with open('$VALDIR/artifacts/bos-path-diagnostic.jsonl') as f:
     for line in f:
         obj = json.loads(line.strip())
-        if obj.get('http_status', 0) >= 400:
-            print(f'virtual-hosted failed: http={obj[\"http_status\"]}, '
-                  f'code={obj.get(\"s3_error_code\")}, '
+        if obj.get('operation') == 'ListObjectsV2':
+            seen = True
+            assert obj['addressing_style'] == 'path', obj
+            print(f'path-style diagnostic event: http={obj[\"http_status\"]}, '
                   f'addressing_style={obj[\"addressing_style\"]}')
             break
-    else:
-        print('WARNING: virtual-hosted style succeeded against BOS (unexpected)')
+assert seen, 'no ListObjectsV2 event found'
 "
 ```
 
-**Expect**: Virtual-hosted style should fail against BOS (404, 301, or connection error). This confirms `--addressing-style path` is required.
+**Expect**: The trace reports `"addressing_style":"path"`. This is only a
+legacy/diagnostic check; normal BOS usage remains virtual-hosted.
 
 ---
 
