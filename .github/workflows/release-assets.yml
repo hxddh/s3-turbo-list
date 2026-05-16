@@ -94,7 +94,7 @@ jobs:
           else
             gh release create "$TAG" \
               --repo hxddh/s3-turbo-list \
-              --target "$TAG" \
+              --verify-tag \
               --title "$TAG" \
               --notes "Release assets for $TAG"
           fi
