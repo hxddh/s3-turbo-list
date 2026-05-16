@@ -103,8 +103,8 @@ struct Cli {
     profile: Option<String>,
 
     /// S3 addressing style: path, virtual, or auto
-    #[arg(long, default_value = "auto", global = true)]
-    addressing_style: String,
+    #[arg(long, global = true)]
+    addressing_style: Option<String>,
 
     /// Emit S3 compat trace events to stderr
     #[arg(long, global = true)]
@@ -197,14 +197,12 @@ fn main() {
         std::process::exit(1);
     });
 
-    cfg.apply_profile_preset();
-
     cfg.apply_cli_overrides(
         cli.threads,
         cli.concurrency,
         cli.endpoint.as_deref(),
-        cli.force_path_style || cli.endpoint.is_some(),
-        Some(&cli.addressing_style),
+        cli.force_path_style,
+        cli.addressing_style.as_deref(),
         cli.profile.as_deref(),
         cli.debug_s3,
         cli.trace_compat.as_deref(),
@@ -213,6 +211,8 @@ fn main() {
         cli.output_ks_file.as_deref(),
         cli.output_parquet_file.as_deref(),
     );
+    cfg.apply_profile_preset();
+    cfg.normalize_addressing_style();
 
     // Setup logging.
     let opt_log = cli.log || cfg.output.log_file.is_some();

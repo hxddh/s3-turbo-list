@@ -353,13 +353,27 @@ impl S3TurboConfig {
         if let Some(e) = endpoint {
             self.s3.endpoint_url = Some(e.to_string());
         }
-        if force_path_style {
-            self.s3.force_path_style = true;
-        }
         if let Some(s) = addressing_style {
             if let Ok(style) = s.parse::<AddressingStyle>() {
-                self.s3.addressing_style = style;
+                match style {
+                    AddressingStyle::Path => {
+                        self.s3.addressing_style = AddressingStyle::Path;
+                        self.s3.force_path_style = true;
+                    }
+                    AddressingStyle::Virtual => {
+                        self.s3.addressing_style = AddressingStyle::Virtual;
+                        self.s3.force_path_style = false;
+                    }
+                    AddressingStyle::Auto => {
+                        self.s3.addressing_style = AddressingStyle::Auto;
+                        self.s3.force_path_style = false;
+                    }
+                }
             }
+        }
+        if force_path_style {
+            self.s3.force_path_style = true;
+            self.s3.addressing_style = AddressingStyle::Path;
         }
         if let Some(p) = profile {
             self.s3.profile = Some(p.to_string());
@@ -395,9 +409,9 @@ impl S3TurboConfig {
                     self.s3.endpoint_url = Some("https://s3.bj.bcebos.com".to_string());
                 }
                 if self.s3.addressing_style == AddressingStyle::Auto {
-                    self.s3.addressing_style = AddressingStyle::Path;
+                    self.s3.addressing_style = AddressingStyle::Virtual;
                 }
-                log::info!("Applied BOS vendor profile: path-style addressing, bj endpoint");
+                log::info!("Applied BOS vendor profile: virtual-hosted addressing, bj endpoint");
             }
             "minio" => {
                 if self.s3.addressing_style == AddressingStyle::Auto {
@@ -406,6 +420,18 @@ impl S3TurboConfig {
                 log::info!("Applied MinIO vendor profile: path-style addressing");
             }
             other => log::warn!("Unknown vendor/profile '{}' — no preset applied", other),
+        }
+    }
+
+    pub fn normalize_addressing_style(&mut self) {
+        if self.s3.force_path_style {
+            self.s3.addressing_style = AddressingStyle::Path;
+            return;
+        }
+
+        match self.s3.addressing_style {
+            AddressingStyle::Path => self.s3.force_path_style = true,
+            AddressingStyle::Virtual | AddressingStyle::Auto => self.s3.force_path_style = false,
         }
     }
 }
@@ -625,7 +651,83 @@ profile = "bos"
             config.s3.endpoint_url.as_deref(),
             Some("https://s3.bj.bcebos.com")
         );
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
+        assert!(!config.s3.force_path_style);
+    }
+
+    #[test]
+    fn test_apply_bos_profile_preserves_explicit_path_style() {
+        let mut config = S3TurboConfig::default();
+        config.s3.profile = Some("bos".to_string());
+        config.s3.addressing_style = AddressingStyle::Path;
+        config.apply_profile_preset();
+        config.normalize_addressing_style();
         assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
+        assert!(config.s3.force_path_style);
+    }
+
+    #[test]
+    fn test_normalize_addressing_style_path_forces_path_style() {
+        let mut config = S3TurboConfig::default();
+        config.s3.addressing_style = AddressingStyle::Path;
+        config.normalize_addressing_style();
+        assert!(config.s3.force_path_style);
+    }
+
+    #[test]
+    fn test_normalize_addressing_style_force_path_style_wins() {
+        let mut config = S3TurboConfig::default();
+        config.s3.addressing_style = AddressingStyle::Virtual;
+        config.s3.force_path_style = true;
+        config.normalize_addressing_style();
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
+        assert!(config.s3.force_path_style);
+    }
+
+    #[test]
+    fn test_endpoint_url_does_not_force_path_style() {
+        let mut config = S3TurboConfig::default();
+        config.apply_cli_overrides(
+            None,
+            None,
+            Some("https://s3.bj.bcebos.com"),
+            false,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        config.normalize_addressing_style();
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
+        assert!(!config.s3.force_path_style);
+    }
+
+    #[test]
+    fn test_cli_virtual_addressing_overrides_config_force_path_style() {
+        let mut config = S3TurboConfig::default();
+        config.s3.force_path_style = true;
+        config.s3.addressing_style = AddressingStyle::Path;
+        config.apply_cli_overrides(
+            None,
+            None,
+            None,
+            false,
+            Some("virtual"),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        config.normalize_addressing_style();
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
+        assert!(!config.s3.force_path_style);
     }
 
     #[test]

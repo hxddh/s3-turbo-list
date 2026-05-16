@@ -151,19 +151,12 @@ s3-turbo-list supports this with virtual-hosted addressing:
 ```bash
 # Virtual-hosted (recommended for BOS)
 s3-turbo-list list --region bj --bucket my-bos-bucket \
-  --endpoint-url https://s3.bj.bcebos.com \
-  --addressing-style virtual
+  --profile bos
 ```
 
-> **Note on `--profile bos`:** The built-in `bos` profile preset currently
-> defaults to path-style addressing for legacy compatibility.  Override it
-> with `--addressing-style virtual` to use the recommended virtual-hosted
-> mode:
->
-> ```bash
-> s3-turbo-list list --region bj --bucket my-bos-bucket \
->   --profile bos --addressing-style virtual
-> ```
+The built-in `bos` profile preset uses the BOS S3-compatible endpoint and
+virtual-hosted addressing.  You can still pass `--endpoint-url` explicitly
+when validating a specific regional endpoint.
 
 Path-style is supported but intended only for legacy compatibility,
 diagnostics, or controlled validation:
@@ -171,7 +164,8 @@ diagnostics, or controlled validation:
 ```bash
 # Path-style (legacy / diagnostic only)
 s3-turbo-list list --region bj --bucket my-bos-bucket \
-  --profile bos
+  --profile bos \
+  --addressing-style path
 ```
 
 ### Trace / debug
@@ -337,6 +331,7 @@ the following fields:
 | **BOS** (Baidu Object Storage) | ✅ Validated | virtual-hosted (recommended), path (legacy/diagnostic) | See `docs/validation-results/` for endpoint-specific details. |
 
 Validation details:
+- [`docs/validation-results/v0.1.1-code-review-fixes-20260516.md`](docs/validation-results/v0.1.1-code-review-fixes-20260516.md)
 - [`docs/validation-results/final-validation-summary-20260514.md`](docs/validation-results/final-validation-summary-20260514.md)
 - [`docs/validation-results/aws-s3-baseline-20260514.md`](docs/validation-results/aws-s3-baseline-20260514.md)
 - [`docs/validation-results/bos-s3-compatible-20260514.md`](docs/validation-results/bos-s3-compatible-20260514.md)

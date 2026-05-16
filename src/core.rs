@@ -519,6 +519,8 @@ pub struct S3TaskContext {
     pub profile: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
+    pub max_attempts: u32,
+    pub operation_timeout_secs: u64,
     /// CLI `--start-after` override — if set, the first segment uses this
     /// instead of the hint-segment start.
     pub start_after: Option<String>,
@@ -599,6 +601,8 @@ impl S3TaskContext {
             profile: profile.map(|p| p.to_string()),
             delimiter: delimiter.map(|d| d.to_string()),
             max_keys,
+            max_attempts: s3_config.max_attempts.max(1),
+            operation_timeout_secs: s3_config.operation_timeout_secs.max(1),
             start_after: start_after.map(|s| s.to_string()),
             checkpoint_completed,
         }

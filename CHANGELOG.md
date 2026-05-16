@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-16
+
 ### Added
 - Publication readiness: README with usage and compatibility guidance.
 - Publication readiness: runnable example scripts under `examples/`.
@@ -16,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - BOS documentation updated to recommend virtual-hosted addressing (per BOS official guidance).
+- `--profile bos` now defaults to virtual-hosted addressing instead of path-style.
+- `--endpoint-url` no longer implicitly forces path-style addressing; use `--addressing-style path` or `--force-path-style` when path-style is required.
+
+### Fixed
+- ListObjectsV2 per-page watchdog now honors `operation_timeout_secs` instead of a hard-coded 5 seconds.
+- ListObjectsV2 stream timeouts are retried within the configured `max_attempts` budget instead of being treated as immediately fatal.
 
 ## [0.1.0] — 2026-05-14
 

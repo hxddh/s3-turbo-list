@@ -122,9 +122,10 @@ async fn flat_list_run_to_complete(
         match flat_list(ctx, prefix, &start_after, until, retry_attempt).await {
             Ok(()) => return,
             Err(err) => {
-                if err.continue_on_error() {
+                let next_retry_attempt = retry_attempt.saturating_add(1);
+                if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
                     start_after = err.next_start_owned();
-                    retry_attempt = retry_attempt.saturating_add(1);
+                    retry_attempt = next_retry_attempt;
                     debug!(
                         "Retrying from '{}' (attempt {}): {}",
                         start_after, retry_attempt, err
@@ -133,8 +134,10 @@ async fn flat_list_run_to_complete(
                 }
                 // Fatal error.
                 error!(
-                    "Flat List S3 Task — {} — fatal: {}",
-                    ctx.s3_bucket_name, err
+                    "Flat List S3 Task — {} — fatal after {} attempt(s): {}",
+                    ctx.s3_bucket_name,
+                    retry_attempt.saturating_add(1),
+                    err
                 );
                 if ctx.is_running() {
                     ctx.complete();
@@ -183,7 +186,7 @@ async fn flat_list(
     let mut page_count: u32 = 0;
 
     loop {
-        let timeout_dur = Duration::from_secs(5); // operation_timeout_secs
+        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let page_start = Instant::now();
         let res = timeout_at(Instant::now() + timeout_dur, stream.next()).await;
         let latency_ms = page_start.elapsed().as_millis() as u64;

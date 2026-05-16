@@ -69,11 +69,9 @@ impl FlatRuntimeError {
     }
 
     /// Returns `true` if this error is transient and the operation should be retried.
-    /// Stream timeouts are excluded — the paginator state is not recoverable after a
-    /// `stream.next()` timeout, so re-creating the paginator and retrying will hit the
-    /// same timeout repeatedly.
+    /// The caller owns the retry budget and must cap retry attempts.
     pub fn continue_on_error(&self) -> bool {
-        self.errno < ERROR_NO_BUCKET && self.errno != ERROR_S3_NEXT_STREAM_TIMEOUT
+        self.errno < ERROR_NO_BUCKET
     }
 
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
@@ -221,20 +219,19 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_timeout_is_non_retryable() {
-        // A stream timeout should NOT be retried — the paginator state is
-        // lost and a fresh paginator would hit the same timeout repeatedly.
+    fn test_stream_timeout_is_retryable_with_external_budget() {
+        // Stream timeouts are transient, but the caller must enforce max_attempts.
         let err = FlatRuntimeError::new(
             ERROR_S3_NEXT_STREAM_TIMEOUT,
             "timeout".into(),
             "key-42".into(),
         );
         assert!(
-            !err.continue_on_error(),
-            "stream timeout must not be retryable"
+            err.continue_on_error(),
+            "stream timeout should be retryable within the caller's retry budget"
         );
-        assert!(!err.is_retryable());
-        assert!(err.is_fatal());
+        assert!(err.is_retryable());
+        assert!(!err.is_fatal());
     }
 
     #[test]

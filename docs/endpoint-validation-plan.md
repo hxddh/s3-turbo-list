@@ -1197,7 +1197,8 @@ python3 -m json.tool "$VALDIR/artifacts/bos-compat-probe.json"
 
 **Expect**:
 - BOS typically supports all ListObjectsV2 parameters
-- `addressing_style` field reports `"path"` (BOS requires path-style)
+- `addressing_style` field reports the requested style. For normal BOS usage,
+  prefer `"virtual"`; path-style is legacy/diagnostic only.
 
 **Failure interpretation**:
 - `encoding-type=url` error → known BOS limitation; document in findings
@@ -1211,7 +1212,6 @@ $BIN list \
   --profile bos \
   --endpoint-url https://s3.bj.bcebos.com \
   --region bj \
-  --addressing-style path \
   --prefix "/" \
   --max-keys 1000 \
   --threads 6 --concurrency 20 \
@@ -1222,7 +1222,7 @@ $BIN list \
 
 **Expect**:
 - Exit code 0
-- Log shows `"Applied BOS vendor profile: path-style addressing, bj endpoint"`
+- Log shows `"Applied BOS vendor profile: virtual-hosted addressing, bj endpoint"`
 - Parquet rows match bucket contents
 
 ### C.5 BOS with --debug-s3 and --trace-compat
@@ -1370,7 +1370,7 @@ $BIN list \
   --log 2>&1 | grep -i "bos\|endpoint\|addressing"
 
 # Expected:
-# "Applied BOS vendor profile: path-style addressing, bj endpoint"
+# "Applied BOS vendor profile: virtual-hosted addressing, bj endpoint"
 ```
 
 **Verify the endpoint_url override from profile preset**:
@@ -1435,22 +1435,23 @@ print(f'profile: {identity.get(\"profile\")}')
 print(f'addressing_style: {identity.get(\"addressing_style\")}')
 print(f'bucket: {identity.get(\"bucket\")}')
 print(f'region: {identity.get(\"region\")}')
-# Expect: profile=bos, addressing_style=path, bucket=$BOS_BUCKET, region=bj
+# Expect: profile=bos, addressing_style=virtual, bucket=$BOS_BUCKET, region=bj
 "
 ```
 
-### C.9 Path-style addressing (BOS requirement)
+### C.9 BOS path-style diagnostic mode
 
-BOS requires path-style addressing. Verify it's enforced:
+BOS supports virtual-hosted addressing for normal usage. Path-style remains
+available for legacy or diagnostic checks and must be requested explicitly:
 
 ```bash
-# Try virtual-hosted — should fail or redirect
+# Explicit path-style diagnostic run
 $BIN list \
   --bucket "$BOS_BUCKET" \
   --profile bos \
   --endpoint-url https://s3.bj.bcebos.com \
   --region bj \
-  --addressing-style virtual \
+  --addressing-style path \
   --prefix "/" \
   --max-keys 2 \
   --threads 2 --concurrency 2 \
@@ -1648,10 +1649,10 @@ echo "Validation artifacts preserved at: $VALDIR/artifacts"
 - [ ] BOS compat-probe → `compatible` or `partial`
 - [ ] BOS basic list → correct row count
 - [ ] BOS --profile bos → auto-detected endpoint/addr-style
-- [ ] BOS --trace-compat → `"profile":"bos"`, `"addressing_style":"path"`, `"endpoint_url":"https://s3.bj.bcebos.com"`
+- [ ] BOS --trace-compat → `"profile":"bos"`, `"addressing_style":"virtual"`, `"endpoint_url":"https://s3.bj.bcebos.com"`
 - [ ] BOS truncated_raw_body on error → present, XML content, ≤ 512 bytes
 - [ ] BOS truncated_raw_body on auth error → present, error code matches
-- [ ] BOS path-style required → virtual-hosted fails
-- [ ] BOS checkpoint identity → profile=bos, addressing_style=path in identity block
+- [ ] BOS explicit path-style diagnostic run → `"addressing_style":"path"`
+- [ ] BOS checkpoint identity → profile=bos, addressing_style=virtual in identity block
 - [ ] All Parquet outputs valid (schema, types, non-zero rows)
 - [ ] Log files collected, key events confirmed

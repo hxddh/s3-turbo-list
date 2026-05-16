@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.0'
+        default: 'v0.1.1'
 
 permissions:
   contents: write
@@ -20,11 +20,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - asset: s3-turbo-list-0.1.0-linux-x86_64
+          - asset: s3-turbo-list-0.1.1-linux-x86_64
             runner: ubuntu-latest
-          - asset: s3-turbo-list-0.1.0-macos-aarch64
+          - asset: s3-turbo-list-0.1.1-macos-aarch64
             runner: macos-15
-          - asset: s3-turbo-list-0.1.0-macos-x86_64
+          - asset: s3-turbo-list-0.1.1-macos-x86_64
             runner: macos-15-intel
 
     name: Build ${{ matrix.asset }}
@@ -93,7 +93,7 @@ jobs:
           gh release download "${{ inputs.tag }}" \
             --repo hxddh/s3-turbo-list \
             --dir flat \
-            --pattern 's3-turbo-list-0.1.0-linux-aarch64'
+            --pattern 's3-turbo-list-0.1.1-linux-aarch64'
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -118,9 +118,9 @@ jobs:
         run: |
           cd flat
           gh release upload "${{ inputs.tag }}" \
-            s3-turbo-list-0.1.0-linux-x86_64 \
-            s3-turbo-list-0.1.0-macos-aarch64 \
-            s3-turbo-list-0.1.0-macos-x86_64 \
+            s3-turbo-list-0.1.1-linux-x86_64 \
+            s3-turbo-list-0.1.1-macos-aarch64 \
+            s3-turbo-list-0.1.1-macos-x86_64 \
             SHA256SUMS \
             --repo hxddh/s3-turbo-list \
             --clobber
