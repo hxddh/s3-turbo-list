@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use log::info;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,13 @@ pub struct OutputWriteStats {
     pub parquet_rows: usize,
     pub ks_entries: usize,
     pub elapsed_secs: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListStreamingStats {
+    received_batches: usize,
+    received_objects: usize,
+    streamed_rows: usize,
 }
 
 // ── PrefixMap: dashmap-based concurrent object store ───────
@@ -124,17 +131,8 @@ impl PrefixMap {
             }
         }
 
-        // Write KS file
         ks_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let ks_path = writer.ks_path().to_string();
-        if let Ok(ks_file) = tokio::fs::File::create(&ks_path).await {
-            let mut buf = tokio::io::BufWriter::new(ks_file);
-            for (prefix, count) in &ks_entries {
-                let line = format!("\"{}\",\"{}\"\n", prefix, count);
-                let _ = buf.write_all(line.as_bytes()).await;
-            }
-            let _ = buf.flush().await;
-        }
+        let _ = write_ks_entries(writer.ks_path(), &ks_entries).await;
 
         DumpStats {
             parquet_rows: writer.total_rows(),
@@ -283,6 +281,178 @@ pub async fn data_map_task(
     }
 }
 
+pub async fn data_map_task_list_streaming(
+    mut ctx: DataMapContext,
+    filename_ks: &str,
+    filename_output: &str,
+    output_config: OutputConfig,
+) {
+    ctx.start();
+    ctx.g_state.wait_to_start().await;
+
+    info!("Data Map Task — list streaming started");
+
+    let output_file = match tokio::fs::File::create(filename_output).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("Failed to create output file {}: {}", filename_output, e);
+            ctx.complete();
+            ctx.quit();
+            return;
+        }
+    };
+    let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
+    let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
+        buf_writer,
+        filename_ks,
+        output_config.row_group_size,
+        &output_config.compression,
+        output_config.compression_level,
+    );
+
+    let mut prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let started_at = Instant::now();
+    let write_started_at = Instant::now();
+    let mut last_ts = epoch_secs();
+    let mut stats = ListStreamingStats {
+        received_batches: 0,
+        received_objects: 0,
+        streamed_rows: 0,
+    };
+
+    loop {
+        let recv_result = ctx.data_map_channel.recv().await;
+
+        match recv_result {
+            Some(batch) => {
+                ingest_list_streaming_batch(&mut parquet, &mut prefix_counts, &mut stats, batch)
+                    .await;
+            }
+            None => {
+                info!("Data Map Task — list streaming channel disconnected, finalizing output");
+                finalize_list_streaming_output(
+                    parquet,
+                    filename_ks,
+                    filename_output,
+                    &prefix_counts,
+                    stats,
+                    started_at,
+                    write_started_at,
+                )
+                .await;
+                ctx.complete();
+                return;
+            }
+        }
+
+        if ctx.is_quit() {
+            info!("Data Map Task — list streaming force quit, finalizing output");
+            finalize_list_streaming_output(
+                parquet,
+                filename_ks,
+                filename_output,
+                &prefix_counts,
+                stats,
+                started_at,
+                write_started_at,
+            )
+            .await;
+            ctx.complete();
+            return;
+        } else if !ctx.all_list_tasks_is_running() {
+            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+                ingest_list_streaming_batch(&mut parquet, &mut prefix_counts, &mut stats, batch)
+                    .await;
+            }
+            info!("Data Map Task — list streaming all list tasks done, finalizing output");
+            finalize_list_streaming_output(
+                parquet,
+                filename_ks,
+                filename_output,
+                &prefix_counts,
+                stats,
+                started_at,
+                write_started_at,
+            )
+            .await;
+            ctx.complete();
+            ctx.quit();
+            return;
+        }
+
+        let now = epoch_secs();
+        if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
+            let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+            info!(
+                "Data Map Task — list streaming prefixes {}, received batches {}, received objects {}, streamed rows {}, {:.0} objects/sec",
+                prefix_counts.len(),
+                stats.received_batches,
+                stats.received_objects,
+                stats.streamed_rows,
+                stats.received_objects as f64 / elapsed
+            );
+            last_ts = now;
+        }
+    }
+}
+
+async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
+    parquet: &mut crate::utils::AsyncParquetOutput<W>,
+    prefix_counts: &mut BTreeMap<String, usize>,
+    stats: &mut ListStreamingStats,
+    batch: Vec<(ObjectKey, ObjectProps)>,
+) {
+    stats.received_batches += 1;
+    stats.received_objects += batch.len();
+
+    let mut rows = Vec::with_capacity(batch.len());
+    for (key, props) in batch {
+        let (prefix, _) = key.decode();
+        *prefix_counts.entry(prefix).or_insert(0) += 1;
+
+        if props.final_status_check() != MatchResult::Ignore {
+            rows.push((key, props));
+        }
+    }
+
+    stats.streamed_rows += rows.len();
+    parquet.write_batch(rows, OUTPUT_FLAG_EQUAL).await;
+}
+
+async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>(
+    parquet: crate::utils::AsyncParquetOutput<W>,
+    filename_ks: &str,
+    filename_output: &str,
+    prefix_counts: &BTreeMap<String, usize>,
+    stats: ListStreamingStats,
+    started_at: Instant,
+    write_started_at: Instant,
+) {
+    let parquet_rows = parquet.total_rows();
+    let ks_entries = write_ks_counts(filename_ks, prefix_counts).await;
+    parquet.close().await;
+
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    let write_elapsed = write_started_at.elapsed().as_secs_f64();
+    info!(
+        "Data Map Task — list streaming complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",
+        stats.streamed_rows,
+        stats.received_batches,
+        stats.received_objects,
+        prefix_counts.len(),
+        elapsed,
+        stats.received_objects as f64 / elapsed,
+    );
+    info!(
+        "Data Map Task — list streaming output metrics: Parquet rows {} to '{}', KS write entries {} to '{}', write elapsed {:.3}s",
+        parquet_rows,
+        filename_output,
+        ks_entries,
+        filename_ks,
+        write_elapsed,
+    );
+}
+
 fn insert_batch_grouped(map: &PrefixMap, batch: Vec<(ObjectKey, ObjectProps)>) {
     let mut grouped: HashMap<String, Vec<(ObjectName, ObjectProps)>> = HashMap::new();
     for (key, props) in batch {
@@ -329,6 +499,34 @@ async fn write_output(
         stats.parquet_rows, output, stats.ks_entries, ks, stats.elapsed_secs
     );
     Some(stats)
+}
+
+async fn write_ks_counts(path: &str, counts: &BTreeMap<String, usize>) -> usize {
+    let entries: Vec<(String, usize)> = counts.iter().map(|(p, c)| (p.clone(), *c)).collect();
+    write_ks_entries(path, &entries).await
+}
+
+async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> usize {
+    match tokio::fs::File::create(path).await {
+        Ok(ks_file) => {
+            let mut buf = tokio::io::BufWriter::new(ks_file);
+            for (prefix, count) in entries {
+                let line = format!("\"{}\",\"{}\"\n", prefix, count);
+                if let Err(e) = buf.write_all(line.as_bytes()).await {
+                    log::error!("Failed to write KS file {}: {}", path, e);
+                    break;
+                }
+            }
+            if let Err(e) = buf.flush().await {
+                log::error!("Failed to flush KS file {}: {}", path, e);
+            }
+            entries.len()
+        }
+        Err(e) => {
+            log::error!("Failed to create KS file {}: {}", path, e);
+            0
+        }
+    }
 }
 
 fn log_data_map_final(

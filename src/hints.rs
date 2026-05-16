@@ -1,4 +1,4 @@
-use crate::auto_hints::HintsCache;
+use crate::auto_hints::{HintsCache, SegmentEstimate};
 use log::info;
 use serde::Serialize;
 
@@ -13,6 +13,8 @@ const TOML_FIELDS: &[&str] = &[
     "sampled_pages",
     "sample_limit",
     "max_pages",
+    "estimate_mode",
+    "segment_estimates",
 ];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -33,6 +35,17 @@ pub struct HintsMetadata {
     pub sampled_pages: Option<usize>,
     pub sample_limit: Option<usize>,
     pub max_pages: Option<usize>,
+    pub estimate_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HintsEstimateSummary {
+    pub sampled: bool,
+    pub estimate_mode: Option<String>,
+    pub count: usize,
+    pub min_estimated_objects: usize,
+    pub max_estimated_objects: usize,
+    pub total_estimated_objects: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +54,8 @@ pub struct HintsValidationReport {
     pub format: HintsFormat,
     pub boundary_count: usize,
     pub metadata: Option<HintsMetadata>,
+    pub estimate_summary: Option<HintsEstimateSummary>,
+    pub first_estimates: Vec<SegmentEstimate>,
     pub first_boundaries: Vec<String>,
     pub warnings: Vec<String>,
     pub valid: bool,
@@ -76,11 +91,20 @@ pub fn inspect_hints_file(
             .take(preview_limit)
             .cloned()
             .collect();
+        let estimate_summary = summarize_estimates(&cache);
+        let first_estimates = cache
+            .segment_estimates
+            .iter()
+            .take(preview_limit)
+            .cloned()
+            .collect();
         Ok(HintsValidationReport {
             path: path.to_string(),
             format: HintsFormat::Toml,
             boundary_count: cache.boundaries.len(),
             metadata: Some(HintsMetadata::from(&cache)),
+            estimate_summary,
+            first_estimates,
             first_boundaries,
             warnings,
             valid: true,
@@ -100,11 +124,38 @@ pub fn inspect_hints_file(
             format: HintsFormat::Plain,
             boundary_count: boundaries.len(),
             metadata: None,
+            estimate_summary: None,
+            first_estimates: Vec::new(),
             first_boundaries,
             warnings,
             valid: true,
         })
     }
+}
+
+fn summarize_estimates(cache: &HintsCache) -> Option<HintsEstimateSummary> {
+    if cache.segment_estimates.is_empty() {
+        return None;
+    }
+
+    let mut min = usize::MAX;
+    let mut max = 0usize;
+    let mut total = 0usize;
+    for estimate in &cache.segment_estimates {
+        min = min.min(estimate.estimated_objects);
+        max = max.max(estimate.estimated_objects);
+        total += estimate.estimated_objects;
+    }
+
+    Some(HintsEstimateSummary {
+        sampled: cache.scan_mode.as_deref() == Some("sampled")
+            || cache.estimate_mode.as_deref() == Some("sampled"),
+        estimate_mode: cache.estimate_mode.clone(),
+        count: cache.segment_estimates.len(),
+        min_estimated_objects: min,
+        max_estimated_objects: max,
+        total_estimated_objects: total,
+    })
 }
 
 pub fn warn_bos_hinted_segments(profile: Option<&str>, boundaries: &[String]) {
@@ -332,6 +383,7 @@ impl From<&HintsCache> for HintsMetadata {
             sampled_pages: cache.sampled_pages,
             sample_limit: cache.sample_limit,
             max_pages: cache.max_pages,
+            estimate_mode: cache.estimate_mode.clone(),
         }
     }
 }
@@ -448,12 +500,23 @@ sampled_objects = 2
 sampled_pages = 1
 sample_limit = 2
 max_pages = 1
+
+[[segment_estimates]]
+start_after = ""
+end_before = "a/"
+estimated_objects = 1
+
+[[segment_estimates]]
+start_after = "a/"
+estimated_objects = 1
 "#;
         let (_dir, path) = write_tmp(content);
         let report = inspect_hints_file(&path, 1).unwrap();
         let metadata = report.metadata.unwrap();
         assert_eq!(metadata.scan_mode.as_deref(), Some("sampled"));
         assert_eq!(metadata.sample_limit, Some(2));
+        assert_eq!(report.estimate_summary.unwrap().count, 2);
+        assert_eq!(report.first_estimates.len(), 1);
         assert_eq!(report.first_boundaries, vec!["a/"]);
     }
 }

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-16
+
+### Added
+- List mode now streams received object batches directly to Parquet while maintaining lightweight KS prefix counts, reducing memory pressure on large buckets.
+- Auto-hints TOML caches now include per-segment object estimates with sampled/full metadata.
+- `hints-validate` now reports estimate summaries, including sampled status, count, min/max/sum, and preview estimates.
+- Local integration coverage for list-mode streaming output and `DiffFlag = 0` semantics.
+
+### Changed
+- Diff mode continues to use the existing `PrefixMap` matching path; only list mode uses streaming output.
+- CLI integration tests now execute Cargo's prebuilt test binary instead of repeatedly shelling out through `cargo run`.
+- Release asset workflow now creates the GitHub Release when missing before uploading assets, while still requiring the externally built linux-aarch64 asset.
+- Documentation refreshed for v0.1.4 streaming readiness and release hardening.
+
 ## [0.1.3] - 2026-05-16
 
 ### Added

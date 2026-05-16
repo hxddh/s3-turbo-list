@@ -559,16 +559,28 @@ fn main() {
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
         let is_diff = mode == RunMode::BiDir;
         let output_config = cfg.output.clone();
-        set.spawn(async move {
-            data_map::data_map_task(
-                data_map_ctx,
-                &filename_ks,
-                &filename_output,
-                is_diff,
-                output_config,
-            )
-            .await
-        });
+        if is_diff {
+            set.spawn(async move {
+                data_map::data_map_task(
+                    data_map_ctx,
+                    &filename_ks,
+                    &filename_output,
+                    true,
+                    output_config,
+                )
+                .await
+            });
+        } else {
+            set.spawn(async move {
+                data_map::data_map_task_list_streaming(
+                    data_map_ctx,
+                    &filename_ks,
+                    &filename_output,
+                    output_config,
+                )
+                .await
+            });
+        }
 
         // ── Spawn monitor task ──────────────────────────────
         let mon_ctx = core::MonContext::new(g_state.clone());
@@ -1289,6 +1301,34 @@ fn run_hints_validate(path: &str, preview: usize, json: bool) {
                             .sampled_pages
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                if let Some(summary) = &report.estimate_summary {
+                    println!(
+                        "  Estimates:       {} ({})",
+                        summary.count,
+                        if summary.sampled {
+                            "sampled/estimated"
+                        } else {
+                            "observed/full"
+                        }
+                    );
+                    println!(
+                        "  Estimate min/max/sum: {}/{}/{}",
+                        summary.min_estimated_objects,
+                        summary.max_estimated_objects,
+                        summary.total_estimated_objects
+                    );
+                }
+            }
+            if !report.first_estimates.is_empty() {
+                println!("  First {} estimates:", report.first_estimates.len());
+                for estimate in &report.first_estimates {
+                    println!(
+                        "    - start_after='{}', end_before='{}', estimated_objects={}",
+                        estimate.start_after,
+                        estimate.end_before.as_deref().unwrap_or(""),
+                        estimate.estimated_objects
                     );
                 }
             }

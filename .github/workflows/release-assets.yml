@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.3'
+        default: 'v0.1.4'
 
 permissions:
   contents: write
@@ -35,7 +35,11 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustup default stable
 
       - name: Derive release asset name
         run: |
@@ -82,6 +86,21 @@ jobs:
         with:
           path: artifacts
 
+      - name: Ensure GitHub release exists
+        run: |
+          TAG="${{ inputs.tag }}"
+          if gh release view "$TAG" --repo hxddh/s3-turbo-list >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+          else
+            gh release create "$TAG" \
+              --repo hxddh/s3-turbo-list \
+              --target "$TAG" \
+              --title "$TAG" \
+              --notes "Release assets for $TAG"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Assemble flat asset directory
         run: |
           mkdir -p flat
@@ -94,10 +113,13 @@ jobs:
           # Download existing linux-aarch64 asset from the release. On this
           # project the arm64 Linux asset is built on the Oracle arm host and
           # uploaded before this workflow fills in the remaining platforms.
-          gh release download "${{ inputs.tag }}" \
+          if ! gh release download "${{ inputs.tag }}" \
             --repo hxddh/s3-turbo-list \
             --dir flat \
-            --pattern "s3-turbo-list-${VERSION}-linux-aarch64"
+            --pattern "s3-turbo-list-${VERSION}-linux-aarch64"; then
+            echo "::error::Missing s3-turbo-list-${VERSION}-linux-aarch64. Build and upload the Oracle arm64 asset before finalizing release assets."
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
 

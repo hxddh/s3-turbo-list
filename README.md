@@ -42,7 +42,7 @@ independent segments, runs them in parallel, and assembles the result.
 |---|---|
 | **ListObjectsV2 scanning** | High-performance concurrent listing via the S3 ListObjectsV2 API. |
 | **Multi-threaded / segmented listing** | Auto-discovered key-space hints split a bucket into parallel segments, or supply your own hints file. |
-| **Parquet output** | Results written to configurable compressed Parquet — drop into any analytics tool. |
+| **Streaming Parquet output** | List mode writes received batches directly to configurable compressed Parquet, keeping memory bounded for large buckets. |
 | **KS keyspace output** | Companion CSV showing per-prefix object counts. |
 | **Trace JSONL output** | Every S3 API call recorded as structured JSONL for observability and debugging. |
 | **Compat-probe** | Quick validation of any S3-compatible endpoint before full-scale work. |
@@ -243,6 +243,17 @@ boundaries = [
 ]
 generated_at = "2026-05-14T12:00:00Z"
 scan_mode = "full"
+estimate_mode = "full"
+
+[[segment_estimates]]
+start_after = ""
+end_before = "alpha/"
+estimated_objects = 12000
+
+[[segment_estimates]]
+start_after = "alpha/"
+end_before = "beta/"
+estimated_objects = 18000
 ```
 
 Generate hints automatically:
@@ -260,7 +271,9 @@ s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
 
 In sampled mode, the TOML `total_objects` field is the sampled object count,
 not the full bucket total.  The cache also records `scan_mode`,
-`sampled_objects`, `sampled_pages`, `sample_limit`, and `max_pages`.
+`sampled_objects`, `sampled_pages`, `sample_limit`, `max_pages`, and
+per-segment estimates marked as sampled/estimated rather than authoritative
+bucket-wide statistics.
 
 Validate a hints file locally before a cloud run:
 ```bash
@@ -390,6 +403,7 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Release packaging | v0.1.1+ multi-platform release assets published |
 | ✅ Done | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
 | ✅ Done | Large-run readiness | data_map batch insertion metrics, hints validation, sampled auto-hints |
+| ✅ Done | Streaming readiness | list-mode streaming Parquet output, segment estimates, release/test hardening |
 | 🔜 Next | Benchmark harness | Throughput benchmarks across endpoints |
 | 🔜 Next | CLI help polish | Expanded --help, man page, shell completions |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |

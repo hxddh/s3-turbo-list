@@ -1,10 +1,14 @@
 // Integration tests for data_map aggregation and Parquet output pipeline.
 use arrow::array::RecordBatchReader;
+use s3_turbo_list::config::OutputConfig;
 use s3_turbo_list::core::{
-    ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+    DataMapContext, GlobalState, ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+    S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
 };
 use s3_turbo_list::data_map::{ObjectMap, PrefixMap};
 use s3_turbo_list::utils::AsyncParquetOutput;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 // ── Single prefix, single object ──────────────────────────
 
@@ -229,6 +233,72 @@ async fn test_diff_mode_includes_equal_rows() {
         flags_seen.contains(&2),
         "DiffFlag=2 (Right-only) missing from output"
     );
+}
+
+// ── List streaming output uses DiffFlag=0 and writes KS counts ─────────────
+
+#[tokio::test]
+async fn test_list_streaming_writes_equal_diff_flag_and_ks() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("list_streaming.parquet");
+    let ks_path = dir.path().join("list_streaming.ks");
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = GlobalState::new(quit, 1);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let ctx = DataMapContext::new(rx, g_state);
+
+    let parquet_path_for_task = parquet_path.to_str().unwrap().to_string();
+    let ks_path_for_task = ks_path.to_str().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        s3_turbo_list::data_map::data_map_task_list_streaming(
+            ctx,
+            &ks_path_for_task,
+            &parquet_path_for_task,
+            OutputConfig {
+                row_group_size: 1,
+                ..OutputConfig::default()
+            },
+        )
+        .await;
+    });
+
+    let mut first = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [1u8; 16]);
+    first.last_modified = 1;
+    let mut second = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 200, [2u8; 16]);
+    second.last_modified = 2;
+    tx.send(vec![
+        (ObjectKey::from("logs/a.txt"), first),
+        (ObjectKey::from("logs/b.txt"), second),
+    ])
+    .await
+    .unwrap();
+    drop(tx);
+    task.await.unwrap();
+
+    let std_file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.collect();
+    let total_rows: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    for batch in &batches {
+        let batch = batch.as_ref().unwrap();
+        let col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .unwrap();
+        for i in 0..col.len() {
+            assert_eq!(col.value(i), 0, "list streaming DiffFlag must be 0");
+        }
+    }
+
+    let ks = std::fs::read_to_string(&ks_path).unwrap();
+    assert_eq!(ks, "\"logs\",\"2\"\n");
 }
 
 // ── Parquet output schema verification ────────────────────

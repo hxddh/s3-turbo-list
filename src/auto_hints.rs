@@ -5,6 +5,14 @@ use std::collections::BTreeMap;
 // ── Cached hints format ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentEstimate {
+    pub start_after: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_before: Option<String>,
+    pub estimated_objects: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HintsCache {
     pub bucket: String,
     pub region: Option<String>,
@@ -21,6 +29,10 @@ pub struct HintsCache {
     pub sample_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pages: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segment_estimates: Vec<SegmentEstimate>,
 }
 
 // ── Main entry point ───────────────────────────────────────
@@ -110,6 +122,7 @@ pub async fn generate_hints(
 
     // Phase 2: split prefixes exceeding threshold.
     let boundaries = split_prefixes(&prefix_counts, sample_threshold, max_prefix_depth);
+    let segment_estimates = estimate_segments(&boundaries, &prefix_counts);
 
     info!(
         "Auto-hints: generated {} key-space boundaries",
@@ -132,6 +145,12 @@ pub async fn generate_hints(
         sampled_pages: sampled_mode.then_some(scanned_pages),
         sample_limit,
         max_pages,
+        estimate_mode: Some(if sampled_mode {
+            "sampled".to_string()
+        } else {
+            "full".to_string()
+        }),
+        segment_estimates: segment_estimates.clone(),
     };
 
     let output_path = output.map(|o| o.to_string()).unwrap_or_else(|| {
@@ -156,6 +175,7 @@ pub async fn generate_hints(
     println!("  Pages scanned:         {}", scanned_pages);
     println!("  Unique prefixes:       {}", prefix_counts.len());
     println!("  Key-space boundaries:  {}", boundaries.len());
+    print_estimate_summary(&segment_estimates, sampled_mode);
     println!("  Cache file:            {}", output_path);
     if sampled_mode {
         println!(
@@ -173,6 +193,77 @@ pub async fn generate_hints(
         if boundaries.len() > 5 {
             println!("    ... and {} more", boundaries.len() - 5);
         }
+    }
+}
+
+fn estimate_segments(
+    boundaries: &[String],
+    counts: &BTreeMap<String, usize>,
+) -> Vec<SegmentEstimate> {
+    let mut estimates: Vec<SegmentEstimate> = Vec::with_capacity(boundaries.len() + 1);
+    let mut starts = Vec::with_capacity(boundaries.len() + 1);
+    starts.push(String::new());
+    starts.extend(boundaries.iter().cloned());
+
+    for (i, start) in starts.iter().enumerate() {
+        let end = boundaries.get(i).cloned();
+        let estimated_objects = counts
+            .iter()
+            .filter(|(prefix, _)| {
+                (start.is_empty() || prefix.as_str() >= start.as_str())
+                    && end.as_ref().map_or(true, |e| prefix.as_str() < e.as_str())
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        estimates.push(SegmentEstimate {
+            start_after: start.clone(),
+            end_before: end,
+            estimated_objects,
+        });
+    }
+
+    estimates
+}
+
+fn print_estimate_summary(estimates: &[SegmentEstimate], sampled_mode: bool) {
+    if estimates.is_empty() {
+        return;
+    }
+
+    let total: usize = estimates.iter().map(|e| e.estimated_objects).sum();
+    let min = estimates
+        .iter()
+        .map(|e| e.estimated_objects)
+        .min()
+        .unwrap_or(0);
+    let max = estimates
+        .iter()
+        .map(|e| e.estimated_objects)
+        .max()
+        .unwrap_or(0);
+    println!(
+        "  Segment estimates:     {} segments, min {}, max {}, total {} ({})",
+        estimates.len(),
+        min,
+        max,
+        total,
+        if sampled_mode {
+            "sampled/estimated"
+        } else {
+            "observed/full"
+        }
+    );
+    println!("  First 5 estimates:");
+    for estimate in estimates.iter().take(5) {
+        println!(
+            "    - start_after='{}', end_before='{}', estimated_objects={}",
+            estimate.start_after,
+            estimate.end_before.as_deref().unwrap_or(""),
+            estimate.estimated_objects
+        );
+    }
+    if estimates.len() > 5 {
+        println!("    ... and {} more", estimates.len() - 5);
     }
 }
 
@@ -275,6 +366,12 @@ mod tests {
             sampled_pages: Some(2),
             sample_limit: Some(100),
             max_pages: Some(2),
+            estimate_mode: Some("sampled".to_string()),
+            segment_estimates: vec![SegmentEstimate {
+                start_after: String::new(),
+                end_before: Some("a/".to_string()),
+                estimated_objects: 50,
+            }],
         };
 
         let encoded = toml::to_string_pretty(&cache).unwrap();
@@ -284,5 +381,16 @@ mod tests {
         let decoded: HintsCache = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.scan_mode.as_deref(), Some("sampled"));
         assert_eq!(decoded.sampled_pages, Some(2));
+        assert_eq!(decoded.segment_estimates.len(), 1);
+    }
+
+    #[test]
+    fn test_estimate_segments() {
+        let counts = make_counts(&[("a/", 10), ("b/", 20), ("c/", 30)]);
+        let boundaries = vec!["b/".to_string()];
+        let estimates = estimate_segments(&boundaries, &counts);
+        assert_eq!(estimates.len(), 2);
+        assert_eq!(estimates[0].estimated_objects, 10);
+        assert_eq!(estimates[1].estimated_objects, 50);
     }
 }

@@ -91,6 +91,6 @@ on BOS should wait for a BOS-side fix or use single-segment fallback.
 | `checkpoint-resume.sh` | List with checkpoint save and resume | `.parquet`, `.ks` |
 | `hints-file-toml.sh` | List with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
 | `hints-validate.sh` | Validate TOML or plain-text hints locally | stdout |
-| `auto-hints-sampled.sh` | Generate estimated hints from bounded sampling | `hints.sampled.toml` |
+| `auto-hints-sampled.sh` | Generate sampled hints with segment estimates | `hints.sampled.toml` |
 | `read-parquet.py` | Read a Parquet file with pandas | stdout |
 | `inspect-trace.py` | Summarize a trace JSONL file | stdout |
