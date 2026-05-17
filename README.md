@@ -53,7 +53,9 @@ independent segments, runs them in parallel, and assembles the result.
 
 ## Installation
 
-Download the binary for your platform from the GitHub release, verify it with `SHA256SUMS`, install it into your `PATH`, then configure an AWS-compatible profile.
+Download the binary for your platform from the GitHub release, verify it with
+`SHA256SUMS`, install it into your `PATH`, then configure AWS-compatible
+credentials through the standard AWS SDK credential chain.
 
 See [INSTALL.md](INSTALL.md) for platform-specific installation and AWS S3 / BOS / MinIO configuration examples.
 
@@ -144,6 +146,29 @@ s3-turbo-list list --bucket my-bucket \
 #   profile = "minio"
 ```
 
+### Endpoint profiles
+
+Endpoint profiles are optional presets for common S3-compatible providers.
+They are explicit: the default path remains standard S3 behavior unless you
+set `--profile` or `profile = "..."` in config.
+
+```bash
+# Local-only profile discovery
+s3-turbo-list profiles list
+s3-turbo-list profiles show r2 --json
+
+# Cloudflare R2 example; endpoint is account-specific
+s3-turbo-list list --bucket my-bucket \
+  --endpoint-url https://<account-id>.r2.cloudflarestorage.com \
+  --region auto \
+  --profile r2
+```
+
+Built-in profiles: `aws`, `minio`, `bos`, `r2`, `b2`, and `oss`.
+Profiles only fill safe defaults such as addressing style or documented
+endpoint defaults when the user has not supplied an explicit value.  They do
+not change output schema, diff semantics, or pagination behavior.
+
 ### BOS (Baidu Object Storage)
 
 BOS recommends bucket virtual hosting (`bucket.s3.<region>.bcebos.com`).
@@ -215,6 +240,22 @@ operation, endpoint, addressing style, profile, region, bucket, prefix,
 delimiter, max-keys, start-after, continuation token, HTTP status, S3
 error code, request ID, latency, pagination details, and truncated error
 body excerpts (first 512 bytes).
+
+### Local benchmark and CLI docs
+
+```bash
+# Synthetic local streaming-output benchmark; does not contact S3
+s3-turbo-list benchmark-local --objects 100000 --batch-size 5000 --json
+
+# Shell completions and man page
+s3-turbo-list completions bash > s3-turbo-list.bash
+s3-turbo-list completions zsh > _s3-turbo-list
+s3-turbo-list man > s3-turbo-list.1
+```
+
+The helper script `scripts/benchmark-local.sh` writes a machine-readable
+local benchmark report.  See [`docs/benchmarking.md`](docs/benchmarking.md)
+and [`docs/endpoint-profiles.md`](docs/endpoint-profiles.md).
 
 ### Diff mode
 
@@ -396,6 +437,9 @@ the following fields:
 | **AWS S3** (`us-east-2`) | ✅ Validated | path, virtual-hosted | Full compatibility. Baseline reference. |
 | **MinIO** (v2025-09-07) | ✅ Validated | path, virtual-hosted | Full compatibility. Local and remote. |
 | **BOS** (Baidu Object Storage) | ✅ Validated | virtual-hosted (recommended), path (legacy/diagnostic) | See `docs/validation-results/` for endpoint-specific details. |
+| **Cloudflare R2** | 📋 Profile documented | provider-specific | Use `profiles show r2`; run `compat-probe` before production use. |
+| **Backblaze B2** | 📋 Profile documented | provider-specific | Use `profiles show b2`; run `compat-probe` before production use. |
+| **Alibaba OSS** | 📋 Profile documented | provider-specific | Use `profiles show oss`; run `compat-probe` before production use. |
 
 Validation details:
 - [`docs/validation-results/v0.1.1-code-review-fixes-20260516.md`](docs/validation-results/v0.1.1-code-review-fixes-20260516.md)
@@ -440,7 +484,8 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
 | ✅ Done | Large-run readiness | data_map batch insertion metrics, hints validation, sampled auto-hints |
 | ✅ Done | Streaming readiness | list-mode streaming Parquet output, segment estimates, release/test hardening |
-| 🔜 Next | Benchmark harness | Throughput benchmarks across endpoints |
-| 🔜 Next | CLI help polish | Expanded --help, man page, shell completions |
+| ✅ Done | Benchmark harness | Local synthetic streaming-output benchmark plus JSON report |
+| ✅ Done | CLI help polish | Shell completions and man page generation |
+| ✅ Done | Optional endpoint compatibility profiles | Per-provider presets and local profile inspection |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
-| 📋 Later | Optional endpoint compatibility profiles | Per-provider presets (Cloudflare R2, Backblaze B2, etc.) |
+| 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |

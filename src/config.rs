@@ -399,27 +399,20 @@ impl S3TurboConfig {
     }
 
     pub fn apply_profile_preset(&mut self) {
-        let profile = match &self.s3.profile {
-            Some(p) => p.as_str(),
-            None => return,
-        };
-        match profile {
-            "bos" => {
-                if self.s3.endpoint_url.is_none() {
-                    self.s3.endpoint_url = Some("https://s3.bj.bcebos.com".to_string());
-                }
-                if self.s3.addressing_style == AddressingStyle::Auto {
-                    self.s3.addressing_style = AddressingStyle::Virtual;
-                }
-                log::info!("Applied BOS vendor profile: virtual-hosted addressing, bj endpoint");
+        if let Some(application) = crate::profiles::apply_profile_preset(self) {
+            if application.known {
+                log::info!(
+                    "Applied endpoint profile '{}': endpoint applied {}, addressing applied {}",
+                    application.name,
+                    application.endpoint_url_applied,
+                    application.addressing_style_applied
+                );
+            } else {
+                log::warn!(
+                    "Unknown vendor/profile '{}' — no preset applied",
+                    application.name
+                );
             }
-            "minio" => {
-                if self.s3.addressing_style == AddressingStyle::Auto {
-                    self.s3.addressing_style = AddressingStyle::Path;
-                }
-                log::info!("Applied MinIO vendor profile: path-style addressing");
-            }
-            other => log::warn!("Unknown vendor/profile '{}' — no preset applied", other),
         }
     }
 

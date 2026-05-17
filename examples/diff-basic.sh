@@ -7,7 +7,7 @@
 # Optional env vars:
 #   REGION        — left region (default: us-east-1)
 #   TARGET_REGION — right region (default: same as REGION)
-#   PROFILE       — AWS named profile (default: default)
+#   AWS_PROFILE   — AWS SDK credentials profile (optional)
 #   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/diff-basic)
 #   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
@@ -24,7 +24,6 @@ set -euo pipefail
 : "${RIGHT_BUCKET:?set RIGHT_BUCKET to the target (right) bucket name}"
 REGION="${REGION:-us-east-1}"
 TARGET_REGION="${TARGET_REGION:-$REGION}"
-PROFILE="${PROFILE:-default}"
 OUTDIR="${OUTDIR:-./artifacts/diff-basic}"
 S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
@@ -38,7 +37,6 @@ echo "    Output: $OUTDIR/diff.parquet"
 set -- \
   diff \
   --region "$REGION" \
-  --profile "$PROFILE" \
   --bucket "$LEFT_BUCKET" \
   --target-region "$TARGET_REGION" \
   --target-bucket "$RIGHT_BUCKET" \

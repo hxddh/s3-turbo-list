@@ -14,7 +14,7 @@
 #   BUCKET        — S3 bucket name
 # Optional env vars:
 #   REGION        — AWS region (default: us-east-1)
-#   PROFILE       — AWS named profile (default: default)
+#   AWS_PROFILE   — AWS SDK credentials profile (optional)
 #   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/hints-file-toml)
 #   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
@@ -23,7 +23,6 @@ set -euo pipefail
 
 : "${BUCKET:?set BUCKET to the S3 bucket name}"
 REGION="${REGION:-us-east-1}"
-PROFILE="${PROFILE:-default}"
 OUTDIR="${OUTDIR:-./artifacts/hints-file-toml}"
 S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
@@ -59,7 +58,6 @@ echo "                $OUTDIR/hints-output.ks"
 set -- \
   list \
   --region "$REGION" \
-  --profile "$PROFILE" \
   --bucket "$BUCKET" \
   --hints-file "$OUTDIR/hints.toml" \
   --output-parquet-file "$OUTDIR/hints-output.parquet" \

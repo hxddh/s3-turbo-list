@@ -101,6 +101,14 @@ fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["doctor", "--help"]);
     assert_eq!(code, 0, "doctor --help should exit 0");
     assert!(stdout.contains("--local-only"));
+
+    let (code, stdout, _stderr) = run_cli(&["profiles", "--help"]);
+    assert_eq!(code, 0, "profiles --help should exit 0");
+    assert!(stdout.contains("list"));
+
+    let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
+    assert_eq!(code, 0, "benchmark-local --help should exit 0");
+    assert!(stdout.contains("--objects"));
 }
 
 #[test]
@@ -128,6 +136,69 @@ fn test_cli_doctor_json_local_only_success() {
     assert!(checks
         .iter()
         .any(|check| check["name"] == "network" && check["status"] == "skipped"));
+}
+
+#[test]
+fn test_cli_profiles_list_json_local_only() {
+    let (code, stdout, stderr) = run_cli(&["profiles", "list", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let profiles = json.as_array().unwrap();
+    assert!(profiles.iter().any(|profile| profile["name"] == "bos"));
+    assert!(profiles.iter().any(|profile| profile["name"] == "r2"));
+    assert!(profiles.iter().any(|profile| profile["name"] == "b2"));
+    assert!(profiles.iter().any(|profile| profile["name"] == "oss"));
+}
+
+#[test]
+fn test_cli_profiles_show_r2_json_local_only() {
+    let (code, stdout, stderr) = run_cli(&["profiles", "show", "r2", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["name"], "r2");
+    assert_eq!(json["default_region"], "auto");
+    assert_eq!(json["requires_explicit_endpoint"], true);
+    assert_eq!(json["tested_by_project"], false);
+}
+
+#[test]
+fn test_cli_completions_and_man_local_only() {
+    let (code, stdout, stderr) = run_cli(&["completions", "bash"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("s3-turbo-list"));
+    assert!(stdout.contains("benchmark-local"));
+
+    let (code, stdout, stderr) = run_cli(&["man"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("s3-turbo-list"));
+    assert!(stdout.contains(".SH DESCRIPTION"));
+}
+
+#[test]
+fn test_cli_benchmark_local_json_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&[
+        "benchmark-local",
+        "--objects",
+        "32",
+        "--batch-size",
+        "8",
+        "--prefixes",
+        "4",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["network"], "none: synthetic local data only");
+    assert_eq!(json["objects"], 32);
+    assert_eq!(json["metrics"]["received_objects"], 32);
+    assert_eq!(json["metrics"]["streamed_rows"], 32);
+    assert_eq!(json["metrics"]["parquet_rows"], 32);
+    assert_eq!(json["metrics"]["ks_entries"], 4);
 }
 
 #[test]

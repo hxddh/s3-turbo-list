@@ -1,14 +1,18 @@
 // All modules exported from the library crate (src/lib.rs).
 // The binary uses `s3_turbo_list::...` paths to avoid module duplication.
 use s3_turbo_list::{
-    agent, auto_hints, checkpoint, config, core, data_map, diff, hints, mon, tasks_s3, trace,
+    agent, auto_hints, checkpoint, config, core, data_map, diff, hints, mon, profiles, tasks_s3,
+    trace,
 };
 
 use chrono::Local;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use config::S3TurboConfig;
 use core::RunMode;
 use log::{error, info};
+use serde::Serialize;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -101,7 +105,7 @@ struct Cli {
     #[arg(long, global = true)]
     continuation_token: Option<String>,
 
-    /// AWS named profile or vendor profile name (e.g. "bos", "minio")
+    /// Endpoint compatibility profile name (e.g. "bos", "minio", "r2")
     #[arg(long, global = true)]
     profile: Option<String>,
 
@@ -244,12 +248,91 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show endpoint compatibility profiles without contacting S3
+    Profiles {
+        #[command(subcommand)]
+        cmd: ProfileCommands,
+    },
+
+    /// Generate shell completions without contacting S3
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Generate a man page to stdout without contacting S3
+    Man,
+
+    /// Run a local synthetic streaming-output benchmark without contacting S3
+    BenchmarkLocal {
+        /// Number of synthetic objects to write
+        #[arg(long, default_value_t = 10_000)]
+        objects: usize,
+
+        /// Objects per synthetic batch
+        #[arg(long, default_value_t = 1_000)]
+        batch_size: usize,
+
+        /// Number of distinct key prefixes
+        #[arg(long, default_value_t = 128)]
+        prefixes: usize,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Write JSON report to this path
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Keep generated local Parquet/KS artifacts
+        #[arg(long)]
+        keep_artifacts: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommands {
+    /// List known endpoint profiles
+    List {
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one endpoint profile
+    Show {
+        /// Profile name, for example aws, minio, bos, r2, b2, or oss
+        name: String,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Main ───────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
+
+    match &cli.cmd {
+        Commands::Completions { shell } => {
+            generate_completions(*shell);
+            return;
+        }
+        Commands::Man => {
+            generate_man_page();
+            return;
+        }
+        Commands::Profiles { cmd } => {
+            run_profiles(cmd);
+            return;
+        }
+        _ => {}
+    }
 
     // This command is intentionally local-only and should not depend on S3
     // credentials, endpoint configuration, or a valid runtime config file.
@@ -333,6 +416,40 @@ fn main() {
             }
             if report.status == "error" {
                 std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+            return;
+        }
+        Commands::BenchmarkLocal {
+            objects,
+            batch_size,
+            prefixes,
+            json,
+            output,
+            keep_artifacts,
+        } => {
+            let report =
+                run_benchmark_local(*objects, *batch_size, *prefixes, *keep_artifacts, &cfg);
+            if *json || output.is_some() {
+                let rendered = agent::to_pretty_json(&report);
+                if let Some(path) = output.as_deref() {
+                    if let Err(e) = agent::write_json_file(path, &report) {
+                        eprintln!("Benchmark write error: {}", e);
+                        std::process::exit(agent::ExitCode::OutputWrite.code());
+                    }
+                }
+                if *json {
+                    println!("{}", rendered);
+                }
+            } else {
+                println!(
+                    "local benchmark: {} objects in {:.3}s ({:.0} objects/sec)",
+                    report.objects, report.elapsed_secs, report.objects_per_sec
+                );
+                println!("  parquet: {}", report.parquet_file);
+                println!("  ks:      {}", report.ks_file);
+                if !report.artifacts_kept {
+                    println!("  artifacts removed");
+                }
             }
             return;
         }
@@ -441,6 +558,12 @@ fn main() {
         }
         Commands::ConfigInspect { .. } | Commands::Doctor { .. } => {
             unreachable!("local-only commands are handled before runtime setup")
+        }
+        Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
+            unreachable!("local-only commands are handled before config load")
+        }
+        Commands::BenchmarkLocal { .. } => {
+            unreachable!("benchmark-local is handled before runtime setup")
         }
     };
 
@@ -858,6 +981,243 @@ fn main() {
     }
 }
 
+fn generate_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+fn generate_man_page() {
+    let cmd = Cli::command();
+    let man = clap_mangen::Man::new(cmd);
+    let mut buffer: Vec<u8> = Vec::new();
+    if let Err(e) = man.render(&mut buffer) {
+        eprintln!("Man page generation error: {}", e);
+        std::process::exit(agent::ExitCode::InternalError.code());
+    }
+    if let Err(e) = std::io::stdout().write_all(&buffer) {
+        eprintln!("Man page write error: {}", e);
+        std::process::exit(agent::ExitCode::OutputWrite.code());
+    }
+}
+
+fn run_profiles(cmd: &ProfileCommands) {
+    match cmd {
+        ProfileCommands::List { json } => {
+            if *json {
+                println!("{}", agent::to_pretty_json(&profiles::all_profiles()));
+            } else {
+                println!("Known endpoint compatibility profiles:");
+                for profile in profiles::all_profiles() {
+                    println!(
+                        "  {:<6} {:<36} addressing={:<7} status={}",
+                        profile.name,
+                        profile.provider,
+                        profile.recommended_addressing_style,
+                        profile.status
+                    );
+                }
+            }
+        }
+        ProfileCommands::Show { name, json } => match profiles::get_profile(name) {
+            Some(profile) if *json => println!("{}", agent::to_pretty_json(profile)),
+            Some(profile) => {
+                println!("profile: {}", profile.name);
+                println!("provider: {}", profile.provider);
+                println!("status: {}", profile.status);
+                println!("default_region: {}", profile.default_region.unwrap_or("-"));
+                println!(
+                    "default_endpoint_url: {}",
+                    profile.default_endpoint_url.unwrap_or("-")
+                );
+                println!(
+                    "recommended_addressing_style: {}",
+                    profile.recommended_addressing_style
+                );
+                println!(
+                    "requires_explicit_endpoint: {}",
+                    profile.requires_explicit_endpoint
+                );
+                println!("tested_by_project: {}", profile.tested_by_project);
+                if !profile.notes.is_empty() {
+                    println!("notes:");
+                    for note in profile.notes {
+                        println!("  - {}", note);
+                    }
+                }
+                if !profile.limitations.is_empty() {
+                    println!("limitations:");
+                    for limitation in profile.limitations {
+                        println!("  - {}", limitation);
+                    }
+                }
+            }
+            None => {
+                eprintln!("Unknown endpoint profile '{}'", name);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LocalBenchmarkReport {
+    schema_version: &'static str,
+    tool_version: &'static str,
+    status: String,
+    benchmark: String,
+    network: String,
+    objects: usize,
+    batch_size: usize,
+    prefixes: usize,
+    elapsed_secs: f64,
+    objects_per_sec: f64,
+    parquet_file: String,
+    parquet_bytes: u64,
+    ks_file: String,
+    ks_bytes: u64,
+    metrics: agent::MetricsSummary,
+    artifacts_kept: bool,
+}
+
+fn run_benchmark_local(
+    objects: usize,
+    batch_size: usize,
+    prefixes: usize,
+    keep_artifacts: bool,
+    cfg: &S3TurboConfig,
+) -> LocalBenchmarkReport {
+    let objects = objects.max(1);
+    let batch_size = batch_size.max(1);
+    let prefixes = prefixes.max(1);
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let artifact_dir = std::env::temp_dir().join(format!("s3-turbo-list-benchmark-{}", suffix));
+    std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "Benchmark setup error: failed to create {}: {}",
+            artifact_dir.display(),
+            e
+        );
+        std::process::exit(agent::ExitCode::OutputWrite.code());
+    });
+    let parquet_file = artifact_dir.join("benchmark.parquet");
+    let ks_file = artifact_dir.join("benchmark.ks");
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = core::GlobalState::new(quit, 2);
+    let started = Instant::now();
+    let output_config = cfg.output.clone();
+    let parquet_path = parquet_file.display().to_string();
+    let ks_path = ks_file.display().to_string();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(cfg.runtime.worker_threads)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Benchmark runtime error: {}", e);
+            std::process::exit(agent::ExitCode::InternalError.code());
+        });
+
+    rt.block_on(async {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
+            cfg.channel.capacity,
+        );
+        let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
+        let data_map_ks = ks_path.clone();
+        let data_map_parquet = parquet_path.clone();
+        let data_map_output_config = output_config.clone();
+        let data_map = tokio::spawn(async move {
+            data_map::data_map_task_list_streaming(
+                data_map_ctx,
+                &data_map_ks,
+                &data_map_parquet,
+                data_map_output_config,
+            )
+            .await;
+        });
+
+        let producer_state = g_state.clone();
+        let producer = tokio::spawn(async move {
+            producer_state.list_task_start(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
+            producer_state.wait_to_start().await;
+            let mut sent = 0usize;
+            while sent < objects {
+                let take = (objects - sent).min(batch_size);
+                let mut batch = Vec::with_capacity(take);
+                for offset in 0..take {
+                    let index = sent + offset;
+                    let prefix_index = index % prefixes;
+                    let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
+                    let key = core::ObjectKey::from(key_text.as_str());
+                    let mut etag = [0u8; 16];
+                    etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
+                    let props = core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+                        1024 + (index % 4096) as u64,
+                        etag,
+                    );
+                    batch.push((key, props));
+                }
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+                sent += take;
+            }
+            producer_state.list_task_complete(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
+        });
+
+        if let Err(e) = producer.await {
+            eprintln!("Benchmark producer task failed: {}", e);
+            g_state.inc_fatal_error();
+        }
+        if let Err(e) = data_map.await {
+            eprintln!("Benchmark data-map task failed: {}", e);
+            g_state.inc_fatal_error();
+        }
+    });
+    rt.shutdown_background();
+
+    let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
+    let parquet_bytes = std::fs::metadata(&parquet_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
+    let metrics = g_state.metrics_snapshot().into();
+    let artifacts_kept = keep_artifacts;
+    if !artifacts_kept {
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+
+    LocalBenchmarkReport {
+        schema_version: agent::AGENT_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: if g_state.read_fatal_error() == 0 {
+            "ok".to_string()
+        } else {
+            "error".to_string()
+        },
+        benchmark: "local-list-streaming-output".to_string(),
+        network: "none: synthetic local data only".to_string(),
+        objects,
+        batch_size,
+        prefixes,
+        elapsed_secs,
+        objects_per_sec: objects as f64 / elapsed_secs,
+        parquet_file: parquet_path,
+        parquet_bytes,
+        ks_file: ks_path,
+        ks_bytes,
+        metrics,
+        artifacts_kept,
+    }
+}
+
 fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
     let (planned_ks, planned_parquet, planned_hints) = planned_output_paths(cli, cfg);
     let outputs =
@@ -972,6 +1332,10 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         Commands::HintsValidate { .. } => ("hints-validate".to_string(), None, None, None, None),
         Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
+        Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None),
+        Commands::Completions { .. } => ("completions".to_string(), None, None, None, None),
+        Commands::Man => ("man".to_string(), None, None, None, None),
+        Commands::BenchmarkLocal { .. } => ("benchmark-local".to_string(), None, None, None, None),
     };
 
     agent::CommandInputSummary {

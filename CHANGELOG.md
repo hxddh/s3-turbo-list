@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-05-17
+
+### Added
+- Local synthetic `benchmark-local` command for list-mode streaming output throughput reports without contacting S3.
+- `scripts/benchmark-local.sh` wrapper and benchmarking documentation with machine-readable JSON output.
+- Local-only endpoint profile inspection via `profiles list` and `profiles show`, covering `aws`, `minio`, `bos`, `r2`, `b2`, and `oss`.
+- Shell completion generation via `completions <shell>` and man page generation via `man`.
+- Agent/config summaries now include whether the selected endpoint profile is known and its documented warnings.
+
+### Changed
+- Endpoint profile defaults are now backed by a shared registry instead of hard-coded `bos`/`minio` branches.
+- README roadmap now marks benchmark harness, CLI help polish, and optional endpoint compatibility profiles as delivered.
+
 ## [0.1.7] - 2026-05-17
 
 ### Added

@@ -8,7 +8,7 @@ To get started with s3-turbo-list:
 2. Download `SHA256SUMS`.
 3. Verify the checksum.
 4. Install the binary into your `PATH`.
-5. Configure an AWS-compatible profile.
+5. Configure AWS-compatible credentials.
 6. Run a first listing command.
 
 All release assets are published at the [GitHub releases page](https://github.com/hxddh/s3-turbo-list/releases).
@@ -17,10 +17,10 @@ All release assets are published at the [GitHub releases page](https://github.co
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.7-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.7-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.7-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.7-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.8-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.8-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.8-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.8-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +56,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.7-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.7-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.8-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.8-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +65,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.7-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.7-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.8-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.8-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +78,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.7-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.7-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.7-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.8-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.8-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.8-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.7-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.7-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.7-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.8-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.8-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.8-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -101,13 +101,32 @@ the `xattr` command above.
 If `/usr/local/bin` is not writable, install into `~/.local/bin` or another
 directory on your `PATH`.
 
+## Optional shell completions and man page
+
+Generate shell completions locally after installing the binary:
+
+```bash
+s3-turbo-list completions bash > s3-turbo-list.bash
+s3-turbo-list completions zsh > _s3-turbo-list
+s3-turbo-list completions fish > s3-turbo-list.fish
+s3-turbo-list man > s3-turbo-list.1
+```
+
+These commands only write to stdout and do not contact S3.
+
 ## Configure AWS S3 credentials
 
-s3-turbo-list uses the standard AWS credential and profile configuration.
-Run `aws configure` to set up a profile:
+s3-turbo-list uses the standard AWS SDK credential chain.  Run
+`aws configure` to set up credentials:
 
 ```bash
 aws configure --profile default
+```
+
+For a non-default AWS credentials profile, use the AWS SDK environment:
+
+```bash
+export AWS_PROFILE=my-aws-profile
 ```
 
 Then run a first listing:
@@ -118,10 +137,13 @@ mkdir -p out
 s3-turbo-list list \
   --bucket my-bucket \
   --region us-east-1 \
-  --profile default \
   --output-parquet-file out/aws-basic.parquet \
   --output-ks-file out/aws-basic.ks
 ```
+
+The s3-turbo-list `--profile` flag is for endpoint compatibility presets such
+as `minio`, `bos`, `r2`, `b2`, or `oss`; it is not a substitute for
+`AWS_PROFILE`.
 
 ## Agent-safe local preflight
 
@@ -133,8 +155,7 @@ s3-turbo-list doctor --local-only --json
 
 s3-turbo-list --dry-run --agent list \
   --bucket my-bucket \
-  --region us-east-1 \
-  --profile default
+  --region us-east-1
 ```
 
 For full details on machine-readable plans, manifests, and exit codes, see
@@ -149,6 +170,7 @@ normal BOS usage.
 
 ```bash
 aws configure --profile bos
+export AWS_PROFILE=bos
 ```
 
 Normal BOS usage:
@@ -225,7 +247,6 @@ Example with all output types:
 s3-turbo-list list \
   --bucket my-bucket \
   --region us-east-1 \
-  --profile default \
   --debug-s3 \
   --trace-compat out/trace.jsonl \
   --output-parquet-file out/output.parquet \
@@ -259,7 +280,6 @@ Resume picks up where an interrupted scan left off:
 s3-turbo-list list \
   --bucket my-bucket \
   --region us-east-1 \
-  --profile default \
   --resume \
   --output-parquet-file out/resume.parquet \
   --output-ks-file out/resume.ks
@@ -289,7 +309,6 @@ Run with a hints file:
 s3-turbo-list list \
   --bucket my-bucket \
   --region us-east-1 \
-  --profile default \
   --hints-file ./hints.toml \
   --output-parquet-file out/hints.parquet \
   --output-ks-file out/hints.ks
@@ -312,7 +331,6 @@ from a bounded sample:
 s3-turbo-list auto-hints \
   --bucket my-bucket \
   --region us-east-1 \
-  --profile default \
   --sample-limit 1000000 \
   --max-pages 1000 \
   --output ./hints.sampled.toml

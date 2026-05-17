@@ -48,6 +48,18 @@ Output directory for artifacts.  Each script defaults to
 export OUTDIR=/tmp/s3tl-examples/aws-basic
 ```
 
+### `AWS_PROFILE`
+
+Use the standard AWS SDK environment variable for non-default credential
+profiles:
+
+```bash
+export AWS_PROFILE=my-aws-profile
+```
+
+The s3-turbo-list `--profile` flag is reserved for endpoint compatibility
+presets such as `minio`, `bos`, `r2`, `b2`, and `oss`.
+
 ## Recommended order
 
 1. Read [`README.md`](../README.md) first — understand the tool.
@@ -65,6 +77,8 @@ export OUTDIR=/tmp/s3tl-examples/aws-basic
    BUCKET=my-bos-bucket ./examples/bos-basic-list.sh
    ```
 5. Explore **diff**, **checkpoint/resume**, **trace**, and **hints**.
+6. For a local-only throughput check, run `./scripts/benchmark-local.sh`
+   from the repository root.  It uses synthetic data and does not contact S3.
 
 ## BOS default guidance
 

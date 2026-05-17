@@ -17,7 +17,7 @@
 #   BUCKET        — S3 bucket name
 # Optional env vars:
 #   REGION        — AWS region (default: us-east-1)
-#   PROFILE       — AWS named profile (default: default)
+#   AWS_PROFILE   — AWS SDK credentials profile (optional)
 #   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/checkpoint-resume)
 #   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
@@ -26,7 +26,6 @@ set -euo pipefail
 
 : "${BUCKET:?set BUCKET to the S3 bucket name}"
 REGION="${REGION:-us-east-1}"
-PROFILE="${PROFILE:-default}"
 OUTDIR="${OUTDIR:-./artifacts/checkpoint-resume}"
 S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
@@ -36,7 +35,6 @@ build_args() {
   set -- \
     list \
     --region "$REGION" \
-    --profile "$PROFILE" \
     --bucket "$BUCKET" \
     --output-parquet-file "$OUTDIR/checkpoint.parquet" \
     --output-ks-file "$OUTDIR/checkpoint.ks"

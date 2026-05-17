@@ -2,6 +2,7 @@ use crate::checkpoint::{CheckpointIdentity, CheckpointJournal};
 use crate::config::S3TurboConfig;
 use crate::core::RunMetricsSnapshot;
 use crate::hints::{self, HintsEstimateSummary};
+use crate::profiles;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -53,6 +54,8 @@ pub struct S3Summary {
     pub force_path_style: bool,
     pub addressing_style: String,
     pub profile: Option<String>,
+    pub profile_known: bool,
+    pub profile_warnings: Vec<String>,
     pub debug_s3: bool,
     pub trace_compat: Option<String>,
     pub start_after: Option<String>,
@@ -88,6 +91,25 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 max_concurrency: cfg.runtime.max_concurrency,
             },
             s3: S3Summary {
+                profile_known: cfg
+                    .s3
+                    .profile
+                    .as_deref()
+                    .and_then(profiles::get_profile)
+                    .is_some(),
+                profile_warnings: cfg
+                    .s3
+                    .profile
+                    .as_deref()
+                    .and_then(profiles::get_profile)
+                    .map(|profile| {
+                        profile
+                            .limitations
+                            .iter()
+                            .map(|item| (*item).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 max_attempts: cfg.s3.max_attempts,
                 initial_backoff_secs: cfg.s3.initial_backoff_secs,
                 connect_timeout_secs: cfg.s3.connect_timeout_secs,

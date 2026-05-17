@@ -13,6 +13,7 @@ pub mod diff; // init_diff_state, diff_complete_notice
 pub mod error; // FlatRuntimeError, error code constants
 pub mod hints;
 pub mod mon;
+pub mod profiles;
 pub mod stats;
 pub mod tasks_s3;
 pub mod trace; // S3CompatEvent, S3TraceWriter, JsonlTraceWriter, create_trace_writer
