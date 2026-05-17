@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-05-17
+
+### Added
+- Run manifests now include artifact summaries for Parquet, KS, hints, trace, and log outputs, including size, SHA256, line counts, and Parquet metadata.
+- Dry-run plans now summarize local hints files and checkpoint compatibility without contacting S3.
+- Dry-run file conflict entries now report output parent directory existence and writability.
+- Synthetic list-mode streaming integration coverage for 20k local objects across multiple prefixes and batches.
+- Agent examples for local dry-run planning, guarded manifest-producing runs, and manifest inspection.
+
+### Changed
+- Agent documentation now describes artifact summaries and the expanded dry-run plan fields.
+- Data-map integration tests now share a local correctness helper for Parquet schema, row count, list-mode DiffFlag, and KS totals.
+
 ## [0.1.6] - 2026-05-17
 
 ### Added

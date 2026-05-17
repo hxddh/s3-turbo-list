@@ -20,9 +20,9 @@ CLI overrides, profile presets, and addressing-style normalization.
 directory, config parse status, local output parent directories, and explicitly
 marks network probing as skipped.
 
-`--dry-run` resolves command inputs, planned output paths, hints source, and
-checkpoint identity without creating Parquet/KS files and without making S3
-requests.
+`--dry-run` resolves command inputs, planned output paths, hints source,
+checkpoint identity, output parent directories, and local file conflicts
+without creating Parquet/KS files and without making S3 requests.
 
 ## Dry-run plan files
 
@@ -54,6 +54,11 @@ Agents should treat `network` as authoritative for dry-run behavior.  Current
 dry-run reports `none: dry-run only resolves local configuration and planned
 paths`.
 
+When a hints file is present, `hints` includes parse status, format, boundary
+count, warnings, and estimate summary metadata.  When `--resume` is set and a
+checkpoint file exists, `checkpoint` reports parse status, completed/total
+segments, and identity match details.
+
 ## Run manifests
 
 For real listing runs, write a final manifest:
@@ -81,6 +86,7 @@ The manifest includes:
 - `started_at`, `finished_at`, `elapsed_secs`
 - `inputs`
 - `outputs`
+- `artifacts`
 - `metrics`
 - `checkpoint`
 - `warnings`
@@ -88,6 +94,17 @@ The manifest includes:
 The `metrics` object includes data-map counters such as received batches,
 received objects, streamed rows, unique prefixes, Parquet rows, KS entries,
 fatal listing errors, and output write errors.
+
+The `artifacts` array describes generated files:
+
+- `kind`: `parquet`, `ks`, `hints`, `trace`, or `log`
+- `path`
+- `exists`
+- `size_bytes`
+- `sha256`
+- `line_count` for line-oriented files
+- `parquet.row_count`, `parquet.row_group_count`, and `parquet.schema_fields`
+  for Parquet outputs
 
 ## Stable exit codes
 

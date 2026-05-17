@@ -207,7 +207,8 @@ s3-turbo-list --run-manifest run.json list \
 ```
 
 See [`docs/agent-usage.md`](docs/agent-usage.md) for JSON fields and stable
-exit-code classes.
+exit-code classes.  Run manifests include artifact summaries with SHA256,
+file sizes, line counts, and Parquet row/schema metadata.
 
 Trace output is one JSON object per line (JSONL). Each line contains:
 operation, endpoint, addressing style, profile, region, bucket, prefix,

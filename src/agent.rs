@@ -1,6 +1,11 @@
+use crate::checkpoint::{CheckpointIdentity, CheckpointJournal};
 use crate::config::S3TurboConfig;
 use crate::core::RunMetricsSnapshot;
+use crate::hints::{self, HintsEstimateSummary};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const AGENT_SCHEMA_VERSION: &str = "s3-turbo-list.agent.v1";
@@ -145,12 +150,23 @@ pub struct HintsPlan {
     pub source: String,
     pub path: Option<String>,
     pub exists: bool,
+    pub valid: Option<bool>,
+    pub format: Option<String>,
+    pub boundary_count: Option<usize>,
+    pub estimate_summary: Option<HintsEstimateSummary>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckpointPlan {
     pub enabled: bool,
     pub path: Option<String>,
+    pub exists: bool,
+    pub valid: Option<bool>,
+    pub identity_matches: Option<bool>,
+    pub identity_mismatches: Vec<String>,
+    pub completed_segments: Option<usize>,
+    pub total_segments: Option<usize>,
     pub identity_fields: Vec<String>,
 }
 
@@ -158,6 +174,9 @@ pub struct CheckpointPlan {
 pub struct FileConflict {
     pub path: String,
     pub exists: bool,
+    pub parent_path: Option<String>,
+    pub parent_exists: bool,
+    pub parent_writable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,9 +240,28 @@ pub struct RunManifest {
     pub command: Vec<String>,
     pub inputs: CommandInputSummary,
     pub outputs: OutputPathSummary,
+    pub artifacts: Vec<ArtifactSummary>,
     pub metrics: MetricsSummary,
     pub checkpoint: CheckpointPlan,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactSummary {
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub line_count: Option<usize>,
+    pub parquet: Option<ParquetArtifactSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParquetArtifactSummary {
+    pub row_count: i64,
+    pub row_group_count: usize,
+    pub schema_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,16 +302,27 @@ pub fn detect_hints_plan(
     region: Option<&str>,
 ) -> HintsPlan {
     if let Some(path) = explicit_hints_file {
+        let report = inspect_hints_for_plan(path);
         return HintsPlan {
             source: "explicit".to_string(),
             path: Some(path.to_string()),
             exists: Path::new(path).exists(),
+            valid: report.as_ref().map(|r| r.valid),
+            format: report
+                .as_ref()
+                .map(|r| format!("{:?}", r.format).to_lowercase()),
+            boundary_count: report.as_ref().map(|r| r.boundary_count),
+            estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
+            warnings: report
+                .map(|r| r.warnings)
+                .unwrap_or_else(|| vec!["hints file does not exist or could not be parsed".into()]),
         };
     }
 
     if let Some(bucket) = bucket {
         let path = conventional_hints_path(bucket, region);
         let exists = Path::new(&path).exists();
+        let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
         return HintsPlan {
             source: if exists {
                 "auto_cache"
@@ -283,6 +332,13 @@ pub fn detect_hints_plan(
             .to_string(),
             path: Some(path),
             exists,
+            valid: report.as_ref().map(|r| r.valid),
+            format: report
+                .as_ref()
+                .map(|r| format!("{:?}", r.format).to_lowercase()),
+            boundary_count: report.as_ref().map(|r| r.boundary_count),
+            estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
+            warnings: report.map(|r| r.warnings).unwrap_or_default(),
         };
     }
 
@@ -290,13 +346,28 @@ pub fn detect_hints_plan(
         source: "not_applicable".to_string(),
         path: None,
         exists: false,
+        valid: None,
+        format: None,
+        boundary_count: None,
+        estimate_summary: None,
+        warnings: Vec::new(),
     }
+}
+
+fn inspect_hints_for_plan(path: &str) -> Option<hints::HintsValidationReport> {
+    hints::inspect_hints_file(path, 3).ok()
 }
 
 pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> CheckpointPlan {
     CheckpointPlan {
         enabled,
         path,
+        exists: false,
+        valid: None,
+        identity_matches: None,
+        identity_mismatches: Vec::new(),
+        completed_segments: None,
+        total_segments: None,
         identity_fields: vec![
             "bucket".to_string(),
             "region".to_string(),
@@ -308,6 +379,44 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
             "mode".to_string(),
         ],
     }
+}
+
+pub fn checkpoint_plan(
+    enabled: bool,
+    path: Option<String>,
+    current_identity: Option<&CheckpointIdentity>,
+) -> CheckpointPlan {
+    let mut plan = default_checkpoint_plan(enabled, path.clone());
+    let Some(path) = path else {
+        return plan;
+    };
+    plan.exists = Path::new(&path).exists();
+    if !plan.exists {
+        return plan;
+    }
+
+    match CheckpointJournal::load(&path) {
+        Some(journal) => {
+            plan.valid = Some(true);
+            plan.completed_segments = Some(journal.completed_indices.len());
+            plan.total_segments = Some(journal.total_segments);
+            if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
+                let mismatches = stored.diff(current);
+                plan.identity_matches = Some(mismatches.is_empty());
+                plan.identity_mismatches = mismatches;
+            } else if current_identity.is_some() {
+                plan.identity_matches = Some(false);
+                plan.identity_mismatches = vec!["identity".to_string()];
+            }
+        }
+        None => {
+            plan.valid = Some(false);
+            if current_identity.is_some() {
+                plan.identity_matches = Some(false);
+            }
+        }
+    }
+    plan
 }
 
 pub fn output_conflicts(outputs: &OutputPathSummary) -> Vec<FileConflict> {
@@ -323,8 +432,109 @@ pub fn output_conflicts(outputs: &OutputPathSummary) -> Vec<FileConflict> {
     .map(|path| FileConflict {
         path: path.clone(),
         exists: Path::new(path).exists(),
+        parent_path: output_parent(path).map(|p| p.display().to_string()),
+        parent_exists: output_parent(path).map(|p| p.exists()).unwrap_or(true),
+        parent_writable: output_parent(path).and_then(parent_writable),
     })
     .collect()
+}
+
+fn output_parent(path: &str) -> Option<PathBuf> {
+    Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+fn parent_writable(path: PathBuf) -> Option<bool> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(!metadata.permissions().readonly())
+}
+
+pub fn collect_artifacts(outputs: &OutputPathSummary) -> Vec<ArtifactSummary> {
+    let mut artifacts = Vec::new();
+    if let Some(path) = &outputs.parquet_file {
+        artifacts.push(summarize_artifact("parquet", path));
+    }
+    if let Some(path) = &outputs.ks_file {
+        artifacts.push(summarize_artifact("ks", path));
+    }
+    if let Some(path) = &outputs.hints_file {
+        artifacts.push(summarize_artifact("hints", path));
+    }
+    if let Some(path) = &outputs.trace_compat {
+        artifacts.push(summarize_artifact("trace", path));
+    }
+    if let Some(path) = &outputs.log_file {
+        artifacts.push(summarize_artifact("log", path));
+    }
+    artifacts
+}
+
+fn summarize_artifact(kind: &str, path: &str) -> ArtifactSummary {
+    let exists = Path::new(path).exists();
+    if !exists {
+        return ArtifactSummary {
+            kind: kind.to_string(),
+            path: path.to_string(),
+            exists,
+            size_bytes: None,
+            sha256: None,
+            line_count: None,
+            parquet: None,
+        };
+    }
+
+    ArtifactSummary {
+        kind: kind.to_string(),
+        path: path.to_string(),
+        exists,
+        size_bytes: std::fs::metadata(path).ok().map(|m| m.len()),
+        sha256: sha256_file(path).ok(),
+        line_count: matches!(kind, "ks" | "trace" | "log" | "hints")
+            .then(|| line_count(path).ok())
+            .flatten(),
+        parquet: (kind == "parquet")
+            .then(|| parquet_summary(path).ok())
+            .flatten(),
+    }
+}
+
+fn sha256_file(path: &str) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn line_count(path: &str) -> Result<usize, String> {
+    let content = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(content.iter().filter(|b| **b == b'\n').count())
+}
+
+fn parquet_summary(path: &str) -> Result<ParquetArtifactSummary, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = SerializedFileReader::new(file).map_err(|e| e.to_string())?;
+    let metadata = reader.metadata();
+    let schema_fields = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+    Ok(ParquetArtifactSummary {
+        row_count: metadata.file_metadata().num_rows(),
+        row_group_count: metadata.num_row_groups(),
+        schema_fields,
+    })
 }
 
 pub fn config_inspect_report(cfg: &S3TurboConfig) -> ConfigInspectReport {

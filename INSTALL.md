@@ -17,10 +17,10 @@ All release assets are published at the [GitHub releases page](https://github.co
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.6-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.6-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.6-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.6-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.7-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.7-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.7-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.7-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +56,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.6-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.6-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.7-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.7-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +65,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.6-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.6-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.7-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.7-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +78,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.6-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.6-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.6-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.7-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.7-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.7-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.6-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.6-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.6-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.7-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.7-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.7-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -138,7 +138,8 @@ s3-turbo-list --dry-run --agent list \
 ```
 
 For full details on machine-readable plans, manifests, and exit codes, see
-[`docs/agent-usage.md`](docs/agent-usage.md).
+[`docs/agent-usage.md`](docs/agent-usage.md).  Manifest artifact summaries
+include SHA256, file sizes, line counts, and Parquet metadata.
 
 ## Configure BOS
 

@@ -15,6 +15,19 @@ fn run_cli(args: &[&str]) -> (i32, String, String) {
     (exit_code, stdout, stderr)
 }
 
+fn run_cli_in_dir(args: &[&str], cwd: &std::path::Path) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("failed to execute s3-turbo-list test binary");
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (exit_code, stdout, stderr)
+}
+
 #[test]
 fn test_cli_help_top_level() {
     let (code, stdout, _stderr) = run_cli(&["--help"]);
@@ -165,6 +178,9 @@ fn test_cli_dry_run_plan_json_list_no_cloud() {
         json["outputs"]["parquet_file"],
         parquet_path.to_str().unwrap()
     );
+    assert_eq!(json["file_conflicts"][0]["exists"], false);
+    assert_eq!(json["file_conflicts"][0]["parent_exists"], true);
+    assert_eq!(json["file_conflicts"][0]["parent_writable"], true);
 }
 
 #[test]
@@ -190,6 +206,87 @@ fn test_cli_dry_run_agent_stdout_json() {
         .as_str()
         .unwrap()
         .contains("auto-hints will scan S3 pages"));
+}
+
+#[test]
+fn test_cli_dry_run_reports_hints_and_checkpoint_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let hints_path = dir.path().join("hints.toml");
+    std::fs::write(
+        &hints_path,
+        r#"bucket = "test-bucket"
+region = "us-east-1"
+total_objects = 30
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+scan_mode = "sampled"
+estimate_mode = "sampled"
+
+[[segment_estimates]]
+start_after = ""
+end_before = "m/"
+estimated_objects = 10
+
+[[segment_estimates]]
+start_after = "m/"
+estimated_objects = 20
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("us-east-1_test-bucket_checkpoint.toml"),
+        r#"bucket = "test-bucket"
+prefix = ""
+total_segments = 2
+completed_indices = [0]
+last_updated = "2026-05-17T00:00:00Z"
+
+[identity]
+bucket = "test-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = "/"
+addressing_style = "auto"
+mode = "list"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--agent",
+            "--dry-run",
+            "--resume",
+            "--hints-file",
+            hints_path.to_str().unwrap(),
+            "list",
+            "--bucket",
+            "test-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(json["hints"]["source"], "explicit");
+    assert_eq!(json["hints"]["exists"], true);
+    assert_eq!(json["hints"]["valid"], true);
+    assert_eq!(json["hints"]["format"], "toml");
+    assert_eq!(json["hints"]["boundary_count"], 1);
+    assert_eq!(
+        json["hints"]["estimate_summary"]["total_estimated_objects"],
+        30
+    );
+
+    assert_eq!(json["checkpoint"]["enabled"], true);
+    assert_eq!(json["checkpoint"]["exists"], true);
+    assert_eq!(json["checkpoint"]["valid"], true);
+    assert_eq!(json["checkpoint"]["identity_matches"], true);
+    assert_eq!(json["checkpoint"]["completed_segments"], 1);
+    assert_eq!(json["checkpoint"]["total_segments"], 2);
 }
 
 #[test]

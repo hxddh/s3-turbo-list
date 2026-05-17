@@ -2,6 +2,7 @@
 use arrow::array::RecordBatchReader;
 use parquet::basic::Compression;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use s3_turbo_list::agent::{self, OutputPathSummary};
 use s3_turbo_list::config::OutputConfig;
 use s3_turbo_list::core::{
     DataMapContext, GlobalState, ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
@@ -11,6 +12,8 @@ use s3_turbo_list::data_map::{ObjectMap, PrefixMap};
 use s3_turbo_list::utils::AsyncParquetOutput;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+const EXPECTED_SCHEMA: [&str; 5] = ["Key", "Size", "LastModified", "ETag", "DiffFlag"];
 
 // ── Single prefix, single object ──────────────────────────
 
@@ -356,6 +359,92 @@ async fn test_list_streaming_handles_empty_batch_and_sorts_ks() {
 }
 
 #[tokio::test]
+async fn test_list_streaming_synthetic_dataset_consistency_and_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("synthetic.parquet");
+    let ks_path = dir.path().join("synthetic.ks");
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = GlobalState::new(quit, 1);
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    let ctx = DataMapContext::new(rx, g_state.clone());
+
+    let prefixes = ["alpha", "beta", "gamma", "omega"];
+    let mut expected_prefix_counts = std::collections::BTreeMap::new();
+    let total = 20_000usize;
+    let batch_size = 257usize;
+
+    let mut batch = Vec::with_capacity(batch_size);
+    for i in 0..total {
+        let prefix = prefixes[i % prefixes.len()];
+        *expected_prefix_counts
+            .entry(prefix.to_string())
+            .or_insert(0usize) += 1;
+        let mut props =
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, i as u64, [7u8; 16]);
+        props.last_modified = 1_715_700_000 + i as u64;
+        batch.push((
+            ObjectKey::from(format!("{}/object-{:06}.dat", prefix, i).as_str()),
+            props,
+        ));
+        if batch.len() == batch_size {
+            tx.send(std::mem::take(&mut batch)).await.unwrap();
+        }
+    }
+    if !batch.is_empty() {
+        tx.send(batch).await.unwrap();
+    }
+    drop(tx);
+
+    let parquet_path_for_task = parquet_path.to_str().unwrap().to_string();
+    let ks_path_for_task = ks_path.to_str().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        s3_turbo_list::data_map::data_map_task_list_streaming(
+            ctx,
+            &ks_path_for_task,
+            &parquet_path_for_task,
+            OutputConfig {
+                row_group_size: 512,
+                compression: "snappy".to_string(),
+                ..OutputConfig::default()
+            },
+        )
+        .await;
+    });
+    task.await.unwrap();
+
+    assert_list_output_consistency(&parquet_path, &ks_path, total, &expected_prefix_counts);
+
+    let metrics = g_state.metrics_snapshot();
+    assert_eq!(metrics.data_received_objects, total);
+    assert_eq!(metrics.data_streamed_rows, total);
+    assert_eq!(metrics.data_parquet_rows, total);
+    assert_eq!(metrics.data_ks_entries, prefixes.len());
+
+    let outputs = OutputPathSummary {
+        parquet_file: Some(parquet_path.to_str().unwrap().to_string()),
+        ks_file: Some(ks_path.to_str().unwrap().to_string()),
+        hints_file: None,
+        trace_compat: None,
+        log_file: None,
+    };
+    let artifacts = agent::collect_artifacts(&outputs);
+    assert_eq!(artifacts.len(), 2);
+    let parquet = artifacts.iter().find(|a| a.kind == "parquet").unwrap();
+    assert!(parquet.exists);
+    assert!(parquet.size_bytes.unwrap() > 0);
+    assert_eq!(parquet.sha256.as_ref().unwrap().len(), 64);
+    let parquet_meta = parquet.parquet.as_ref().unwrap();
+    assert_eq!(parquet_meta.row_count, total as i64);
+    assert_eq!(parquet_meta.schema_fields, EXPECTED_SCHEMA);
+
+    let ks = artifacts.iter().find(|a| a.kind == "ks").unwrap();
+    assert!(ks.exists);
+    assert_eq!(ks.line_count, Some(prefixes.len()));
+    assert_eq!(ks.sha256.as_ref().unwrap().len(), 64);
+}
+
+#[tokio::test]
 async fn test_list_streaming_honors_parquet_compression_config() {
     let dir = tempfile::tempdir().unwrap();
     let parquet_path = dir.path().join("list_streaming_snappy.parquet");
@@ -442,4 +531,45 @@ async fn test_parquet_output_schema() {
     let batch = &batches[0];
     let batch = batch.as_ref().expect("batch should be Ok");
     assert_eq!(batch.num_rows(), 1);
+}
+
+fn assert_list_output_consistency(
+    parquet_path: &std::path::Path,
+    ks_path: &std::path::Path,
+    expected_rows: usize,
+    expected_prefix_counts: &std::collections::BTreeMap<String, usize>,
+) {
+    let std_file = std::fs::File::open(parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let schema = reader.schema();
+    let actual_schema: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(actual_schema, EXPECTED_SCHEMA);
+
+    let batches: Vec<_> = reader.collect();
+    let total_rows: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(total_rows, expected_rows);
+
+    for batch in &batches {
+        let batch = batch.as_ref().unwrap();
+        let diff_flags = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .unwrap();
+        for i in 0..diff_flags.len() {
+            assert_eq!(diff_flags.value(i), 0, "list mode DiffFlag must be 0");
+        }
+    }
+
+    let ks = std::fs::read_to_string(ks_path).unwrap();
+    let mut total_ks_count = 0usize;
+    for (prefix, expected_count) in expected_prefix_counts {
+        let line = format!("\"{}\",\"{}\"", prefix, expected_count);
+        assert!(ks.contains(&line), "missing KS line: {}", line);
+        total_ks_count += expected_count;
+    }
+    assert_eq!(total_ks_count, expected_rows);
 }

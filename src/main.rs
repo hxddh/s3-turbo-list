@@ -807,6 +807,8 @@ fn main() {
         "failed"
     };
 
+    let manifest_outputs =
+        runtime_output_summary(&cli, &cfg, Some(&filename_ks), Some(&filename_output));
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -817,12 +819,27 @@ fn main() {
         elapsed_secs: run_timer.elapsed().as_secs_f64(),
         command: std::env::args().collect(),
         inputs: command_input_summary(&cli, &cfg),
-        outputs: runtime_output_summary(&cli, &cfg, Some(&filename_ks), Some(&filename_output)),
+        artifacts: agent::collect_artifacts(&manifest_outputs),
+        outputs: manifest_outputs,
         metrics: metrics.into(),
-        checkpoint: agent::default_checkpoint_plan(
+        checkpoint: agent::checkpoint_plan(
             cli.resume,
             cli.resume
                 .then(|| checkpoint::checkpoint_path(opt_bucket, opt_region)),
+            Some(&checkpoint::CheckpointIdentity::new(
+                opt_bucket,
+                opt_region,
+                &opt_prefix,
+                Some(&cli.delimiter),
+                cli.max_keys,
+                cfg.s3.profile.as_deref(),
+                Some(&cfg.s3.addressing_style.to_string()),
+                Some(if mode == RunMode::BiDir {
+                    "bidir"
+                } else {
+                    "list"
+                }),
+            )),
         ),
         warnings: vec![],
     };
@@ -852,6 +869,22 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         .as_deref()
         .filter(|_| cli.resume)
         .map(|bucket| checkpoint::checkpoint_path(bucket, inputs.region.as_deref()));
+    let current_identity = inputs.bucket.as_deref().map(|bucket| {
+        checkpoint::CheckpointIdentity::new(
+            bucket,
+            inputs.region.as_deref(),
+            &inputs.prefix,
+            Some(&inputs.delimiter),
+            inputs.max_keys,
+            inputs.profile.as_deref(),
+            Some(&inputs.addressing_style),
+            Some(if inputs.mode == "diff" {
+                "bidir"
+            } else {
+                "list"
+            }),
+        )
+    });
     let hints = agent::detect_hints_plan(
         cli.hints_file.as_deref(),
         inputs.bucket.as_deref(),
@@ -879,7 +912,7 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         outputs,
         resolved_config: cfg.into(),
         hints,
-        checkpoint: agent::default_checkpoint_plan(cli.resume, checkpoint_path),
+        checkpoint: agent::checkpoint_plan(cli.resume, checkpoint_path, current_identity.as_ref()),
         file_conflicts,
         warnings,
     }
