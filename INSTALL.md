@@ -17,10 +17,10 @@ All release assets are published at the [GitHub releases page](https://github.co
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.4-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.4-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.4-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.4-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.5-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.5-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.5-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.5-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +56,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.4-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.4-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.5-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.5-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +65,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.4-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.4-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.5-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.5-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +78,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.4-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.4-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.4-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.5-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.5-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.5-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.4-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.4-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.4-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.5-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.5-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.5-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -138,12 +138,11 @@ Normal BOS usage:
 ```bash
 mkdir -p out
 
+# The bos profile preset sets the BOS endpoint and virtual-hosted addressing.
 s3-turbo-list list \
   --bucket your-bos-bucket \
   --region bj \
   --profile bos \
-  --endpoint-url https://s3.bj.bcebos.com \
-  --addressing-style virtual \
   --output-parquet-file out/bos-basic.parquet \
   --output-ks-file out/bos-basic.ks
 ```
@@ -248,9 +247,9 @@ s3-turbo-list list \
   --output-ks-file out/resume.ks
 ```
 
-Resume uses checkpoint identity validation.  If bucket, region, endpoint,
-delimiter, max_keys, addressing_style, or other identity fields change,
-the checkpoint is rejected to prevent mismatched data.
+Resume uses checkpoint identity validation.  If bucket, region, prefix,
+delimiter, max_keys, profile, addressing_style, or mode change, the
+checkpoint is rejected to prevent mismatched data.
 
 ## Hints file
 
@@ -305,6 +304,9 @@ In sampled mode, `total_objects` means sampled objects, not the full bucket
 total.  Segment estimates in the hints cache are sampled/estimated, not
 authoritative bucket-wide statistics.  Use full-scan `auto-hints` when you
 need observed bucket-wide prefix statistics.
+
+For runtime defaults and advanced TOML-only settings, see
+[`docs/tuning.md`](docs/tuning.md).
 
 ## Troubleshooting
 

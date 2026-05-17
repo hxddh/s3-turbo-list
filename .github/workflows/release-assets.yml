@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.4'
+        default: 'v0.1.5'
 
 permissions:
   contents: write
@@ -123,10 +123,48 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Validate complete asset set
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          expected=(
+            "s3-turbo-list-${VERSION}-linux-aarch64"
+            "s3-turbo-list-${VERSION}-linux-x86_64"
+            "s3-turbo-list-${VERSION}-macos-aarch64"
+            "s3-turbo-list-${VERSION}-macos-x86_64"
+          )
+
+          for asset in "${expected[@]}"; do
+            if [ ! -s "flat/${asset}" ]; then
+              echo "::error::Missing or empty release asset: ${asset}"
+              exit 1
+            fi
+          done
+
+          actual_count="$(find flat -maxdepth 1 -type f -name "s3-turbo-list-${VERSION}-*" | wc -l | tr -d ' ')"
+          if [ "$actual_count" != "4" ]; then
+            echo "::error::Expected exactly 4 platform binaries, found ${actual_count}"
+            find flat -maxdepth 1 -type f -name "s3-turbo-list-${VERSION}-*" -print
+            exit 1
+          fi
+
       - name: Generate combined SHA256SUMS
         run: |
           cd flat
-          sha256sum s3-turbo-list-* > SHA256SUMS
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          expected=(
+            "s3-turbo-list-${VERSION}-linux-aarch64"
+            "s3-turbo-list-${VERSION}-linux-x86_64"
+            "s3-turbo-list-${VERSION}-macos-aarch64"
+            "s3-turbo-list-${VERSION}-macos-x86_64"
+          )
+          sha256sum "${expected[@]}" > SHA256SUMS
+          line_count="$(wc -l < SHA256SUMS | tr -d ' ')"
+          if [ "$line_count" != "4" ]; then
+            echo "::error::SHA256SUMS must contain exactly 4 entries, found ${line_count}"
+            exit 1
+          fi
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
           echo "=== Verification ==="
@@ -148,5 +186,14 @@ jobs:
             SHA256SUMS \
             --repo hxddh/s3-turbo-list \
             --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: List release assets for audit
+        run: |
+          gh release view "${{ inputs.tag }}" \
+            --repo hxddh/s3-turbo-list \
+            --json assets \
+            --jq '.assets[].name'
         env:
           GH_TOKEN: ${{ github.token }}

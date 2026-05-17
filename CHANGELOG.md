@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-17
+
+### Added
+- Tuning reference documentation for core default values and TOML-only advanced knobs.
+- Release workflow assertions for the complete four-platform asset set and SHA256SUMS entries.
+- Integration coverage for `hints-validate --json` estimate metadata.
+- Integration coverage for list-mode streaming KS ordering and Parquet compression configuration.
+
+### Changed
+- Documentation now describes checkpoint identity fields consistently across README and INSTALL.
+- Diff-mode documentation now states that Equal rows are always emitted in current releases.
+- Validation status wording no longer hard-codes a stale test count.
+
 ## [0.1.4] - 2026-05-16
 
 ### Added

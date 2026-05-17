@@ -93,6 +93,54 @@ fn test_cli_hints_validate_plain_success() {
 }
 
 #[test]
+fn test_cli_hints_validate_json_estimates_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hints.toml");
+    std::fs::write(
+        &path,
+        r#"bucket = "b"
+region = "us-east-1"
+total_objects = 30
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+scan_mode = "sampled"
+sampled_objects = 30
+sampled_pages = 2
+sample_limit = 30
+max_pages = 2
+estimate_mode = "sampled"
+
+[[segment_estimates]]
+start_after = ""
+end_before = "m/"
+estimated_objects = 10
+
+[[segment_estimates]]
+start_after = "m/"
+estimated_objects = 20
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "hints-validate",
+        "--hints-file",
+        path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["metadata"]["scan_mode"], "sampled");
+    assert_eq!(json["estimate_summary"]["sampled"], true);
+    assert_eq!(json["estimate_summary"]["count"], 2);
+    assert_eq!(json["estimate_summary"]["min_estimated_objects"], 10);
+    assert_eq!(json["estimate_summary"]["max_estimated_objects"], 20);
+    assert_eq!(json["estimate_summary"]["total_estimated_objects"], 30);
+    assert_eq!(json["first_estimates"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn test_cli_hints_validate_malformed_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.txt");

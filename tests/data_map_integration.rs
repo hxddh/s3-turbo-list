@@ -1,5 +1,7 @@
 // Integration tests for data_map aggregation and Parquet output pipeline.
 use arrow::array::RecordBatchReader;
+use parquet::basic::Compression;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use s3_turbo_list::config::OutputConfig;
 use s3_turbo_list::core::{
     DataMapContext, GlobalState, ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
@@ -299,6 +301,102 @@ async fn test_list_streaming_writes_equal_diff_flag_and_ks() {
 
     let ks = std::fs::read_to_string(&ks_path).unwrap();
     assert_eq!(ks, "\"logs\",\"2\"\n");
+}
+
+#[tokio::test]
+async fn test_list_streaming_handles_empty_batch_and_sorts_ks() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("list_streaming_sorted.parquet");
+    let ks_path = dir.path().join("list_streaming_sorted.ks");
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = GlobalState::new(quit, 1);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let ctx = DataMapContext::new(rx, g_state);
+
+    let parquet_path_for_task = parquet_path.to_str().unwrap().to_string();
+    let ks_path_for_task = ks_path.to_str().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        s3_turbo_list::data_map::data_map_task_list_streaming(
+            ctx,
+            &ks_path_for_task,
+            &parquet_path_for_task,
+            OutputConfig::default(),
+        )
+        .await;
+    });
+
+    tx.send(Vec::new()).await.unwrap();
+    tx.send(vec![
+        (
+            ObjectKey::from("zeta/file.txt"),
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 10, [3u8; 16]),
+        ),
+        (
+            ObjectKey::from("alpha/file.txt"),
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 20, [4u8; 16]),
+        ),
+    ])
+    .await
+    .unwrap();
+    drop(tx);
+    task.await.unwrap();
+
+    let std_file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.collect();
+    let total_rows: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    let ks = std::fs::read_to_string(&ks_path).unwrap();
+    assert_eq!(ks, "\"alpha\",\"1\"\n\"zeta\",\"1\"\n");
+}
+
+#[tokio::test]
+async fn test_list_streaming_honors_parquet_compression_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("list_streaming_snappy.parquet");
+    let ks_path = dir.path().join("list_streaming_snappy.ks");
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = GlobalState::new(quit, 1);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let ctx = DataMapContext::new(rx, g_state);
+
+    let parquet_path_for_task = parquet_path.to_str().unwrap().to_string();
+    let ks_path_for_task = ks_path.to_str().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        s3_turbo_list::data_map::data_map_task_list_streaming(
+            ctx,
+            &ks_path_for_task,
+            &parquet_path_for_task,
+            OutputConfig {
+                row_group_size: 1,
+                compression: "snappy".to_string(),
+                ..OutputConfig::default()
+            },
+        )
+        .await;
+    });
+
+    tx.send(vec![(
+        ObjectKey::from("logs/a.txt"),
+        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [5u8; 16]),
+    )])
+    .await
+    .unwrap();
+    drop(tx);
+    task.await.unwrap();
+
+    let file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+    assert!(metadata.num_row_groups() >= 1);
+    let compression = metadata.row_group(0).column(0).compression();
+    assert_eq!(compression, Compression::SNAPPY);
 }
 
 // ── Parquet output schema verification ────────────────────

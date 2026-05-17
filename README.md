@@ -194,8 +194,8 @@ s3-turbo-list diff \
   --region us-east-2 --bucket source-bucket \
   --target-region us-west-2 --target-bucket target-bucket
 
-# Include equal rows in output
-# (controlled by internal config; equal rows default to included)
+# In current releases, diff mode always outputs Equal rows.
+# Filter DiffFlag=0 downstream with pandas or duckdb if needed.
 
 # With trace for both sides
 s3-turbo-list diff \
@@ -284,6 +284,12 @@ Use a hints file:
 ```bash
 s3-turbo-list list --region us-east-2 --bucket my-bucket -H hints.toml
 ```
+
+Advanced runtime and auto-hints tuning is documented in
+[`docs/tuning.md`](docs/tuning.md).  Some knobs, including
+`auto_hints.sample_threshold`, `auto_hints.max_prefix_depth`, and
+`auto_hints.min_segment_size`, are TOML-only settings and do not have CLI
+flags.
 
 ## Output schema
 
@@ -382,9 +388,9 @@ Validation details:
 
 ## Validation status
 
-All validation is complete. 113/113 tests pass on a clean working tree.
+All validation is complete.  The test suite passes on a clean working tree.
 
-Validation covered three endpoints (MinIO, AWS S3, BOS) across 13+ test
+Validation covered three endpoints (MinIO, AWS S3, BOS) across 15 test
 categories per endpoint: compat-probe, standard listing, prefix filter,
 delimiter, pagination, start-after, encoding-type, continuation token,
 error behaviour, checkpoint/resume, identity verification, diff mode,
@@ -399,7 +405,7 @@ incompatibilities were documented.  Full details in
 | Priority | Item | Status |
 |---|---|---|
 | ✅ Done | README / docs polish | This document |
-| ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete — 113/113 tests |
+| ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete |
 | ✅ Done | Release packaging | v0.1.1+ multi-platform release assets published |
 | ✅ Done | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
 | ✅ Done | Large-run readiness | data_map batch insertion metrics, hints validation, sampled auto-hints |
