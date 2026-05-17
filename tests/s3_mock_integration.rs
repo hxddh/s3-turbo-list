@@ -1,0 +1,669 @@
+use arrow::array::{Array, StringArray};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    method: String,
+    path: String,
+    query: BTreeMap<String, String>,
+}
+
+struct MockResponse {
+    status: u16,
+    reason: &'static str,
+    body: String,
+}
+
+impl MockResponse {
+    fn ok_xml(body: String) -> Self {
+        Self {
+            status: 200,
+            reason: "OK",
+            body,
+        }
+    }
+
+    fn empty_ok() -> Self {
+        Self {
+            status: 200,
+            reason: "OK",
+            body: String::new(),
+        }
+    }
+
+    fn error(status: u16, code: &str, message: &str) -> Self {
+        Self {
+            status,
+            reason: if status == 503 {
+                "Service Unavailable"
+            } else {
+                "Error"
+            },
+            body: format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message><RequestId>mock-request</RequestId></Error>"#,
+                code, message
+            ),
+        }
+    }
+}
+
+struct MockS3Server {
+    addr: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockS3Server {
+    fn start(
+        handler: impl Fn(RecordedRequest, usize) -> MockResponse + Send + Sync + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("set mock server nonblocking");
+        let addr = listener.local_addr().expect("mock server local addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(handler);
+
+        let thread_requests = requests.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            let mut sequence = 0usize;
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        sequence += 1;
+                        handle_connection(stream, sequence, &thread_requests, handler.as_ref());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            requests,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for MockS3Server {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    sequence: usize,
+    requests: &Arc<Mutex<Vec<RecordedRequest>>>,
+    handler: &(dyn Fn(RecordedRequest, usize) -> MockResponse + Send + Sync),
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let Some(request) = read_request(&mut stream) else {
+        return;
+    };
+    requests.lock().unwrap().push(request.clone());
+    let response = handler(request, sequence);
+    write_response(&mut stream, response);
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buf);
+    let first_line = request.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let target = parts.next()?;
+    let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    Some(RecordedRequest {
+        method,
+        path: path.to_string(),
+        query: parse_query(raw_query),
+    })
+}
+
+fn write_response(stream: &mut TcpStream, response: MockResponse) {
+    let body = response.body.as_bytes();
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nx-amz-request-id: mock-request\r\nConnection: close\r\n\r\n",
+        response.status,
+        response.reason,
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn parse_query(raw: &str) -> BTreeMap<String, String> {
+    raw.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    out.push(decoded);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn list_bucket_xml(
+    prefix: &str,
+    max_keys: i32,
+    contents: &[&str],
+    common_prefixes: &[&str],
+    truncated: bool,
+    next_token: Option<&str>,
+) -> String {
+    let contents_xml: String = contents
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            format!(
+                "<Contents><Key>{}</Key><LastModified>2026-05-17T00:00:{:02}.000Z</LastModified><ETag>&quot;{:032x}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+                xml_escape(key),
+                index,
+                index + 1,
+                100 + index
+            )
+        })
+        .collect();
+    let common_prefixes_xml: String = common_prefixes
+        .iter()
+        .map(|prefix| {
+            format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(prefix)
+            )
+        })
+        .collect();
+    let next_token_xml = next_token
+        .map(|token| {
+            format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                xml_escape(token)
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>mock-bucket</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>{}{}{}</ListBucketResult>"#,
+        xml_escape(prefix),
+        contents.len() + common_prefixes.len(),
+        max_keys,
+        if truncated { "true" } else { "false" },
+        contents_xml,
+        common_prefixes_xml,
+        next_token_xml
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn write_fast_config(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"[s3]
+max_attempts = 3
+initial_backoff_secs = 0
+connect_timeout_secs = 2
+operation_timeout_secs = 2
+"#,
+    )
+    .unwrap();
+}
+
+fn run_cli(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+        .current_dir(cwd)
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(args)
+        .output()
+        .expect("run s3-turbo-list");
+
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn parquet_keys(path: &std::path::Path) -> Vec<String> {
+    let file = std::fs::File::open(path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut keys = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..column.len() {
+            keys.push(column.value(row).to_string());
+        }
+    }
+    keys
+}
+
+#[test]
+fn local_mock_list_paginates_and_records_protocol_fields() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path.trim_end_matches('/'), "/mock-bucket");
+        assert_eq!(
+            request.query.get("list-type").map(String::as_str),
+            Some("2")
+        );
+
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["logs/a.txt", "logs/b.txt"],
+                &[],
+                true,
+                Some("token-1"),
+            )),
+            Some("token-1") => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["logs/c.txt"],
+                &["logs/archive/"],
+                false,
+                None,
+            )),
+            Some(_) => MockResponse::error(400, "InvalidToken", "unexpected continuation token"),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    let trace = dir.path().join("trace.jsonl");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--prefix".into(),
+        "logs/".into(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    assert_eq!(
+        parquet_keys(&parquet),
+        vec!["logs/a.txt", "logs/b.txt", "logs/c.txt"]
+    );
+    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"logs\",\"3\"\n");
+
+    let requests = server.requests();
+    let list_requests: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
+    assert_eq!(list_requests.len(), 2, "{:#?}", list_requests);
+    assert_eq!(
+        list_requests[0].query.get("prefix").map(String::as_str),
+        Some("logs/")
+    );
+    assert_eq!(
+        list_requests[0].query.get("delimiter").map(String::as_str),
+        Some("/")
+    );
+    assert_eq!(
+        list_requests[0].query.get("max-keys").map(String::as_str),
+        Some("2")
+    );
+    assert!(!list_requests[0].query.contains_key("continuation-token"));
+    assert_eq!(
+        list_requests[1]
+            .query
+            .get("continuation-token")
+            .map(String::as_str),
+        Some("token-1")
+    );
+
+    let trace_lines = std::fs::read_to_string(trace).unwrap();
+    let trace_events: Vec<Value> = trace_lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(trace_events
+        .iter()
+        .any(|event| event["next_continuation_token_present"] == true));
+    assert!(trace_events
+        .iter()
+        .any(|event| event["common_prefixes_count"] == 1));
+}
+
+#[test]
+fn local_mock_compat_probe_covers_head_list_and_pagination() {
+    let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
+        "HEAD" => MockResponse::empty_ok(),
+        "GET" => match request.query.get("continuation-token").map(String::as_str) {
+            Some("probe-page-2") => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                3,
+                &["probe/d.txt"],
+                &[],
+                false,
+                None,
+            )),
+            _ if request.query.get("max-keys").map(String::as_str) == Some("3") => {
+                MockResponse::ok_xml(list_bucket_xml(
+                    request
+                        .query
+                        .get("prefix")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    3,
+                    &["probe/a.txt", "probe/b.txt", "probe/c.txt"],
+                    &[],
+                    true,
+                    Some("probe-page-2"),
+                ))
+            }
+            _ => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                1,
+                &["probe/a.txt"],
+                &[],
+                false,
+                None,
+            )),
+        },
+        _ => MockResponse::error(405, "MethodNotAllowed", "unexpected method"),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let report = dir.path().join("compat.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "compat-probe".into(),
+        "--endpoint".into(),
+        server.endpoint(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output".into(),
+        report.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+    assert_eq!(report["overall_status"], "compatible");
+    assert!(report["tests"].as_array().unwrap().iter().any(|test| {
+        test["test"] == "ListObjectsV2 pagination check" && test["status"] == "ok"
+    }));
+
+    let requests = server.requests();
+    assert!(requests.iter().any(|request| request.method == "HEAD"));
+    assert!(requests.iter().any(|request| {
+        request.method == "GET"
+            && request.query.get("encoding-type").map(String::as_str) == Some("url")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.query.get("continuation-token").map(String::as_str) == Some("probe-page-2")
+    }));
+}
+
+#[test]
+fn local_mock_resume_keeps_original_segment_start_after() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.get("start-after").map(String::as_str) != Some("m/") {
+            return MockResponse::error(
+                500,
+                "UnexpectedSegment",
+                "resume should only request the uncompleted m/ segment",
+            );
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["z-last.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    let parquet = dir.path().join("resume.parquet");
+    let ks = dir.path().join("resume.ks");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+total_objects = 2
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &checkpoint,
+        r#"bucket = "mock-bucket"
+prefix = ""
+total_segments = 2
+completed_indices = [0]
+last_updated = "2026-05-17T00:00:00Z"
+
+[identity]
+bucket = "mock-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = "/"
+addressing_style = "path"
+mode = "list"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet), vec!["z-last.txt"]);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{:#?}", requests);
+    assert_eq!(
+        requests[0].query.get("start-after").map(String::as_str),
+        Some("m/")
+    );
+}
+
+#[test]
+fn local_mock_sdk_retries_transient_list_error() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        assert_eq!(request.method, "GET");
+        let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            return MockResponse::error(503, "SlowDown", "retry this request");
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["retry/succeeded.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("retry.parquet");
+    let ks = dir.path().join("retry.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "SDK should retry the initial 503 SlowDown"
+    );
+    assert_eq!(parquet_keys(&parquet), vec!["retry/succeeded.txt"]);
+}

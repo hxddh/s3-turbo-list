@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-05-17
+
+### Added
+- Local S3 protocol mock integration harness covering ListObjectsV2 pagination,
+  continuation tokens, `start-after`, `prefix`, `delimiter`, `max-keys`, XML
+  error responses, SDK retry of transient list failures, `compat-probe`, and
+  checkpoint/resume segment identity without contacting real cloud endpoints.
+- Documentation for the local mock harness scope, safety boundaries, and
+  maintenance expectations.
+
+### Changed
+- Resume now preserves original key-space segment starts when filtering out
+  completed checkpoint segments, preventing resumed hinted runs from reusing a
+  synthetic single segment that starts at the beginning of the bucket.
+- Release asset workflow opts into GitHub Actions Node.js 24 execution ahead of
+  the Node.js 20 runner migration.
+
 ## [0.1.8] - 2026-05-17
 
 ### Added

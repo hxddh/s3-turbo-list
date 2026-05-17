@@ -2,7 +2,7 @@ use crate::config::S3Config;
 use crate::stats::HttpStatusCodeTracker;
 use crate::trace::S3TraceWriter;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -852,23 +852,44 @@ impl KeySpaceHints {
         // guard catches any path that bypasses the loader.
         warn_on_suspicious_boundaries(hints);
 
-        let mut v = VecDeque::new();
-        if hints.is_empty() {
-            // No hints → single segment covering everything.
-            v.push_back(KeySpacePair::new(0, String::new(), String::new()));
-        } else {
-            let mut start = String::new();
-            for (i, key) in hints.iter().enumerate() {
-                v.push_back(KeySpacePair::new(i, start.clone(), key.clone()));
-                start = key.clone();
-            }
-            v.push_back(KeySpacePair::new(hints.len(), start, String::new()));
-        }
+        let v = Self::pairs_from_boundaries(hints);
         Self {
             inner: v,
             inflight: HashMap::new(),
             done: Vec::new(),
         }
+    }
+
+    pub fn new_uncompleted_from(hints: &[String], completed_indices: &[usize]) -> Self {
+        warn_on_suspicious_boundaries(hints);
+
+        let completed: HashSet<usize> = completed_indices.iter().copied().collect();
+        let v = Self::pairs_from_boundaries(hints)
+            .into_iter()
+            .filter(|pair| !completed.contains(&pair.index))
+            .collect();
+        Self {
+            inner: v,
+            inflight: HashMap::new(),
+            done: Vec::new(),
+        }
+    }
+
+    fn pairs_from_boundaries(hints: &[String]) -> VecDeque<KeySpacePair> {
+        let mut v = VecDeque::new();
+        if hints.is_empty() {
+            // No hints → single segment covering everything.
+            v.push_back(KeySpacePair::new(0, String::new(), String::new()));
+            return v;
+        }
+
+        let mut start = String::new();
+        for (i, key) in hints.iter().enumerate() {
+            v.push_back(KeySpacePair::new(i, start.clone(), key.clone()));
+            start = key.clone();
+        }
+        v.push_back(KeySpacePair::new(hints.len(), start, String::new()));
+        v
     }
 
     pub fn next(&mut self) -> Option<KeySpacePair> {
@@ -959,6 +980,19 @@ mod tests {
         assert_eq!(p2.start, "d/");
         assert_eq!(p2.end, None);
 
+        assert!(hints.next().is_none());
+    }
+
+    #[test]
+    fn test_key_space_hints_uncompleted_preserves_original_segment_starts() {
+        let boundaries = vec!["m/".to_string()];
+        let mut hints = KeySpaceHints::new_uncompleted_from(&boundaries, &[0]);
+        assert_eq!(hints.total_count(), 1);
+
+        let remaining = hints.next().unwrap();
+        assert_eq!(remaining.index, 1);
+        assert_eq!(remaining.start, "m/");
+        assert_eq!(remaining.end, None);
         assert!(hints.next().is_none());
     }
 

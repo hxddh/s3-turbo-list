@@ -49,6 +49,7 @@ independent segments, runs them in parallel, and assembles the result.
 | **Checkpoint / resume** | Interrupted scans resume from last-saved segment. Identity-verified to prevent mismatches. |
 | **Diff mode** | Bi-directional diff between two buckets with per-object DiffFlag. Equal rows optionally included. |
 | **Agent-friendly JSON** | Local dry-run plans, config inspection, doctor checks, stable exit codes, and run manifests for automation. |
+| **Local protocol harness** | Integration-test-only S3 mock verifies protocol correctness without contacting real cloud endpoints. |
 | **Endpoint validation workflow** | Compat-probe → listing → trace review. Documented in `docs/validation-results/`. |
 
 ## Installation
@@ -256,6 +257,10 @@ s3-turbo-list man > s3-turbo-list.1
 The helper script `scripts/benchmark-local.sh` writes a machine-readable
 local benchmark report.  See [`docs/benchmarking.md`](docs/benchmarking.md)
 and [`docs/endpoint-profiles.md`](docs/endpoint-profiles.md).
+
+The local S3 protocol mock used by integration tests is documented in
+[`docs/local-s3-mock.md`](docs/local-s3-mock.md).  It validates CLI behavior
+against local XML fixtures and never contacts real cloud endpoints.
 
 ### Diff mode
 
@@ -487,5 +492,6 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Benchmark harness | Local synthetic streaming-output benchmark plus JSON report |
 | ✅ Done | CLI help polish | Shell completions and man page generation |
 | ✅ Done | Optional endpoint compatibility profiles | Per-provider presets and local profile inspection |
+| ✅ Done | Local S3 protocol mock | Local correctness harness for ListObjectsV2, compat-probe, retry, and checkpoint/resume |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
 | 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |

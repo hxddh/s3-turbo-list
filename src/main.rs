@@ -689,20 +689,20 @@ fn main() {
             opt_region,
             cfg.s3.profile.as_deref(),
         );
-        let hints = core::KeySpaceHints::new_from(&ks_list);
+        let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
 
         // Filter out completed segments when resuming.
         let hints = if let Some(ref cj) = checkpoint_journal {
-            let remaining_boundaries = cj.filter_uncompleted(&ks_list);
-            let filtered = core::KeySpaceHints::new_from(&remaining_boundaries);
+            let filtered =
+                core::KeySpaceHints::new_uncompleted_from(&ks_list, &cj.completed_indices);
             info!(
                 "Resume: {} segments filtered, {} remaining",
-                ks_list.len() + 1 - remaining_boundaries.len(),
+                original_hints_count.saturating_sub(filtered.total_count()),
                 filtered.total_count()
             );
             filtered
         } else {
-            hints
+            core::KeySpaceHints::new_from(&ks_list)
         };
         let hints_count = hints.total_count();
 
@@ -864,7 +864,7 @@ fn main() {
                     let journal = checkpoint::CheckpointJournal {
                         bucket: opt_bucket.to_string(),
                         prefix: opt_prefix.clone(),
-                        total_segments: hints_count,
+                        total_segments: original_hints_count,
                         completed_indices: completed,
                         last_updated: chrono::Local::now().to_rfc3339(),
                         identity: Some(current_identity.clone()),
@@ -886,7 +886,7 @@ fn main() {
                     let journal = checkpoint::CheckpointJournal {
                         bucket: opt_bucket.to_string(),
                         prefix: opt_prefix.clone(),
-                        total_segments: hints_count,
+                        total_segments: original_hints_count,
                         completed_indices: completed,
                         last_updated: chrono::Local::now().to_rfc3339(),
                         identity: Some(current_identity.clone()),
