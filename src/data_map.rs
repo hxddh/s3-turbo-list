@@ -225,7 +225,14 @@ pub async fn data_map_task(
                     &output_config,
                 )
                 .await;
-                log_data_map_final(&map, received_batches, received_objects, started_at, stats);
+                log_data_map_final(
+                    &ctx.g_state,
+                    &map,
+                    received_batches,
+                    received_objects,
+                    started_at,
+                    stats,
+                );
                 ctx.complete();
                 return;
             }
@@ -241,7 +248,14 @@ pub async fn data_map_task(
                 &output_config,
             )
             .await;
-            log_data_map_final(&map, received_batches, received_objects, started_at, stats);
+            log_data_map_final(
+                &ctx.g_state,
+                &map,
+                received_batches,
+                received_objects,
+                started_at,
+                stats,
+            );
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
@@ -260,7 +274,14 @@ pub async fn data_map_task(
                 &output_config,
             )
             .await;
-            log_data_map_final(&map, received_batches, received_objects, started_at, stats);
+            log_data_map_final(
+                &ctx.g_state,
+                &map,
+                received_batches,
+                received_objects,
+                started_at,
+                stats,
+            );
             ctx.complete();
             ctx.quit();
             return;
@@ -296,6 +317,7 @@ pub async fn data_map_task_list_streaming(
         Ok(f) => f,
         Err(e) => {
             log::error!("Failed to create output file {}: {}", filename_output, e);
+            ctx.g_state.inc_output_error();
             ctx.complete();
             ctx.quit();
             return;
@@ -332,6 +354,7 @@ pub async fn data_map_task_list_streaming(
                 info!("Data Map Task — list streaming channel disconnected, finalizing output");
                 finalize_list_streaming_output(
                     parquet,
+                    &ctx.g_state,
                     filename_ks,
                     filename_output,
                     &prefix_counts,
@@ -349,6 +372,7 @@ pub async fn data_map_task_list_streaming(
             info!("Data Map Task — list streaming force quit, finalizing output");
             finalize_list_streaming_output(
                 parquet,
+                &ctx.g_state,
                 filename_ks,
                 filename_output,
                 &prefix_counts,
@@ -367,6 +391,7 @@ pub async fn data_map_task_list_streaming(
             info!("Data Map Task — list streaming all list tasks done, finalizing output");
             finalize_list_streaming_output(
                 parquet,
+                &ctx.g_state,
                 filename_ks,
                 filename_output,
                 &prefix_counts,
@@ -421,6 +446,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 
 async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet: crate::utils::AsyncParquetOutput<W>,
+    g_state: &core::GlobalState,
     filename_ks: &str,
     filename_output: &str,
     prefix_counts: &BTreeMap<String, usize>,
@@ -434,6 +460,14 @@ async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>
 
     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
     let write_elapsed = write_started_at.elapsed().as_secs_f64();
+    g_state.record_data_metrics(
+        stats.received_batches,
+        stats.received_objects,
+        stats.streamed_rows,
+        prefix_counts.len(),
+        parquet_rows,
+        ks_entries,
+    );
     info!(
         "Data Map Task — list streaming complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",
         stats.streamed_rows,
@@ -530,6 +564,7 @@ async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> usize {
 }
 
 fn log_data_map_final(
+    g_state: &core::GlobalState,
     map: &PrefixMap,
     received_batches: usize,
     received_objects: usize,
@@ -548,10 +583,20 @@ fn log_data_map_final(
         received_objects as f64 / elapsed,
     );
     if let Some(stats) = write_stats {
+        g_state.record_data_metrics(
+            received_batches,
+            received_objects,
+            stats.parquet_rows,
+            prefix_count,
+            stats.parquet_rows,
+            stats.ks_entries,
+        );
         info!(
             "Data Map Task — output metrics: Parquet rows {}, KS entries {}, write elapsed {:.3}s",
             stats.parquet_rows, stats.ks_entries, stats.elapsed_secs
         );
+    } else {
+        g_state.inc_output_error();
     }
 }
 

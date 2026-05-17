@@ -388,7 +388,30 @@ pub struct GlobalState {
     pub task_next_stream_timeout_count: Arc<AtomicUsize>,
     pub s3_client_timeout_count: Arc<AtomicUsize>,
     pub s3_client_generic_error_count: Arc<AtomicUsize>,
+    pub fatal_error_count: Arc<AtomicUsize>,
+    pub output_error_count: Arc<AtomicUsize>,
+    pub data_received_batches: Arc<AtomicUsize>,
+    pub data_received_objects: Arc<AtomicUsize>,
+    pub data_streamed_rows: Arc<AtomicUsize>,
+    pub data_unique_prefixes: Arc<AtomicUsize>,
+    pub data_parquet_rows: Arc<AtomicUsize>,
+    pub data_ks_entries: Arc<AtomicUsize>,
     pub(crate) task_rendez: TaskRendezvous,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunMetricsSnapshot {
+    pub fatal_errors: usize,
+    pub output_errors: usize,
+    pub stream_timeouts: usize,
+    pub s3_client_timeouts: usize,
+    pub s3_client_generic_errors: usize,
+    pub data_received_batches: usize,
+    pub data_received_objects: usize,
+    pub data_streamed_rows: usize,
+    pub data_unique_prefixes: usize,
+    pub data_parquet_rows: usize,
+    pub data_ks_entries: usize,
 }
 
 impl GlobalState {
@@ -400,6 +423,14 @@ impl GlobalState {
             task_next_stream_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_generic_error_count: Arc::new(AtomicUsize::new(0)),
+            fatal_error_count: Arc::new(AtomicUsize::new(0)),
+            output_error_count: Arc::new(AtomicUsize::new(0)),
+            data_received_batches: Arc::new(AtomicUsize::new(0)),
+            data_received_objects: Arc::new(AtomicUsize::new(0)),
+            data_streamed_rows: Arc::new(AtomicUsize::new(0)),
+            data_unique_prefixes: Arc::new(AtomicUsize::new(0)),
+            data_parquet_rows: Arc::new(AtomicUsize::new(0)),
+            data_ks_entries: Arc::new(AtomicUsize::new(0)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
     }
@@ -427,6 +458,53 @@ impl GlobalState {
     }
     pub fn read_s3_client_generic_error(&self) -> usize {
         self.s3_client_generic_error_count.load(Ordering::SeqCst)
+    }
+    pub fn inc_fatal_error(&self) {
+        self.fatal_error_count.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn read_fatal_error(&self) -> usize {
+        self.fatal_error_count.load(Ordering::SeqCst)
+    }
+    pub fn inc_output_error(&self) {
+        self.output_error_count.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn read_output_error(&self) -> usize {
+        self.output_error_count.load(Ordering::SeqCst)
+    }
+    pub fn record_data_metrics(
+        &self,
+        received_batches: usize,
+        received_objects: usize,
+        streamed_rows: usize,
+        unique_prefixes: usize,
+        parquet_rows: usize,
+        ks_entries: usize,
+    ) {
+        self.data_received_batches
+            .store(received_batches, Ordering::SeqCst);
+        self.data_received_objects
+            .store(received_objects, Ordering::SeqCst);
+        self.data_streamed_rows
+            .store(streamed_rows, Ordering::SeqCst);
+        self.data_unique_prefixes
+            .store(unique_prefixes, Ordering::SeqCst);
+        self.data_parquet_rows.store(parquet_rows, Ordering::SeqCst);
+        self.data_ks_entries.store(ks_entries, Ordering::SeqCst);
+    }
+    pub fn metrics_snapshot(&self) -> RunMetricsSnapshot {
+        RunMetricsSnapshot {
+            fatal_errors: self.read_fatal_error(),
+            output_errors: self.read_output_error(),
+            stream_timeouts: self.read_task_next_stream_timeout(),
+            s3_client_timeouts: self.read_s3_client_timeout(),
+            s3_client_generic_errors: self.read_s3_client_generic_error(),
+            data_received_batches: self.data_received_batches.load(Ordering::SeqCst),
+            data_received_objects: self.data_received_objects.load(Ordering::SeqCst),
+            data_streamed_rows: self.data_streamed_rows.load(Ordering::SeqCst),
+            data_unique_prefixes: self.data_unique_prefixes.load(Ordering::SeqCst),
+            data_parquet_rows: self.data_parquet_rows.load(Ordering::SeqCst),
+            data_ks_entries: self.data_ks_entries.load(Ordering::SeqCst),
+        }
     }
     pub fn get_tracker(&self) -> Arc<HttpStatusCodeTracker> {
         Arc::clone(&self.tracker)

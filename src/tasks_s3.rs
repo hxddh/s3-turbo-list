@@ -139,6 +139,7 @@ async fn flat_list_run_to_complete(
                     retry_attempt.saturating_add(1),
                     err
                 );
+                ctx.g_state.inc_fatal_error();
                 if ctx.is_running() {
                     ctx.complete();
                 }

@@ -1,7 +1,7 @@
 // All modules exported from the library crate (src/lib.rs).
 // The binary uses `s3_turbo_list::...` paths to avoid module duplication.
 use s3_turbo_list::{
-    auto_hints, checkpoint, config, core, data_map, diff, hints, mon, tasks_s3, trace,
+    agent, auto_hints, checkpoint, config, core, data_map, diff, hints, mon, tasks_s3, trace,
 };
 
 use chrono::Local;
@@ -11,6 +11,7 @@ use core::RunMode;
 use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 // ── CLI definition ─────────────────────────────────────────
 
@@ -115,6 +116,22 @@ struct Cli {
     /// Write S3 compat trace events to this JSONL file
     #[arg(long, global = true)]
     trace_compat: Option<String>,
+
+    /// Emit machine-readable summaries for AI agents and automation
+    #[arg(long, global = true)]
+    agent: bool,
+
+    /// Resolve inputs and outputs without contacting S3
+    #[arg(long, global = true)]
+    dry_run: bool,
+
+    /// Write dry-run plan JSON to this path
+    #[arg(long, global = true)]
+    plan_json: Option<String>,
+
+    /// Write final run manifest JSON to this path
+    #[arg(long, global = true)]
+    run_manifest: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -209,6 +226,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect resolved local config without contacting S3
+    ConfigInspect {
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run local environment checks without contacting S3
+    Doctor {
+        /// Do not contact S3 endpoints
+        #[arg(long, default_value_t = true)]
+        local_only: bool,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Main ───────────────────────────────────────────────────
@@ -231,7 +266,7 @@ fn main() {
     // Load config.
     let mut cfg = S3TurboConfig::load(cli.config.as_deref()).unwrap_or_else(|e| {
         eprintln!("Config error: {}", e);
-        std::process::exit(1);
+        std::process::exit(agent::ExitCode::CliConfig.code());
     });
 
     cfg.apply_cli_overrides(
@@ -250,6 +285,73 @@ fn main() {
     );
     cfg.apply_profile_preset();
     cfg.normalize_addressing_style();
+
+    match &cli.cmd {
+        Commands::ConfigInspect { json } => {
+            let report = agent::config_inspect_report(&cfg);
+            if *json || cli.agent {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                println!("s3-turbo-list {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "  threads:      {}",
+                    report.resolved_config.runtime.worker_threads
+                );
+                println!(
+                    "  concurrency:  {}",
+                    report.resolved_config.runtime.max_concurrency
+                );
+                println!(
+                    "  profile:      {}",
+                    report.resolved_config.s3.profile.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  endpoint:     {}",
+                    report
+                        .resolved_config
+                        .s3
+                        .endpoint_url
+                        .as_deref()
+                        .unwrap_or("-")
+                );
+                println!(
+                    "  addressing:   {}",
+                    report.resolved_config.s3.addressing_style
+                );
+            }
+            return;
+        }
+        Commands::Doctor { local_only, json } => {
+            let report = agent::doctor_report(*local_only, &cfg);
+            if *json || cli.agent {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                println!("Doctor status: {}", report.status);
+                for check in &report.checks {
+                    println!("  {}: {} — {}", check.name, check.status, check.message);
+                }
+            }
+            if report.status == "error" {
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if cli.dry_run {
+        let report = build_plan_report(&cli, &cfg);
+        if let Some(path) = cli.plan_json.as_deref() {
+            if let Err(e) = agent::write_json_file(path, &report) {
+                eprintln!("Plan write error: {}", e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            }
+        }
+        if cli.agent || cli.plan_json.is_none() {
+            println!("{}", agent::to_pretty_json(&report));
+        }
+        return;
+    }
 
     // Setup logging.
     let opt_log = cli.log || cfg.output.log_file.is_some();
@@ -337,6 +439,9 @@ fn main() {
             run_hints_validate(hints_file, *preview, *json);
             return;
         }
+        Commands::ConfigInspect { .. } | Commands::Doctor { .. } => {
+            unreachable!("local-only commands are handled before runtime setup")
+        }
     };
 
     let opt_prefix = if cli.prefix == "/" {
@@ -349,7 +454,7 @@ fn main() {
     if let Some(ref filter_expr) = cli.filter {
         if let Err(e) = config::install_filter(filter_expr, &mode) {
             eprintln!("Filter error: {}", e);
-            std::process::exit(1);
+            std::process::exit(agent::ExitCode::CliConfig.code());
         }
         info!("Filter installed: \"{}\"", filter_expr);
     }
@@ -361,14 +466,38 @@ fn main() {
     let region_prefix: std::borrow::Cow<'_, str> = opt_region
         .map(|r: &str| format!("{}_", r).into())
         .unwrap_or_default();
+    let filename_ks = cfg
+        .output
+        .ks_file
+        .clone()
+        .unwrap_or_else(|| format!("{}_{}_{}.ks", region_prefix, opt_bucket, dt_str));
+    let filename_output = cfg.output.parquet_file.clone().unwrap_or_else(|| {
+        if mode == RunMode::List {
+            format!("{}_{}_{}.parquet", region_prefix, opt_bucket, dt_str)
+        } else {
+            let tr = opt_target_region.and_then(|r| r).unwrap_or("");
+            let tb = opt_target_bucket.unwrap_or("");
+            format!(
+                "{}_{}_{}_{}_{}.parquet",
+                region_prefix, opt_bucket, tr, tb, dt_str
+            )
+        }
+    });
 
     // Setup Ctrl-C handler
     let quit = Arc::new(AtomicBool::new(false));
+    let interrupted = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
+    let i = interrupted.clone();
     ctrlc::set_handler(move || {
         q.store(true, Ordering::SeqCst);
+        i.store(true, Ordering::SeqCst);
     })
     .expect("failed to set ctrl-c signal handler");
+
+    let g_state = core::GlobalState::new(quit, g_tasks_count);
+    let run_started_at = chrono::Utc::now();
+    let run_timer = Instant::now();
 
     // Build runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -413,7 +542,7 @@ fn main() {
             );
         }
 
-        let g_state = core::GlobalState::new(quit, g_tasks_count);
+        let g_state = g_state.clone();
         let mut set = tokio::task::JoinSet::new();
         let concurrency = cfg.runtime.max_concurrency;
         let channel_capacity = cfg.channel.capacity;
@@ -538,33 +667,17 @@ fn main() {
         };
 
         // ── Spawn data map task ─────────────────────────────
-        let filename_ks = cfg
-            .output
-            .ks_file
-            .clone()
-            .unwrap_or_else(|| format!("{}_{}_{}.ks", region_prefix, opt_bucket, dt_str));
-        let filename_output = cfg.output.parquet_file.clone().unwrap_or_else(|| {
-            if mode == RunMode::List {
-                format!("{}_{}_{}.parquet", region_prefix, opt_bucket, dt_str)
-            } else {
-                let tr = opt_target_region.and_then(|r| r).unwrap_or("");
-                let tb = opt_target_bucket.unwrap_or("");
-                format!(
-                    "{}_{}_{}_{}_{}.parquet",
-                    region_prefix, opt_bucket, tr, tb, dt_str
-                )
-            }
-        });
-
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
         let is_diff = mode == RunMode::BiDir;
         let output_config = cfg.output.clone();
+        let filename_ks_for_task = filename_ks.clone();
+        let filename_output_for_task = filename_output.clone();
         if is_diff {
             set.spawn(async move {
                 data_map::data_map_task(
                     data_map_ctx,
-                    &filename_ks,
-                    &filename_output,
+                    &filename_ks_for_task,
+                    &filename_output_for_task,
                     true,
                     output_config,
                 )
@@ -574,8 +687,8 @@ fn main() {
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(
                     data_map_ctx,
-                    &filename_ks,
-                    &filename_output,
+                    &filename_ks_for_task,
+                    &filename_output_for_task,
                     output_config,
                 )
                 .await
@@ -611,6 +724,7 @@ fn main() {
                     error!("Task panic message: {}", msg);
                 }
                 // Propagate panic as failure — exit with non-zero code.
+                g_state.inc_fatal_error();
                 g_state.quit();
             }
 
@@ -673,6 +787,270 @@ fn main() {
     });
 
     rt.shutdown_background();
+
+    let metrics = g_state.metrics_snapshot();
+    let interrupted = interrupted.load(Ordering::SeqCst);
+    let exit_code = if interrupted {
+        agent::ExitCode::Interrupted
+    } else if metrics.output_errors > 0 {
+        agent::ExitCode::OutputWrite
+    } else if metrics.fatal_errors > 0 {
+        agent::ExitCode::NetworkRetryExhausted
+    } else {
+        agent::ExitCode::Success
+    };
+    let status = if exit_code == agent::ExitCode::Success {
+        "success"
+    } else if exit_code == agent::ExitCode::Interrupted {
+        "interrupted"
+    } else {
+        "failed"
+    };
+
+    let manifest = agent::RunManifest {
+        schema_version: agent::AGENT_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: status.to_string(),
+        exit_code: exit_code.code(),
+        started_at: run_started_at.to_rfc3339(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        elapsed_secs: run_timer.elapsed().as_secs_f64(),
+        command: std::env::args().collect(),
+        inputs: command_input_summary(&cli, &cfg),
+        outputs: runtime_output_summary(&cli, &cfg, Some(&filename_ks), Some(&filename_output)),
+        metrics: metrics.into(),
+        checkpoint: agent::default_checkpoint_plan(
+            cli.resume,
+            cli.resume
+                .then(|| checkpoint::checkpoint_path(opt_bucket, opt_region)),
+        ),
+        warnings: vec![],
+    };
+
+    if let Some(path) = cli.run_manifest.as_deref() {
+        if let Err(e) = agent::write_json_file(path, &manifest) {
+            eprintln!("Manifest write error: {}", e);
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
+    }
+    if cli.agent {
+        println!("{}", agent::to_pretty_json(&manifest));
+    }
+    if exit_code != agent::ExitCode::Success {
+        std::process::exit(exit_code.code());
+    }
+}
+
+fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
+    let (planned_ks, planned_parquet, planned_hints) = planned_output_paths(cli, cfg);
+    let outputs =
+        runtime_output_summary(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref())
+            .with_hints(planned_hints);
+    let inputs = command_input_summary(cli, cfg);
+    let checkpoint_path = inputs
+        .bucket
+        .as_deref()
+        .filter(|_| cli.resume)
+        .map(|bucket| checkpoint::checkpoint_path(bucket, inputs.region.as_deref()));
+    let hints = agent::detect_hints_plan(
+        cli.hints_file.as_deref(),
+        inputs.bucket.as_deref(),
+        inputs.region.as_deref(),
+    );
+    let file_conflicts = agent::output_conflicts(&outputs);
+    let mut warnings = Vec::new();
+    if matches!(cli.cmd, Commands::CompatProbe { .. }) {
+        warnings.push(
+            "compat-probe will contact the configured endpoint when not run with --dry-run"
+                .to_string(),
+        );
+    }
+    if matches!(cli.cmd, Commands::AutoHints { .. }) {
+        warnings.push("auto-hints will scan S3 pages when not run with --dry-run".to_string());
+    }
+
+    agent::PlanReport {
+        schema_version: agent::AGENT_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: "ok".to_string(),
+        command: std::env::args().collect(),
+        network: "none: dry-run only resolves local configuration and planned paths".to_string(),
+        inputs,
+        outputs,
+        resolved_config: cfg.into(),
+        hints,
+        checkpoint: agent::default_checkpoint_plan(cli.resume, checkpoint_path),
+        file_conflicts,
+        warnings,
+    }
+}
+
+trait OutputPathSummaryExt {
+    fn with_hints(self, hints_file: Option<String>) -> Self;
+}
+
+impl OutputPathSummaryExt for agent::OutputPathSummary {
+    fn with_hints(mut self, hints_file: Option<String>) -> Self {
+        self.hints_file = hints_file;
+        self
+    }
+}
+
+fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputSummary {
+    let prefix = if cli.prefix == "/" {
+        String::new()
+    } else {
+        cli.prefix.clone()
+    };
+    let (mode, bucket, region, target_bucket, target_region) = match &cli.cmd {
+        Commands::List { region, bucket } => (
+            "list".to_string(),
+            Some(bucket.clone()),
+            region.clone(),
+            None,
+            None,
+        ),
+        Commands::Diff {
+            region,
+            bucket,
+            target_region,
+            target_bucket,
+        } => (
+            "diff".to_string(),
+            Some(bucket.clone()),
+            region.clone(),
+            Some(target_bucket.clone()),
+            target_region.clone(),
+        ),
+        Commands::CompatProbe { region, bucket, .. } => (
+            "compat-probe".to_string(),
+            Some(bucket.clone()),
+            Some(region.clone()),
+            None,
+            None,
+        ),
+        Commands::AutoHints { region, bucket, .. } => (
+            "auto-hints".to_string(),
+            Some(bucket.clone()),
+            region.clone(),
+            None,
+            None,
+        ),
+        Commands::HintsValidate { .. } => ("hints-validate".to_string(), None, None, None, None),
+        Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
+        Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
+    };
+
+    agent::CommandInputSummary {
+        mode,
+        bucket,
+        region,
+        target_bucket,
+        target_region,
+        prefix,
+        delimiter: cli.delimiter.clone(),
+        max_keys: cli.max_keys,
+        start_after: cfg.s3.start_after.clone(),
+        continuation_token: cli.continuation_token.clone(),
+        profile: cfg.s3.profile.clone(),
+        addressing_style: cfg.s3.addressing_style.to_string(),
+    }
+}
+
+fn runtime_output_summary(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+    ks_file: Option<&str>,
+    parquet_file: Option<&str>,
+) -> agent::OutputPathSummary {
+    let hints_file = match &cli.cmd {
+        Commands::AutoHints {
+            region,
+            bucket,
+            output,
+            ..
+        } => output
+            .clone()
+            .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
+        _ => None,
+    };
+    let compat_output = match &cli.cmd {
+        Commands::CompatProbe { output, .. } => output.clone(),
+        _ => None,
+    };
+    agent::OutputPathSummary {
+        parquet_file: parquet_file.map(str::to_string).or(compat_output),
+        ks_file: ks_file.map(str::to_string),
+        hints_file,
+        trace_compat: cfg.s3.trace_compat.clone(),
+        log_file: cfg.output.log_file.clone(),
+    }
+}
+
+fn planned_output_paths(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let now = Local::now().format("%Y%m%d%H%M%S").to_string();
+    match &cli.cmd {
+        Commands::List { region, bucket } => {
+            let prefix = region
+                .as_ref()
+                .map(|r| format!("{}_", r))
+                .unwrap_or_default();
+            let ks = cfg
+                .output
+                .ks_file
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}_{}.ks", prefix, bucket, now));
+            let parquet = cfg
+                .output
+                .parquet_file
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}_{}.parquet", prefix, bucket, now));
+            (Some(ks), Some(parquet), None)
+        }
+        Commands::Diff {
+            region,
+            bucket,
+            target_region,
+            target_bucket,
+        } => {
+            let prefix = region
+                .as_ref()
+                .map(|r| format!("{}_", r))
+                .unwrap_or_default();
+            let ks = cfg
+                .output
+                .ks_file
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}_{}.ks", prefix, bucket, now));
+            let parquet = cfg.output.parquet_file.clone().unwrap_or_else(|| {
+                format!(
+                    "{}_{}_{}_{}_{}.parquet",
+                    prefix,
+                    bucket,
+                    target_region.as_deref().unwrap_or(""),
+                    target_bucket,
+                    now
+                )
+            });
+            (Some(ks), Some(parquet), None)
+        }
+        Commands::AutoHints {
+            region,
+            bucket,
+            output,
+            ..
+        } => (
+            None,
+            None,
+            output
+                .clone()
+                .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
+        ),
+        _ => (None, None, None),
+    }
 }
 
 // ── Unified hints loader ───────────────────────────────────
@@ -700,7 +1078,7 @@ fn load_hints(
             Err(e) => {
                 error!("Failed to load hints file '{}': {}", path, e);
                 error!("Aborting to avoid sending malformed S3 requests.");
-                std::process::exit(1);
+                std::process::exit(agent::ExitCode::CliConfig.code());
             }
         }
     }

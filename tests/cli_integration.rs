@@ -80,6 +80,135 @@ fn test_cli_help_hints_validate() {
 }
 
 #[test]
+fn test_cli_help_agent_local_commands() {
+    let (code, stdout, _stderr) = run_cli(&["config-inspect", "--help"]);
+    assert_eq!(code, 0, "config-inspect --help should exit 0");
+    assert!(stdout.contains("--json"));
+
+    let (code, stdout, _stderr) = run_cli(&["doctor", "--help"]);
+    assert_eq!(code, 0, "doctor --help should exit 0");
+    assert!(stdout.contains("--local-only"));
+}
+
+#[test]
+fn test_cli_config_inspect_json_success() {
+    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(json["status"], "ok");
+    assert!(json["resolved_config"]["runtime"]["worker_threads"].is_number());
+    assert!(json["resolved_config"]["s3"]["addressing_style"].is_string());
+}
+
+#[test]
+fn test_cli_doctor_json_local_only_success() {
+    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["local_only"], true);
+    let checks = json["checks"].as_array().unwrap();
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "network" && check["status"] == "skipped"));
+}
+
+#[test]
+fn test_cli_dry_run_plan_json_list_no_cloud() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = dir.path().join("plan.json");
+    let ks_path = dir.path().join("out.ks");
+    let parquet_path = dir.path().join("out.parquet");
+
+    let (code, stdout, stderr) = run_cli(&[
+        "--dry-run",
+        "--plan-json",
+        plan_path.to_str().unwrap(),
+        "--output-ks-file",
+        ks_path.to_str().unwrap(),
+        "--output-parquet-file",
+        parquet_path.to_str().unwrap(),
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stdout.is_empty(),
+        "plan-json without --agent should not print stdout"
+    );
+    assert!(plan_path.exists());
+    assert!(!ks_path.exists(), "dry-run must not create KS output");
+    assert!(
+        !parquet_path.exists(),
+        "dry-run must not create Parquet output"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(plan_path).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(
+        json["network"],
+        "none: dry-run only resolves local configuration and planned paths"
+    );
+    assert_eq!(json["inputs"]["mode"], "list");
+    assert_eq!(json["inputs"]["bucket"], "agent-test-bucket");
+    assert_eq!(json["outputs"]["ks_file"], ks_path.to_str().unwrap());
+    assert_eq!(
+        json["outputs"]["parquet_file"],
+        parquet_path.to_str().unwrap()
+    );
+}
+
+#[test]
+fn test_cli_dry_run_agent_stdout_json() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--dry-run",
+        "auto-hints",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["inputs"]["mode"], "auto-hints");
+    assert_eq!(
+        json["outputs"]["hints_file"],
+        "us-east-1_agent-test-bucket_hints.toml"
+    );
+    assert!(json["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("auto-hints will scan S3 pages"));
+}
+
+#[test]
+fn test_cli_bad_config_exits_with_config_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.toml");
+    std::fs::write(&path, "[s3\n").unwrap();
+
+    let (code, _stdout, stderr) = run_cli(&[
+        "--config",
+        path.to_str().unwrap(),
+        "config-inspect",
+        "--json",
+    ]);
+    assert_eq!(code, 2, "bad config should use stable config exit code");
+    assert!(stderr.contains("Config error"));
+}
+
+#[test]
 fn test_cli_hints_validate_plain_success() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.txt");

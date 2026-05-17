@@ -48,6 +48,7 @@ independent segments, runs them in parallel, and assembles the result.
 | **Compat-probe** | Quick validation of any S3-compatible endpoint before full-scale work. |
 | **Checkpoint / resume** | Interrupted scans resume from last-saved segment. Identity-verified to prevent mismatches. |
 | **Diff mode** | Bi-directional diff between two buckets with per-object DiffFlag. Equal rows optionally included. |
+| **Agent-friendly JSON** | Local dry-run plans, config inspection, doctor checks, stable exit codes, and run manifests for automation. |
 | **Endpoint validation workflow** | Compat-probe → listing → trace review. Documented in `docs/validation-results/`. |
 
 ## Installation
@@ -179,6 +180,34 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket \
 s3-turbo-list list --region us-east-2 --bucket my-bucket \
   --debug-s3
 ```
+
+### Agent / automation mode
+
+Use local-only JSON commands before allowing an agent or CI job to run a scan:
+
+```bash
+s3-turbo-list config-inspect --json
+s3-turbo-list doctor --local-only --json
+
+s3-turbo-list --dry-run --agent list \
+  --region us-east-2 \
+  --bucket my-bucket \
+  --output-parquet-file out/list.parquet \
+  --output-ks-file out/list.ks
+```
+
+For a real run, write a machine-readable manifest:
+
+```bash
+s3-turbo-list --run-manifest run.json list \
+  --region us-east-2 \
+  --bucket my-bucket \
+  --output-parquet-file out/list.parquet \
+  --output-ks-file out/list.ks
+```
+
+See [`docs/agent-usage.md`](docs/agent-usage.md) for JSON fields and stable
+exit-code classes.
 
 Trace output is one JSON object per line (JSONL). Each line contains:
 operation, endpoint, addressing style, profile, region, bucket, prefix,

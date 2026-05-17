@@ -3,6 +3,7 @@
 // The binary in src/main.rs also uses this crate via `use s3_turbo_list::...`.
 
 // Public to integration tests (types needed to exercise pipelines):
+pub mod agent;
 pub mod auto_hints;
 pub mod checkpoint; // CheckpointIdentity, CheckpointJournal, checkpoint_path
 pub mod config;

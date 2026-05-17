@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-17
+
+### Added
+- Agent-friendly machine-readable CLI surfaces: `--agent`, `--dry-run`, `--plan-json`, and `--run-manifest`.
+- Local-only `config-inspect --json` and `doctor --local-only --json` commands for automation preflight checks without contacting S3.
+- Stable exit-code classes for config, output, network/fatal, interrupted, and internal-error outcomes.
+- Run manifest and dry-run plan JSON schemas with resolved config, inputs, planned outputs, checkpoint metadata, and runtime metrics.
+- Agent usage documentation covering no-cloud planning, local doctor checks, manifests, and retry interpretation.
+
+### Changed
+- Data-map final metrics are now recorded into shared runtime state so agent manifests can report Parquet rows, KS entries, batches, objects, and prefix counts.
+- Fatal list-task failures now increment a tracked runtime error counter for machine-readable final status.
+
 ## [0.1.5] - 2026-05-17
 
 ### Added
