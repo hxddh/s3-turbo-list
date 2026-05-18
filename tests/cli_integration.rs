@@ -70,6 +70,21 @@ fn test_cli_help_auto_hints() {
         stdout.contains("bucket"),
         "auto-hints help should mention 'bucket'"
     );
+    assert!(
+        stdout.contains("always TOML"),
+        "auto-hints help should describe TOML output"
+    );
+}
+
+#[test]
+fn test_cli_help_discover_prefixes() {
+    let (code, stdout, _stderr) = run_cli(&["discover-prefixes", "--help"]);
+    assert_eq!(
+        code, 0,
+        "s3-turbo-list discover-prefixes --help should exit 0"
+    );
+    assert!(stdout.contains("--bucket"));
+    assert!(stdout.contains("--toml"));
 }
 
 #[test]
@@ -358,6 +373,41 @@ mode = "list"
     assert_eq!(json["checkpoint"]["identity_matches"], true);
     assert_eq!(json["checkpoint"]["completed_segments"], 1);
     assert_eq!(json["checkpoint"]["total_segments"], 2);
+}
+
+#[test]
+fn test_cli_dry_run_no_auto_hints_reports_disabled_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("us-east-1_test-bucket_hints.toml"),
+        r#"bucket = "test-bucket"
+region = "us-east-1"
+total_objects = 30
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--agent",
+            "--dry-run",
+            "--no-auto-hints",
+            "list",
+            "--bucket",
+            "test-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hints"]["source"], "disabled_single_segment_fallback");
+    assert_eq!(json["hints"]["exists"], false);
 }
 
 #[test]

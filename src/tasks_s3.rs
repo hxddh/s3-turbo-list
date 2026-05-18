@@ -47,7 +47,8 @@ async fn flat_reactor_task(
 
                 set.spawn(async move {
                     let end_ref: Option<&str> = end.as_deref();
-                    flat_list_run_to_complete(&task_ctx, &start_prefix, &start, end_ref).await;
+                    flat_list_run_to_complete(&task_ctx, index, &start_prefix, &start, end_ref)
+                        .await;
                     index
                 });
             } else {
@@ -111,6 +112,7 @@ async fn flat_reactor_task(
 
 async fn flat_list_run_to_complete(
     ctx: &S3TaskContext,
+    segment_index: usize,
     prefix: &str,
     start: &str,
     until: Option<&str>,
@@ -119,7 +121,16 @@ async fn flat_list_run_to_complete(
     let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
     let mut retry_attempt: u32 = 0;
     loop {
-        match flat_list(ctx, prefix, &start_after, until, retry_attempt).await {
+        match flat_list(
+            ctx,
+            segment_index,
+            prefix,
+            &start_after,
+            until,
+            retry_attempt,
+        )
+        .await
+        {
             Ok(()) => return,
             Err(err) => {
                 let next_retry_attempt = retry_attempt.saturating_add(1);
@@ -153,6 +164,7 @@ async fn flat_list_run_to_complete(
 
 async fn flat_list(
     ctx: &S3TaskContext,
+    segment_index: usize,
     prefix: &str,
     start_after: &str,
     until: Option<&str>,
@@ -185,6 +197,9 @@ async fn flat_list(
     let mut next_start = start_after.to_string();
     let mut is_ended = false;
     let mut page_count: u32 = 0;
+    let mut object_count: usize = 0;
+    let mut common_prefixes_count: usize = 0;
+    let segment_start = Instant::now();
 
     loop {
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
@@ -272,6 +287,8 @@ async fn flat_list(
                 let key_count_opt = objects.key_count();
                 let contents_count = objects.contents().len() as i32;
                 let cp_count = objects.common_prefixes().len() as i32;
+                common_prefixes_count =
+                    common_prefixes_count.saturating_add(objects.common_prefixes().len());
 
                 // Emit trace event for this page.
                 emit_trace_compat(
@@ -308,9 +325,12 @@ async fn flat_list(
                         }
                     };
 
-                    // Check segment boundary.
+                    // Segment ranges are (start_after, end_before].  The next
+                    // segment starts with start_after=end_before, so excluding
+                    // equality here would drop a real object whose key equals
+                    // the boundary.
                     if let Some(end) = until {
-                        if end <= obj_key {
+                        if end < obj_key {
                             debug!("Segment boundary reached at key: {}", obj_key);
                             is_ended = true;
                             break;
@@ -326,6 +346,7 @@ async fn flat_list(
                     let mut props: ObjectProps = obj.into();
                     props.set_dir(ctx.dir);
                     batch.push((key, props));
+                    object_count = object_count.saturating_add(1);
 
                     remaining_keys = remaining_keys.saturating_sub(1);
                 }
@@ -353,11 +374,73 @@ async fn flat_list(
         }
     }
 
+    let ended_by = if is_ended { "boundary" } else { "pagination" };
+    emit_segment_summary(
+        ctx,
+        segment_index,
+        prefix,
+        start_after,
+        until,
+        retry_attempt,
+        page_count,
+        object_count,
+        common_prefixes_count,
+        segment_start.elapsed().as_millis() as u64,
+        ended_by,
+    );
+
     debug!(
         "Segment complete: start={}, end={:?}, pages={}",
         start_after, until, page_count
     );
     Ok(())
+}
+
+fn emit_segment_summary(
+    ctx: &S3TaskContext,
+    segment_index: usize,
+    prefix: &str,
+    start_after: &str,
+    until: Option<&str>,
+    retry_attempt: u32,
+    page_count: u32,
+    object_count: usize,
+    common_prefixes_count: usize,
+    elapsed_ms: u64,
+    ended_by: &str,
+) {
+    let writer = match &ctx.trace_writer {
+        Some(w) => w,
+        None => return,
+    };
+
+    let mut event = S3CompatEvent::new(
+        "ListObjectsV2SegmentSummary",
+        &ctx.endpoint_url,
+        &ctx.s3_bucket_name,
+        prefix,
+    );
+    event.region = ctx.region.clone();
+    event.profile = ctx.profile.clone();
+    event.addressing_style = ctx.addressing_style.clone();
+    event.start_after = if start_after.is_empty() {
+        None
+    } else {
+        Some(start_after.to_string())
+    };
+    event.end_before = until.map(str::to_string);
+    event.delimiter = ctx.delimiter.clone();
+    event.max_keys = ctx.max_keys;
+    event.retry_attempt = retry_attempt;
+    event.latency_ms = elapsed_ms;
+    event.http_status = 200;
+    event.segment_index = Some(segment_index);
+    event.segment_pages = Some(page_count);
+    event.segment_objects = Some(object_count);
+    event.segment_common_prefixes = Some(common_prefixes_count);
+    event.ended_by = Some(ended_by.to_string());
+
+    writer.write_event(event);
 }
 
 // ── Trace event emission ───────────────────────────────────

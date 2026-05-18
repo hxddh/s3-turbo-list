@@ -139,7 +139,7 @@ metadata, and retry details.
 ## Safety expectations
 
 - `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
-- `list`, `diff`, `auto-hints`, and `compat-probe` can contact S3 unless
+- `list`, `diff`, `auto-hints`, `discover-prefixes`, and `compat-probe` can contact S3 unless
   combined with `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS
   pagination workarounds or change hot-path listing behavior.

@@ -17,10 +17,10 @@ All release assets are published at the [GitHub releases page](https://github.co
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.9-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.9-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.9-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.9-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.10-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.10-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.10-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.10-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +56,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.9-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.9-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.10-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.10-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +65,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.9-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.9-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.10-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.10-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +78,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.9-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.9-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.9-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.10-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.10-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.10-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.9-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.9-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.9-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.10-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.10-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.10-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -336,10 +336,30 @@ s3-turbo-list auto-hints \
   --output ./hints.sampled.toml
 ```
 
+`auto-hints` can also be scoped to a subtree:
+
+```bash
+s3-turbo-list --prefix logs/2026/ auto-hints \
+  --bucket my-bucket \
+  --region us-east-1 \
+  --output ./logs-2026-hints.toml
+```
+
+Use `discover-prefixes` when you want delimiter-based `CommonPrefixes` as a
+starting point for manual hints:
+
+```bash
+s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
+  --bucket my-bucket \
+  --region us-east-1 \
+  --output ./logs-prefixes.txt
+```
+
 In sampled mode, `total_objects` means sampled objects, not the full bucket
-total.  Segment estimates in the hints cache are sampled/estimated, not
-authoritative bucket-wide statistics.  Use full-scan `auto-hints` when you
-need observed bucket-wide prefix statistics.
+total.  Prefix-scoped hints describe only the selected subtree.  Segment
+estimates in the hints cache are sampled/estimated, not authoritative
+bucket-wide statistics.  Use full-scan `auto-hints` when you need observed
+bucket-wide prefix statistics.
 
 For runtime defaults and advanced TOML-only settings, see
 [`docs/tuning.md`](docs/tuning.md).

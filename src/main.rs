@@ -193,17 +193,17 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Auto-discover KeySpace hints via adaptive sampling
+    /// Auto-discover KeySpace hints via a sequential object scan
     AutoHints {
         /// AWS region
         #[arg(long)]
         region: Option<String>,
 
-        /// Bucket to sample
+        /// Bucket to analyze
         #[arg(long)]
         bucket: String,
 
-        /// Output hints file path
+        /// Output hints file path; content is always TOML regardless of extension
         #[arg(short, long)]
         output: Option<String>,
 
@@ -214,6 +214,29 @@ enum Commands {
         /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
         #[arg(long)]
         max_pages: Option<usize>,
+    },
+
+    /// Discover delimiter CommonPrefixes and write prefix hints
+    DiscoverPrefixes {
+        /// AWS region
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Bucket to inspect
+        #[arg(long)]
+        bucket: String,
+
+        /// Output prefixes file; plain text by default
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
+        #[arg(long)]
+        max_pages: Option<usize>,
+
+        /// Write a TOML report instead of one prefix per line
+        #[arg(long)]
+        toml: bool,
     },
 
     /// Validate a local hints file without contacting S3
@@ -544,6 +567,25 @@ fn main() {
                 output.as_deref(),
                 *sample_limit,
                 *max_pages,
+                &cli,
+                &cfg,
+            );
+            return;
+        }
+        Commands::DiscoverPrefixes {
+            region,
+            bucket,
+            output,
+            max_pages,
+            toml,
+        } => {
+            run_discover_prefixes(
+                region.as_deref(),
+                bucket,
+                output.as_deref(),
+                *max_pages,
+                *toml,
+                &cli,
                 &cfg,
             );
             return;
@@ -688,6 +730,7 @@ fn main() {
             opt_bucket,
             opt_region,
             cfg.s3.profile.as_deref(),
+            cli.no_auto_hints,
         );
         let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
 
@@ -1249,6 +1292,7 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         cli.hints_file.as_deref(),
         inputs.bucket.as_deref(),
         inputs.region.as_deref(),
+        cli.no_auto_hints,
     );
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = Vec::new();
@@ -1260,6 +1304,18 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
     }
     if matches!(cli.cmd, Commands::AutoHints { .. }) {
         warnings.push("auto-hints will scan S3 pages when not run with --dry-run".to_string());
+        if cli.threads.is_some() || cli.concurrency.is_some() {
+            warnings.push(
+                "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
+                    .to_string(),
+            );
+        }
+    }
+    if matches!(cli.cmd, Commands::DiscoverPrefixes { .. }) {
+        warnings.push(
+            "discover-prefixes will scan S3 ListObjectsV2 pages when not run with --dry-run"
+                .to_string(),
+        );
     }
 
     agent::PlanReport {
@@ -1329,6 +1385,13 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             None,
             None,
         ),
+        Commands::DiscoverPrefixes { region, bucket, .. } => (
+            "discover-prefixes".to_string(),
+            Some(bucket.clone()),
+            region.clone(),
+            None,
+            None,
+        ),
         Commands::HintsValidate { .. } => ("hints-validate".to_string(), None, None, None, None),
         Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
@@ -1369,6 +1432,24 @@ fn runtime_output_summary(
         } => output
             .clone()
             .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
+        Commands::DiscoverPrefixes {
+            region,
+            bucket,
+            output,
+            toml,
+            ..
+        } => output.clone().or_else(|| {
+            Some(if let Some(r) = region {
+                format!(
+                    "{}_{}_prefixes.{}",
+                    r,
+                    bucket,
+                    if *toml { "toml" } else { "txt" }
+                )
+            } else {
+                format!("{}_prefixes.{}", bucket, if *toml { "toml" } else { "txt" })
+            })
+        }),
         _ => None,
     };
     let compat_output = match &cli.cmd {
@@ -1446,6 +1527,28 @@ fn planned_output_paths(
                 .clone()
                 .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
         ),
+        Commands::DiscoverPrefixes {
+            region,
+            bucket,
+            output,
+            toml,
+            ..
+        } => (
+            None,
+            None,
+            output.clone().or_else(|| {
+                Some(if let Some(r) = region {
+                    format!(
+                        "{}_{}_prefixes.{}",
+                        r,
+                        bucket,
+                        if *toml { "toml" } else { "txt" }
+                    )
+                } else {
+                    format!("{}_prefixes.{}", bucket, if *toml { "toml" } else { "txt" })
+                })
+            }),
+        ),
         _ => (None, None, None),
     }
 }
@@ -1464,6 +1567,7 @@ fn load_hints(
     bucket: &str,
     region: Option<&str>,
     profile: Option<&str>,
+    no_auto_hints: bool,
 ) -> Vec<String> {
     // 1. Explicit --hints-file takes absolute precedence.
     if let Some(path) = hints_file {
@@ -1478,6 +1582,13 @@ fn load_hints(
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
         }
+    }
+
+    if no_auto_hints {
+        info!(
+            "--no-auto-hints set. Skipping conventional hints cache lookup and using single-segment fallback."
+        );
+        return vec![];
     }
 
     // 2. Try auto-hints cache at conventional path.
@@ -1991,6 +2102,7 @@ fn run_auto_hints(
     output: Option<&str>,
     sample_limit: Option<usize>,
     max_pages: Option<usize>,
+    cli: &Cli,
     cfg: &S3TurboConfig,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2001,8 +2113,17 @@ fn run_auto_hints(
 
     let endpoint = cfg.s3.endpoint_url.as_deref();
     let fps = cfg.s3.force_path_style;
-    let threshold = cfg.auto_hints.sample_threshold;
-    let depth = cfg.auto_hints.max_prefix_depth;
+    let prefix = if cli.prefix == "/" {
+        ""
+    } else {
+        cli.prefix.as_str()
+    };
+
+    if cli.threads.is_some() || cli.concurrency.is_some() {
+        log::warn!(
+            "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
+        );
+    }
 
     if cfg.s3.profile.as_deref() == Some("bos") {
         log::warn!(
@@ -2013,17 +2134,66 @@ fn run_auto_hints(
     }
 
     rt.block_on(async {
-        auto_hints::generate_hints(
+        auto_hints::generate_hints(auto_hints::GenerateHintsOptions {
             region,
             bucket,
             output,
-            endpoint,
-            fps,
-            threshold,
-            depth,
+            endpoint_url: endpoint,
+            force_path_style: fps,
+            prefix,
+            max_keys: cli.max_keys,
+            max_attempts: cfg.s3.max_attempts,
+            initial_backoff_secs: cfg.s3.initial_backoff_secs,
+            connect_timeout_secs: cfg.s3.connect_timeout_secs,
+            operation_timeout_secs: cfg.s3.operation_timeout_secs,
+            sample_threshold: cfg.auto_hints.sample_threshold,
+            max_prefix_depth: cfg.auto_hints.max_prefix_depth,
+            max_prefix_entries: cfg.auto_hints.max_prefix_entries,
             sample_limit,
             max_pages,
-        )
+        })
+        .await
+    });
+}
+
+fn run_discover_prefixes(
+    region: Option<&str>,
+    bucket: &str,
+    output: Option<&str>,
+    max_pages: Option<usize>,
+    toml: bool,
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let prefix = if cli.prefix == "/" {
+        ""
+    } else {
+        cli.prefix.as_str()
+    };
+
+    rt.block_on(async {
+        auto_hints::discover_prefixes(auto_hints::DiscoverPrefixesOptions {
+            region,
+            bucket,
+            output,
+            endpoint_url: cfg.s3.endpoint_url.as_deref(),
+            force_path_style: cfg.s3.force_path_style,
+            prefix,
+            delimiter: &cli.delimiter,
+            max_keys: cli.max_keys,
+            max_attempts: cfg.s3.max_attempts,
+            initial_backoff_secs: cfg.s3.initial_backoff_secs,
+            connect_timeout_secs: cfg.s3.connect_timeout_secs,
+            operation_timeout_secs: cfg.s3.operation_timeout_secs,
+            max_pages,
+            toml,
+        })
         .await
     });
 }

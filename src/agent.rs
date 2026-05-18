@@ -76,6 +76,7 @@ pub struct AutoHintsSummary {
     pub sample_threshold: usize,
     pub max_prefix_depth: usize,
     pub min_segment_size: usize,
+    pub max_prefix_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +135,7 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 sample_threshold: cfg.auto_hints.sample_threshold,
                 max_prefix_depth: cfg.auto_hints.max_prefix_depth,
                 min_segment_size: cfg.auto_hints.min_segment_size,
+                max_prefix_entries: cfg.auto_hints.max_prefix_entries,
             },
             channel: ChannelSummary {
                 capacity: cfg.channel.capacity,
@@ -322,6 +324,7 @@ pub fn detect_hints_plan(
     explicit_hints_file: Option<&str>,
     bucket: Option<&str>,
     region: Option<&str>,
+    no_auto_hints: bool,
 ) -> HintsPlan {
     if let Some(path) = explicit_hints_file {
         let report = inspect_hints_for_plan(path);
@@ -338,6 +341,19 @@ pub fn detect_hints_plan(
             warnings: report
                 .map(|r| r.warnings)
                 .unwrap_or_else(|| vec!["hints file does not exist or could not be parsed".into()]),
+        };
+    }
+
+    if no_auto_hints {
+        return HintsPlan {
+            source: "disabled_single_segment_fallback".to_string(),
+            path: None,
+            exists: false,
+            valid: None,
+            format: None,
+            boundary_count: None,
+            estimate_summary: None,
+            warnings: vec!["--no-auto-hints skips conventional hints cache loading".to_string()],
         };
     }
 

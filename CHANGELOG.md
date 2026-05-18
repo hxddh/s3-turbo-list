@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-05-18
+
+### Added
+- `discover-prefixes` command to page through ListObjectsV2 `CommonPrefixes`
+  and write prefix hints locally, without relying on external cloud CLIs.
+- Auto-hints metadata for prefix-scoped scans, max-keys, prefix map bounds, and
+  bounded prefix-count mode.
+- Auto-hints heartbeat logging during long scans.
+- Trace `ListObjectsV2SegmentSummary` events with per-segment pages, object
+  count, CommonPrefixes count, elapsed time, boundaries, and completion reason.
+- Local mock coverage for boundary-key correctness, `--no-auto-hints`,
+  prefix/max-keys auto-hints, paginated CommonPrefixes discovery, and segment
+  summary traces.
+
+### Changed
+- `auto-hints` now honors global `--prefix` and `--max-keys` for its sequential
+  object scan and uses the resolved S3 retry/timeout configuration.
+- `--no-auto-hints` now skips conventional hints-cache loading when no explicit
+  `--hints-file` is provided, forcing single-segment fallback.
+- Documentation now explains segmented listing parallelism, hints boundary
+  caveats, prefix-scoped sampled estimates, compression choices, and endpoint
+  profile maturity.
+
+### Fixed
+- Hinted listing no longer drops an object whose key is exactly equal to a
+  segment boundary.  Segment ranges now include the right boundary because the
+  adjacent segment starts strictly after that same key.
+
 ## [0.1.9] - 2026-05-17
 
 ### Added

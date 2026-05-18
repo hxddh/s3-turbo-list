@@ -429,6 +429,14 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
     assert!(trace_events
         .iter()
         .any(|event| event["common_prefixes_count"] == 1));
+    assert!(trace_events.iter().any(|event| {
+        event["operation"] == "ListObjectsV2SegmentSummary"
+            && event["segment_index"] == 0
+            && event["segment_pages"] == 2
+            && event["segment_objects"] == 3
+            && event["segment_common_prefixes"] == 1
+            && event["ended_by"] == "pagination"
+    }));
 }
 
 #[test]
@@ -609,6 +617,279 @@ mode = "list"
     assert_eq!(
         requests[0].query.get("start-after").map(String::as_str),
         Some("m/")
+    );
+}
+
+#[test]
+fn local_mock_segment_boundary_key_is_not_dropped() {
+    let server = MockS3Server::start(|request, _sequence| {
+        let start_after = request.query.get("start-after").map(String::as_str);
+        let contents = match start_after {
+            None => vec!["a.txt", "m/"],
+            Some("m/") => vec!["z.txt"],
+            Some(other) => {
+                return MockResponse::error(
+                    500,
+                    "UnexpectedStartAfter",
+                    &format!("unexpected start-after {}", other),
+                );
+            }
+        };
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &contents,
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let parquet = dir.path().join("boundary.parquet");
+    let ks = dir.path().join("boundary.ks");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+total_objects = 3
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut keys = parquet_keys(&parquet);
+    keys.sort();
+    assert_eq!(keys, vec!["a.txt", "m/", "z.txt"]);
+}
+
+#[test]
+fn local_mock_no_auto_hints_skips_conventional_cache() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.contains_key("start-after") {
+            return MockResponse::error(
+                500,
+                "UnexpectedHints",
+                "--no-auto-hints should force single-segment listing",
+            );
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["single-segment.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("no-auto.parquet");
+    let ks = dir.path().join("no-auto.ks");
+    write_fast_config(&config);
+    std::fs::write(
+        dir.path().join("us-east-1_mock-bucket_hints.toml"),
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+total_objects = 2
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet), vec!["single-segment.txt"]);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{:#?}", requests);
+    assert!(!requests[0].query.contains_key("start-after"));
+}
+
+#[test]
+fn local_mock_auto_hints_uses_prefix_and_max_keys() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(
+            request.query.get("prefix").map(String::as_str),
+            Some("logs/")
+        );
+        assert_eq!(request.query.get("max-keys").map(String::as_str), Some("2"));
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            2,
+            &["logs/a.txt", "logs/b.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("auto-hints.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--prefix".into(),
+        "logs/".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "auto-hints".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output".into(),
+        hints.display().to_string(),
+        "--max-pages".into(),
+        "1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let rendered = std::fs::read_to_string(hints).unwrap();
+    assert!(rendered.contains("prefix = \"logs/\""));
+    assert!(rendered.contains("max_keys = 2"));
+}
+
+#[test]
+fn local_mock_discover_prefixes_collects_paginated_common_prefixes() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(
+            request.query.get("prefix").map(String::as_str),
+            Some("logs/")
+        );
+        assert_eq!(
+            request.query.get("delimiter").map(String::as_str),
+            Some("/")
+        );
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &[],
+                &["logs/app/"],
+                true,
+                Some("prefix-page-2"),
+            )),
+            Some("prefix-page-2") => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &[],
+                &["logs/archive/"],
+                false,
+                None,
+            )),
+            Some(_) => MockResponse::error(400, "InvalidToken", "unexpected continuation token"),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let output = dir.path().join("prefixes.txt");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--prefix".into(),
+        "logs/".into(),
+        "--delimiter".into(),
+        "/".into(),
+        "discover-prefixes".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output".into(),
+        output.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "logs/app/\nlogs/archive/\n"
     );
 }
 

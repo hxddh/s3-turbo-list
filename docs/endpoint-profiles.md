@@ -28,6 +28,13 @@ s3-turbo-list list \
 | `b2` | Backblaze B2 S3-compatible API | provider-specific | account/bucket-specific | path | documented preset |
 | `oss` | Alibaba Cloud OSS S3-compatible API | provider-specific | region-specific | virtual | documented preset |
 
+`validated` means the project has run its endpoint validation flow for that
+provider or local server.  `documented preset` means the profile encodes known
+provider defaults, but the project has not claimed full validation for that
+endpoint.  In particular, OSS, R2, and B2 profiles should be treated as starting
+points until `compat-probe` and a representative listing run pass in the target
+environment.
+
 ## Precedence
 
 Profiles only fill defaults when the user did not provide a value.  Explicit

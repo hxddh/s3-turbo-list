@@ -154,6 +154,8 @@ pub struct AutoHintsConfig {
     pub max_prefix_depth: usize,
     #[serde(default = "default_min_segment_size")]
     pub min_segment_size: usize,
+    #[serde(default = "default_max_prefix_entries")]
+    pub max_prefix_entries: usize,
 }
 
 impl Default for AutoHintsConfig {
@@ -162,6 +164,7 @@ impl Default for AutoHintsConfig {
             sample_threshold: default_sample_threshold(),
             max_prefix_depth: default_max_prefix_depth(),
             min_segment_size: default_min_segment_size(),
+            max_prefix_entries: default_max_prefix_entries(),
         }
     }
 }
@@ -248,6 +251,9 @@ fn default_max_prefix_depth() -> usize {
 fn default_min_segment_size() -> usize {
     1000
 }
+fn default_max_prefix_entries() -> usize {
+    1_000_000
+}
 fn default_channel_capacity() -> usize {
     64
 }
@@ -326,6 +332,7 @@ impl S3TurboConfig {
         self.auto_hints.sample_threshold = other.auto_hints.sample_threshold;
         self.auto_hints.max_prefix_depth = other.auto_hints.max_prefix_depth;
         self.auto_hints.min_segment_size = other.auto_hints.min_segment_size;
+        self.auto_hints.max_prefix_entries = other.auto_hints.max_prefix_entries;
         self.channel.capacity = other.channel.capacity;
     }
 

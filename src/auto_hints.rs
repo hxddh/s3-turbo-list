@@ -1,6 +1,7 @@
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 // ── Cached hints format ────────────────────────────────────
 
@@ -16,9 +17,17 @@ pub struct SegmentEstimate {
 pub struct HintsCache {
     pub bucket: String,
     pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     pub total_objects: usize,
     pub boundaries: Vec<String>,
     pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_keys: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prefix_entries: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prefix_counts_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,52 +44,102 @@ pub struct HintsCache {
     pub segment_estimates: Vec<SegmentEstimate>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GenerateHintsOptions<'a> {
+    pub region: Option<&'a str>,
+    pub bucket: &'a str,
+    pub output: Option<&'a str>,
+    pub endpoint_url: Option<&'a str>,
+    pub force_path_style: bool,
+    pub prefix: &'a str,
+    pub max_keys: Option<i32>,
+    pub max_attempts: u32,
+    pub initial_backoff_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub operation_timeout_secs: u64,
+    pub sample_threshold: usize,
+    pub max_prefix_depth: usize,
+    pub max_prefix_entries: usize,
+    pub sample_limit: Option<usize>,
+    pub max_pages: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DiscoverPrefixesOptions<'a> {
+    pub region: Option<&'a str>,
+    pub bucket: &'a str,
+    pub output: Option<&'a str>,
+    pub endpoint_url: Option<&'a str>,
+    pub force_path_style: bool,
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub max_keys: Option<i32>,
+    pub max_attempts: u32,
+    pub initial_backoff_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub operation_timeout_secs: u64,
+    pub max_pages: Option<usize>,
+    pub toml: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixDiscoveryCache {
+    pub bucket: String,
+    pub region: Option<String>,
+    pub prefix: String,
+    pub delimiter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_keys: Option<i32>,
+    pub generated_at: String,
+    pub scanned_pages: usize,
+    pub common_prefixes_count: usize,
+    pub common_prefixes: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ── Main entry point ───────────────────────────────────────
 
-pub async fn generate_hints(
-    region: Option<&str>,
-    bucket: &str,
-    output: Option<&str>,
-    endpoint_url: Option<&str>,
-    force_path_style: bool,
-    sample_threshold: usize,
-    max_prefix_depth: usize,
-    sample_limit: Option<usize>,
-    max_pages: Option<usize>,
-) {
-    let sampled_mode = sample_limit.is_some() || max_pages.is_some();
+pub async fn generate_hints(options: GenerateHintsOptions<'_>) {
+    let sampled_mode = options.sample_limit.is_some() || options.max_pages.is_some();
     info!(
-        "Auto-hints: scanning bucket '{}' (threshold={}, max_depth={}, sample_limit={:?}, max_pages={:?})",
-        bucket, sample_threshold, max_prefix_depth, sample_limit, max_pages,
+        "Auto-hints: scanning bucket '{}' prefix '{}' (threshold={}, max_depth={}, sample_limit={:?}, max_pages={:?})",
+        options.bucket,
+        options.prefix,
+        options.sample_threshold,
+        options.max_prefix_depth,
+        options.sample_limit,
+        options.max_pages,
     );
 
-    // Build S3 client.
-    let loader = aws_config::from_env()
-        .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3));
-
-    let config = loader.load().await;
-    let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
-    if let Some(r) = region {
-        s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(r.to_owned()));
-    }
-    if let Some(ep) = endpoint_url {
-        s3_cfg = s3_cfg.endpoint_url(ep.to_string());
-    }
-    if force_path_style {
-        s3_cfg = s3_cfg.force_path_style(true);
-    }
-    let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
+    let client = build_client(
+        options.region,
+        options.endpoint_url,
+        options.force_path_style,
+        options.max_attempts,
+        options.initial_backoff_secs,
+        options.connect_timeout_secs,
+        options.operation_timeout_secs,
+    )
+    .await;
 
     // Phase 1: sequential scan collecting prefix→count.
     let mut prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut total_objects = 0usize;
     let mut scanned_pages = 0usize;
     let mut stopped_by_limit = false;
-    let mut paginator = client
+    let mut prefix_counts_truncated = false;
+    let mut request = client
         .list_objects_v2()
-        .bucket(bucket)
-        .into_paginator()
-        .send();
+        .bucket(options.bucket)
+        .prefix(options.prefix);
+    if let Some(max_keys) = options.max_keys {
+        request = request.max_keys(max_keys);
+    }
+    let mut paginator = request.into_paginator().send();
+    let mut last_heartbeat = Instant::now();
 
     'scan: loop {
         match paginator.next().await {
@@ -93,14 +152,40 @@ pub async fn generate_hints(
                             .rsplit_once('/')
                             .map(|(p, _)| p.to_string())
                             .unwrap_or_else(|| "/".to_string());
-                        *prefix_counts.entry(prefix).or_insert(0) += 1;
-                        if sample_limit.is_some_and(|limit| total_objects >= limit) {
+                        if let Some(count) = prefix_counts.get_mut(&prefix) {
+                            *count += 1;
+                        } else if prefix_counts.len() < options.max_prefix_entries {
+                            prefix_counts.insert(prefix, 1);
+                        } else {
+                            prefix_counts_truncated = true;
+                        }
+                        if options
+                            .sample_limit
+                            .is_some_and(|limit| total_objects >= limit)
+                        {
                             stopped_by_limit = true;
                             break 'scan;
                         }
                     }
                 }
-                if max_pages.is_some_and(|limit| scanned_pages >= limit) {
+                if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+                    info!(
+                        "Auto-hints: scanned {} objects across {} pages, {} unique prefixes{}",
+                        total_objects,
+                        scanned_pages,
+                        prefix_counts.len(),
+                        if prefix_counts_truncated {
+                            " (prefix map bounded)"
+                        } else {
+                            ""
+                        }
+                    );
+                    last_heartbeat = Instant::now();
+                }
+                if options
+                    .max_pages
+                    .is_some_and(|limit| scanned_pages >= limit)
+                {
                     stopped_by_limit = true;
                     break;
                 }
@@ -114,14 +199,23 @@ pub async fn generate_hints(
     }
 
     info!(
-        "Auto-hints: scanned {} objects across {} pages and {} unique prefixes",
+        "Auto-hints: scanned {} objects across {} pages and {} unique prefixes{}",
         total_objects,
         scanned_pages,
         prefix_counts.len(),
+        if prefix_counts_truncated {
+            " (prefix map bounded)"
+        } else {
+            ""
+        },
     );
 
     // Phase 2: split prefixes exceeding threshold.
-    let boundaries = split_prefixes(&prefix_counts, sample_threshold, max_prefix_depth);
+    let boundaries = split_prefixes(
+        &prefix_counts,
+        options.sample_threshold,
+        options.max_prefix_depth,
+    );
     let segment_estimates = estimate_segments(&boundaries, &prefix_counts);
 
     info!(
@@ -131,11 +225,15 @@ pub async fn generate_hints(
 
     // Phase 3: write cache file.
     let cache = HintsCache {
-        bucket: bucket.to_string(),
-        region: region.map(|r| r.to_string()),
+        bucket: options.bucket.to_string(),
+        region: options.region.map(|r| r.to_string()),
+        prefix: (!options.prefix.is_empty()).then(|| options.prefix.to_string()),
         total_objects,
         boundaries: boundaries.clone(),
         generated_at: chrono::Local::now().to_rfc3339(),
+        max_keys: options.max_keys,
+        max_prefix_entries: Some(options.max_prefix_entries),
+        prefix_counts_truncated,
         scan_mode: Some(if sampled_mode {
             "sampled".to_string()
         } else {
@@ -143,8 +241,8 @@ pub async fn generate_hints(
         }),
         sampled_objects: sampled_mode.then_some(total_objects),
         sampled_pages: sampled_mode.then_some(scanned_pages),
-        sample_limit,
-        max_pages,
+        sample_limit: options.sample_limit,
+        max_pages: options.max_pages,
         estimate_mode: Some(if sampled_mode {
             "sampled".to_string()
         } else {
@@ -153,11 +251,11 @@ pub async fn generate_hints(
         segment_estimates: segment_estimates.clone(),
     };
 
-    let output_path = output.map(|o| o.to_string()).unwrap_or_else(|| {
-        if let Some(r) = region {
-            format!("{}_{}_hints.toml", r, bucket)
+    let output_path = options.output.map(|o| o.to_string()).unwrap_or_else(|| {
+        if let Some(r) = options.region {
+            format!("{}_{}_hints.toml", r, options.bucket)
         } else {
-            format!("{}_hints.toml", bucket)
+            format!("{}_hints.toml", options.bucket)
         }
     });
 
@@ -166,14 +264,28 @@ pub async fn generate_hints(
     info!("Auto-hints: cache written to {}", output_path);
 
     // Print summary for user.
-    println!("Auto-hints generated for bucket '{}':", bucket);
+    println!("Auto-hints generated for bucket '{}':", options.bucket);
     println!(
         "  Scan mode:             {}",
         if sampled_mode { "sampled" } else { "full" }
     );
+    println!(
+        "  Prefix:                {}",
+        if options.prefix.is_empty() {
+            "(bucket root)"
+        } else {
+            options.prefix
+        }
+    );
     println!("  Objects scanned:       {}", total_objects);
     println!("  Pages scanned:         {}", scanned_pages);
     println!("  Unique prefixes:       {}", prefix_counts.len());
+    if prefix_counts_truncated {
+        println!(
+            "  Prefix map:            bounded at {} entries; estimates are partial",
+            options.max_prefix_entries
+        );
+    }
     println!("  Key-space boundaries:  {}", boundaries.len());
     print_estimate_summary(&segment_estimates, sampled_mode);
     println!("  Cache file:            {}", output_path);
@@ -194,6 +306,155 @@ pub async fn generate_hints(
             println!("    ... and {} more", boundaries.len() - 5);
         }
     }
+}
+
+pub async fn discover_prefixes(options: DiscoverPrefixesOptions<'_>) {
+    info!(
+        "Discover-prefixes: scanning bucket '{}' prefix '{}' delimiter '{}'",
+        options.bucket, options.prefix, options.delimiter
+    );
+
+    let client = build_client(
+        options.region,
+        options.endpoint_url,
+        options.force_path_style,
+        options.max_attempts,
+        options.initial_backoff_secs,
+        options.connect_timeout_secs,
+        options.operation_timeout_secs,
+    )
+    .await;
+
+    let mut request = client
+        .list_objects_v2()
+        .bucket(options.bucket)
+        .prefix(options.prefix)
+        .delimiter(options.delimiter);
+    if let Some(max_keys) = options.max_keys {
+        request = request.max_keys(max_keys);
+    }
+
+    let mut paginator = request.into_paginator().send();
+    let mut scanned_pages = 0usize;
+    let mut common_prefixes = BTreeSet::new();
+    let mut last_heartbeat = Instant::now();
+
+    loop {
+        match paginator.next().await {
+            Some(Ok(response)) => {
+                scanned_pages += 1;
+                for cp in response.common_prefixes() {
+                    if let Some(prefix) = cp.prefix() {
+                        common_prefixes.insert(prefix.to_string());
+                    }
+                }
+                if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+                    info!(
+                        "Discover-prefixes: scanned {} pages, {} unique CommonPrefixes",
+                        scanned_pages,
+                        common_prefixes.len()
+                    );
+                    last_heartbeat = Instant::now();
+                }
+                if options
+                    .max_pages
+                    .is_some_and(|limit| scanned_pages >= limit)
+                {
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                log::warn!("Discover-prefixes scan error: {:?}", e);
+                break;
+            }
+            None => break,
+        }
+    }
+
+    let prefixes: Vec<String> = common_prefixes.into_iter().collect();
+    let output_path = options.output.map(|o| o.to_string()).unwrap_or_else(|| {
+        let extension = if options.toml { "toml" } else { "txt" };
+        if let Some(r) = options.region {
+            format!("{}_{}_prefixes.{}", r, options.bucket, extension)
+        } else {
+            format!("{}_prefixes.{}", options.bucket, extension)
+        }
+    });
+
+    if options.toml {
+        let cache = PrefixDiscoveryCache {
+            bucket: options.bucket.to_string(),
+            region: options.region.map(|r| r.to_string()),
+            prefix: options.prefix.to_string(),
+            delimiter: options.delimiter.to_string(),
+            max_keys: options.max_keys,
+            generated_at: chrono::Local::now().to_rfc3339(),
+            scanned_pages,
+            common_prefixes_count: prefixes.len(),
+            common_prefixes: prefixes.clone(),
+        };
+        let toml_str = toml::to_string_pretty(&cache).expect("Failed to serialize prefixes cache");
+        std::fs::write(&output_path, toml_str).expect("Failed to write prefixes cache");
+    } else {
+        let body = if prefixes.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", prefixes.join("\n"))
+        };
+        std::fs::write(&output_path, body).expect("Failed to write prefixes file");
+    }
+
+    println!("Discovered CommonPrefixes for bucket '{}':", options.bucket);
+    println!(
+        "  Prefix:                {}",
+        if options.prefix.is_empty() {
+            "(bucket root)"
+        } else {
+            options.prefix
+        }
+    );
+    println!("  Delimiter:             {}", options.delimiter);
+    println!("  Pages scanned:         {}", scanned_pages);
+    println!("  CommonPrefixes:        {}", prefixes.len());
+    println!("  Output file:           {}", output_path);
+}
+
+async fn build_client(
+    region: Option<&str>,
+    endpoint_url: Option<&str>,
+    force_path_style: bool,
+    max_attempts: u32,
+    initial_backoff_secs: u64,
+    connect_timeout_secs: u64,
+    operation_timeout_secs: u64,
+) -> aws_sdk_s3::Client {
+    let loader = aws_config::from_env()
+        .retry_config(
+            aws_config::retry::RetryConfig::standard()
+                .with_max_attempts(max_attempts)
+                .with_initial_backoff(Duration::from_secs(initial_backoff_secs)),
+        )
+        .timeout_config(
+            aws_config::timeout::TimeoutConfigBuilder::new()
+                .connect_timeout(Duration::from_secs(connect_timeout_secs))
+                .operation_timeout(Duration::from_secs(operation_timeout_secs))
+                .read_timeout(Duration::from_secs(operation_timeout_secs))
+                .operation_attempt_timeout(Duration::from_secs(operation_timeout_secs))
+                .build(),
+        );
+
+    let config = loader.load().await;
+    let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
+    if let Some(r) = region {
+        s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(r.to_owned()));
+    }
+    if let Some(ep) = endpoint_url {
+        s3_cfg = s3_cfg.endpoint_url(ep.to_string());
+    }
+    if force_path_style {
+        s3_cfg = s3_cfg.force_path_style(true);
+    }
+    aws_sdk_s3::Client::from_conf(s3_cfg.build())
 }
 
 fn estimate_segments(
@@ -358,9 +619,13 @@ mod tests {
         let cache = HintsCache {
             bucket: "bucket".to_string(),
             region: Some("us-east-1".to_string()),
+            prefix: Some("logs/".to_string()),
             total_objects: 100,
             boundaries: vec!["a/".to_string(), "b/".to_string()],
             generated_at: "2026-05-16T00:00:00Z".to_string(),
+            max_keys: Some(500),
+            max_prefix_entries: Some(1_000_000),
+            prefix_counts_truncated: false,
             scan_mode: Some("sampled".to_string()),
             sampled_objects: Some(100),
             sampled_pages: Some(2),
@@ -380,6 +645,8 @@ mod tests {
 
         let decoded: HintsCache = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.scan_mode.as_deref(), Some("sampled"));
+        assert_eq!(decoded.prefix.as_deref(), Some("logs/"));
+        assert_eq!(decoded.max_keys, Some(500));
         assert_eq!(decoded.sampled_pages, Some(2));
         assert_eq!(decoded.segment_estimates.len(), 1);
     }

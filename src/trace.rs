@@ -15,7 +15,7 @@ use std::sync::Mutex;
 /// One structured trace event per S3 API call.  Every field is serialised
 /// for JSONL output; optional fields use `skip_serializing_if`.
 ///
-/// Field count: 28 fields (12 required + 16 optional).
+/// Field count: additive schema; optional fields use `skip_serializing_if`.
 #[derive(Debug, Clone, Serialize)]
 pub struct S3CompatEvent {
     // ── request identity ──────────────────────────────────
@@ -68,6 +68,20 @@ pub struct S3CompatEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_continuation_token_present: Option<bool>,
 
+    // ── segment summary metadata ─────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_pages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_objects: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_common_prefixes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<String>,
+
     // ── error body ────────────────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_raw_body: Option<String>, // first 512 bytes of error body
@@ -105,6 +119,12 @@ impl S3CompatEvent {
             contents_count: None,
             common_prefixes_count: None,
             next_continuation_token_present: None,
+            segment_index: None,
+            end_before: None,
+            segment_pages: None,
+            segment_objects: None,
+            segment_common_prefixes: None,
+            ended_by: None,
             truncated_raw_body: None,
         }
     }

@@ -20,6 +20,7 @@ for large listings.  Values come from `src/config.rs`.
 | `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
 | `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
 | `auto_hints.min_segment_size` | `1000` | Reserved segment-size tuning value. |
+| `auto_hints.max_prefix_entries` | `1000000` | Maximum unique parent prefixes retained during auto-hints counting before bounded mode. |
 
 For high-latency or cross-region endpoints, consider raising
 `s3.operation_timeout_secs` to `30` or `60` to reduce retry churn.
@@ -49,6 +50,7 @@ compression_level = 3
 sample_threshold = 10000
 max_prefix_depth = 5
 min_segment_size = 1000
+max_prefix_entries = 1000000
 
 [channel]
 capacity = 128
@@ -58,5 +60,16 @@ CLI flags exist for common runtime controls such as `--threads`,
 `--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
 `--max-keys`, `--start-after`, output file paths, `--sample-limit`, and
 `--max-pages`.  The `auto_hints.sample_threshold`,
-`auto_hints.max_prefix_depth`, and `auto_hints.min_segment_size` values are
-TOML-only.
+`auto_hints.max_prefix_depth`, `auto_hints.min_segment_size`, and
+`auto_hints.max_prefix_entries` values are TOML-only.
+
+## Auto-Hints Scope
+
+`auto-hints` performs one sequential ListObjectsV2 object scan.  `--prefix`
+restricts that scan to a subtree, and `--max-keys` controls page size.  The
+resulting TOML records the prefix when one was used.  Do not reuse
+prefix-scoped hints as if they described the entire bucket.
+
+Use `discover-prefixes` for delimiter-based `CommonPrefixes` discovery.  That
+command writes prefix candidates; it does not claim object-count-balanced
+segments.

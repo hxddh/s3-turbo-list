@@ -42,6 +42,7 @@ independent segments, runs them in parallel, and assembles the result.
 |---|---|
 | **ListObjectsV2 scanning** | High-performance concurrent listing via the S3 ListObjectsV2 API. |
 | **Multi-threaded / segmented listing** | Auto-discovered key-space hints split a bucket into parallel segments, or supply your own hints file. |
+| **Prefix discovery** | `discover-prefixes` paginates ListObjectsV2 `CommonPrefixes` locally into prefix hints. |
 | **Streaming Parquet output** | List mode writes received batches directly to configurable compressed Parquet, keeping memory bounded for large buckets. |
 | **KS keyspace output** | Companion CSV showing per-prefix object counts. |
 | **Trace JSONL output** | Every S3 API call recorded as structured JSONL for observability and debugging. |
@@ -337,6 +338,22 @@ Generate hints automatically:
 s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
 ```
 
+Generate hints for one prefix subtree:
+```bash
+s3-turbo-list --prefix logs/2026/ auto-hints \
+  --region us-east-2 \
+  --bucket my-bucket \
+  -o logs-2026-hints.toml
+```
+
+Discover delimiter-based CommonPrefixes before building manual hints:
+```bash
+s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
+  --region us-east-2 \
+  --bucket my-bucket \
+  -o logs-prefixes.txt
+```
+
 For very large buckets, generate an estimated hints file from a bounded sample:
 ```bash
 s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
@@ -345,11 +362,22 @@ s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
   --max-pages 1000
 ```
 
+Hints boundaries are lexicographic cut points, not directories.  A boundary may
+also be a real object key; v0.1.10 treats that object as part of the preceding
+segment so adjacent `start-after` segments do not drop it.  Folder marker
+objects such as `logs/` are ordinary keys for correctness purposes.
+
 In sampled mode, the TOML `total_objects` field is the sampled object count,
-not the full bucket total.  The cache also records `scan_mode`,
-`sampled_objects`, `sampled_pages`, `sample_limit`, `max_pages`, and
-per-segment estimates marked as sampled/estimated rather than authoritative
+not the full bucket total.  Prefix-scoped hints generated with `--prefix` are
+valid for that prefix subtree, not for the whole bucket.  The cache also records
+`scan_mode`, `sampled_objects`, `sampled_pages`, `sample_limit`, `max_pages`,
+and per-segment estimates marked as sampled/estimated rather than authoritative
 bucket-wide statistics.
+
+`auto-hints` performs one sequential object scan.  `--prefix` and `--max-keys`
+apply to that scan; `--threads` and `--concurrency` do not make it parallel.
+Use `discover-prefixes` for delimiter/CommonPrefixes discovery instead of
+mixing delimiter folding into object-count estimates.
 
 Validate a hints file locally before a cloud run:
 ```bash
@@ -363,9 +391,17 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket -H hints.toml
 
 Advanced runtime and auto-hints tuning is documented in
 [`docs/tuning.md`](docs/tuning.md).  Some knobs, including
-`auto_hints.sample_threshold`, `auto_hints.max_prefix_depth`, and
-`auto_hints.min_segment_size`, are TOML-only settings and do not have CLI
-flags.
+`auto_hints.sample_threshold`, `auto_hints.max_prefix_depth`,
+`auto_hints.min_segment_size`, and `auto_hints.max_prefix_entries`, are
+TOML-only settings and do not have CLI flags.
+
+### How segmented listing works
+
+Parallelism happens between key-space segments, not inside a single
+ListObjectsV2 continuation chain.  `--concurrency` only helps when hints provide
+enough boundaries to keep workers busy.  With no hints, or after
+`--no-auto-hints`, listing falls back to one segment and follows one paginator
+chain.
 
 ## Output schema
 
@@ -433,6 +469,12 @@ the following fields:
 | `contents_count` | int? | Number of `Contents` entries in the response. |
 | `common_prefixes_count` | int? | Number of `CommonPrefixes` entries. |
 | `next_continuation_token_present` | bool? | Whether the response explicitly included a next continuation token. |
+| `segment_index` | uint? | Segment index for `ListObjectsV2SegmentSummary` events. |
+| `end_before` | string? | Upper segment boundary, when present. |
+| `segment_pages` | uint32? | Pages read by a completed segment summary. |
+| `segment_objects` | uint? | Objects emitted by a completed segment summary. |
+| `segment_common_prefixes` | uint? | CommonPrefixes seen by a completed segment summary. |
+| `ended_by` | string? | Segment completion reason, such as `"pagination"` or `"boundary"`. |
 | `truncated_raw_body` | string? | First 512 bytes of the error response body. |
 
 ## Endpoint compatibility matrix
@@ -493,5 +535,6 @@ incompatibilities were documented.  Full details in
 | ✅ Done | CLI help polish | Shell completions and man page generation |
 | ✅ Done | Optional endpoint compatibility profiles | Per-provider presets and local profile inspection |
 | ✅ Done | Local S3 protocol mock | Local correctness harness for ListObjectsV2, compat-probe, retry, and checkpoint/resume |
+| ✅ Done | Hints correctness / prefix discovery | Boundary key correctness, `--no-auto-hints`, prefix-scoped auto-hints, CommonPrefixes discovery |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
 | 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |
