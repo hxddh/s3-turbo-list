@@ -1,12 +1,12 @@
 // All modules exported from the library crate (src/lib.rs).
 // The binary uses `s3_turbo_list::...` paths to avoid module duplication.
 use s3_turbo_list::{
-    agent, auto_hints, checkpoint, config, core, data_map, diff, hints, mon, profiles, tasks_s3,
-    trace,
+    agent, auto_hints, checkpoint, config, core, data_map, diff, hints, local_tools, mon, profiles,
+    tasks_s3, trace,
 };
 
 use chrono::Local;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use config::S3TurboConfig;
 use core::RunMode;
@@ -254,6 +254,98 @@ enum Commands {
         json: bool,
     },
 
+    /// Merge local TOML/plain hints files without contacting S3
+    HintsMerge {
+        /// Input hints files
+        #[arg(required = true)]
+        inputs: Vec<String>,
+
+        /// Output hints file path; content is always TOML regardless of extension
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Output format for the command report
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        output_format: ReportFormat,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Emit JSON report with stdout reserved for machine-readable output
+        #[arg(long)]
+        machine_readable: bool,
+
+        /// Write local tooling manifest JSON to this path
+        #[arg(long)]
+        emit_manifest: Option<String>,
+    },
+
+    /// Summarize a local --trace-compat JSONL file without contacting S3
+    TraceSummary {
+        /// Trace JSONL file
+        trace_file: String,
+
+        /// Output format for the report
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        output_format: ReportFormat,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Emit JSON report with stdout reserved for machine-readable output
+        #[arg(long)]
+        machine_readable: bool,
+    },
+
+    /// Generate conservative next-run hints from a local trace and hints file
+    HintsRebalance {
+        /// Trace JSONL file
+        #[arg(long)]
+        trace: String,
+
+        /// Existing hints file
+        #[arg(short = 'H', long)]
+        hints_file: String,
+
+        /// Output hints file path; content is always TOML regardless of extension
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Maximum number of new boundaries to add
+        #[arg(long, default_value_t = 8)]
+        max_new_boundaries: usize,
+
+        /// Segment page ratio over median required before adding a boundary
+        #[arg(long, default_value_t = 5.0)]
+        long_tail_ratio: f64,
+
+        /// Minimum segment page count before considering a split
+        #[arg(long, default_value_t = 5)]
+        min_pages: u32,
+
+        /// Explain long-tail decisions in human output
+        #[arg(long)]
+        explain: bool,
+
+        /// Output format for the command report
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        output_format: ReportFormat,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Emit JSON report with stdout reserved for machine-readable output
+        #[arg(long)]
+        machine_readable: bool,
+
+        /// Write local tooling manifest JSON to this path
+        #[arg(long)]
+        emit_manifest: Option<String>,
+    },
+
     /// Inspect resolved local config without contacting S3
     ConfigInspect {
         /// Emit JSON report
@@ -316,6 +408,13 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    Text,
+    Json,
+    Markdown,
+}
+
 #[derive(Subcommand)]
 enum ProfileCommands {
     /// List known endpoint profiles
@@ -352,6 +451,65 @@ fn main() {
         }
         Commands::Profiles { cmd } => {
             run_profiles(cmd);
+            return;
+        }
+        Commands::HintsMerge {
+            inputs,
+            output,
+            output_format,
+            json,
+            machine_readable,
+            emit_manifest,
+        } => {
+            run_hints_merge(
+                inputs,
+                output.as_deref(),
+                cli.dry_run,
+                *output_format,
+                *json || *machine_readable || cli.agent,
+                emit_manifest.as_deref(),
+            );
+            return;
+        }
+        Commands::TraceSummary {
+            trace_file,
+            output_format,
+            json,
+            machine_readable,
+        } => {
+            run_trace_summary(
+                trace_file,
+                *output_format,
+                *json || *machine_readable || cli.agent,
+            );
+            return;
+        }
+        Commands::HintsRebalance {
+            trace,
+            hints_file,
+            output,
+            max_new_boundaries,
+            long_tail_ratio,
+            min_pages,
+            explain,
+            output_format,
+            json,
+            machine_readable,
+            emit_manifest,
+        } => {
+            run_hints_rebalance(
+                trace,
+                hints_file,
+                output.as_deref(),
+                cli.dry_run,
+                *max_new_boundaries,
+                *long_tail_ratio,
+                *min_pages,
+                *explain,
+                *output_format,
+                *json || *machine_readable || cli.agent,
+                emit_manifest.as_deref(),
+            );
             return;
         }
         _ => {}
@@ -603,6 +761,11 @@ fn main() {
         }
         Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
             unreachable!("local-only commands are handled before config load")
+        }
+        Commands::HintsMerge { .. }
+        | Commands::TraceSummary { .. }
+        | Commands::HintsRebalance { .. } => {
+            unreachable!("local tooling commands are handled before config load")
         }
         Commands::BenchmarkLocal { .. } => {
             unreachable!("benchmark-local is handled before runtime setup")
@@ -1044,6 +1207,118 @@ fn generate_man_page() {
     }
 }
 
+fn run_hints_merge(
+    inputs: &[String],
+    output: Option<&str>,
+    dry_run: bool,
+    output_format: ReportFormat,
+    json: bool,
+    emit_manifest: Option<&str>,
+) {
+    match local_tools::merge_hints_files(inputs, output, dry_run) {
+        Ok(report) => {
+            if let Some(manifest_path) = emit_manifest {
+                let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
+                if let Err(e) = local_tools::write_local_manifest(
+                    manifest_path,
+                    "hints-merge",
+                    inputs,
+                    &outputs,
+                    &report,
+                    &report.warnings,
+                ) {
+                    eprintln!("Manifest write error: {}", e);
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            }
+            if json || output_format == ReportFormat::Json {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                print!("{}", local_tools::render_merge_text(&report));
+            }
+        }
+        Err(e) => {
+            eprintln!("Hints merge failed: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
+fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) {
+    match local_tools::trace_summary(trace_file) {
+        Ok(report) => {
+            if json || output_format == ReportFormat::Json {
+                println!("{}", agent::to_pretty_json(&report));
+            } else if output_format == ReportFormat::Markdown {
+                print!("{}", local_tools::render_trace_summary_markdown(&report));
+            } else {
+                print!("{}", local_tools::render_trace_summary_text(&report));
+            }
+        }
+        Err(e) => {
+            eprintln!("Trace summary failed: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hints_rebalance(
+    trace: &str,
+    hints_file: &str,
+    output: Option<&str>,
+    dry_run: bool,
+    max_new_boundaries: usize,
+    long_tail_ratio: f64,
+    min_pages: u32,
+    explain: bool,
+    output_format: ReportFormat,
+    json: bool,
+    emit_manifest: Option<&str>,
+) {
+    if !(long_tail_ratio.is_finite() && long_tail_ratio >= 1.0) {
+        eprintln!("Hints rebalance failed: --long-tail-ratio must be >= 1.0");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+
+    match local_tools::rebalance_hints(
+        trace,
+        hints_file,
+        output,
+        dry_run,
+        max_new_boundaries,
+        long_tail_ratio,
+        min_pages,
+    ) {
+        Ok(report) => {
+            if let Some(manifest_path) = emit_manifest {
+                let inputs = vec![trace.to_string(), hints_file.to_string()];
+                let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
+                if let Err(e) = local_tools::write_local_manifest(
+                    manifest_path,
+                    "hints-rebalance",
+                    &inputs,
+                    &outputs,
+                    &report,
+                    &report.warnings,
+                ) {
+                    eprintln!("Manifest write error: {}", e);
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            }
+            if json || output_format == ReportFormat::Json {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                print!("{}", local_tools::render_rebalance_text(&report, explain));
+            }
+        }
+        Err(e) => {
+            eprintln!("Hints rebalance failed: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
 fn run_profiles(cmd: &ProfileCommands) {
     match cmd {
         ProfileCommands::List { json } => {
@@ -1393,6 +1668,9 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             None,
         ),
         Commands::HintsValidate { .. } => ("hints-validate".to_string(), None, None, None, None),
+        Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None),
+        Commands::TraceSummary { .. } => ("trace-summary".to_string(), None, None, None, None),
+        Commands::HintsRebalance { .. } => ("hints-rebalance".to_string(), None, None, None, None),
         Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
         Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None),

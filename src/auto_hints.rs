@@ -23,6 +23,10 @@ pub struct HintsCache {
     pub boundaries: Vec<String>,
     pub generated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_prefix_entries: Option<usize>,
@@ -234,6 +238,8 @@ pub async fn generate_hints(options: GenerateHintsOptions<'_>) {
         max_keys: options.max_keys,
         max_prefix_entries: Some(options.max_prefix_entries),
         prefix_counts_truncated,
+        source_count: None,
+        source_files: Vec::new(),
         scan_mode: Some(if sampled_mode {
             "sampled".to_string()
         } else {
@@ -623,6 +629,8 @@ mod tests {
             total_objects: 100,
             boundaries: vec!["a/".to_string(), "b/".to_string()],
             generated_at: "2026-05-16T00:00:00Z".to_string(),
+            source_count: None,
+            source_files: Vec::new(),
             max_keys: Some(500),
             max_prefix_entries: Some(1_000_000),
             prefix_counts_truncated: false,

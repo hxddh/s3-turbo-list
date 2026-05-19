@@ -240,8 +240,27 @@ file sizes, line counts, and Parquet row/schema metadata.
 Trace output is one JSON object per line (JSONL). Each line contains:
 operation, endpoint, addressing style, profile, region, bucket, prefix,
 delimiter, max-keys, start-after, continuation token, HTTP status, S3
-error code, request ID, latency, pagination details, and truncated error
+error code, request ID, latency, pagination details, optional per-page
+`first_key`/`last_key` samples when tracing is enabled, and truncated error
 body excerpts (first 512 bytes).
+
+Local trace and hints tooling is available for agents and CI without contacting
+S3:
+
+```bash
+s3-turbo-list trace-summary trace.jsonl --output-format json
+s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
+s3-turbo-list hints-rebalance \
+  --trace trace.jsonl \
+  --hints-file merged.toml \
+  --output rebalanced.toml \
+  --emit-manifest rebalance.manifest.json \
+  --machine-readable
+```
+
+These commands parse local files only.  They do not alter `list`/`diff`
+concurrency, do not add S3 requests, and do not enable provider-specific
+pagination workarounds.
 
 ### Local benchmark and CLI docs
 
@@ -382,6 +401,21 @@ mixing delimiter folding into object-count estimates.
 Validate a hints file locally before a cloud run:
 ```bash
 s3-turbo-list hints-validate --hints-file hints.toml
+```
+
+Merge multiple local hints files into one sorted TOML cache:
+```bash
+s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
+```
+
+Analyze a previous trace and generate conservative next-run hints for observed
+long-tail segments:
+```bash
+s3-turbo-list hints-rebalance \
+  --trace trace.jsonl \
+  --hints-file merged.toml \
+  --output rebalanced.toml \
+  --explain
 ```
 
 Use a hints file:
@@ -536,5 +570,6 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Optional endpoint compatibility profiles | Per-provider presets and local profile inspection |
 | ✅ Done | Local S3 protocol mock | Local correctness harness for ListObjectsV2, compat-probe, retry, and checkpoint/resume |
 | ✅ Done | Hints correctness / prefix discovery | Boundary key correctness, `--no-auto-hints`, prefix-scoped auto-hints, CommonPrefixes discovery |
+| ✅ Done | Trace-driven hints tooling | Local hints merge, trace summary, conservative rebalance, and agent-readable manifests |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
 | 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |

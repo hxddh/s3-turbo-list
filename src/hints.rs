@@ -8,6 +8,8 @@ const TOML_FIELDS: &[&str] = &[
     "total_objects",
     "boundaries",
     "generated_at",
+    "source_count",
+    "source_files",
     "scan_mode",
     "sampled_objects",
     "sampled_pages",

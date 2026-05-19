@@ -230,6 +230,8 @@ async fn flat_list(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     true,
                     false,
                     None,
@@ -260,6 +262,8 @@ async fn flat_list(
                     Some(0),
                     Some(0),
                     Some(0),
+                    None,
+                    None,
                     false,
                     false,
                     None,
@@ -308,6 +312,8 @@ async fn flat_list(
                     key_count_opt,
                     Some(contents_count),
                     Some(cp_count),
+                    objects.contents().first().and_then(|o| o.key()),
+                    objects.contents().last().and_then(|o| o.key()),
                     false,
                     false,
                     None,
@@ -462,6 +468,8 @@ fn emit_trace_compat(
     key_count: Option<i32>,
     contents_count: Option<i32>,
     common_prefixes_count: Option<i32>,
+    first_key: Option<&str>,
+    last_key: Option<&str>,
     retryable: bool,
     fatal: bool,
     truncated_raw_body: Option<String>,
@@ -496,6 +504,8 @@ fn emit_trace_compat(
     event.key_count = key_count;
     event.contents_count = contents_count;
     event.common_prefixes_count = common_prefixes_count;
+    event.first_key = first_key.map(str::to_string);
+    event.last_key = last_key.map(str::to_string);
     event.truncated_raw_body = truncated_raw_body;
 
     writer.write_event(event);
@@ -549,6 +559,8 @@ fn handle_sdk_error(
                 s3_msg.clone(),
                 request_id.clone(),
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -619,6 +631,8 @@ fn handle_sdk_error(
                 None,
                 None,
                 None,
+                None,
+                None,
                 retryable,
                 false,
                 None,
@@ -647,6 +661,8 @@ fn handle_sdk_error(
                 Some(format!("{:?}", other)),
                 None,
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,

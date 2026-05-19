@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-05-19
+
+### Added
+- Local `hints-merge` command for combining TOML and plain hints files into a
+  sorted, deduplicated TOML hints cache without contacting S3.
+- Local `trace-summary` command for summarizing `--trace-compat` JSONL files
+  into human text, markdown, or JSON for agents and CI.
+- Conservative local `hints-rebalance` command that uses trace segment
+  summaries and per-page key samples to propose or write next-run hints for
+  long-tail segments.
+- Agent-friendly `--output-format json`, `--machine-readable`, and
+  `--emit-manifest` surfaces for the new local hints tooling commands.
+- Optional per-page `first_key` and `last_key` trace fields when S3 tracing is
+  enabled, giving offline rebalance tooling real observed key cut points.
+
+### Changed
+- Local hints/trace tooling is handled before config loading and before runtime
+  setup, keeping these commands no-cloud and independent of S3 credentials.
+- Documentation now describes trace-driven hints workflows for agents and
+  large-bucket tuning.
+
 ## [0.1.10] - 2026-05-18
 
 ### Added

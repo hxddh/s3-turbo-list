@@ -11,6 +11,9 @@ These commands do not contact S3 endpoints:
 s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list --dry-run --agent list --bucket my-bucket --region us-east-1
+s3-turbo-list trace-summary trace.jsonl --machine-readable
+s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
+s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
 ```
 
 `config-inspect --json` prints the resolved local configuration after TOML,
@@ -23,6 +26,10 @@ marks network probing as skipped.
 `--dry-run` resolves command inputs, planned output paths, hints source,
 checkpoint identity, output parent directories, and local file conflicts
 without creating Parquet/KS files and without making S3 requests.
+
+`trace-summary`, `hints-merge`, and `hints-rebalance` are local file tooling
+commands.  They are handled before S3 config loading, do not require cloud
+credentials, and do not change list/diff hot-path behavior.
 
 ## Dry-run plan files
 
@@ -136,9 +143,41 @@ Use the manifest for final run status and aggregate metrics.  Use trace JSONL
 for endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
 metadata, and retry details.
 
+## Trace-driven hints tooling
+
+The local hints tooling commands support machine-readable output for agents:
+
+```bash
+s3-turbo-list trace-summary trace.jsonl --output-format json
+
+s3-turbo-list hints-merge \
+  base.toml prefixes.txt \
+  --output merged.toml \
+  --emit-manifest merge.manifest.json \
+  --machine-readable
+
+s3-turbo-list hints-rebalance \
+  --trace trace.jsonl \
+  --hints-file merged.toml \
+  --output rebalanced.toml \
+  --emit-manifest rebalance.manifest.json \
+  --machine-readable
+```
+
+`--machine-readable` is an alias for JSON report output on these commands.
+Warnings and recommendations are JSON fields, so agents should not scrape human
+text.  `--emit-manifest` records input/output file hashes for reproducibility.
+
+`hints-rebalance` is conservative.  It only adds boundaries from observed
+per-page trace key samples and only for segments that exceed the configured
+long-tail threshold.  If a trace was produced by an older binary and lacks
+`last_key` samples, the command reports the long-tail segments but does not
+guess synthetic boundaries.
+
 ## Safety expectations
 
 - `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
+- `trace-summary`, `hints-merge`, and `hints-rebalance` are local-only.
 - `list`, `diff`, `auto-hints`, `discover-prefixes`, and `compat-probe` can contact S3 unless
   combined with `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS

@@ -73,3 +73,18 @@ prefix-scoped hints as if they described the entire bucket.
 Use `discover-prefixes` for delimiter-based `CommonPrefixes` discovery.  That
 command writes prefix candidates; it does not claim object-count-balanced
 segments.
+
+## Trace-Driven Hints Iteration
+
+For large buckets, treat hints as an iterative performance input:
+
+```bash
+s3-turbo-list trace-summary trace.jsonl
+s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
+s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --output next.toml --explain
+```
+
+These commands read local files only.  They do not contact S3 and do not change
+the listing hot path.  `hints-rebalance` only adds boundaries from observed
+trace key samples (`last_key`) for segments that are clear long-tail outliers;
+otherwise it reports recommendations without guessing cut points.

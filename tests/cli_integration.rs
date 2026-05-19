@@ -124,6 +124,18 @@ fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
     assert_eq!(code, 0, "benchmark-local --help should exit 0");
     assert!(stdout.contains("--objects"));
+
+    let (code, stdout, _stderr) = run_cli(&["trace-summary", "--help"]);
+    assert_eq!(code, 0, "trace-summary --help should exit 0");
+    assert!(stdout.contains("--machine-readable"));
+
+    let (code, stdout, _stderr) = run_cli(&["hints-merge", "--help"]);
+    assert_eq!(code, 0, "hints-merge --help should exit 0");
+    assert!(stdout.contains("--emit-manifest"));
+
+    let (code, stdout, _stderr) = run_cli(&["hints-rebalance", "--help"]);
+    assert_eq!(code, 0, "hints-rebalance --help should exit 0");
+    assert!(stdout.contains("--long-tail-ratio"));
 }
 
 #[test]
@@ -497,4 +509,114 @@ fn test_cli_hints_validate_malformed_failure() {
         run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
     assert_ne!(code, 0, "malformed hints should fail");
     assert!(stderr.contains("Hints validation failed"));
+}
+
+#[test]
+fn test_cli_hints_merge_json_writes_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.toml");
+    let out = dir.path().join("merged.toml");
+    let manifest = dir.path().join("merge.manifest.json");
+    std::fs::write(&a, "logs/a/\nlogs/c/\n").unwrap();
+    std::fs::write(
+        &b,
+        r#"bucket = "b"
+total_objects = 0
+boundaries = ["logs/b/", "logs/c/"]
+generated_at = "2026-05-19T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "hints-merge",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--emit-manifest",
+        manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["boundary_count"], 3);
+    assert_eq!(json["duplicate_count"], 1);
+    assert_eq!(json["output_written"], true);
+
+    let merged = std::fs::read_to_string(out).unwrap();
+    assert!(merged.contains("logs/a/"));
+    assert!(merged.contains("logs/b/"));
+    assert!(merged.contains("logs/c/"));
+
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["command"], "hints-merge");
+    assert_eq!(manifest_json["outputs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_cli_trace_summary_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("trace.jsonl");
+    std::fs::write(
+        &trace,
+        r#"{"timestamp":"2026-05-19T00:00:00Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"start_after":"a/","contents_count":2,"first_key":"a/1","last_key":"a/2"}
+{"timestamp":"2026-05-19T00:00:01Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":50,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":0,"segment_pages":3,"segment_objects":30,"segment_common_prefixes":0,"ended_by":"boundary","end_before":"m/"}
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&["trace-summary", trace.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["segment_count"], 1);
+    assert_eq!(json["total_pages"], 3);
+    assert_eq!(json["total_objects"], 30);
+    assert_eq!(json["list_events"], 1);
+}
+
+#[test]
+fn test_cli_hints_rebalance_adds_trace_sample_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let hints = dir.path().join("hints.txt");
+    let trace = dir.path().join("trace.jsonl");
+    let out = dir.path().join("new.toml");
+    std::fs::write(&hints, "m/\n").unwrap();
+    std::fs::write(
+        &trace,
+        r#"{"timestamp":"2026-05-19T00:00:00Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"a/1","last_key":"a/2"}
+{"timestamp":"2026-05-19T00:00:01Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"c/1","last_key":"c/2"}
+{"timestamp":"2026-05-19T00:00:02Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"e/1","last_key":"e/2"}
+{"timestamp":"2026-05-19T00:00:03Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"g/1","last_key":"g/2"}
+{"timestamp":"2026-05-19T00:00:04Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"i/1","last_key":"i/2"}
+{"timestamp":"2026-05-19T00:00:05Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":500,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":0,"segment_pages":5,"segment_objects":50,"segment_common_prefixes":0,"ended_by":"boundary","end_before":"m/"}
+{"timestamp":"2026-05-19T00:00:06Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":1,"segment_pages":1,"segment_objects":10,"segment_common_prefixes":0,"ended_by":"pagination","start_after":"m/"}
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "hints-rebalance",
+        "--trace",
+        trace.to_str().unwrap(),
+        "--hints-file",
+        hints.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--long-tail-ratio",
+        "2",
+        "--min-pages",
+        "2",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["added_boundaries"].as_array().unwrap().len(), 1);
+    assert_eq!(json["output_written"], true);
+
+    let rendered = std::fs::read_to_string(out).unwrap();
+    assert!(rendered.contains("e/2"));
+    assert!(rendered.contains("m/"));
 }

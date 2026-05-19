@@ -6,7 +6,7 @@
 //!   - [`StderrTraceWriter`] — stderr      (--debug-s3)
 //!   - [`NoopTraceWriter`]   — silent       (default)
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::Mutex;
 
@@ -16,7 +16,7 @@ use std::sync::Mutex;
 /// for JSONL output; optional fields use `skip_serializing_if`.
 ///
 /// Field count: additive schema; optional fields use `skip_serializing_if`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3CompatEvent {
     // ── request identity ──────────────────────────────────
     pub timestamp: String, // ISO 8601, wall-clock
@@ -67,6 +67,10 @@ pub struct S3CompatEvent {
     pub common_prefixes_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_continuation_token_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_key: Option<String>,
 
     // ── segment summary metadata ─────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +123,8 @@ impl S3CompatEvent {
             contents_count: None,
             common_prefixes_count: None,
             next_continuation_token_present: None,
+            first_key: None,
+            last_key: None,
             segment_index: None,
             end_before: None,
             segment_pages: None,
