@@ -93,7 +93,7 @@ struct Cli {
     no_auto_hints: bool,
 
     // ── S3-compatible observability flags ─────────────────
-    /// Delimiter for ListObjectsV2 (default: "/")
+    /// Delimiter for ListObjectsV2; default "/" lists top-level keys, use --delimiter '' for recursive full-bucket listing
     #[arg(long, default_value = "/", global = true)]
     delimiter: String,
 
@@ -741,6 +741,11 @@ fn main() {
         return;
     }
 
+    let run_warnings = runtime_guardrail_warnings(&cli, &cfg);
+    if !cli.agent {
+        print_runtime_warnings(&run_warnings);
+    }
+
     // Setup logging.
     let opt_log = cli.log || cfg.output.log_file.is_some();
     let loglevel = std::env::var("RUST_LOG").unwrap_or_else(|_| "s3_turbo_list=info".to_string());
@@ -1265,7 +1270,7 @@ fn main() {
                 }),
             )),
         ),
-        warnings: vec![],
+        warnings: run_warnings.clone(),
     };
 
     if let Some(path) = cli.run_manifest.as_deref() {
@@ -1848,7 +1853,7 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         cli.no_auto_hints,
     );
     let file_conflicts = agent::output_conflicts(&outputs);
-    let mut warnings = Vec::new();
+    let mut warnings = runtime_guardrail_warnings(cli, cfg);
     if matches!(cli.cmd, Commands::CompatProbe { .. }) {
         warnings.push(
             "compat-probe will contact the configured endpoint when not run with --dry-run"
@@ -1884,6 +1889,61 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         checkpoint: agent::checkpoint_plan(cli.resume, checkpoint_path, current_identity.as_ref()),
         file_conflicts,
         warnings,
+    }
+}
+
+fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if matches!(
+        cli.cmd,
+        Commands::List { .. }
+            | Commands::Diff { .. }
+            | Commands::AutoHints { .. }
+            | Commands::DiscoverPrefixes { .. }
+            | Commands::CompatProbe { .. }
+    ) {
+        if let Some(profile) = cfg
+            .s3
+            .profile
+            .as_deref()
+            .filter(|name| profiles::is_endpoint_preset_name(name))
+        {
+            if !credential_environment_signal_present() {
+                warnings.push(format!(
+                    "--profile '{}' is an endpoint compatibility preset only; credentials still come from AWS_PROFILE or the AWS SDK default credential chain. If '{}' is also your credentials profile name, set AWS_PROFILE={}.",
+                    profile, profile, profile
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+fn credential_environment_signal_present() -> bool {
+    [
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+    })
+}
+
+fn print_runtime_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("WARN {}", warning);
     }
 }
 

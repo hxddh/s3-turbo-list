@@ -13,14 +13,34 @@ To get started with s3-turbo-list:
 
 All release assets are published at the [GitHub releases page](https://github.com/hxddh/s3-turbo-list/releases).
 
+## 30-second first run
+
+After installing the binary and configuring credentials, run a local check,
+then dry-run the command before the real listing:
+
+```bash
+s3-turbo-list doctor --local-only --simple
+export AWS_PROFILE=default
+
+s3-turbo-list --dry-run --agent --output-dir out --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+
+s3-turbo-list --output-dir out --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+```
+
+`--delimiter ''` performs a recursive full-bucket object inventory.  The
+default delimiter is `/`, which is hierarchical and only returns top-level
+objects plus `CommonPrefixes`.
+
 ## Choose the correct binary
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.12-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.12-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.12-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.12-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.13-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.13-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.13-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.13-macos-x86_64` |
 
 To identify your platform:
 
@@ -56,8 +76,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.12-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.12-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.13-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.13-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -65,8 +85,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.12-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.12-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.13-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.13-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -78,18 +98,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.12-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.12-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.12-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.13-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.13-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.13-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.12-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.12-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.12-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.13-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.13-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.13-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -136,10 +156,10 @@ s3-turbo-list doctor --local-only --simple
 s3-turbo-list init-config --output s3-turbo-list.toml
 
 s3-turbo-list --dry-run --agent --output-dir out \
-  list --bucket my-bucket --region us-east-1
+  --delimiter '' list --bucket my-bucket --region us-east-1
 
 s3-turbo-list --output-dir out \
-  list --bucket my-bucket --region us-east-1
+  --delimiter '' list --bucket my-bucket --region us-east-1
 ```
 
 The s3-turbo-list `--profile` flag is for endpoint compatibility presets such
@@ -156,7 +176,7 @@ s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list recipes aws-basic
 
-s3-turbo-list --dry-run --agent --output-dir out list \
+s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
   --bucket my-bucket \
   --region us-east-1
 ```
@@ -183,6 +203,7 @@ mkdir -p out
 
 # The bos profile preset sets the BOS endpoint and virtual-hosted addressing.
 s3-turbo-list list \
+  --delimiter '' \
   --bucket your-bos-bucket \
   --region bj \
   --profile bos \
@@ -196,6 +217,7 @@ legacy compatibility or diagnostic checks:
 ```bash
 # Path-style (legacy / diagnostic only)
 s3-turbo-list list \
+  --delimiter '' \
   --bucket your-bos-bucket \
   --region bj \
   --profile bos \
@@ -225,6 +247,7 @@ First run:
 mkdir -p out
 
 s3-turbo-list list \
+  --delimiter '' \
   --bucket my-minio-bucket \
   --region us-east-1 \
   --profile minio \

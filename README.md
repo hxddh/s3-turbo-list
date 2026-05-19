@@ -64,7 +64,24 @@ See [INSTALL.md](INSTALL.md) for platform-specific installation and AWS S3 / BOS
 
 ## Quick start
 
-### Build
+### 30 seconds
+
+```bash
+# After installing the release binary:
+s3-turbo-list doctor --local-only --simple
+export AWS_PROFILE=default
+s3-turbo-list --dry-run --agent --output-dir out --delimiter '' \
+  list --region us-east-2 --bucket my-bucket
+s3-turbo-list --output-dir out --delimiter '' \
+  list --region us-east-2 --bucket my-bucket
+```
+
+`init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
+not contact S3 and do not edit AWS credentials. Use `AWS_PROFILE` for
+credentials; use `--profile` only for endpoint compatibility presets such as
+`minio`, `bos`, `r2`, `b2`, or `oss`.
+
+### Build from source
 
 ```bash
 cargo build
@@ -81,25 +98,24 @@ s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list quickstart aws
 ```
 
-`init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
-not contact S3 and do not edit AWS credentials. Use `AWS_PROFILE` for
-credentials; use `--profile` only for endpoint compatibility presets such as
-`minio`, `bos`, `r2`, `b2`, or `oss`.
-
 ### Basic list command
 
 ```bash
 # Dry-run first; does not contact S3
-s3-turbo-list --dry-run --agent --output-dir out \
+s3-turbo-list --dry-run --agent --output-dir out --delimiter '' \
   list --region us-east-2 --bucket my-bucket
 
 # Real run; creates out/ and writes Parquet + KeySpace files
-s3-turbo-list --output-dir out \
+s3-turbo-list --output-dir out --delimiter '' \
   list --region us-east-2 --bucket my-bucket
 
 # Limit parallelism
-cargo run -- list --region us-east-2 --bucket my-bucket --prefix logs/ -T 4 -c 20
+cargo run -- --delimiter '' list --region us-east-2 --bucket my-bucket --prefix logs/ -T 4 -c 20
 ```
+
+The default delimiter is `/`, which performs hierarchical listing and returns
+top-level objects plus `CommonPrefixes`.  Use `--delimiter ''` for a recursive
+full-bucket object inventory.
 
 Output files (auto-named):
 - `<region>_<bucket>_<timestamp>.parquet` — object listing
@@ -142,14 +158,14 @@ cat trace.jsonl | jq 'select(.s3_error_code != null)'
 
 ```bash
 # Standard listing
-s3-turbo-list list --region us-east-2 --bucket my-bucket
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket
 
 # With virtual-hosted addressing
-s3-turbo-list list --region us-east-2 --bucket my-bucket \
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --addressing-style virtual
 
 # Enable trace
-s3-turbo-list list --region us-east-2 --bucket my-bucket \
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
 ```
 
@@ -157,7 +173,7 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket \
 
 ```bash
 # Local MinIO
-s3-turbo-list list --bucket my-bucket \
+s3-turbo-list --delimiter '' list --bucket my-bucket \
   --endpoint-url http://localhost:9000 \
   --profile minio
 
@@ -179,7 +195,7 @@ s3-turbo-list profiles list
 s3-turbo-list profiles show r2 --json
 
 # Cloudflare R2 example; endpoint is account-specific
-s3-turbo-list list --bucket my-bucket \
+s3-turbo-list --delimiter '' list --bucket my-bucket \
   --endpoint-url https://<account-id>.r2.cloudflarestorage.com \
   --region auto \
   --profile r2
@@ -197,7 +213,7 @@ s3-turbo-list supports this with virtual-hosted addressing:
 
 ```bash
 # Virtual-hosted (recommended for BOS)
-s3-turbo-list list --region bj --bucket my-bos-bucket \
+s3-turbo-list --delimiter '' list --region bj --bucket my-bos-bucket \
   --profile bos
 ```
 
@@ -210,7 +226,7 @@ diagnostics, or controlled validation:
 
 ```bash
 # Path-style (legacy / diagnostic only)
-s3-turbo-list list --region bj --bucket my-bos-bucket \
+s3-turbo-list --delimiter '' list --region bj --bucket my-bos-bucket \
   --profile bos \
   --addressing-style path
 ```
@@ -219,11 +235,11 @@ s3-turbo-list list --region bj --bucket my-bos-bucket \
 
 ```bash
 # Write trace to file
-s3-turbo-list list --region us-east-2 --bucket my-bucket \
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
 
 # Stream trace events to stderr
-s3-turbo-list list --region us-east-2 --bucket my-bucket \
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --debug-s3
 ```
 

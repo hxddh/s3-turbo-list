@@ -641,6 +641,19 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
                     .to_string()
             }),
     });
+    if let Some(profile) = std::env::var("AWS_PROFILE")
+        .ok()
+        .filter(|value| profiles::is_endpoint_preset_name(value))
+    {
+        checks.push(DoctorCheck {
+            name: "aws_profile_endpoint_preset_name".to_string(),
+            status: "warn".to_string(),
+            message: format!(
+                "AWS_PROFILE={} also matches an endpoint compatibility preset name; verify this is your credentials profile, not a --profile value pasted into AWS_PROFILE",
+                profile
+            ),
+        });
+    }
     checks.push(DoctorCheck {
         name: "endpoint_profile".to_string(),
         status: match cfg.s3.profile.as_deref() {

@@ -110,6 +110,13 @@ pub fn get_profile(name: &str) -> Option<&'static EndpointProfile> {
         .find(|profile| profile.name.eq_ignore_ascii_case(name))
 }
 
+pub fn is_endpoint_preset_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "bos" | "minio" | "r2" | "b2" | "oss"
+    )
+}
+
 pub fn apply_profile_preset(cfg: &mut S3TurboConfig) -> Option<ProfileApplication> {
     let name = cfg.s3.profile.clone()?;
     let Some(profile) = get_profile(&name) else {

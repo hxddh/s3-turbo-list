@@ -13,7 +13,7 @@ s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list recipes agent-safe
-s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
@@ -46,6 +46,7 @@ Use `--plan-json` when stdout should stay quiet:
 ```bash
 s3-turbo-list --dry-run \
   --plan-json plan.json \
+  --delimiter '' \
   --output-parquet-file out/list.parquet \
   --output-ks-file out/list.ks \
   list --bucket my-bucket --region us-east-1
@@ -69,6 +70,10 @@ Agents should treat `network` as authoritative for dry-run behavior.  Current
 dry-run reports `none: dry-run only resolves local configuration and planned
 paths`.
 
+Agents should also inspect `warnings`.  For example, a warning that `--profile`
+is only an endpoint compatibility preset means credentials still come from
+`AWS_PROFILE` or the standard AWS SDK credential chain.
+
 When a hints file is present, `hints` includes parse status, format, boundary
 count, warnings, and estimate summary metadata.  When `--resume` is set and a
 checkpoint file exists, `checkpoint` reports parse status, completed/total
@@ -79,7 +84,7 @@ segments, and identity match details.
 For real listing runs, write a final manifest:
 
 ```bash
-s3-turbo-list --run-manifest run.json list \
+s3-turbo-list --run-manifest run.json --delimiter '' list \
   --bucket my-bucket \
   --region us-east-1 \
   --output-parquet-file out/list.parquet \
@@ -89,7 +94,7 @@ s3-turbo-list --run-manifest run.json list \
 With `--agent`, the same manifest is also printed to stdout at the end:
 
 ```bash
-s3-turbo-list --agent --run-manifest run.json list \
+s3-turbo-list --agent --run-manifest run.json --delimiter '' list \
   --bucket my-bucket \
   --region us-east-1
 ```
@@ -109,6 +114,9 @@ The manifest includes:
 The `metrics` object includes data-map counters such as received batches,
 received objects, streamed rows, unique prefixes, Parquet rows, KS entries,
 fatal listing errors, and output write errors.
+
+Run manifest `warnings` use the same guardrail wording as dry-run plans so
+agents can compare preflight and completed runs consistently.
 
 The `artifacts` array describes generated files:
 

@@ -7,7 +7,7 @@ BIN="${S3_TURBO_LIST_BIN:-cargo run --}"
 OUTDIR="${OUTDIR:-./artifacts/agent-dry-run}"
 BUCKET="${BUCKET:-example-bucket}"
 REGION="${REGION:-us-east-1}"
-PROFILE="${PROFILE:-default}"
+ENDPOINT_PROFILE="${ENDPOINT_PROFILE:-}"
 
 mkdir -p "$OUTDIR"
 
@@ -18,11 +18,15 @@ cmd=(
   --plan-json "$OUTDIR/plan.json"
   --output-parquet-file "$OUTDIR/list.parquet"
   --output-ks-file "$OUTDIR/list.ks"
+  --delimiter ''
   list
   --bucket "$BUCKET"
   --region "$REGION"
-  --profile "$PROFILE"
 )
+
+if [[ -n "$ENDPOINT_PROFILE" ]]; then
+  cmd+=(--profile "$ENDPOINT_PROFILE")
+fi
 
 printf 'Running local-only dry-run:\n'
 printf '  %q' "${cmd[@]}"

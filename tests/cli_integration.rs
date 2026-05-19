@@ -15,6 +15,52 @@ fn run_cli(args: &[&str]) -> (i32, String, String) {
     (exit_code, stdout, stderr)
 }
 
+fn run_cli_without_aws_env(args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    clear_aws_env(&mut cmd);
+    let output = cmd
+        .args(args)
+        .output()
+        .expect("failed to execute s3-turbo-list test binary");
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (exit_code, stdout, stderr)
+}
+
+fn run_cli_with_aws_profile(args: &[&str], profile: &str) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    clear_aws_env(&mut cmd);
+    let output = cmd
+        .env("AWS_PROFILE", profile)
+        .args(args)
+        .output()
+        .expect("failed to execute s3-turbo-list test binary");
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (exit_code, stdout, stderr)
+}
+
+fn clear_aws_env(cmd: &mut Command) {
+    for name in [
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    ] {
+        cmd.env_remove(name);
+    }
+}
+
 fn run_cli_in_dir(args: &[&str], cwd: &std::path::Path) -> (i32, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
         .current_dir(cwd)
@@ -49,6 +95,10 @@ fn test_cli_help_list() {
     assert!(
         stdout.contains("--bucket"),
         "list help should contain '--bucket'"
+    );
+    assert!(
+        stdout.contains("recursive full-bucket listing"),
+        "list help should explain recursive delimiter usage"
     );
 }
 
@@ -201,15 +251,18 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--output-dir"));
+    assert!(stdout.contains("--delimiter ''"));
 
     let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("AWS_PROFILE"));
     assert!(stdout.contains("--profile r2"));
+    assert!(stdout.contains("--delimiter ''"));
 
     let (code, stdout, stderr) = run_cli(&["cheatsheet"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("First run"));
+    assert!(stdout.contains("--delimiter ''"));
 }
 
 #[test]
@@ -273,6 +326,24 @@ fn test_cli_doctor_json_local_only_success() {
     assert!(checks
         .iter()
         .any(|check| check["name"] == "network" && check["status"] == "skipped"));
+}
+
+#[test]
+fn test_cli_doctor_warns_when_aws_profile_matches_endpoint_preset_name() {
+    let (code, stdout, stderr) =
+        run_cli_with_aws_profile(&["doctor", "--local-only", "--json"], "bos");
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    assert!(checks.iter().any(|check| {
+        check["name"] == "aws_profile_endpoint_preset_name"
+            && check["status"] == "warn"
+            && check["message"]
+                .as_str()
+                .unwrap()
+                .contains("endpoint compatibility preset name")
+    }));
 }
 
 #[test]
@@ -414,6 +485,31 @@ fn test_cli_dry_run_agent_stdout_json() {
         .as_str()
         .unwrap()
         .contains("auto-hints will scan S3 pages"));
+}
+
+#[test]
+fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--profile",
+        "bos",
+        "--agent",
+        "--dry-run",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "bj",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("--profile 'bos' is an endpoint compatibility preset only")
+    }));
 }
 
 #[test]

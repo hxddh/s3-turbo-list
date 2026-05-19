@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-05-19
+
+### Added
+- Runtime and dry-run warnings when an endpoint compatibility `--profile` such
+  as `bos`, `minio`, `r2`, `b2`, or `oss` may be confused with an AWS
+  credentials profile.
+- `doctor` hint when `AWS_PROFILE` is set to a name that also matches an
+  endpoint compatibility preset.
+
+### Changed
+- `list --help`, README, INSTALL, recipes, quickstart, and cheatsheet now make
+  the recursive full-bucket `--delimiter ''` path more visible while preserving
+  the existing default delimiter behavior.
+- Run manifests now include the same guardrail warnings exposed in dry-run
+  plans, giving agents a consistent preflight and post-run signal.
+
 ## [0.1.12] - 2026-05-19
 
 ### Added

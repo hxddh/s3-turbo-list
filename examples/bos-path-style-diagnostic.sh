@@ -10,7 +10,7 @@
 # Optional env vars:
 #   ENDPOINT_URL  — BOS endpoint (default: https://s3.bj.bcebos.com)
 #   REGION        — BOS region (default: bj)
-#   PROFILE       — profile name (default: bos)
+#   ENDPOINT_PROFILE — endpoint compatibility profile name (default: bos)
 #   OUTDIR        — output directory (default: ./artifacts/bos-path-style-diagnostic)
 #   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ set -euo pipefail
 : "${BUCKET:?set BUCKET to the BOS bucket name}"
 ENDPOINT_URL="${ENDPOINT_URL:-https://s3.bj.bcebos.com}"
 REGION="${REGION:-bj}"
-PROFILE="${PROFILE:-bos}"
+ENDPOINT_PROFILE="${ENDPOINT_PROFILE:-bos}"
 OUTDIR="${OUTDIR:-./artifacts/bos-path-style-diagnostic}"
 S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
@@ -34,9 +34,10 @@ echo "    Output: $OUTDIR/bos-path-style.parquet"
 echo "            $OUTDIR/bos-path-style.ks"
 
 $S3TL list \
+  --delimiter '' \
   --endpoint-url "$ENDPOINT_URL" \
   --region "$REGION" \
-  --profile "$PROFILE" \
+  --profile "$ENDPOINT_PROFILE" \
   --bucket "$BUCKET" \
   --addressing-style path \
   --output-parquet-file "$OUTDIR/bos-path-style.parquet" \

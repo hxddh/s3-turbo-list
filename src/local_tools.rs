@@ -343,7 +343,7 @@ pub fn render_init_config_text(report: &InitConfigReport) -> String {
     out.push_str("  s3-turbo-list doctor --local-only --simple\n");
     out.push_str("  s3-turbo-list --dry-run --agent --config ");
     out.push_str(&report.output);
-    out.push_str(" --output-dir out list --bucket my-bucket --region us-east-1\n");
+    out.push_str(" --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1\n");
     append_warnings_and_recommendations(&mut out, &report.warnings, &[]);
     out
 }
@@ -366,8 +366,8 @@ Run: s3-turbo-list recipes <name>
             r#"AWS basic:
   export AWS_PROFILE=default
   s3-turbo-list doctor --local-only --simple
-  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
-  s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
@@ -375,7 +375,7 @@ Run: s3-turbo-list recipes <name>
             r#"Large bucket:
   s3-turbo-list auto-hints --bucket my-bucket --region us-east-1 --sample-limit 1000000 -o hints.toml
   s3-turbo-list hints-validate --hints-file hints.toml --json
-  s3-turbo-list --output-dir out --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out --delimiter '' --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
   s3-turbo-list trace-summary out/trace.jsonl --machine-readable
 "#
             .to_string(),
@@ -384,7 +384,7 @@ Run: s3-turbo-list recipes <name>
             r#"Local MinIO:
   export AWS_ACCESS_KEY_ID=minioadmin
   export AWS_SECRET_ACCESS_KEY=minioadmin
-  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
@@ -392,7 +392,7 @@ Run: s3-turbo-list recipes <name>
             r#"Agent-safe local commands:
   s3-turbo-list config-inspect --json
   s3-turbo-list doctor --local-only --json
-  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list trace-summary trace.jsonl --machine-readable
 "#
             .to_string(),
@@ -410,8 +410,8 @@ pub fn render_cheatsheet() -> String {
 First run:
   s3-turbo-list doctor --local-only --simple
   s3-turbo-list init-config --output s3-turbo-list.toml
-  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
-  s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 
 Credentials vs endpoint profiles:
   export AWS_PROFILE=my-credentials-profile
@@ -435,9 +435,9 @@ pub fn render_quickstart(provider: &str) -> Result<String, String> {
 2. Check local setup:
    s3-turbo-list doctor --local-only --simple
 3. Dry-run:
-   s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 4. First list:
-   s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+   s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
@@ -447,7 +447,7 @@ pub fn render_quickstart(provider: &str) -> Result<String, String> {
    export AWS_ACCESS_KEY_ID=minioadmin
    export AWS_SECRET_ACCESS_KEY=minioadmin
 2. First list:
-   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out list --bucket my-bucket --region us-east-1
+   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
@@ -456,7 +456,7 @@ pub fn render_quickstart(provider: &str) -> Result<String, String> {
 1. Select credentials with AWS_PROFILE, not --profile:
    export AWS_PROFILE=my-r2-creds
 2. Use --profile r2 for endpoint compatibility defaults:
-   s3-turbo-list --profile r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com --output-dir out list --bucket my-bucket --region auto
+   s3-turbo-list --profile r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com --output-dir out --delimiter '' list --bucket my-bucket --region auto
 "#
             .to_string(),
         ),
@@ -465,7 +465,7 @@ pub fn render_quickstart(provider: &str) -> Result<String, String> {
 1. Select credentials with AWS_PROFILE, not --profile:
    export AWS_PROFILE=my-bos-creds
 2. Use virtual-hosted addressing:
-   s3-turbo-list --profile bos --addressing-style virtual --output-dir out list --bucket my-bucket --region bj
+   s3-turbo-list --profile bos --addressing-style virtual --output-dir out --delimiter '' list --bucket my-bucket --region bj
 3. For authoritative BOS output, prefer single-segment listing when service-side start_after + continuation-token compatibility matters.
 "#
             .to_string(),

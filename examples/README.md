@@ -60,6 +60,10 @@ export AWS_PROFILE=my-aws-profile
 The s3-turbo-list `--profile` flag is reserved for endpoint compatibility
 presets such as `minio`, `bos`, `r2`, `b2`, and `oss`.
 
+The basic list examples use `--delimiter ''` for recursive full-bucket object
+inventories.  Without that override, the default delimiter `/` performs
+hierarchical listing and returns top-level objects plus `CommonPrefixes`.
+
 ## Recommended order
 
 1. Read [`README.md`](../README.md) first — understand the tool.
