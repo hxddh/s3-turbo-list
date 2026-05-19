@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-05-19
+
+### Added
+- Local `init-config` command for writing starter TOML configs without touching
+  AWS credentials, shell configuration, or global files.
+- Local `recipes`, `quickstart`, and `cheatsheet` commands for concise beginner
+  and copy-paste workflows.
+- Global `--output-dir` shortcut for `list` and `diff` Parquet/KeySpace output
+  paths, with real runs creating the requested directory.
+- `doctor --simple` and `doctor --fix-suggestions` for compact local
+  diagnostics and next-step commands.
+- `--overwrite` for local generated config/hints outputs.
+
+### Changed
+- Successful human-mode runs now print a compact `Wrote:` summary with generated
+  output paths.
+- `doctor` now reports local config file presence, `AWS_PROFILE`, and endpoint
+  compatibility profile status.
+
 ## [0.1.11] - 2026-05-19
 
 ### Added

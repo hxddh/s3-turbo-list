@@ -10,7 +10,10 @@ These commands do not contact S3 endpoints:
 ```bash
 s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
-s3-turbo-list --dry-run --agent list --bucket my-bucket --region us-east-1
+s3-turbo-list doctor --local-only --simple --fix-suggestions
+s3-turbo-list init-config --output s3-turbo-list.toml
+s3-turbo-list recipes agent-safe
+s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
@@ -20,16 +23,21 @@ s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry
 CLI overrides, profile presets, and addressing-style normalization.
 
 `doctor --local-only --json` checks the binary version, current working
-directory, config parse status, local output parent directories, and explicitly
-marks network probing as skipped.
+directory, config parse status, local config file presence, `AWS_PROFILE`,
+endpoint compatibility profile status, local output parent directories, and
+explicitly marks network probing as skipped.  `doctor --simple` is intended for
+compact human output; agents should prefer `--json`.
 
 `--dry-run` resolves command inputs, planned output paths, hints source,
 checkpoint identity, output parent directories, and local file conflicts
 without creating Parquet/KS files and without making S3 requests.
+`--output-dir` is safe in dry-run: it plans Parquet/KS paths but does not create
+the directory until a real `list` or `diff` run.
 
-`trace-summary`, `hints-merge`, and `hints-rebalance` are local file tooling
-commands.  They are handled before S3 config loading, do not require cloud
-credentials, and do not change list/diff hot-path behavior.
+`init-config`, `recipes`, `quickstart`, `cheatsheet`, `trace-summary`,
+`hints-merge`, and `hints-rebalance` are local tooling commands.  They are
+handled before S3 config loading, do not require cloud credentials, and do not
+change list/diff hot-path behavior.
 
 ## Dry-run plan files
 

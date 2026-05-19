@@ -63,21 +63,27 @@ presets such as `minio`, `bos`, `r2`, `b2`, and `oss`.
 ## Recommended order
 
 1. Read [`README.md`](../README.md) first — understand the tool.
-2. Run **MinIO** locally (no cloud credentials needed):
+2. Run local preflight helpers:
+   ```bash
+   s3-turbo-list doctor --local-only --simple
+   s3-turbo-list recipes
+   s3-turbo-list quickstart aws
+   ```
+3. Run **MinIO** locally (no cloud credentials needed):
    ```bash
    # Start MinIO, create a bucket, then:
    BUCKET=my-test-bucket ./examples/minio-basic-list.sh
    ```
-3. Run **AWS S3** with an explicit bucket:
+4. Run **AWS S3** with an explicit bucket:
    ```bash
    BUCKET=my-real-bucket REGION=us-east-2 ./examples/aws-basic-list.sh
    ```
-4. Run **BOS** (virtual-hosted by default, as recommended by BOS):
+5. Run **BOS** (virtual-hosted by default, as recommended by BOS):
    ```bash
    BUCKET=my-bos-bucket ./examples/bos-basic-list.sh
    ```
-5. Explore **diff**, **checkpoint/resume**, **trace**, and **hints**.
-6. For a local-only throughput check, run `./scripts/benchmark-local.sh`
+6. Explore **diff**, **checkpoint/resume**, **trace**, and **hints**.
+7. For a local-only throughput check, run `./scripts/benchmark-local.sh`
    from the repository root.  It uses synthetic data and does not contact S3.
 
 ## BOS default guidance

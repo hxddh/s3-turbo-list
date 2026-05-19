@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long, global = true)]
     output_parquet_file: Option<String>,
 
+    /// Directory for default Parquet and KeySpace outputs
+    #[arg(long, global = true)]
+    output_dir: Option<String>,
+
     /// Resume from checkpoint
     #[arg(long, global = true)]
     resume: bool,
@@ -279,6 +283,10 @@ enum Commands {
         /// Write local tooling manifest JSON to this path
         #[arg(long)]
         emit_manifest: Option<String>,
+
+        /// Allow replacing an existing output hints file
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Summarize a local --trace-compat JSONL file without contacting S3
@@ -344,6 +352,44 @@ enum Commands {
         /// Write local tooling manifest JSON to this path
         #[arg(long)]
         emit_manifest: Option<String>,
+
+        /// Allow replacing an existing output hints file
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Write a starter local TOML config without contacting S3
+    InitConfig {
+        /// Endpoint compatibility profile template: aws, minio, r2, b2, oss, or bos
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Output config path
+        #[arg(short, long, default_value = "s3-turbo-list.toml")]
+        output: String,
+
+        /// Allow replacing an existing config file
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print concise command recipes without contacting S3
+    Recipes {
+        /// Recipe name, for example aws-basic, large-bucket, local-minio, or agent-safe
+        name: Option<String>,
+    },
+
+    /// Print a compact command cheatsheet without contacting S3
+    Cheatsheet,
+
+    /// Print provider-specific first-run steps without contacting S3
+    Quickstart {
+        /// Provider name: aws, minio, r2, or bos
+        provider: String,
     },
 
     /// Inspect resolved local config without contacting S3
@@ -362,6 +408,14 @@ enum Commands {
         /// Emit JSON report
         #[arg(long)]
         json: bool,
+
+        /// Emit compact OK/WARN/NEXT output
+        #[arg(long)]
+        simple: bool,
+
+        /// Include command suggestions for common local issues
+        #[arg(long)]
+        fix_suggestions: bool,
     },
 
     /// Show endpoint compatibility profiles without contacting S3
@@ -460,11 +514,13 @@ fn main() {
             json,
             machine_readable,
             emit_manifest,
+            overwrite,
         } => {
             run_hints_merge(
                 inputs,
                 output.as_deref(),
                 cli.dry_run,
+                *overwrite,
                 *output_format,
                 *json || *machine_readable || cli.agent,
                 emit_manifest.as_deref(),
@@ -496,12 +552,14 @@ fn main() {
             json,
             machine_readable,
             emit_manifest,
+            overwrite,
         } => {
             run_hints_rebalance(
                 trace,
                 hints_file,
                 output.as_deref(),
                 cli.dry_run,
+                *overwrite,
                 *max_new_boundaries,
                 *long_tail_ratio,
                 *min_pages,
@@ -510,6 +568,27 @@ fn main() {
                 *json || *machine_readable || cli.agent,
                 emit_manifest.as_deref(),
             );
+            return;
+        }
+        Commands::InitConfig {
+            profile,
+            output,
+            overwrite,
+            json,
+        } => {
+            run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
+            return;
+        }
+        Commands::Recipes { name } => {
+            run_recipes(name.as_deref());
+            return;
+        }
+        Commands::Cheatsheet => {
+            print!("{}", local_tools::render_cheatsheet());
+            return;
+        }
+        Commands::Quickstart { provider } => {
+            run_quickstart(provider);
             return;
         }
         _ => {}
@@ -549,6 +628,7 @@ fn main() {
     );
     cfg.apply_profile_preset();
     cfg.normalize_addressing_style();
+    apply_output_dir_defaults(&cli, &mut cfg);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -585,14 +665,24 @@ fn main() {
             }
             return;
         }
-        Commands::Doctor { local_only, json } => {
+        Commands::Doctor {
+            local_only,
+            json,
+            simple,
+            fix_suggestions,
+        } => {
             let report = agent::doctor_report(*local_only, &cfg);
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
+            } else if *simple {
+                print_doctor_simple(&report, *fix_suggestions);
             } else {
                 println!("Doctor status: {}", report.status);
                 for check in &report.checks {
                     println!("  {}: {} — {}", check.name, check.status, check.message);
+                }
+                if *fix_suggestions {
+                    print_doctor_suggestions(&report);
                 }
             }
             if report.status == "error" {
@@ -764,7 +854,11 @@ fn main() {
         }
         Commands::HintsMerge { .. }
         | Commands::TraceSummary { .. }
-        | Commands::HintsRebalance { .. } => {
+        | Commands::HintsRebalance { .. }
+        | Commands::InitConfig { .. }
+        | Commands::Recipes { .. }
+        | Commands::Cheatsheet
+        | Commands::Quickstart { .. } => {
             unreachable!("local tooling commands are handled before config load")
         }
         Commands::BenchmarkLocal { .. } => {
@@ -811,6 +905,7 @@ fn main() {
             )
         }
     });
+    ensure_output_dir(&cli);
 
     // Setup Ctrl-C handler
     let quit = Arc::new(AtomicBool::new(false));
@@ -1181,6 +1276,8 @@ fn main() {
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
+    } else if exit_code == agent::ExitCode::Success {
+        print_wrote_summary(&manifest.outputs);
     }
     if exit_code != agent::ExitCode::Success {
         std::process::exit(exit_code.code());
@@ -1207,15 +1304,52 @@ fn generate_man_page() {
     }
 }
 
+fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: bool) {
+    match local_tools::init_config(output, profile, overwrite) {
+        Ok(report) => {
+            if json {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                print!("{}", local_tools::render_init_config_text(&report));
+            }
+        }
+        Err(e) => {
+            eprintln!("Init config failed: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
+fn run_recipes(name: Option<&str>) {
+    match local_tools::render_recipe(name) {
+        Ok(rendered) => print!("{}", rendered),
+        Err(e) => {
+            eprintln!("Recipe error: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
+fn run_quickstart(provider: &str) {
+    match local_tools::render_quickstart(provider) {
+        Ok(rendered) => print!("{}", rendered),
+        Err(e) => {
+            eprintln!("Quickstart error: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
 fn run_hints_merge(
     inputs: &[String],
     output: Option<&str>,
     dry_run: bool,
+    overwrite: bool,
     output_format: ReportFormat,
     json: bool,
     emit_manifest: Option<&str>,
 ) {
-    match local_tools::merge_hints_files(inputs, output, dry_run) {
+    match local_tools::merge_hints_files(inputs, output, dry_run, overwrite) {
         Ok(report) => {
             if let Some(manifest_path) = emit_manifest {
                 let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
@@ -1268,6 +1402,7 @@ fn run_hints_rebalance(
     hints_file: &str,
     output: Option<&str>,
     dry_run: bool,
+    overwrite: bool,
     max_new_boundaries: usize,
     long_tail_ratio: f64,
     min_pages: u32,
@@ -1289,6 +1424,7 @@ fn run_hints_rebalance(
         max_new_boundaries,
         long_tail_ratio,
         min_pages,
+        overwrite,
     ) {
         Ok(report) => {
             if let Some(manifest_path) = emit_manifest {
@@ -1375,6 +1511,148 @@ fn run_profiles(cmd: &ProfileCommands) {
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
         },
+    }
+}
+
+fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
+    let Some(output_dir) = cli.output_dir.as_deref() else {
+        return;
+    };
+
+    match &cli.cmd {
+        Commands::List { region, bucket } => {
+            let stem = output_stem(region.as_deref(), bucket, None, None);
+            if cfg.output.parquet_file.is_none() {
+                cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
+            }
+            if cfg.output.ks_file.is_none() {
+                cfg.output.ks_file = Some(format!("{}/{}.ks", output_dir, stem));
+            }
+        }
+        Commands::Diff {
+            region,
+            bucket,
+            target_region,
+            target_bucket,
+        } => {
+            let stem = output_stem(
+                region.as_deref(),
+                bucket,
+                target_region.as_deref(),
+                Some(target_bucket),
+            );
+            if cfg.output.parquet_file.is_none() {
+                cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
+            }
+            if cfg.output.ks_file.is_none() {
+                cfg.output.ks_file = Some(format!("{}/{}.ks", output_dir, stem));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn output_stem(
+    region: Option<&str>,
+    bucket: &str,
+    target_region: Option<&str>,
+    target_bucket: Option<&String>,
+) -> String {
+    let now = Local::now().format("%Y%m%d%H%M%S");
+    let mut parts = Vec::new();
+    if let Some(region) = region.filter(|r| !r.is_empty()) {
+        parts.push(sanitize_path_component(region));
+    }
+    parts.push(sanitize_path_component(bucket));
+    if let Some(target_region) = target_region.filter(|r| !r.is_empty()) {
+        parts.push(sanitize_path_component(target_region));
+    }
+    if let Some(target_bucket) = target_bucket {
+        parts.push(sanitize_path_component(target_bucket));
+    }
+    parts.push(now.to_string());
+    parts.join("_")
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn ensure_output_dir(cli: &Cli) {
+    if cli.dry_run {
+        return;
+    }
+    if let Some(dir) = cli.output_dir.as_deref() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("Output directory error: failed to create '{}': {}", dir, e);
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
+    }
+}
+
+fn print_wrote_summary(outputs: &agent::OutputPathSummary) {
+    println!("Wrote:");
+    if let Some(path) = &outputs.parquet_file {
+        println!("  Parquet: {}", path);
+    }
+    if let Some(path) = &outputs.ks_file {
+        println!("  KeySpace: {}", path);
+    }
+    if let Some(path) = &outputs.hints_file {
+        println!("  Hints: {}", path);
+    }
+    if let Some(path) = &outputs.trace_compat {
+        println!("  Trace: {}", path);
+    }
+    if let Some(path) = &outputs.log_file {
+        println!("  Log: {}", path);
+    }
+}
+
+fn print_doctor_simple(report: &agent::DoctorReport, fix_suggestions: bool) {
+    for check in &report.checks {
+        let label = match check.status.as_str() {
+            "ok" => "OK",
+            "warn" => "WARN",
+            "error" => "ERROR",
+            "skipped" => "SKIP",
+            _ => "INFO",
+        };
+        println!("{} {}: {}", label, check.name, check.message);
+    }
+    if fix_suggestions {
+        print_doctor_suggestions(report);
+    }
+}
+
+fn print_doctor_suggestions(report: &agent::DoctorReport) {
+    for check in &report.checks {
+        match check.name.as_str() {
+            "aws_profile" if check.status == "warn" => {
+                println!("NEXT export AWS_PROFILE=default");
+            }
+            name if name.ends_with("_parent") && check.status == "error" => {
+                if let Some(path) = check
+                    .message
+                    .strip_prefix("parent directory does not exist: ")
+                {
+                    println!("NEXT mkdir -p {}", path);
+                }
+            }
+            "endpoint_profile" if check.status == "warn" => {
+                println!("NEXT s3-turbo-list profiles list");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1671,6 +1949,10 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None),
         Commands::TraceSummary { .. } => ("trace-summary".to_string(), None, None, None, None),
         Commands::HintsRebalance { .. } => ("hints-rebalance".to_string(), None, None, None, None),
+        Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None),
+        Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None),
+        Commands::Cheatsheet => ("cheatsheet".to_string(), None, None, None, None),
+        Commands::Quickstart { .. } => ("quickstart".to_string(), None, None, None, None),
         Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
         Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None),

@@ -5,6 +5,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactSummary {
@@ -38,6 +39,16 @@ pub struct HintsMergeReport {
     pub output: Option<String>,
     pub output_written: bool,
     pub dry_run: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InitConfigReport {
+    pub status: String,
+    pub profile: String,
+    pub output: String,
+    pub output_written: bool,
+    pub overwrite: bool,
     pub warnings: Vec<String>,
 }
 
@@ -119,6 +130,7 @@ pub fn merge_hints_files(
     inputs: &[String],
     output: Option<&str>,
     dry_run: bool,
+    overwrite: bool,
 ) -> Result<HintsMergeReport, String> {
     if inputs.is_empty() {
         return Err("hints-merge requires at least one input file".to_string());
@@ -143,7 +155,7 @@ pub fn merge_hints_files(
         if dry_run {
             false
         } else {
-            write_hints_cache(path, "merged", None, all.clone(), Some(inputs))?;
+            write_hints_cache(path, "merged", None, all.clone(), Some(inputs), overwrite)?;
             true
         }
     } else {
@@ -176,6 +188,7 @@ pub fn rebalance_hints(
     max_new_boundaries: usize,
     long_tail_ratio: f64,
     min_pages: u32,
+    overwrite: bool,
 ) -> Result<HintsRebalanceReport, String> {
     let analysis = analyze_trace(trace_path)?;
     let original = hints::parse_hints_file(hints_path)?;
@@ -248,6 +261,7 @@ pub fn rebalance_hints(
                 None,
                 new_boundaries.clone(),
                 Some(&[hints_path.to_string(), trace_path.to_string()]),
+                overwrite,
             )?;
             true
         }
@@ -285,6 +299,182 @@ pub fn rebalance_hints(
         warnings,
         recommendations,
     })
+}
+
+pub fn init_config(
+    output: &str,
+    profile: Option<&str>,
+    overwrite: bool,
+) -> Result<InitConfigReport, String> {
+    ensure_can_write(output, overwrite)?;
+    let profile_name = profile.unwrap_or("aws").to_lowercase();
+    let warnings = init_config_warnings(&profile_name);
+    let rendered = init_config_template(&profile_name);
+    if let Some(parent) = Path::new(output)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory '{}': {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    std::fs::write(output, rendered)
+        .map_err(|e| format!("failed to write config '{}': {}", output, e))?;
+    Ok(InitConfigReport {
+        status: "success".to_string(),
+        profile: profile_name,
+        output: output.to_string(),
+        output_written: true,
+        overwrite,
+        warnings,
+    })
+}
+
+pub fn render_init_config_text(report: &InitConfigReport) -> String {
+    let mut out = String::new();
+    out.push_str("Config initialized:\n");
+    out.push_str(&format!("  Profile:         {}\n", report.profile));
+    out.push_str(&format!("  Output:          {}\n", report.output));
+    out.push_str("Next:\n");
+    out.push_str("  s3-turbo-list doctor --local-only --simple\n");
+    out.push_str("  s3-turbo-list --dry-run --agent --config ");
+    out.push_str(&report.output);
+    out.push_str(" --output-dir out list --bucket my-bucket --region us-east-1\n");
+    append_warnings_and_recommendations(&mut out, &report.warnings, &[]);
+    out
+}
+
+pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
+    let name = name.unwrap_or("index");
+    match name {
+        "index" | "list" => Ok(
+            r#"Available recipes:
+  aws-basic      Minimal AWS S3 dry-run and list
+  large-bucket   Hints, trace, and output-dir workflow
+  local-minio    Local MinIO endpoint example
+  agent-safe     Local-only agent/CI commands
+
+Run: s3-turbo-list recipes <name>
+"#
+            .to_string(),
+        ),
+        "aws-basic" => Ok(
+            r#"AWS basic:
+  export AWS_PROFILE=default
+  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+"#
+            .to_string(),
+        ),
+        "large-bucket" => Ok(
+            r#"Large bucket:
+  s3-turbo-list auto-hints --bucket my-bucket --region us-east-1 --sample-limit 1000000 -o hints.toml
+  s3-turbo-list hints-validate --hints-file hints.toml --json
+  s3-turbo-list --output-dir out --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
+  s3-turbo-list trace-summary out/trace.jsonl --machine-readable
+"#
+            .to_string(),
+        ),
+        "local-minio" => Ok(
+            r#"Local MinIO:
+  export AWS_ACCESS_KEY_ID=minioadmin
+  export AWS_SECRET_ACCESS_KEY=minioadmin
+  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out list --bucket my-bucket --region us-east-1
+"#
+            .to_string(),
+        ),
+        "agent-safe" => Ok(
+            r#"Agent-safe local commands:
+  s3-turbo-list config-inspect --json
+  s3-turbo-list doctor --local-only --json
+  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list trace-summary trace.jsonl --machine-readable
+"#
+            .to_string(),
+        ),
+        other => Err(format!(
+            "unknown recipe '{}'. Run 's3-turbo-list recipes' to list recipes.",
+            other
+        )),
+    }
+}
+
+pub fn render_cheatsheet() -> String {
+    r#"s3-turbo-list cheatsheet
+
+First run:
+  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list init-config --output s3-turbo-list.toml
+  s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+
+Credentials vs endpoint profiles:
+  export AWS_PROFILE=my-credentials-profile
+  s3-turbo-list --profile r2 ...
+
+Useful local commands:
+  s3-turbo-list profiles list
+  s3-turbo-list hints-validate --hints-file hints.toml --json
+  s3-turbo-list trace-summary trace.jsonl --machine-readable
+  s3-turbo-list recipes large-bucket
+"#
+    .to_string()
+}
+
+pub fn render_quickstart(provider: &str) -> Result<String, String> {
+    match provider {
+        "aws" => Ok(
+            r#"AWS quickstart:
+1. Set credentials:
+   export AWS_PROFILE=default
+2. Check local setup:
+   s3-turbo-list doctor --local-only --simple
+3. Dry-run:
+   s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+4. First list:
+   s3-turbo-list --output-dir out list --bucket my-bucket --region us-east-1
+"#
+            .to_string(),
+        ),
+        "minio" => Ok(
+            r#"MinIO quickstart:
+1. Set local credentials:
+   export AWS_ACCESS_KEY_ID=minioadmin
+   export AWS_SECRET_ACCESS_KEY=minioadmin
+2. First list:
+   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out list --bucket my-bucket --region us-east-1
+"#
+            .to_string(),
+        ),
+        "r2" => Ok(
+            r#"Cloudflare R2 quickstart:
+1. Select credentials with AWS_PROFILE, not --profile:
+   export AWS_PROFILE=my-r2-creds
+2. Use --profile r2 for endpoint compatibility defaults:
+   s3-turbo-list --profile r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com --output-dir out list --bucket my-bucket --region auto
+"#
+            .to_string(),
+        ),
+        "bos" => Ok(
+            r#"BOS quickstart:
+1. Select credentials with AWS_PROFILE, not --profile:
+   export AWS_PROFILE=my-bos-creds
+2. Use virtual-hosted addressing:
+   s3-turbo-list --profile bos --addressing-style virtual --output-dir out list --bucket my-bucket --region bj
+3. For authoritative BOS output, prefer single-segment listing when service-side start_after + continuation-token compatibility matters.
+"#
+            .to_string(),
+        ),
+        other => Err(format!(
+            "unknown quickstart '{}'. Valid values: aws, minio, r2, bos.",
+            other
+        )),
+    }
 }
 
 pub fn render_trace_summary_text(report: &TraceSummaryReport) -> String {
@@ -596,7 +786,9 @@ fn write_hints_cache(
     region: Option<String>,
     boundaries: Vec<String>,
     sources: Option<&[String]>,
+    overwrite: bool,
 ) -> Result<(), String> {
+    ensure_can_write(path, overwrite)?;
     let cache = HintsCache {
         bucket: bucket.to_string(),
         region,
@@ -619,7 +811,102 @@ fn write_hints_cache(
     };
     let rendered = toml::to_string_pretty(&cache)
         .map_err(|e| format!("failed to serialize hints TOML: {}", e))?;
+    if let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory '{}': {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
     std::fs::write(path, rendered).map_err(|e| format!("failed to write '{}': {}", path, e))
+}
+
+fn ensure_can_write(path: &str, overwrite: bool) -> Result<(), String> {
+    if !overwrite && Path::new(path).exists() {
+        return Err(format!(
+            "Output file exists: {}\nNext step:\n  choose a different --output\n  or pass --overwrite",
+            path
+        ));
+    }
+    Ok(())
+}
+
+fn init_config_warnings(profile: &str) -> Vec<String> {
+    match profile {
+        "bos" => vec![
+            "BOS profile is a compatibility preset; it does not enable BOS pagination workarounds"
+                .to_string(),
+        ],
+        "oss" | "r2" | "b2" => vec![format!(
+            "{} profile is documented but should be validated with compat-probe before production use",
+            profile
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn init_config_template(profile: &str) -> String {
+    let (endpoint, addressing, force_path) = match profile {
+        "minio" => ("http://127.0.0.1:9000", "path", "true"),
+        "r2" => (
+            "https://<account-id>.r2.cloudflarestorage.com",
+            "virtual",
+            "false",
+        ),
+        "b2" => ("https://s3.<region>.backblazeb2.com", "virtual", "false"),
+        "oss" => ("https://oss-<region>.aliyuncs.com", "virtual", "false"),
+        "bos" => ("https://s3.<region>.bcebos.com", "virtual", "false"),
+        _ => ("", "auto", "false"),
+    };
+    let endpoint_line = if endpoint.is_empty() {
+        "# endpoint_url = \"https://s3.amazonaws.com\"".to_string()
+    } else {
+        format!("endpoint_url = \"{}\"", endpoint)
+    };
+    let profile_line = if profile == "aws" {
+        "# profile = \"aws\"".to_string()
+    } else {
+        format!("profile = \"{}\"", profile)
+    };
+    format!(
+        r#"# s3-turbo-list local config
+# AWS credentials are selected with AWS_PROFILE or the standard AWS SDK chain.
+# The s3-turbo-list `profile` below is an endpoint compatibility profile.
+
+[runtime]
+worker_threads = 10
+max_concurrency = 100
+
+[s3]
+{endpoint_line}
+{profile_line}
+addressing_style = "{addressing}"
+force_path_style = {force_path}
+max_attempts = 10
+initial_backoff_secs = 30
+connect_timeout_secs = 60
+operation_timeout_secs = 5
+
+[output]
+row_group_size = 10000
+compression = "gzip"
+compression_level = 6
+
+[auto_hints]
+sample_threshold = 10000
+max_prefix_depth = 5
+min_segment_size = 1000
+max_prefix_entries = 1000000
+
+[channel]
+capacity = 64
+"#
+    )
 }
 
 fn append_warnings_and_recommendations(out: &mut String, warnings: &[String], recs: &[String]) {

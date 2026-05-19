@@ -50,6 +50,7 @@ independent segments, runs them in parallel, and assembles the result.
 | **Checkpoint / resume** | Interrupted scans resume from last-saved segment. Identity-verified to prevent mismatches. |
 | **Diff mode** | Bi-directional diff between two buckets with per-object DiffFlag. Equal rows optionally included. |
 | **Agent-friendly JSON** | Local dry-run plans, config inspection, doctor checks, stable exit codes, and run manifests for automation. |
+| **Beginner-friendly local UX** | `init-config`, `quickstart`, `recipes`, `cheatsheet`, `--output-dir`, and compact `doctor` output. |
 | **Local protocol harness** | Integration-test-only S3 mock verifies protocol correctness without contacting real cloud endpoints. |
 | **Endpoint validation workflow** | Compat-probe → listing → trace review. Documented in `docs/validation-results/`. |
 
@@ -72,11 +73,29 @@ cargo build
 cargo build --release
 ```
 
+### First local preflight
+
+```bash
+s3-turbo-list doctor --local-only --simple
+s3-turbo-list init-config --output s3-turbo-list.toml
+s3-turbo-list quickstart aws
+```
+
+`init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
+not contact S3 and do not edit AWS credentials. Use `AWS_PROFILE` for
+credentials; use `--profile` only for endpoint compatibility presets such as
+`minio`, `bos`, `r2`, `b2`, or `oss`.
+
 ### Basic list command
 
 ```bash
-# List a bucket with default settings
-cargo run -- list --region us-east-2 --bucket my-bucket
+# Dry-run first; does not contact S3
+s3-turbo-list --dry-run --agent --output-dir out \
+  list --region us-east-2 --bucket my-bucket
+
+# Real run; creates out/ and writes Parquet + KeySpace files
+s3-turbo-list --output-dir out \
+  list --region us-east-2 --bucket my-bucket
 
 # Limit parallelism
 cargo run -- list --region us-east-2 --bucket my-bucket --prefix logs/ -T 4 -c 20
@@ -261,6 +280,14 @@ s3-turbo-list hints-rebalance \
 These commands parse local files only.  They do not alter `list`/`diff`
 concurrency, do not add S3 requests, and do not enable provider-specific
 pagination workarounds.
+
+For concise local help:
+
+```bash
+s3-turbo-list recipes
+s3-turbo-list recipes large-bucket
+s3-turbo-list cheatsheet
+```
 
 ### Local benchmark and CLI docs
 
@@ -571,5 +598,6 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Local S3 protocol mock | Local correctness harness for ListObjectsV2, compat-probe, retry, and checkpoint/resume |
 | ✅ Done | Hints correctness / prefix discovery | Boundary key correctness, `--no-auto-hints`, prefix-scoped auto-hints, CommonPrefixes discovery |
 | ✅ Done | Trace-driven hints tooling | Local hints merge, trace summary, conservative rebalance, and agent-readable manifests |
+| ✅ Done | Beginner-friendly local UX | init-config, quickstart, recipes, cheatsheet, output-dir, doctor simple output |
 | 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
 | 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |

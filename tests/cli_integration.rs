@@ -125,6 +125,18 @@ fn test_cli_help_agent_local_commands() {
     assert_eq!(code, 0, "benchmark-local --help should exit 0");
     assert!(stdout.contains("--objects"));
 
+    let (code, stdout, _stderr) = run_cli(&["init-config", "--help"]);
+    assert_eq!(code, 0, "init-config --help should exit 0");
+    assert!(stdout.contains("--overwrite"));
+
+    let (code, stdout, _stderr) = run_cli(&["recipes", "--help"]);
+    assert_eq!(code, 0, "recipes --help should exit 0");
+    assert!(stdout.contains("Recipe name"));
+
+    let (code, stdout, _stderr) = run_cli(&["quickstart", "--help"]);
+    assert_eq!(code, 0, "quickstart --help should exit 0");
+    assert!(stdout.contains("Provider name"));
+
     let (code, stdout, _stderr) = run_cli(&["trace-summary", "--help"]);
     assert_eq!(code, 0, "trace-summary --help should exit 0");
     assert!(stdout.contains("--machine-readable"));
@@ -148,6 +160,104 @@ fn test_cli_config_inspect_json_success() {
     assert_eq!(json["status"], "ok");
     assert!(json["resolved_config"]["runtime"]["worker_threads"].is_number());
     assert!(json["resolved_config"]["s3"]["addressing_style"].is_string());
+}
+
+#[test]
+fn test_cli_init_config_writes_and_requires_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s3-turbo-list.toml");
+
+    let (code, stdout, stderr) = run_cli(&[
+        "init-config",
+        "--profile",
+        "minio",
+        "--output",
+        path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["profile"], "minio");
+    let rendered = std::fs::read_to_string(&path).unwrap();
+    assert!(rendered.contains("profile = \"minio\""));
+    assert!(rendered.contains("AWS_PROFILE"));
+
+    let (code, _stdout, stderr) = run_cli(&["init-config", "--output", path.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Output file exists"));
+
+    let (code, _stdout, stderr) = run_cli(&[
+        "init-config",
+        "--output",
+        path.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert_eq!(code, 0, "stderr: {}", stderr);
+}
+
+#[test]
+fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
+    let (code, stdout, stderr) = run_cli(&["recipes", "aws-basic"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("--dry-run"));
+    assert!(stdout.contains("--output-dir"));
+
+    let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("AWS_PROFILE"));
+    assert!(stdout.contains("--profile r2"));
+
+    let (code, stdout, stderr) = run_cli(&["cheatsheet"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("First run"));
+}
+
+#[test]
+fn test_cli_output_dir_dry_run_plans_paths_without_creating_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    assert!(!out.exists());
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--agent",
+            "--output-dir",
+            out.to_str().unwrap(),
+            "list",
+            "--bucket",
+            "my-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(!out.exists(), "dry-run must not create output-dir");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let parquet = json["outputs"]["parquet_file"].as_str().unwrap();
+    let ks = json["outputs"]["ks_file"].as_str().unwrap();
+    assert!(parquet.starts_with(out.to_str().unwrap()));
+    assert!(parquet.ends_with(".parquet"));
+    assert!(ks.starts_with(out.to_str().unwrap()));
+    assert!(ks.ends_with(".ks"));
+}
+
+#[test]
+fn test_cli_doctor_simple_fix_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_parent = dir.path().join("missing").join("out.parquet");
+    let (code, stdout, stderr) = run_cli(&[
+        "--output-parquet-file",
+        missing_parent.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+        "--simple",
+        "--fix-suggestions",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("ERROR output_parquet_parent"));
+    assert!(stdout.contains("NEXT mkdir -p"));
 }
 
 #[test]
@@ -545,7 +655,7 @@ generated_at = "2026-05-19T00:00:00Z"
     assert_eq!(json["duplicate_count"], 1);
     assert_eq!(json["output_written"], true);
 
-    let merged = std::fs::read_to_string(out).unwrap();
+    let merged = std::fs::read_to_string(&out).unwrap();
     assert!(merged.contains("logs/a/"));
     assert!(merged.contains("logs/b/"));
     assert!(merged.contains("logs/c/"));
@@ -554,6 +664,15 @@ generated_at = "2026-05-19T00:00:00Z"
         serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
     assert_eq!(manifest_json["command"], "hints-merge");
     assert_eq!(manifest_json["outputs"].as_array().unwrap().len(), 1);
+
+    let (code, _stdout, stderr) = run_cli(&[
+        "hints-merge",
+        a.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Output file exists"));
 }
 
 #[test]

@@ -606,6 +606,61 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
         message: "resolved configuration is valid TOML/CLI state".to_string(),
     });
     checks.push(DoctorCheck {
+        name: "config_file".to_string(),
+        status: if Path::new("./s3-turbo-list.toml").exists() {
+            "ok"
+        } else {
+            "warn"
+        }
+        .to_string(),
+        message: if Path::new("./s3-turbo-list.toml").exists() {
+            "local s3-turbo-list.toml exists".to_string()
+        } else {
+            "local s3-turbo-list.toml not found; run init-config if you want a starter config"
+                .to_string()
+        },
+    });
+    checks.push(DoctorCheck {
+        name: "aws_profile".to_string(),
+        status: if std::env::var("AWS_PROFILE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            "ok"
+        } else {
+            "warn"
+        }
+        .to_string(),
+        message: std::env::var("AWS_PROFILE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("AWS_PROFILE={}", v))
+            .unwrap_or_else(|| {
+                "AWS_PROFILE is not set; the AWS SDK will use its default credential chain"
+                    .to_string()
+            }),
+    });
+    checks.push(DoctorCheck {
+        name: "endpoint_profile".to_string(),
+        status: match cfg.s3.profile.as_deref() {
+            Some(name) if profiles::get_profile(name).is_some() => "ok",
+            Some(_) => "warn",
+            None => "ok",
+        }
+        .to_string(),
+        message: match cfg.s3.profile.as_deref() {
+            Some(name) if profiles::get_profile(name).is_some() => {
+                format!("endpoint compatibility profile '{}' is known", name)
+            }
+            Some(name) => format!(
+                "endpoint compatibility profile '{}' is unknown; this is not an AWS credentials profile",
+                name
+            ),
+            None => "no endpoint compatibility profile selected".to_string(),
+        },
+    });
+    checks.push(DoctorCheck {
         name: "network".to_string(),
         status: if local_only { "skipped" } else { "warn" }.to_string(),
         message: if local_only {
