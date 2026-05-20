@@ -1,6 +1,8 @@
 use crate::auto_hints::{HintsCache, SegmentEstimate};
 use crate::hints;
+use crate::profiles;
 use crate::trace::S3CompatEvent;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -167,6 +169,9 @@ pub struct ManifestArtifactSummary {
     pub path: String,
     pub exists: bool,
     pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub parquet_row_count: Option<i64>,
+    pub parquet_schema_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -391,7 +396,10 @@ pub fn init_config(
     })
 }
 
-pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
+pub fn manifest_summary(
+    path: &str,
+    verify_artifacts: bool,
+) -> Result<ManifestSummaryReport, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read manifest '{}': {}", path, e))?;
     let value: serde_json::Value = serde_json::from_str(&raw)
@@ -430,6 +438,22 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     size_bytes: item.get("size_bytes").and_then(|v| v.as_u64()),
+                    sha256: json_string(item, "sha256"),
+                    parquet_row_count: item
+                        .get("parquet")
+                        .and_then(|v| v.get("row_count"))
+                        .and_then(|v| v.as_i64()),
+                    parquet_schema_fields: item
+                        .get("parquet")
+                        .and_then(|v| v.get("schema_fields"))
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
                 .collect()
         })
@@ -444,6 +468,7 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
         streamed_rows,
         parquet_rows,
         &artifacts,
+        verify_artifacts,
     );
     let check_passed = checks.iter().all(|check| check.status != "fail");
 
@@ -543,6 +568,7 @@ fn manifest_checks(
     streamed_rows: u64,
     parquet_rows: u64,
     artifacts: &[ManifestArtifactSummary],
+    verify_artifacts: bool,
 ) -> Vec<ManifestCheck> {
     let mut checks = Vec::new();
     checks.push(ManifestCheck {
@@ -615,9 +641,121 @@ fn manifest_checks(
                 artifact.path, artifact.exists, current_exists
             ),
         });
+
+        if !verify_artifacts || !current_exists {
+            continue;
+        }
+
+        if let Some(recorded_size) = artifact.size_bytes {
+            let current_size = std::fs::metadata(&artifact.path).ok().map(|m| m.len());
+            checks.push(ManifestCheck {
+                name: format!("artifact_size:{}", artifact.kind),
+                status: if current_size == Some(recorded_size) {
+                    "ok"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                message: format!(
+                    "{} recorded_size={} current_size={}",
+                    artifact.path,
+                    recorded_size,
+                    current_size
+                        .map(|size| size.to_string())
+                        .unwrap_or_else(|| "missing".to_string())
+                ),
+            });
+        }
+
+        if let Some(recorded_sha256) = artifact.sha256.as_deref() {
+            let current_sha256 = sha256_file(&artifact.path).ok();
+            checks.push(ManifestCheck {
+                name: format!("artifact_sha256:{}", artifact.kind),
+                status: if current_sha256.as_deref() == Some(recorded_sha256) {
+                    "ok"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                message: format!(
+                    "{} recorded_sha256={} current_sha256={}",
+                    artifact.path,
+                    recorded_sha256,
+                    current_sha256.unwrap_or_else(|| "unavailable".to_string())
+                ),
+            });
+        }
+
+        if artifact.kind == "parquet"
+            && (artifact.parquet_row_count.is_some() || !artifact.parquet_schema_fields.is_empty())
+        {
+            match current_parquet_summary(&artifact.path) {
+                Ok(current) => {
+                    if let Some(recorded_rows) = artifact.parquet_row_count {
+                        checks.push(ManifestCheck {
+                            name: "artifact_parquet_rows:parquet".to_string(),
+                            status: if current.row_count == recorded_rows {
+                                "ok"
+                            } else {
+                                "fail"
+                            }
+                            .to_string(),
+                            message: format!(
+                                "{} recorded_rows={} current_rows={}",
+                                artifact.path, recorded_rows, current.row_count
+                            ),
+                        });
+                    }
+                    if !artifact.parquet_schema_fields.is_empty() {
+                        checks.push(ManifestCheck {
+                            name: "artifact_parquet_schema:parquet".to_string(),
+                            status: if current.schema_fields == artifact.parquet_schema_fields {
+                                "ok"
+                            } else {
+                                "fail"
+                            }
+                            .to_string(),
+                            message: format!(
+                                "{} recorded_schema={:?} current_schema={:?}",
+                                artifact.path,
+                                artifact.parquet_schema_fields,
+                                current.schema_fields
+                            ),
+                        });
+                    }
+                }
+                Err(e) => checks.push(ManifestCheck {
+                    name: "artifact_parquet_metadata:parquet".to_string(),
+                    status: "fail".to_string(),
+                    message: format!("{} metadata read failed: {}", artifact.path, e),
+                }),
+            }
+        }
     }
 
     checks
+}
+
+struct CurrentParquetSummary {
+    row_count: i64,
+    schema_fields: Vec<String>,
+}
+
+fn current_parquet_summary(path: &str) -> Result<CurrentParquetSummary, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = SerializedFileReader::new(file).map_err(|e| e.to_string())?;
+    let metadata = reader.metadata();
+    let schema_fields = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+    Ok(CurrentParquetSummary {
+        row_count: metadata.file_metadata().num_rows(),
+        schema_fields,
+    })
 }
 
 pub fn render_init_config_text(report: &InitConfigReport) -> String {
@@ -1274,17 +1412,23 @@ fn init_config_warnings(profile: &str) -> Vec<String> {
 }
 
 fn init_config_template(profile: &str) -> String {
-    let (endpoint, addressing, force_path) = match profile {
-        "minio" => ("http://127.0.0.1:9000", "path", "true"),
-        "r2" => (
-            "https://<account-id>.r2.cloudflarestorage.com",
-            "virtual",
-            "false",
-        ),
-        "b2" => ("https://s3.<region>.backblazeb2.com", "virtual", "false"),
-        "oss" => ("https://oss-<region>.aliyuncs.com", "virtual", "false"),
-        "bos" => ("https://s3.<region>.bcebos.com", "virtual", "false"),
-        _ => ("", "auto", "false"),
+    let endpoint = match profile {
+        "minio" => "http://127.0.0.1:9000",
+        "r2" => "https://<account-id>.r2.cloudflarestorage.com",
+        "b2" => "https://s3.<region>.backblazeb2.com",
+        "oss" => "https://oss-<region>.aliyuncs.com",
+        "bos" => "https://s3.<region>.bcebos.com",
+        _ => "",
+    };
+    let (addressing, force_path) = if let Some(profile) = profiles::get_profile(profile) {
+        let addressing = profile.recommended_addressing_style.to_string();
+        let force_path = matches!(
+            profile.recommended_addressing_style,
+            crate::config::AddressingStyle::Path
+        );
+        (addressing, force_path.to_string())
+    } else {
+        ("auto".to_string(), "false".to_string())
     };
     let endpoint_line = if endpoint.is_empty() {
         "# endpoint_url = \"https://s3.amazonaws.com\"".to_string()

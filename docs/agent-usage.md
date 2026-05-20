@@ -140,12 +140,17 @@ write `--run-manifest` to a file and summarize that manifest locally instead.
 Use `manifest-summary --check` when an agent needs a single local validation
 exit code.  It checks the saved manifest status, exit code, fatal/output error
 counters, Parquet row equality when Parquet output applies, and recorded
-artifact paths on the local filesystem.  For `summary-only`, `tsv`, and
-`ndjson` manifests, Parquet row equality is reported as not applicable rather
-than a failure.
+artifact paths on the local filesystem.  When the manifest includes artifact
+metadata, it also verifies current file size, SHA256, and Parquet row/schema
+metadata.  For `summary-only`, `tsv`, and `ndjson` manifests, Parquet row
+equality is reported as not applicable rather than a failure.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.
+Endpoint compatibility profiles that require provider-specific endpoints warn
+in dry-run and `doctor` until an endpoint URL is configured.  Placeholder
+endpoints from starter configs, such as `<account-id>` or `<region>`, are also
+reported locally before a real run.
 
 The `artifacts` array describes generated files:
 

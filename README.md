@@ -170,8 +170,10 @@ s3-turbo-list manifest-summary run.json --check
 
 `--check` exits non-zero when the manifest reports a failed run, a non-zero
 exit code, fatal/output errors, a Parquet row-count mismatch, or a missing
-recorded artifact.  For `summary-only`, `tsv`, and `ndjson` runs, Parquet row
-equality is intentionally reported as not applicable.
+recorded artifact.  When recorded metadata is present, `--check` also verifies
+current artifact file size, SHA256, and Parquet row/schema metadata.  For
+`summary-only`, `tsv`, and `ndjson` runs, Parquet row equality is intentionally
+reported as not applicable.
 
 ### Read Parquet with Python / pyarrow
 
@@ -257,6 +259,10 @@ Built-in profiles: `aws`, `minio`, `bos`, `r2`, `b2`, and `oss`.
 Profiles only fill safe defaults such as addressing style or documented
 endpoint defaults when the user has not supplied an explicit value.  They do
 not change output schema, diff semantics, or pagination behavior.
+Profiles whose endpoints are account, bucket, or region specific will warn
+during `doctor` and dry-run until `--endpoint-url` or `s3.endpoint_url` is set.
+Starter config placeholders such as `<account-id>` are also reported locally
+before a real run.
 
 ### BOS (Baidu Object Storage)
 

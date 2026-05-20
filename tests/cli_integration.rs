@@ -236,6 +236,21 @@ fn test_cli_init_config_writes_and_requires_overwrite() {
     assert!(rendered.contains("profile = \"minio\""));
     assert!(rendered.contains("AWS_PROFILE"));
 
+    let r2_path = dir.path().join("r2.toml");
+    let (code, stdout, stderr) = run_cli(&[
+        "init-config",
+        "--profile",
+        "r2",
+        "--output",
+        r2_path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let rendered = std::fs::read_to_string(&r2_path).unwrap();
+    assert!(rendered.contains("profile = \"r2\""));
+    assert!(rendered.contains("addressing_style = \"path\""));
+    assert!(rendered.contains("force_path_style = true"));
+
     let (code, _stdout, stderr) = run_cli(&["init-config", "--output", path.to_str().unwrap()]);
     assert_ne!(code, 0);
     assert!(stderr.contains("Output file exists"));
@@ -528,6 +543,92 @@ fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
 }
 
 #[test]
+fn test_cli_dry_run_warns_for_profile_missing_or_placeholder_endpoint() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--profile",
+        "r2",
+        "--agent",
+        "--dry-run",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "auto",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("requires an explicit endpoint URL")
+    }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"[s3]
+profile = "r2"
+endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
+"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--config",
+        config.to_str().unwrap(),
+        "--agent",
+        "--dry-run",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "auto",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("still contains template placeholders")
+    }));
+}
+
+#[test]
+fn test_cli_doctor_warns_for_placeholder_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"[s3]
+profile = "r2"
+endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "--config",
+        config.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "endpoint_url"
+            && check["status"] == "warn"
+            && check["message"]
+                .as_str()
+                .unwrap()
+                .contains("template placeholders")
+    }));
+}
+
+#[test]
 fn test_cli_dry_run_summary_only_plans_no_output_artifacts() {
     let (code, stdout, stderr) = run_cli(&[
         "--agent",
@@ -816,6 +917,60 @@ fn test_cli_manifest_summary_check_fails_bad_parquet_manifest() {
     assert!(stdout.contains("Check:        FAIL"));
     assert!(stdout.contains("parquet_rows_match_streamed_rows"));
     assert!(stdout.contains("artifact_exists:ks"));
+}
+
+#[test]
+fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact = dir.path().join("out.ks");
+    std::fs::write(&artifact, "\"logs\",\"1\"\n").unwrap();
+    let manifest = dir.path().join("run.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+  "tool_version": "0.1.17",
+  "status": "success",
+  "exit_code": 0,
+  "elapsed_secs": 1.25,
+  "command": ["s3-turbo-list"],
+  "inputs": {{"output_format": "parquet"}},
+  "outputs": {{
+    "parquet_file": null,
+    "ks_file": "{artifact}",
+    "hints_file": null,
+    "trace_compat": null,
+    "log_file": null
+  }},
+  "artifacts": [
+    {{"kind": "ks", "path": "{artifact}", "exists": true, "size_bytes": 999, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}}
+  ],
+  "metrics": {{
+    "fatal_errors": 0,
+    "output_errors": 0,
+    "received_objects": 1,
+    "streamed_rows": 1,
+    "unique_prefixes": 1,
+    "parquet_rows": 1,
+    "ks_entries": 1,
+    "bytes_total": 100,
+    "summary_only": false,
+    "top_prefixes": []
+  }},
+  "warnings": []
+}}"#,
+            artifact = artifact.display()
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap(), "--check"],
+        dir.path(),
+    );
+    assert_eq!(code, 6, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("artifact_size:ks"));
+    assert!(stdout.contains("artifact_sha256:ks"));
 }
 
 #[test]

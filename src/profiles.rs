@@ -117,6 +117,39 @@ pub fn is_endpoint_preset_name(name: &str) -> bool {
     )
 }
 
+pub fn endpoint_profile_guardrail_warnings(cfg: &S3TurboConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if let Some(profile_name) = cfg.s3.profile.as_deref() {
+        if let Some(profile) = get_profile(profile_name) {
+            let endpoint = cfg.s3.endpoint_url.as_deref().map(str::trim);
+            if profile.requires_explicit_endpoint
+                && endpoint.filter(|value| !value.is_empty()).is_none()
+            {
+                warnings.push(format!(
+                    "endpoint compatibility profile '{}' requires an explicit endpoint URL; pass --endpoint-url or set s3.endpoint_url in config",
+                    profile.name
+                ));
+            }
+        }
+    }
+
+    if let Some(endpoint) = cfg.s3.endpoint_url.as_deref() {
+        if endpoint_url_has_template_placeholder(endpoint) {
+            warnings.push(format!(
+                "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
+                endpoint
+            ));
+        }
+    }
+
+    warnings
+}
+
+pub fn endpoint_url_has_template_placeholder(endpoint: &str) -> bool {
+    endpoint.contains('<') || endpoint.contains('>')
+}
+
 pub fn apply_profile_preset(cfg: &mut S3TurboConfig) -> Option<ProfileApplication> {
     let name = cfg.s3.profile.clone()?;
     let Some(profile) = get_profile(&name) else {

@@ -45,6 +45,12 @@ For example, `--profile bos` fills the standard BOS endpoint and virtual-hosted
 addressing when they are otherwise unset.  Passing `--endpoint-url` or
 `--addressing-style path` keeps the explicit value.
 
+Profiles with account-, bucket-, or region-specific endpoints, such as `minio`,
+`r2`, `b2`, and `oss`, warn during local `doctor` and dry-run preflight until
+an endpoint URL is configured.  Starter config placeholders such as
+`<account-id>` or `<region>` are also reported locally so agents do not launch a
+real run with an unedited template endpoint.
+
 ## Caveats
 
 - `profiles show` and `profiles list` are local-only commands.

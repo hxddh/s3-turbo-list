@@ -680,6 +680,7 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
             None => "no endpoint compatibility profile selected".to_string(),
         },
     });
+    checks.push(endpoint_url_check(cfg));
     checks.push(DoctorCheck {
         name: "network".to_string(),
         status: if local_only { "skipped" } else { "warn" }.to_string(),
@@ -715,6 +716,48 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
         local_only,
         cwd,
         checks,
+    }
+}
+
+fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
+    if let Some(endpoint) = cfg.s3.endpoint_url.as_deref() {
+        if profiles::endpoint_url_has_template_placeholder(endpoint) {
+            return DoctorCheck {
+                name: "endpoint_url".to_string(),
+                status: "warn".to_string(),
+                message: format!(
+                    "endpoint_url contains template placeholders and must be edited before a real run: {}",
+                    endpoint
+                ),
+            };
+        }
+
+        return DoctorCheck {
+            name: "endpoint_url".to_string(),
+            status: "ok".to_string(),
+            message: format!("endpoint_url is configured: {}", endpoint),
+        };
+    }
+
+    if let Some(profile_name) = cfg.s3.profile.as_deref() {
+        if let Some(profile) = profiles::get_profile(profile_name) {
+            if profile.requires_explicit_endpoint {
+                return DoctorCheck {
+                    name: "endpoint_url".to_string(),
+                    status: "warn".to_string(),
+                    message: format!(
+                        "profile '{}' requires --endpoint-url or s3.endpoint_url in config",
+                        profile.name
+                    ),
+                };
+            }
+        }
+    }
+
+    DoctorCheck {
+        name: "endpoint_url".to_string(),
+        status: "ok".to_string(),
+        message: "no explicit endpoint URL required by the selected profile".to_string(),
     }
 }
 

@@ -68,17 +68,19 @@ Output mode guide:
 | Local result validation | `manifest-summary run.json --check` |
 
 `manifest-summary --check` is local-only.  It validates the saved manifest and
-recorded artifact paths on the local filesystem; it does not contact S3 or
-prove the remote bucket has not changed since the run.
+recorded artifact paths on the local filesystem.  When recorded metadata is
+available, it also verifies current artifact size, SHA256, and Parquet
+row/schema metadata.  It does not contact S3 or prove the remote bucket has not
+changed since the run.
 
 ## Choose the correct binary
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.16-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.16-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.16-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.16-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.17-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.17-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.17-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.17-macos-x86_64` |
 
 To identify your platform:
 
@@ -114,8 +116,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.16-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.16-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.17-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.17-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -123,8 +125,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.16-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.16-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.17-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.17-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -136,18 +138,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.16-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.16-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.16-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.17-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.17-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.17-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.16-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.16-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.16-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.17-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.17-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.17-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -225,6 +227,9 @@ s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
 For full details on machine-readable plans, manifests, and exit codes, see
 [`docs/agent-usage.md`](docs/agent-usage.md).  Manifest artifact summaries
 include SHA256, file sizes, line counts, and Parquet metadata.
+Provider profiles that need account- or region-specific endpoints warn locally
+until `--endpoint-url` or `s3.endpoint_url` is set.  Replace any starter config
+placeholder such as `<account-id>` before a real listing run.
 
 ## Configure BOS
 

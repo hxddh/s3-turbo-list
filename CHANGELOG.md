@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-05-20
+
+### Added
+- Local endpoint-profile guardrails for profiles that require an explicit
+  endpoint URL and for starter config endpoints that still contain template
+  placeholders.
+- `doctor` endpoint URL checks for missing provider-specific endpoints and
+  unedited placeholder endpoint values.
+- `manifest-summary --check` artifact integrity checks for recorded file size,
+  SHA256, and Parquet row/schema metadata when those fields are present in the
+  run manifest.
+
+### Changed
+- `init-config --profile r2` and `init-config --profile b2` now use the same
+  path-style addressing defaults as the endpoint profile registry.
+
 ## [0.1.16] - 2026-05-20
 
 ### Added

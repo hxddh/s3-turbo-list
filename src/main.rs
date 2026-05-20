@@ -1492,7 +1492,7 @@ fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) 
 }
 
 fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
-    match local_tools::manifest_summary(manifest_file) {
+    match local_tools::manifest_summary(manifest_file, check) {
         Ok(report) => {
             let check_passed = report.check_passed;
             if json {
@@ -2165,6 +2165,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                 ));
             }
         }
+        warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
     }
     if cli.summary_only
         && (cli.output_dir.is_some()
