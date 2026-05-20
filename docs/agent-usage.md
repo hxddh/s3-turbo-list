@@ -15,9 +15,11 @@ s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list recipes agent-safe
 s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
+s3-turbo-list recipes verify
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
+s3-turbo-list manifest-summary run.json --check
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
@@ -134,6 +136,13 @@ s3-turbo-list manifest-summary run.json --json
 TSV and NDJSON reserve stdout for rows.  Do not combine them with `--agent`;
 write `--run-manifest` to a file and summarize that manifest locally instead.
 `manifest-summary` is local-only and does not load credentials or contact S3.
+
+Use `manifest-summary --check` when an agent needs a single local validation
+exit code.  It checks the saved manifest status, exit code, fatal/output error
+counters, Parquet row equality when Parquet output applies, and recorded
+artifact paths on the local filesystem.  For `summary-only`, `tsv`, and
+`ndjson` manifests, Parquet row equality is reported as not applicable rather
+than a failure.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.

@@ -85,6 +85,7 @@ s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
 s3-turbo-list --run-manifest run.json --delimiter '' \
   list --region us-east-2 --bucket my-bucket --output-format tsv | wc -l
 s3-turbo-list manifest-summary run.json
+s3-turbo-list manifest-summary run.json --check
 ```
 
 `init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
@@ -128,6 +129,10 @@ The default delimiter is `/`, which performs hierarchical listing and returns
 top-level objects plus `CommonPrefixes`.  Use `--delimiter ''` for a recursive
 full-bucket object inventory.
 
+`--continuation-token` is a single-chain ListObjectsV2 resume tool.  Use it
+only with `list` and `--no-auto-hints`; it is intentionally rejected with
+multi-segment hints, `diff`, checkpoint resume, or `--start-after`.
+
 Output files (auto-named):
 - `<region>_<bucket>_<timestamp>.parquet` — object listing
 - `<region>_<bucket>_<timestamp>.ks` — keyspace counts
@@ -151,6 +156,22 @@ Output files (auto-named):
 TSV and NDJSON are list-only formats.  They reserve stdout for rows, so use
 `--run-manifest run.json` plus `s3-turbo-list manifest-summary run.json --json`
 when automation also needs a structured run summary.
+
+### Validating a completed run
+
+`manifest-summary` is local-only: it reads a saved `--run-manifest` JSON file
+and checks recorded artifact paths on the local filesystem without contacting S3.
+
+```bash
+s3-turbo-list --run-manifest run.json --output-dir out --delimiter '' \
+  list --region us-east-2 --bucket my-bucket
+s3-turbo-list manifest-summary run.json --check
+```
+
+`--check` exits non-zero when the manifest reports a failed run, a non-zero
+exit code, fatal/output errors, a Parquet row-count mismatch, or a missing
+recorded artifact.  For `summary-only`, `tsv`, and `ndjson` runs, Parquet row
+equality is intentionally reported as not applicable.
 
 ### Read Parquet with Python / pyarrow
 
@@ -333,6 +354,7 @@ For concise local help:
 ```bash
 s3-turbo-list recipes
 s3-turbo-list recipes summary
+s3-turbo-list recipes verify
 s3-turbo-list recipes large-bucket
 s3-turbo-list cheatsheet
 ```

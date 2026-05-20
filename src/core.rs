@@ -627,6 +627,8 @@ pub struct S3TaskContext {
     /// CLI `--start-after` override — if set, the first segment uses this
     /// instead of the hint-segment start.
     pub start_after: Option<String>,
+    /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
+    pub continuation_token: Option<String>,
     pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -646,6 +648,7 @@ impl S3TaskContext {
         delimiter: Option<&str>,
         max_keys: Option<i32>,
         start_after: Option<&str>,
+        continuation_token: Option<&str>,
         checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     ) -> Self {
         let loader = aws_config::from_env()
@@ -707,6 +710,7 @@ impl S3TaskContext {
             max_attempts: s3_config.max_attempts.max(1),
             operation_timeout_secs: s3_config.operation_timeout_secs.max(1),
             start_after: start_after.map(|s| s.to_string()),
+            continuation_token: continuation_token.map(|s| s.to_string()),
             checkpoint_completed,
         }
     }

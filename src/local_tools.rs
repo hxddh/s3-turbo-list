@@ -128,6 +128,7 @@ pub struct ManifestSummaryReport {
     pub exit_code: Option<i64>,
     pub elapsed_secs: Option<f64>,
     pub command: Vec<String>,
+    pub output_format: Option<String>,
     pub summary_only: bool,
     pub received_objects: u64,
     pub streamed_rows: u64,
@@ -140,6 +141,8 @@ pub struct ManifestSummaryReport {
     pub outputs: ManifestOutputSummary,
     pub artifacts: Vec<ManifestArtifactSummary>,
     pub warnings: Vec<String>,
+    pub check_passed: bool,
+    pub checks: Vec<ManifestCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +167,13 @@ pub struct ManifestArtifactSummary {
     pub path: String,
     pub exists: bool,
     pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestCheck {
+    pub name: String,
+    pub status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -392,18 +402,57 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
 
     let streamed_rows = json_u64(metrics, "streamed_rows");
     let parquet_rows = json_u64(metrics, "parquet_rows");
-    let parquet_rows_match_streamed_rows = if streamed_rows > 0 || parquet_rows > 0 {
-        Some(streamed_rows == parquet_rows)
-    } else {
-        None
-    };
+    let output_format = value
+        .get("inputs")
+        .and_then(|v| json_string(v, "output_format"));
+    let summary_only = metrics
+        .get("summary_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let row_check_applies = manifest_row_check_applies(output_format.as_deref(), summary_only);
+    let parquet_rows_match_streamed_rows =
+        row_check_applies.then_some(streamed_rows == parquet_rows);
+    let run_status = json_string(&value, "status").unwrap_or_else(|| "unknown".to_string());
+    let exit_code = value.get("exit_code").and_then(|v| v.as_i64());
+    let fatal_errors = json_u64(metrics, "fatal_errors");
+    let output_errors = json_u64(metrics, "output_errors");
+    let artifacts: Vec<ManifestArtifactSummary> = value
+        .get("artifacts")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| ManifestArtifactSummary {
+                    kind: json_string(item, "kind").unwrap_or_default(),
+                    path: json_string(item, "path").unwrap_or_default(),
+                    exists: item
+                        .get("exists")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    size_bytes: item.get("size_bytes").and_then(|v| v.as_u64()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let checks = manifest_checks(
+        &run_status,
+        exit_code,
+        fatal_errors,
+        output_errors,
+        output_format.as_deref(),
+        summary_only,
+        streamed_rows,
+        parquet_rows,
+        &artifacts,
+    );
+    let check_passed = checks.iter().all(|check| check.status != "fail");
 
     Ok(ManifestSummaryReport {
         status: "success".to_string(),
         manifest_file: path.to_string(),
         tool_version: json_string(&value, "tool_version"),
-        run_status: json_string(&value, "status").unwrap_or_else(|| "unknown".to_string()),
-        exit_code: value.get("exit_code").and_then(|v| v.as_i64()),
+        run_status,
+        exit_code,
         elapsed_secs: value.get("elapsed_secs").and_then(|v| v.as_f64()),
         command: value
             .get("command")
@@ -415,10 +464,8 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
                     .collect()
             })
             .unwrap_or_default(),
-        summary_only: metrics
-            .get("summary_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        output_format,
+        summary_only,
         received_objects: json_u64(metrics, "received_objects"),
         streamed_rows,
         parquet_rows,
@@ -455,24 +502,7 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
                 .get("outputs")
                 .and_then(|v| json_string(v, "log_file")),
         },
-        artifacts: value
-            .get("artifacts")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| ManifestArtifactSummary {
-                        kind: json_string(item, "kind").unwrap_or_default(),
-                        path: json_string(item, "path").unwrap_or_default(),
-                        exists: item
-                            .get("exists")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        size_bytes: item.get("size_bytes").and_then(|v| v.as_u64()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        artifacts,
         warnings: value
             .get("warnings")
             .and_then(|v| v.as_array())
@@ -483,6 +513,8 @@ pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
                     .collect()
             })
             .unwrap_or_default(),
+        check_passed,
+        checks,
     })
 }
 
@@ -492,6 +524,100 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
 
 fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn manifest_row_check_applies(output_format: Option<&str>, summary_only: bool) -> bool {
+    if summary_only {
+        return false;
+    }
+    matches!(output_format.unwrap_or("parquet"), "parquet")
+}
+
+fn manifest_checks(
+    run_status: &str,
+    exit_code: Option<i64>,
+    fatal_errors: u64,
+    output_errors: u64,
+    output_format: Option<&str>,
+    summary_only: bool,
+    streamed_rows: u64,
+    parquet_rows: u64,
+    artifacts: &[ManifestArtifactSummary],
+) -> Vec<ManifestCheck> {
+    let mut checks = Vec::new();
+    checks.push(ManifestCheck {
+        name: "run_status".to_string(),
+        status: if run_status == "success" {
+            "ok"
+        } else {
+            "fail"
+        }
+        .to_string(),
+        message: format!("manifest status is {}", run_status),
+    });
+    checks.push(ManifestCheck {
+        name: "exit_code".to_string(),
+        status: if exit_code == Some(0) { "ok" } else { "fail" }.to_string(),
+        message: format!(
+            "manifest exit_code is {}",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "missing".to_string())
+        ),
+    });
+    checks.push(ManifestCheck {
+        name: "fatal_errors".to_string(),
+        status: if fatal_errors == 0 { "ok" } else { "fail" }.to_string(),
+        message: format!("metrics.fatal_errors is {}", fatal_errors),
+    });
+    checks.push(ManifestCheck {
+        name: "output_errors".to_string(),
+        status: if output_errors == 0 { "ok" } else { "fail" }.to_string(),
+        message: format!("metrics.output_errors is {}", output_errors),
+    });
+
+    if manifest_row_check_applies(output_format, summary_only) {
+        checks.push(ManifestCheck {
+            name: "parquet_rows_match_streamed_rows".to_string(),
+            status: if parquet_rows == streamed_rows {
+                "ok"
+            } else {
+                "fail"
+            }
+            .to_string(),
+            message: format!(
+                "parquet_rows={} streamed_rows={}",
+                parquet_rows, streamed_rows
+            ),
+        });
+    } else {
+        checks.push(ManifestCheck {
+            name: "parquet_rows_match_streamed_rows".to_string(),
+            status: "skip".to_string(),
+            message: format!(
+                "row check is not applicable for {} output",
+                if summary_only {
+                    "summary-only".to_string()
+                } else {
+                    output_format.unwrap_or("unknown").to_string()
+                }
+            ),
+        });
+    }
+
+    for artifact in artifacts {
+        let current_exists = !artifact.path.is_empty() && Path::new(&artifact.path).exists();
+        checks.push(ManifestCheck {
+            name: format!("artifact_exists:{}", artifact.kind),
+            status: if current_exists { "ok" } else { "fail" }.to_string(),
+            message: format!(
+                "{} recorded_exists={} current_exists={}",
+                artifact.path, artifact.exists, current_exists
+            ),
+        });
+    }
+
+    checks
 }
 
 pub fn render_init_config_text(report: &InitConfigReport) -> String {
@@ -519,6 +645,9 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
         out.push_str(&format!("  Elapsed:      {:.3}s\n", elapsed));
     }
     out.push_str(&format!("  Summary only: {}\n", report.summary_only));
+    if let Some(format) = &report.output_format {
+        out.push_str(&format!("  Output format: {}\n", format));
+    }
     out.push_str(&format!("  Objects:      {}\n", report.streamed_rows));
     out.push_str(&format!(
         "  Bytes:        {} ({})\n",
@@ -532,7 +661,13 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
             "  Row check:    parquet_rows == streamed_rows: {}\n",
             matches
         ));
+    } else {
+        out.push_str("  Row check:    parquet_rows == streamed_rows: not applicable\n");
     }
+    out.push_str(&format!(
+        "  Check:        {}\n",
+        if report.check_passed { "PASS" } else { "FAIL" }
+    ));
     if !report.top_prefixes.is_empty() {
         out.push_str("Top prefixes:\n");
         for prefix in report.top_prefixes.iter().take(10) {
@@ -570,6 +705,14 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
             out.push_str(&format!("  - {}\n", warning));
         }
     }
+    if !report.checks.is_empty() && !report.check_passed {
+        out.push_str("Failed checks:\n");
+        for check in &report.checks {
+            if check.status == "fail" {
+                out.push_str(&format!("  - {}: {}\n", check.name, check.message));
+            }
+        }
+    }
     out
 }
 
@@ -599,6 +742,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
   aws-basic      Minimal AWS S3 dry-run and list
   summary        Count objects and bytes without Parquet/KS outputs
   pipe           Stream list results to shell tools or agents
+  verify         Validate a saved run manifest locally
   large-bucket   Hints, trace, and output-dir workflow
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands
@@ -634,6 +778,18 @@ Run: s3-turbo-list recipes <name>
   s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson | jq -r '.k'
   s3-turbo-list --delimiter '' --run-manifest run.json list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
   s3-turbo-list manifest-summary run.json --json
+"#
+            .to_string(),
+        ),
+        "verify" => Ok(
+            r#"Verify a saved run:
+  s3-turbo-list --run-manifest run.json --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list manifest-summary run.json
+  s3-turbo-list manifest-summary run.json --check
+
+Pipe output with a manifest:
+  s3-turbo-list --run-manifest run.json --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
+  s3-turbo-list manifest-summary run.json --check
 "#
             .to_string(),
         ),
@@ -687,6 +843,7 @@ Useful local commands:
   s3-turbo-list profiles list
   s3-turbo-list hints-validate --hints-file hints.toml --json
   s3-turbo-list trace-summary trace.jsonl --machine-readable
+  s3-turbo-list manifest-summary run.json --check
   s3-turbo-list recipes large-bucket
 "#
     .to_string()

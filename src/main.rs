@@ -323,6 +323,10 @@ enum Commands {
         /// Emit JSON report
         #[arg(long)]
         json: bool,
+
+        /// Validate manifest success, counters, row checks, and recorded artifacts via exit code
+        #[arg(long)]
+        check: bool,
     },
 
     /// Generate conservative next-run hints from a local trace and hints file
@@ -598,8 +602,9 @@ fn main() {
         Commands::ManifestSummary {
             manifest_file,
             json,
+            check,
         } => {
-            run_manifest_summary(manifest_file, *json || cli.agent);
+            run_manifest_summary(manifest_file, *json || cli.agent, *check);
             return;
         }
         Commands::HintsRebalance {
@@ -694,6 +699,7 @@ fn main() {
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_summary_only_command(&cli);
     validate_output_format_command(&cli);
+    validate_continuation_token_command(&cli, &cfg);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -1117,6 +1123,7 @@ fn main() {
             Some(&cli.delimiter),
             cli.max_keys,
             cfg.s3.start_after.as_deref(),
+            cli.continuation_token.as_deref(),
             left_checkpoint.clone(),
         );
         set.spawn(async move {
@@ -1152,6 +1159,7 @@ fn main() {
                 Some(&cli.delimiter),
                 cli.max_keys,
                 cfg.s3.start_after.as_deref(),
+                cli.continuation_token.as_deref(),
                 right_cp.clone(),
             );
             set.spawn(async move {
@@ -1483,13 +1491,17 @@ fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) 
     }
 }
 
-fn run_manifest_summary(manifest_file: &str, json: bool) {
+fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
     match local_tools::manifest_summary(manifest_file) {
         Ok(report) => {
+            let check_passed = report.check_passed;
             if json {
                 println!("{}", agent::to_pretty_json(&report));
             } else {
                 print!("{}", local_tools::render_manifest_summary_text(&report));
+            }
+            if check && !check_passed {
+                std::process::exit(agent::ExitCode::DataValidation.code());
             }
         }
         Err(e) => {
@@ -1685,6 +1697,44 @@ fn validate_output_format_command(cli: &Cli) {
             "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
+fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
+    let Some(token) = cli.continuation_token.as_deref() else {
+        return;
+    };
+    if token.trim().is_empty() {
+        eprintln!("--continuation-token cannot be empty");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    let Commands::List { region, bucket, .. } = &cli.cmd else {
+        eprintln!("--continuation-token is only supported with the list command");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    };
+    if cli.resume {
+        eprintln!("--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if cfg.s3.start_after.is_some() {
+        eprintln!("--continuation-token cannot be combined with --start-after");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if cli.hints_file.is_some() {
+        eprintln!(
+            "--continuation-token is single-chain only and cannot be combined with --hints-file"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if !cli.no_auto_hints {
+        let hints_path = agent::conventional_hints_path(bucket, region.as_deref());
+        if std::path::Path::new(&hints_path).exists() {
+            eprintln!(
+                "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
+                hints_path
+            );
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
     }
 }
 
@@ -2066,6 +2116,12 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
     if cli.summary_only {
         warnings.push(
             "summary-only will scan S3 ListObjectsV2 pages when not run with --dry-run, but it will not write Parquet or KeySpace outputs"
+                .to_string(),
+        );
+    }
+    if cli.continuation_token.is_some() {
+        warnings.push(
+            "continuation-token resumes one sequential ListObjectsV2 chain; hints and checkpoint resume are intentionally not combined with it"
                 .to_string(),
         );
     }

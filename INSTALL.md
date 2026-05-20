@@ -54,16 +54,31 @@ s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 \
 s3-turbo-list --run-manifest run.json --delimiter '' \
   list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
 s3-turbo-list manifest-summary run.json --json
+s3-turbo-list manifest-summary run.json --check
 ```
+
+Output mode guide:
+
+| Need | Command shape |
+|---|---|
+| Repeatable inventory for DuckDB/pandas/audit | default `list` Parquet output |
+| Object count, bytes, and top prefixes only | `--summary-only --run-manifest run.json` |
+| Shell pipeline rows | `list --output-format tsv` |
+| Agent/JQ-readable rows | `list --output-format ndjson` |
+| Local result validation | `manifest-summary run.json --check` |
+
+`manifest-summary --check` is local-only.  It validates the saved manifest and
+recorded artifact paths on the local filesystem; it does not contact S3 or
+prove the remote bucket has not changed since the run.
 
 ## Choose the correct binary
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.15-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.15-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.15-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.15-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.16-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.16-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.16-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.16-macos-x86_64` |
 
 To identify your platform:
 
@@ -99,8 +114,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.15-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.15-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.16-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.16-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -108,8 +123,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.15-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.15-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.16-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.16-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -121,18 +136,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.15-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.15-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.15-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.16-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.16-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.16-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.15-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.15-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.15-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.16-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.16-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.16-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -200,6 +215,7 @@ s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list recipes aws-basic
 s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
+s3-turbo-list recipes verify
 
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
   --bucket my-bucket \

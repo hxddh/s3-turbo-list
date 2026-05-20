@@ -119,6 +119,7 @@ async fn flat_list_run_to_complete(
 ) {
     // If the CLI provided --start-after, it overrides the segment's start.
     let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
+    let mut continuation_token = ctx.continuation_token.clone();
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(
@@ -127,6 +128,7 @@ async fn flat_list_run_to_complete(
             prefix,
             &start_after,
             until,
+            continuation_token.as_deref(),
             retry_attempt,
         )
         .await
@@ -136,6 +138,7 @@ async fn flat_list_run_to_complete(
                 let next_retry_attempt = retry_attempt.saturating_add(1);
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
                     start_after = err.next_start_owned();
+                    continuation_token = None;
                     retry_attempt = next_retry_attempt;
                     debug!(
                         "Retrying from '{}' (attempt {}): {}",
@@ -168,6 +171,7 @@ async fn flat_list(
     prefix: &str,
     start_after: &str,
     until: Option<&str>,
+    continuation_token: Option<&str>,
     retry_attempt: u32,
 ) -> Result<(), FlatRuntimeError> {
     let mut request = ctx
@@ -179,6 +183,9 @@ async fn flat_list(
     // Only set start_after when non-empty.
     if !start_after.is_empty() {
         request = request.start_after(start_after);
+    }
+    if let Some(token) = continuation_token {
+        request = request.continuation_token(token);
     }
 
     if let Some(ref delim) = ctx.delimiter {
@@ -218,7 +225,7 @@ async fn flat_list(
                     "ListObjectsV2",
                     prefix,
                     start_after,
-                    None,
+                    continuation_token,
                     retry_attempt,
                     latency_ms,
                     0,
@@ -250,7 +257,7 @@ async fn flat_list(
                     "ListObjectsV2",
                     prefix,
                     start_after,
-                    None,
+                    continuation_token,
                     retry_attempt,
                     latency_ms,
                     200,
@@ -278,6 +285,7 @@ async fn flat_list(
                     ctx,
                     prefix,
                     start_after,
+                    continuation_token,
                     retry_attempt,
                     latency_ms,
                 );
@@ -300,7 +308,7 @@ async fn flat_list(
                     "ListObjectsV2",
                     prefix,
                     start_after,
-                    next_token.as_deref(),
+                    continuation_token,
                     retry_attempt,
                     latency_ms,
                     200,
@@ -456,7 +464,7 @@ fn emit_trace_compat(
     operation: &str,
     prefix: &str,
     start_after: &str,
-    _next_continuation_token: Option<&str>,
+    continuation_token: Option<&str>,
     retry_attempt: u32,
     latency_ms: u64,
     http_status: u16,
@@ -488,6 +496,7 @@ fn emit_trace_compat(
     } else {
         Some(start_after.to_string())
     };
+    event.continuation_token = continuation_token.map(str::to_string);
     event.delimiter = ctx.delimiter.clone();
     event.max_keys = ctx.max_keys;
     event.retry_attempt = retry_attempt;
@@ -519,6 +528,7 @@ fn handle_sdk_error(
     ctx: &S3TaskContext,
     prefix: &str,
     start_after: &str,
+    continuation_token: Option<&str>,
     retry_attempt: u32,
     latency_ms: u64,
 ) -> Result<(), FlatRuntimeError> {
@@ -551,7 +561,7 @@ fn handle_sdk_error(
                 "ListObjectsV2",
                 prefix,
                 start_after,
-                None,
+                continuation_token,
                 retry_attempt,
                 latency_ms,
                 http_code,
@@ -615,7 +625,7 @@ fn handle_sdk_error(
                 "ListObjectsV2",
                 prefix,
                 start_after,
-                None,
+                continuation_token,
                 retry_attempt,
                 latency_ms,
                 0,
@@ -653,7 +663,7 @@ fn handle_sdk_error(
                 "ListObjectsV2",
                 prefix,
                 start_after,
-                None,
+                continuation_token,
                 retry_attempt,
                 latency_ms,
                 0,

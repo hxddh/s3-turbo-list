@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-05-20
+
+### Added
+- `manifest-summary --check` for local-only run validation with stable exit
+  codes for CI and agents.
+- Manifest summary check details for run status, exit code, fatal/output error
+  counters, Parquet row consistency, and local recorded artifact path existence.
+- `recipes verify` for concise manifest validation workflows.
+
+### Changed
+- `manifest-summary` now treats Parquet row equality as not applicable for
+  `summary-only`, `tsv`, and `ndjson` runs instead of reporting a misleading
+  mismatch.
+- Documentation now includes a compact output-mode and validation guide.
+
+### Fixed
+- `--continuation-token` is now wired into single-chain `list` requests and
+  guarded against confusing combinations with hints, checkpoint resume, diff,
+  or `--start-after`.
+
 ## [0.1.15] - 2026-05-20
 
 ### Added

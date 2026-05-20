@@ -672,6 +672,80 @@ fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it()
 }
 
 #[test]
+fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.query.get("continuation-token").map(String::as_str),
+            Some("seed-token")
+        );
+        assert!(!request.query.contains_key("start-after"));
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/resumed.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--continuation-token".into(),
+        "seed-token".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "ndjson".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let rows: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["k"], "logs/resumed.txt");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .query
+            .get("continuation-token")
+            .map(String::as_str),
+        Some("seed-token")
+    );
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["inputs"]["continuation_token"], "seed-token");
+    assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
+}
+
+#[test]
 fn local_mock_compat_probe_covers_head_list_and_pagination() {
     let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
         "HEAD" => MockResponse::empty_ok(),

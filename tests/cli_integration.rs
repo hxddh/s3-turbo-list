@@ -637,6 +637,65 @@ fn test_cli_dry_run_output_format_ndjson_plans_no_output_artifacts() {
 }
 
 #[test]
+fn test_cli_dry_run_continuation_token_is_single_chain_list() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--agent",
+        "--no-auto-hints",
+        "--continuation-token",
+        "token-123",
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["inputs"]["continuation_token"], "token-123");
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("continuation-token resumes one sequential")
+    }));
+}
+
+#[test]
+fn test_cli_rejects_continuation_token_with_diff_or_hints() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--continuation-token",
+        "token-123",
+        "diff",
+        "--bucket",
+        "left",
+        "--target-bucket",
+        "right",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("--continuation-token is only supported with the list command"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "m/\n").unwrap();
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--continuation-token",
+        "token-123",
+        "--hints-file",
+        hints.to_str().unwrap(),
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("single-chain only"));
+}
+
+#[test]
 fn test_cli_manifest_summary_human_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("run.json");
@@ -693,7 +752,129 @@ fn test_cli_manifest_summary_human_and_json() {
     assert_eq!(json["streamed_rows"], 3);
     assert_eq!(json["bytes_total"], 600);
     assert_eq!(json["summary_only"], true);
+    assert_eq!(
+        json["parquet_rows_match_streamed_rows"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["check_passed"], true);
     assert_eq!(json["top_prefixes"][0]["prefix"], "logs");
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap(), "--check"],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Check:        PASS"));
+}
+
+#[test]
+fn test_cli_manifest_summary_check_fails_bad_parquet_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("run.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "tool_version": "0.1.16",
+  "status": "success",
+  "exit_code": 0,
+  "elapsed_secs": 1.25,
+  "command": ["s3-turbo-list"],
+  "inputs": {"output_format": "parquet"},
+  "outputs": {
+    "parquet_file": "out.parquet",
+    "ks_file": "out.ks",
+    "hints_file": null,
+    "trace_compat": null,
+    "log_file": null
+  },
+  "artifacts": [
+    {"kind": "parquet", "path": "out.parquet", "exists": true, "size_bytes": 10},
+    {"kind": "ks", "path": "out.ks", "exists": false, "size_bytes": null}
+  ],
+  "metrics": {
+    "fatal_errors": 0,
+    "output_errors": 0,
+    "received_objects": 3,
+    "streamed_rows": 3,
+    "unique_prefixes": 2,
+    "parquet_rows": 2,
+    "ks_entries": 2,
+    "bytes_total": 600,
+    "summary_only": false,
+    "top_prefixes": []
+  },
+  "warnings": []
+}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap(), "--check"],
+        dir.path(),
+    );
+    assert_eq!(code, 6, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Check:        FAIL"));
+    assert!(stdout.contains("parquet_rows_match_streamed_rows"));
+    assert!(stdout.contains("artifact_exists:ks"));
+}
+
+#[test]
+fn test_cli_manifest_summary_ndjson_row_check_is_not_applicable() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("run.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "tool_version": "0.1.16",
+  "status": "success",
+  "exit_code": 0,
+  "elapsed_secs": 1.25,
+  "command": ["s3-turbo-list"],
+  "inputs": {"output_format": "ndjson"},
+  "outputs": {
+    "parquet_file": null,
+    "ks_file": null,
+    "hints_file": null,
+    "trace_compat": null,
+    "log_file": null
+  },
+  "artifacts": [],
+  "metrics": {
+    "fatal_errors": 0,
+    "output_errors": 0,
+    "received_objects": 3,
+    "streamed_rows": 3,
+    "unique_prefixes": 2,
+    "parquet_rows": 0,
+    "ks_entries": 0,
+    "bytes_total": 600,
+    "summary_only": false,
+    "top_prefixes": []
+  },
+  "warnings": []
+}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "manifest-summary",
+            manifest.to_str().unwrap(),
+            "--json",
+            "--check",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["parquet_rows_match_streamed_rows"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["check_passed"], true);
+    assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "parquet_rows_match_streamed_rows" && check["status"] == "skip"
+    }));
 }
 
 #[test]
