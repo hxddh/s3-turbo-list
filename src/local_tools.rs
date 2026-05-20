@@ -881,6 +881,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
   summary        Count objects and bytes without Parquet/KS outputs
   pipe           Stream list results to shell tools or agents
   verify         Validate a saved run manifest locally
+  diff-safe      Authoritative single-segment diff workflow
   large-bucket   Hints, trace, and output-dir workflow
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands
@@ -928,6 +929,15 @@ Run: s3-turbo-list recipes <name>
 Pipe output with a manifest:
   s3-turbo-list --run-manifest run.json --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
   s3-turbo-list manifest-summary run.json --check
+"#
+            .to_string(),
+        ),
+        "diff-safe" => Ok(
+            r#"Safe diff:
+  export AWS_PROFILE=default
+  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' diff --bucket source-bucket --region us-east-1 --target-bucket target-bucket --target-region us-east-1
+  s3-turbo-list --run-manifest diff-run.json --output-dir out --delimiter '' diff --bucket source-bucket --region us-east-1 --target-bucket target-bucket --target-region us-east-1
+  s3-turbo-list manifest-summary diff-run.json --check
 "#
             .to_string(),
         ),

@@ -399,6 +399,34 @@ pub fn detect_hints_plan(
     }
 }
 
+pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>) -> HintsPlan {
+    let path = bucket.map(|bucket| conventional_hints_path(bucket, region));
+    let exists = path
+        .as_deref()
+        .map(|path| Path::new(path).exists())
+        .unwrap_or(false);
+    let report = path
+        .as_deref()
+        .filter(|_| exists)
+        .and_then(inspect_hints_for_plan);
+
+    HintsPlan {
+        source: "disabled_for_diff_single_segment".to_string(),
+        path,
+        exists,
+        valid: report.as_ref().map(|r| r.valid),
+        format: report
+            .as_ref()
+            .map(|r| format!("{:?}", r.format).to_lowercase()),
+        boundary_count: report.as_ref().map(|r| r.boundary_count),
+        estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
+        warnings: vec![
+            "diff uses single-segment authoritative mode; conventional hints cache is ignored until paired-segment diff coordination is implemented"
+                .to_string(),
+        ],
+    }
+}
+
 fn inspect_hints_for_plan(path: &str) -> Option<hints::HintsValidationReport> {
     hints::inspect_hints_file(path, 3).ok()
 }

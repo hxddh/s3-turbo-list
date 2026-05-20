@@ -11,7 +11,7 @@ Repository:
 - Local path: `/home/ubuntu/s3-turbo-list`
 - GitHub: `https://github.com/hxddh/s3-turbo-list`
 - Main branch: `main`
-- Current release tag: `v0.1.17`
+- Current release tag: `v0.1.18`
 
 ## Required Reading
 
@@ -147,8 +147,8 @@ Other documented options include GCC 10+ or disabling ASM.
 - Single-segment BOS listing works.
 - Hinted multi-segment listing is safe on AWS S3 and MinIO.
 - Hinted multi-segment listing is not authoritative on BOS until BOS fixes the service-side pagination compatibility issue.
-- Single-segment diff is validated.
-- Multi-segment diff coordination/testing remains an engineering priority.
+- Single-segment diff is validated and is the authoritative default.
+- Multi-segment diff coordination/testing remains deferred to `v0.2.x`.
 - Release artifacts in `dist/` are generated and ignored.
 - `target/` is generated and ignored.
 

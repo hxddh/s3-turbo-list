@@ -16,6 +16,7 @@ s3-turbo-list recipes agent-safe
 s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
 s3-turbo-list recipes verify
+s3-turbo-list recipes diff-safe
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
@@ -85,6 +86,13 @@ count, warnings, and estimate summary metadata.  When `--resume` is set and a
 checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 
+For `diff`, dry-run reports `hints.source =
+"disabled_for_diff_single_segment"`.  Conventional hints caches are
+intentionally ignored, and explicit `diff --hints-file` exits with code `2`
+before any S3 request.  Agents should treat current `diff` runs as
+authoritative single-segment comparisons until paired-segment diff coordination
+lands in `v0.2.x`.
+
 ## Run manifests
 
 For real listing runs, write a final manifest:
@@ -147,6 +155,7 @@ equality is reported as not applicable rather than a failure.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.
+
 Endpoint compatibility profiles that require provider-specific endpoints warn
 in dry-run and `doctor` until an endpoint URL is configured.  Placeholder
 endpoints from starter configs, such as `<account-id>` or `<region>`, are also

@@ -700,6 +700,7 @@ fn main() {
     validate_summary_only_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
+    validate_diff_hints_command(&cli);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -1061,12 +1062,14 @@ fn main() {
         };
 
         // ── Load or generate KeySpace hints ─────────────────
+        let hints_disabled_for_diff = mode == RunMode::BiDir;
         let ks_list: Vec<String> = load_hints(
             cli.hints_file.as_deref(),
             opt_bucket,
             opt_region,
             cfg.s3.profile.as_deref(),
-            cli.no_auto_hints,
+            cli.no_auto_hints || hints_disabled_for_diff,
+            hints_disabled_for_diff,
         );
         let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
 
@@ -1738,6 +1741,18 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
     }
 }
 
+fn validate_diff_hints_command(cli: &Cli) {
+    if !matches!(cli.cmd, Commands::Diff { .. }) {
+        return;
+    }
+    if cli.hints_file.is_some() {
+        eprintln!(
+            "diff with --hints-file is not supported yet: hinted multi-segment diff paired coordination is deferred to v0.2.x; remove --hints-file to run authoritative single-segment diff"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
 fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
     match &cli.cmd {
         Commands::List { output_format, .. } => Some(*output_format),
@@ -2084,12 +2099,16 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
             }),
         )
     });
-    let hints = agent::detect_hints_plan(
-        cli.hints_file.as_deref(),
-        inputs.bucket.as_deref(),
-        inputs.region.as_deref(),
-        cli.no_auto_hints,
-    );
+    let hints = if inputs.mode == "diff" {
+        agent::diff_single_segment_hints_plan(inputs.bucket.as_deref(), inputs.region.as_deref())
+    } else {
+        agent::detect_hints_plan(
+            cli.hints_file.as_deref(),
+            inputs.bucket.as_deref(),
+            inputs.region.as_deref(),
+            cli.no_auto_hints,
+        )
+    };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = runtime_guardrail_warnings(cli, cfg);
     if matches!(cli.cmd, Commands::CompatProbe { .. }) {
@@ -2193,6 +2212,12 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                 "output path flags are ignored when --output-format is tsv or ndjson".to_string(),
             );
         }
+    }
+    if matches!(cli.cmd, Commands::Diff { .. }) {
+        warnings.push(
+            "diff uses single-segment authoritative mode; hinted multi-segment diff paired coordination is deferred to v0.2.x"
+                .to_string(),
+        );
     }
     warnings
 }
@@ -2503,6 +2528,7 @@ fn load_hints(
     region: Option<&str>,
     profile: Option<&str>,
     no_auto_hints: bool,
+    disabled_for_diff: bool,
 ) -> Vec<String> {
     // 1. Explicit --hints-file takes absolute precedence.
     if let Some(path) = hints_file {
@@ -2520,9 +2546,15 @@ fn load_hints(
     }
 
     if no_auto_hints {
-        info!(
-            "--no-auto-hints set. Skipping conventional hints cache lookup and using single-segment fallback."
-        );
+        if disabled_for_diff {
+            info!(
+                "diff mode uses single-segment authoritative fallback. Skipping conventional hints cache lookup."
+            );
+        } else {
+            info!(
+                "--no-auto-hints set. Skipping conventional hints cache lookup and using single-segment fallback."
+            );
+        }
         return vec![];
     }
 

@@ -361,6 +361,7 @@ For concise local help:
 s3-turbo-list recipes
 s3-turbo-list recipes summary
 s3-turbo-list recipes verify
+s3-turbo-list recipes diff-safe
 s3-turbo-list recipes large-bucket
 s3-turbo-list cheatsheet
 ```
@@ -402,6 +403,11 @@ s3-turbo-list diff \
   --target-region us-west-2 --target-bucket target-bucket \
   --trace-compat diff-trace.jsonl
 ```
+
+Diff mode intentionally uses authoritative single-segment listing in current
+releases.  Conventional hints caches are ignored for `diff`, and explicit
+`--hints-file` is rejected before any S3 request.  Paired-segment hinted diff
+coordination is planned for `v0.2.x`; use hints with `list` only for now.
 
 ### Checkpoint / resume
 
@@ -635,9 +641,10 @@ Validation details:
 ## Known limitations
 
 1. **Hinted multi-segment diff paired coordination is deferred.**  Diff mode
-   has been validated for single-segment operations (no hints).  Multi-segment
-   diff coordination across left/right segment pairs is planned but not yet
-   implemented.
+   uses authoritative single-segment listing in current releases.  Conventional
+   hints caches are ignored for `diff`, and `diff --hints-file` is rejected.
+   Multi-segment diff coordination across left/right segment pairs is planned
+   for `v0.2.x`.
 
 2. **Release build on Ubuntu 20.04 arm64 may require an `aws-lc-sys` workaround**
    documented in [`BUILD.md`](BUILD.md).  The `aws-lc-sys` crate detects a

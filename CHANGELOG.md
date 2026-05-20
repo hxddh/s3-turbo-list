@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-05-20
+
+### Added
+- Dry-run and run-manifest warnings now state that `diff` uses authoritative
+  single-segment mode until paired-segment diff coordination is implemented.
+- Dry-run plans report `hints.source = "disabled_for_diff_single_segment"` for
+  `diff` so agents can tell that conventional hints caches are intentionally
+  ignored.
+- `recipes diff-safe` for the recommended local preflight and manifest-check
+  workflow around bucket diffing.
+
+### Changed
+- `diff` now ignores conventional auto-hints caches by default and stays on the
+  single-segment authoritative path.
+
+### Fixed
+- `diff --hints-file` is now rejected before any S3 request instead of allowing
+  an unsupported hinted multi-segment diff path.
+
 ## [0.1.17] - 2026-05-20
 
 ### Added

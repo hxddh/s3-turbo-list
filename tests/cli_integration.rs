@@ -283,6 +283,12 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("--output-format ndjson"));
     assert!(stdout.contains("manifest-summary"));
 
+    let (code, stdout, stderr) = run_cli(&["recipes", "diff-safe"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Safe diff"));
+    assert!(stdout.contains("diff --bucket"));
+    assert!(stdout.contains("manifest-summary"));
+
     let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("AWS_PROFILE"));
@@ -797,6 +803,29 @@ fn test_cli_rejects_continuation_token_with_diff_or_hints() {
 }
 
 #[test]
+fn test_cli_rejects_diff_with_explicit_hints_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "m/\n").unwrap();
+
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--hints-file",
+        hints.to_str().unwrap(),
+        "diff",
+        "--bucket",
+        "left",
+        "--target-bucket",
+        "right",
+    ]);
+
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("diff with --hints-file is not supported yet"));
+    assert!(stderr.contains("v0.2.x"));
+    assert!(stderr.contains("single-segment diff"));
+}
+
+#[test]
 fn test_cli_manifest_summary_human_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("run.json");
@@ -929,7 +958,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.17",
+  "tool_version": "0.1.18",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,
@@ -1146,6 +1175,94 @@ estimate_mode = "full"
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["hints"]["source"], "disabled_single_segment_fallback");
     assert_eq!(json["hints"]["exists"], false);
+}
+
+#[test]
+fn test_cli_dry_run_list_still_reports_conventional_hints_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("us-east-1_test-bucket_hints.toml"),
+        r#"bucket = "test-bucket"
+region = "us-east-1"
+total_objects = 30
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--agent",
+            "--dry-run",
+            "list",
+            "--bucket",
+            "test-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hints"]["source"], "auto_cache");
+    assert_eq!(json["hints"]["exists"], true);
+    assert_eq!(json["hints"]["boundary_count"], 1);
+}
+
+#[test]
+fn test_cli_dry_run_diff_ignores_conventional_hints_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("us-east-1_left_hints.toml"),
+        r#"bucket = "left"
+region = "us-east-1"
+total_objects = 30
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--agent",
+            "--dry-run",
+            "diff",
+            "--bucket",
+            "left",
+            "--region",
+            "us-east-1",
+            "--target-bucket",
+            "right",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hints"]["source"], "disabled_for_diff_single_segment");
+    assert_eq!(json["hints"]["exists"], true);
+    assert_eq!(json["hints"]["boundary_count"], 1);
+    assert!(json["hints"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning
+                .as_str()
+                .unwrap()
+                .contains("conventional hints cache is ignored")
+        }));
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("hinted multi-segment diff paired coordination is deferred")
+    }));
 }
 
 #[test]

@@ -1071,6 +1071,104 @@ estimate_mode = "full"
 }
 
 #[test]
+fn local_mock_diff_ignores_conventional_hints_cache() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.contains_key("start-after") {
+            return MockResponse::error(
+                500,
+                "UnexpectedHints",
+                "diff should ignore conventional hints and use single-segment listing",
+            );
+        }
+        let contents = if request.path.contains("/left") {
+            vec!["same.txt", "left-only.txt"]
+        } else if request.path.contains("/right") {
+            vec!["same.txt", "right-only.txt"]
+        } else {
+            return MockResponse::error(500, "UnexpectedBucket", &request.path);
+        };
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &contents,
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("diff.parquet");
+    let ks = dir.path().join("diff.ks");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+    std::fs::write(
+        dir.path().join("us-east-1_left_hints.toml"),
+        r#"bucket = "left"
+region = "us-east-1"
+total_objects = 2
+boundaries = ["m/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--target-region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut keys = parquet_keys(&parquet);
+    keys.sort();
+    assert_eq!(keys, vec!["left-only.txt", "right-only.txt", "same.txt"]);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{:#?}", requests);
+    assert!(requests
+        .iter()
+        .all(|request| !request.query.contains_key("start-after")));
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert!(manifest_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap()
+            .contains("hinted multi-segment diff paired coordination is deferred")));
+}
+
+#[test]
 fn local_mock_auto_hints_uses_prefix_and_max_keys() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(

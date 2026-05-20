@@ -58,4 +58,6 @@ real run with an unedited template endpoint.
 - R2, B2, and OSS presets are documented defaults, not a claim of full project
   validation.
 - The BOS profile does not enable a default pagination workaround.
-- Hinted multi-segment diff coordination is still deferred.
+- Hinted multi-segment diff coordination is still deferred.  Current `diff`
+  runs ignore conventional hints caches, and `diff --hints-file` is rejected
+  before any S3 request.

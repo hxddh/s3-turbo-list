@@ -1,6 +1,6 @@
 [package]
 name = "s3-turbo-list"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.75"
