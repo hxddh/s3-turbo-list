@@ -440,6 +440,77 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
 }
 
 #[test]
+fn local_mock_summary_only_reports_metrics_without_outputs() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["logs/a.txt", "logs/b.txt"],
+                &[],
+                true,
+                Some("token-1"),
+            )),
+            Some("token-1") => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["images/c.jpg"],
+                &[],
+                false,
+                None,
+            )),
+            Some(_) => MockResponse::error(400, "InvalidToken", "unexpected continuation token"),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--summary-only".into(),
+        "--agent".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let manifest: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(manifest["metrics"]["summary_only"], true);
+    assert_eq!(manifest["metrics"]["received_objects"], 3);
+    assert_eq!(manifest["metrics"]["streamed_rows"], 3);
+    assert_eq!(manifest["metrics"]["parquet_rows"], 0);
+    assert_eq!(manifest["metrics"]["ks_entries"], 0);
+    assert_eq!(manifest["metrics"]["bytes_total"], 301);
+    assert_eq!(manifest["outputs"]["parquet_file"], Value::Null);
+    assert_eq!(manifest["outputs"]["ks_file"], Value::Null);
+    assert!(manifest["artifacts"].as_array().unwrap().is_empty());
+    assert!(!dir.path().join("out.parquet").exists());
+    assert!(!dir.path().join("out.ks").exists());
+}
+
+#[test]
 fn local_mock_compat_probe_covers_head_list_and_pagination() {
     let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
         "HEAD" => MockResponse::empty_ok(),

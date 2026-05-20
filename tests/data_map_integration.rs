@@ -420,6 +420,10 @@ async fn test_list_streaming_synthetic_dataset_consistency_and_artifacts() {
     assert_eq!(metrics.data_streamed_rows, total);
     assert_eq!(metrics.data_parquet_rows, total);
     assert_eq!(metrics.data_ks_entries, prefixes.len());
+    assert_eq!(metrics.data_bytes_total, (0..total as u64).sum::<u64>());
+    assert_eq!(metrics.data_top_prefixes.len(), prefixes.len());
+    assert_eq!(metrics.data_top_prefixes[0].objects, total / prefixes.len());
+    assert!(!metrics.data_summary_only);
 
     let outputs = OutputPathSummary {
         parquet_file: Some(parquet_path.to_str().unwrap().to_string()),
@@ -442,6 +446,49 @@ async fn test_list_streaming_synthetic_dataset_consistency_and_artifacts() {
     assert!(ks.exists);
     assert_eq!(ks.line_count, Some(prefixes.len()));
     assert_eq!(ks.sha256.as_ref().unwrap().len(), 64);
+}
+
+#[tokio::test]
+async fn test_list_summary_only_records_metrics_without_artifacts() {
+    let quit = Arc::new(AtomicBool::new(false));
+    let g_state = GlobalState::new(quit, 1);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let ctx = DataMapContext::new(rx, g_state.clone());
+
+    let task = tokio::spawn(async move {
+        s3_turbo_list::data_map::data_map_task_list_summary_only(ctx).await;
+    });
+
+    let mut first = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [1u8; 16]);
+    first.last_modified = 1;
+    let mut second = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 200, [2u8; 16]);
+    second.last_modified = 2;
+    let mut third = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 300, [3u8; 16]);
+    third.last_modified = 3;
+
+    tx.send(vec![
+        (ObjectKey::from("logs/a.txt"), first),
+        (ObjectKey::from("logs/b.txt"), second),
+        (ObjectKey::from("images/c.jpg"), third),
+    ])
+    .await
+    .unwrap();
+    drop(tx);
+    task.await.unwrap();
+
+    let metrics = g_state.metrics_snapshot();
+    assert_eq!(metrics.data_received_batches, 1);
+    assert_eq!(metrics.data_received_objects, 3);
+    assert_eq!(metrics.data_streamed_rows, 3);
+    assert_eq!(metrics.data_unique_prefixes, 2);
+    assert_eq!(metrics.data_parquet_rows, 0);
+    assert_eq!(metrics.data_ks_entries, 0);
+    assert_eq!(metrics.data_bytes_total, 600);
+    assert!(metrics.data_summary_only);
+    assert_eq!(metrics.data_top_prefixes.len(), 2);
+    assert_eq!(metrics.data_top_prefixes[0].prefix, "logs");
+    assert_eq!(metrics.data_top_prefixes[0].objects, 2);
+    assert_eq!(metrics.data_top_prefixes[0].bytes, 300);
 }
 
 #[tokio::test]

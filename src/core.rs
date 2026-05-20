@@ -3,7 +3,7 @@ use crate::stats::HttpStatusCodeTracker;
 use crate::trace::S3TraceWriter;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -396,7 +396,17 @@ pub struct GlobalState {
     pub data_unique_prefixes: Arc<AtomicUsize>,
     pub data_parquet_rows: Arc<AtomicUsize>,
     pub data_ks_entries: Arc<AtomicUsize>,
+    pub data_bytes_total: Arc<AtomicU64>,
+    pub data_top_prefixes: Arc<Mutex<Vec<PrefixMetric>>>,
+    pub data_summary_only: Arc<AtomicBool>,
     pub(crate) task_rendez: TaskRendezvous,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PrefixMetric {
+    pub prefix: String,
+    pub objects: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -412,6 +422,9 @@ pub struct RunMetricsSnapshot {
     pub data_unique_prefixes: usize,
     pub data_parquet_rows: usize,
     pub data_ks_entries: usize,
+    pub data_bytes_total: u64,
+    pub data_top_prefixes: Vec<PrefixMetric>,
+    pub data_summary_only: bool,
 }
 
 impl GlobalState {
@@ -431,6 +444,9 @@ impl GlobalState {
             data_unique_prefixes: Arc::new(AtomicUsize::new(0)),
             data_parquet_rows: Arc::new(AtomicUsize::new(0)),
             data_ks_entries: Arc::new(AtomicUsize::new(0)),
+            data_bytes_total: Arc::new(AtomicU64::new(0)),
+            data_top_prefixes: Arc::new(Mutex::new(Vec::new())),
+            data_summary_only: Arc::new(AtomicBool::new(false)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
     }
@@ -479,6 +495,9 @@ impl GlobalState {
         unique_prefixes: usize,
         parquet_rows: usize,
         ks_entries: usize,
+        bytes_total: u64,
+        top_prefixes: Vec<PrefixMetric>,
+        summary_only: bool,
     ) {
         self.data_received_batches
             .store(received_batches, Ordering::SeqCst);
@@ -490,6 +509,9 @@ impl GlobalState {
             .store(unique_prefixes, Ordering::SeqCst);
         self.data_parquet_rows.store(parquet_rows, Ordering::SeqCst);
         self.data_ks_entries.store(ks_entries, Ordering::SeqCst);
+        self.data_bytes_total.store(bytes_total, Ordering::SeqCst);
+        *self.data_top_prefixes.lock().unwrap() = top_prefixes;
+        self.data_summary_only.store(summary_only, Ordering::SeqCst);
     }
     pub fn metrics_snapshot(&self) -> RunMetricsSnapshot {
         RunMetricsSnapshot {
@@ -504,6 +526,9 @@ impl GlobalState {
             data_unique_prefixes: self.data_unique_prefixes.load(Ordering::SeqCst),
             data_parquet_rows: self.data_parquet_rows.load(Ordering::SeqCst),
             data_ks_entries: self.data_ks_entries.load(Ordering::SeqCst),
+            data_bytes_total: self.data_bytes_total.load(Ordering::SeqCst),
+            data_top_prefixes: self.data_top_prefixes.lock().unwrap().clone(),
+            data_summary_only: self.data_summary_only.load(Ordering::SeqCst),
         }
     }
     pub fn get_tracker(&self) -> Arc<HttpStatusCodeTracker> {

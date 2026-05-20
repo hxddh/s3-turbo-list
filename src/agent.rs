@@ -232,6 +232,9 @@ pub struct MetricsSummary {
     pub unique_prefixes: usize,
     pub parquet_rows: usize,
     pub ks_entries: usize,
+    pub bytes_total: u64,
+    pub top_prefixes: Vec<crate::core::PrefixMetric>,
+    pub summary_only: bool,
 }
 
 impl From<RunMetricsSnapshot> for MetricsSummary {
@@ -248,6 +251,9 @@ impl From<RunMetricsSnapshot> for MetricsSummary {
             unique_prefixes: metrics.data_unique_prefixes,
             parquet_rows: metrics.data_parquet_rows,
             ks_entries: metrics.data_ks_entries,
+            bytes_total: metrics.data_bytes_total,
+            top_prefixes: metrics.data_top_prefixes,
+            summary_only: metrics.data_summary_only,
         }
     }
 }

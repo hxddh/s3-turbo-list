@@ -13,7 +13,9 @@ s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list recipes agent-safe
+s3-turbo-list recipes summary
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
@@ -113,7 +115,11 @@ The manifest includes:
 
 The `metrics` object includes data-map counters such as received batches,
 received objects, streamed rows, unique prefixes, Parquet rows, KS entries,
-fatal listing errors, and output write errors.
+total bytes, top prefixes, fatal listing errors, and output write errors.
+
+Use `--summary-only` when an agent needs aggregate object count, byte count, or
+top-prefix distribution without writing Parquet/KS artifacts.  This is not a
+dry-run: it scans S3 unless combined with `--dry-run`.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.

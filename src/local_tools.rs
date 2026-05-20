@@ -354,6 +354,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
         "index" | "list" => Ok(
             r#"Available recipes:
   aws-basic      Minimal AWS S3 dry-run and list
+  summary        Count objects and bytes without Parquet/KS outputs
   large-bucket   Hints, trace, and output-dir workflow
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands
@@ -368,6 +369,15 @@ Run: s3-turbo-list recipes <name>
   s3-turbo-list doctor --local-only --simple
   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+"#
+            .to_string(),
+        ),
+        "summary" => Ok(
+            r#"Summary only:
+  export AWS_PROFILE=default
+  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),

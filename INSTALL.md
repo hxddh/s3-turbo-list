@@ -33,14 +33,23 @@ s3-turbo-list --output-dir out --delimiter '' \
 default delimiter is `/`, which is hierarchical and only returns top-level
 objects plus `CommonPrefixes`.
 
+If you only need object count, total bytes, and top-prefix distribution, use
+summary-only mode.  It still scans S3, but it does not write Parquet or
+KeySpace files:
+
+```bash
+s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+```
+
 ## Choose the correct binary
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.13-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.13-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.13-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.13-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.14-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.14-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.14-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.14-macos-x86_64` |
 
 To identify your platform:
 
@@ -76,8 +85,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.13-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.13-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.14-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.14-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -85,8 +94,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.13-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.13-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.14-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.14-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -98,18 +107,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.13-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.13-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.13-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.14-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.14-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.14-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.13-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.13-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.13-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.14-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.14-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.14-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -175,6 +184,7 @@ s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list recipes aws-basic
+s3-turbo-list recipes summary
 
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
   --bucket my-bucket \

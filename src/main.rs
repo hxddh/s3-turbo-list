@@ -140,6 +140,10 @@ struct Cli {
     /// Write final run manifest JSON to this path
     #[arg(long, global = true)]
     run_manifest: Option<String>,
+
+    /// Scan and report aggregate metrics without writing Parquet or KeySpace outputs
+    #[arg(long, global = true)]
+    summary_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -629,6 +633,8 @@ fn main() {
     cfg.apply_profile_preset();
     cfg.normalize_addressing_style();
     apply_output_dir_defaults(&cli, &mut cfg);
+    apply_summary_only_output_defaults(&cli, &mut cfg);
+    validate_summary_only_command(&cli);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -870,7 +876,6 @@ fn main() {
             unreachable!("benchmark-local is handled before runtime setup")
         }
     };
-
     let opt_prefix = if cli.prefix == "/" {
         String::new()
     } else {
@@ -1112,6 +1117,8 @@ fn main() {
                 )
                 .await
             });
+        } else if cli.summary_only {
+            set.spawn(async move { data_map::data_map_task_list_summary_only(data_map_ctx).await });
         } else {
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(
@@ -1236,8 +1243,12 @@ fn main() {
         "failed"
     };
 
-    let manifest_outputs =
-        runtime_output_summary(&cli, &cfg, Some(&filename_ks), Some(&filename_output));
+    let manifest_outputs = runtime_output_summary(
+        &cli,
+        &cfg,
+        (!cli.summary_only).then_some(filename_ks.as_str()),
+        (!cli.summary_only).then_some(filename_output.as_str()),
+    );
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -1281,6 +1292,8 @@ fn main() {
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
+    } else if exit_code == agent::ExitCode::Success && cli.summary_only {
+        print_summary(&manifest.metrics);
     } else if exit_code == agent::ExitCode::Success {
         print_wrote_summary(&manifest.outputs);
     }
@@ -1523,6 +1536,9 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     let Some(output_dir) = cli.output_dir.as_deref() else {
         return;
     };
+    if cli.summary_only {
+        return;
+    }
 
     match &cli.cmd {
         Commands::List { region, bucket } => {
@@ -1554,6 +1570,20 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
             }
         }
         _ => {}
+    }
+}
+
+fn apply_summary_only_output_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
+    if cli.summary_only {
+        cfg.output.parquet_file = None;
+        cfg.output.ks_file = None;
+    }
+}
+
+fn validate_summary_only_command(cli: &Cli) {
+    if cli.summary_only && !matches!(cli.cmd, Commands::List { .. }) {
+        eprintln!("--summary-only is only supported with the list command");
+        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
@@ -1620,6 +1650,47 @@ fn print_wrote_summary(outputs: &agent::OutputPathSummary) {
     }
     if let Some(path) = &outputs.log_file {
         println!("  Log: {}", path);
+    }
+}
+
+fn print_summary(metrics: &agent::MetricsSummary) {
+    println!("Summary:");
+    println!("  objects:  {}", metrics.streamed_rows);
+    println!(
+        "  bytes:    {} ({})",
+        metrics.bytes_total,
+        human_bytes(metrics.bytes_total)
+    );
+    println!("  prefixes: {}", metrics.unique_prefixes);
+    if !metrics.top_prefixes.is_empty() {
+        println!("Top prefixes:");
+        for prefix in metrics.top_prefixes.iter().take(10) {
+            println!(
+                "  {}  objects={} bytes={} ({})",
+                prefix.prefix,
+                prefix.objects,
+                prefix.bytes,
+                human_bytes(prefix.bytes)
+            );
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{:.2} {}", value, unit)
     }
 }
 
@@ -1875,6 +1946,12 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
                 .to_string(),
         );
     }
+    if cli.summary_only {
+        warnings.push(
+            "summary-only will scan S3 ListObjectsV2 pages when not run with --dry-run, but it will not write Parquet or KeySpace outputs"
+                .to_string(),
+        );
+    }
 
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
@@ -1915,6 +1992,16 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                 ));
             }
         }
+    }
+    if cli.summary_only
+        && (cli.output_dir.is_some()
+            || cli.output_parquet_file.is_some()
+            || cli.output_ks_file.is_some())
+    {
+        warnings.push(
+            "--summary-only does not write Parquet or KeySpace outputs; output path flags are ignored"
+                .to_string(),
+        );
     }
     warnings
 }
@@ -2043,6 +2130,16 @@ fn runtime_output_summary(
     ks_file: Option<&str>,
     parquet_file: Option<&str>,
 ) -> agent::OutputPathSummary {
+    if cli.summary_only {
+        return agent::OutputPathSummary {
+            parquet_file: None,
+            ks_file: None,
+            hints_file: None,
+            trace_compat: cfg.s3.trace_compat.clone(),
+            log_file: cfg.output.log_file.clone(),
+        };
+    }
+
     let hints_file = match &cli.cmd {
         Commands::AutoHints {
             region,
@@ -2089,6 +2186,10 @@ fn planned_output_paths(
     cli: &Cli,
     cfg: &S3TurboConfig,
 ) -> (Option<String>, Option<String>, Option<String>) {
+    if cli.summary_only {
+        return (None, None, None);
+    }
+
     let now = Local::now().format("%Y%m%d%H%M%S").to_string();
     match &cli.cmd {
         Commands::List { region, bucket } => {

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-05-20
+
+### Added
+- `--summary-only` for `list` runs that scan S3 and report aggregate metrics
+  without writing Parquet or KeySpace outputs.
+- Manifest metrics for `bytes_total`, `top_prefixes`, and `summary_only`.
+- `recipes summary` for concise object-count and byte-count workflows.
+
+### Changed
+- List metrics now include aggregate byte and top-prefix summaries for agent
+  manifests.
+- `examples/read_manifest.py` now prints summary-only metrics and top prefixes.
+- Documentation now distinguishes default Parquet output, summary-only scans,
+  and dry-run planning.
+
 ## [0.1.13] - 2026-05-19
 
 ### Added

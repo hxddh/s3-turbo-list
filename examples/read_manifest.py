@@ -20,8 +20,23 @@ def main() -> int:
     print(f"elapsed_secs: {manifest.get('elapsed_secs')}")
 
     metrics = manifest.get("metrics", {})
+    print(f"received_objects: {metrics.get('received_objects')}")
+    print(f"streamed_rows: {metrics.get('streamed_rows')}")
+    print(f"bytes_total: {metrics.get('bytes_total')}")
+    print(f"summary_only: {metrics.get('summary_only')}")
     print(f"parquet_rows: {metrics.get('parquet_rows')}")
     print(f"ks_entries: {metrics.get('ks_entries')}")
+
+    top_prefixes = metrics.get("top_prefixes") or []
+    if top_prefixes:
+        print("top_prefixes:")
+        for item in top_prefixes[:10]:
+            print(
+                "  - "
+                f"{item.get('prefix')}: "
+                f"objects={item.get('objects')} "
+                f"bytes={item.get('bytes')}"
+            )
 
     print("artifacts:")
     for artifact in manifest.get("artifacts", []):

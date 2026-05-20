@@ -513,6 +513,67 @@ fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
 }
 
 #[test]
+fn test_cli_dry_run_summary_only_plans_no_output_artifacts() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--dry-run",
+        "--summary-only",
+        "--output-dir",
+        "out",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["outputs"]["parquet_file"], serde_json::Value::Null);
+    assert_eq!(json["outputs"]["ks_file"], serde_json::Value::Null);
+    assert_eq!(
+        json["resolved_config"]["output"]["parquet_file"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["resolved_config"]["output"]["ks_file"],
+        serde_json::Value::Null
+    );
+    assert!(json["file_conflicts"].as_array().unwrap().is_empty());
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("summary-only will scan S3 ListObjectsV2 pages")
+    }));
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("output path flags are ignored")
+    }));
+}
+
+#[test]
+fn test_cli_summary_only_rejects_diff() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--dry-run",
+        "--summary-only",
+        "diff",
+        "--bucket",
+        "left",
+        "--region",
+        "us-east-1",
+        "--target-bucket",
+        "right",
+        "--target-region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("--summary-only is only supported with the list command"));
+}
+
+#[test]
 fn test_cli_dry_run_reports_hints_and_checkpoint_summary() {
     let dir = tempfile::tempdir().unwrap();
     let hints_path = dir.path().join("hints.toml");

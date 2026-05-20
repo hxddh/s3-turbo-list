@@ -74,6 +74,10 @@ s3-turbo-list --dry-run --agent --output-dir out --delimiter '' \
   list --region us-east-2 --bucket my-bucket
 s3-turbo-list --output-dir out --delimiter '' \
   list --region us-east-2 --bucket my-bucket
+
+# Count objects and bytes without writing Parquet/KS outputs
+s3-turbo-list --summary-only --delimiter '' \
+  list --region us-east-2 --bucket my-bucket
 ```
 
 `init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
@@ -120,6 +124,16 @@ full-bucket object inventory.
 Output files (auto-named):
 - `<region>_<bucket>_<timestamp>.parquet` — object listing
 - `<region>_<bucket>_<timestamp>.ks` — keyspace counts
+
+### Choosing an output mode
+
+- Default `list`: scans S3 and writes Parquet + KeySpace artifacts.  Use this
+  for audit records, DuckDB/pandas analysis, and repeatable inventory files.
+- `--summary-only`: scans S3 and reports aggregate metrics such as object
+  count, total bytes, and top prefixes.  It does not write Parquet or KeySpace
+  outputs.
+- `--dry-run`: does not contact S3.  It only resolves inputs, planned outputs,
+  local hints, checkpoint identity, and warnings.
 
 ### Read Parquet with Python / pyarrow
 
@@ -301,6 +315,7 @@ For concise local help:
 
 ```bash
 s3-turbo-list recipes
+s3-turbo-list recipes summary
 s3-turbo-list recipes large-bucket
 s3-turbo-list cheatsheet
 ```
