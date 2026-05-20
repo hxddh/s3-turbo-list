@@ -151,6 +151,7 @@ pub struct CommandInputSummary {
     pub region: Option<String>,
     pub target_bucket: Option<String>,
     pub target_region: Option<String>,
+    pub output_format: Option<String>,
     pub prefix: String,
     pub delimiter: String,
     pub max_keys: Option<i32>,

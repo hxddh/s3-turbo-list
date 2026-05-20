@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-05-20
+
+### Added
+- `list --output-format parquet|tsv|ndjson`, with `parquet` remaining the
+  default artifact-writing mode and TSV/NDJSON streaming rows to stdout.
+- Local-only `manifest-summary` for turning run manifest JSON into human or
+  machine-readable summaries without contacting S3.
+- `recipes pipe` for shell, jq, and agent-friendly list workflows.
+
+### Changed
+- Dry-run plans and run manifests now record the selected list output format.
+- TSV/NDJSON list runs skip Parquet and KeySpace artifact paths while retaining
+  aggregate manifest metrics.
+- Release asset workflow now uses Node 24-native GitHub Actions versions for
+  checkout, upload-artifact, and download-artifact.
+
 ## [0.1.14] - 2026-05-20
 
 ### Added

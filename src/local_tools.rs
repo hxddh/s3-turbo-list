@@ -119,6 +119,53 @@ pub struct LongTailSegment {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestSummaryReport {
+    pub status: String,
+    pub manifest_file: String,
+    pub tool_version: Option<String>,
+    pub run_status: String,
+    pub exit_code: Option<i64>,
+    pub elapsed_secs: Option<f64>,
+    pub command: Vec<String>,
+    pub summary_only: bool,
+    pub received_objects: u64,
+    pub streamed_rows: u64,
+    pub parquet_rows: u64,
+    pub ks_entries: u64,
+    pub bytes_total: u64,
+    pub unique_prefixes: u64,
+    pub parquet_rows_match_streamed_rows: Option<bool>,
+    pub top_prefixes: Vec<ManifestPrefixSummary>,
+    pub outputs: ManifestOutputSummary,
+    pub artifacts: Vec<ManifestArtifactSummary>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestPrefixSummary {
+    pub prefix: String,
+    pub objects: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestOutputSummary {
+    pub parquet_file: Option<String>,
+    pub ks_file: Option<String>,
+    pub hints_file: Option<String>,
+    pub trace_compat: Option<String>,
+    pub log_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestArtifactSummary {
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct TraceAnalysis {
     report: TraceSummaryReport,
@@ -334,6 +381,119 @@ pub fn init_config(
     })
 }
 
+pub fn manifest_summary(path: &str) -> Result<ManifestSummaryReport, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read manifest '{}': {}", path, e))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse manifest '{}': {}", path, e))?;
+    let metrics = value
+        .get("metrics")
+        .ok_or_else(|| format!("manifest '{}' does not contain metrics", path))?;
+
+    let streamed_rows = json_u64(metrics, "streamed_rows");
+    let parquet_rows = json_u64(metrics, "parquet_rows");
+    let parquet_rows_match_streamed_rows = if streamed_rows > 0 || parquet_rows > 0 {
+        Some(streamed_rows == parquet_rows)
+    } else {
+        None
+    };
+
+    Ok(ManifestSummaryReport {
+        status: "success".to_string(),
+        manifest_file: path.to_string(),
+        tool_version: json_string(&value, "tool_version"),
+        run_status: json_string(&value, "status").unwrap_or_else(|| "unknown".to_string()),
+        exit_code: value.get("exit_code").and_then(|v| v.as_i64()),
+        elapsed_secs: value.get("elapsed_secs").and_then(|v| v.as_f64()),
+        command: value
+            .get("command")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        summary_only: metrics
+            .get("summary_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        received_objects: json_u64(metrics, "received_objects"),
+        streamed_rows,
+        parquet_rows,
+        ks_entries: json_u64(metrics, "ks_entries"),
+        bytes_total: json_u64(metrics, "bytes_total"),
+        unique_prefixes: json_u64(metrics, "unique_prefixes"),
+        parquet_rows_match_streamed_rows,
+        top_prefixes: metrics
+            .get("top_prefixes")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| ManifestPrefixSummary {
+                        prefix: json_string(item, "prefix").unwrap_or_default(),
+                        objects: json_u64(item, "objects"),
+                        bytes: json_u64(item, "bytes"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        outputs: ManifestOutputSummary {
+            parquet_file: value
+                .get("outputs")
+                .and_then(|v| json_string(v, "parquet_file")),
+            ks_file: value.get("outputs").and_then(|v| json_string(v, "ks_file")),
+            hints_file: value
+                .get("outputs")
+                .and_then(|v| json_string(v, "hints_file")),
+            trace_compat: value
+                .get("outputs")
+                .and_then(|v| json_string(v, "trace_compat")),
+            log_file: value
+                .get("outputs")
+                .and_then(|v| json_string(v, "log_file")),
+        },
+        artifacts: value
+            .get("artifacts")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| ManifestArtifactSummary {
+                        kind: json_string(item, "kind").unwrap_or_default(),
+                        path: json_string(item, "path").unwrap_or_default(),
+                        exists: item
+                            .get("exists")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        size_bytes: item.get("size_bytes").and_then(|v| v.as_u64()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        warnings: value
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
 pub fn render_init_config_text(report: &InitConfigReport) -> String {
     let mut out = String::new();
     out.push_str("Config initialized:\n");
@@ -348,6 +508,89 @@ pub fn render_init_config_text(report: &InitConfigReport) -> String {
     out
 }
 
+pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Manifest: {}\n", report.manifest_file));
+    out.push_str(&format!("  Status:       {}\n", report.run_status));
+    if let Some(code) = report.exit_code {
+        out.push_str(&format!("  Exit code:    {}\n", code));
+    }
+    if let Some(elapsed) = report.elapsed_secs {
+        out.push_str(&format!("  Elapsed:      {:.3}s\n", elapsed));
+    }
+    out.push_str(&format!("  Summary only: {}\n", report.summary_only));
+    out.push_str(&format!("  Objects:      {}\n", report.streamed_rows));
+    out.push_str(&format!(
+        "  Bytes:        {} ({})\n",
+        report.bytes_total,
+        human_bytes(report.bytes_total)
+    ));
+    out.push_str(&format!("  Prefixes:     {}\n", report.unique_prefixes));
+    out.push_str(&format!("  Parquet rows: {}\n", report.parquet_rows));
+    if let Some(matches) = report.parquet_rows_match_streamed_rows {
+        out.push_str(&format!(
+            "  Row check:    parquet_rows == streamed_rows: {}\n",
+            matches
+        ));
+    }
+    if !report.top_prefixes.is_empty() {
+        out.push_str("Top prefixes:\n");
+        for prefix in report.top_prefixes.iter().take(10) {
+            out.push_str(&format!(
+                "  {}  objects={} bytes={} ({})\n",
+                prefix.prefix,
+                prefix.objects,
+                prefix.bytes,
+                human_bytes(prefix.bytes)
+            ));
+        }
+    }
+    if report.outputs.parquet_file.is_some()
+        || report.outputs.ks_file.is_some()
+        || report.outputs.trace_compat.is_some()
+        || report.outputs.log_file.is_some()
+    {
+        out.push_str("Outputs:\n");
+        if let Some(path) = &report.outputs.parquet_file {
+            out.push_str(&format!("  Parquet:  {}\n", path));
+        }
+        if let Some(path) = &report.outputs.ks_file {
+            out.push_str(&format!("  KeySpace: {}\n", path));
+        }
+        if let Some(path) = &report.outputs.trace_compat {
+            out.push_str(&format!("  Trace:    {}\n", path));
+        }
+        if let Some(path) = &report.outputs.log_file {
+            out.push_str(&format!("  Log:      {}\n", path));
+        }
+    }
+    if !report.warnings.is_empty() {
+        out.push_str("Warnings:\n");
+        for warning in &report.warnings {
+            out.push_str(&format!("  - {}\n", warning));
+        }
+    }
+    out
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{:.2} {}", value, unit)
+    }
+}
+
 pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
     let name = name.unwrap_or("index");
     match name {
@@ -355,6 +598,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
             r#"Available recipes:
   aws-basic      Minimal AWS S3 dry-run and list
   summary        Count objects and bytes without Parquet/KS outputs
+  pipe           Stream list results to shell tools or agents
   large-bucket   Hints, trace, and output-dir workflow
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands
@@ -378,6 +622,18 @@ Run: s3-turbo-list recipes <name>
   s3-turbo-list doctor --local-only --simple
   s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list manifest-summary summary.json
+"#
+            .to_string(),
+        ),
+        "pipe" => Ok(
+            r#"Pipe-friendly list:
+  export AWS_PROFILE=default
+  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format tsv | wc -l
+  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format tsv | awk -F '\t' '{bytes += $2} END {print bytes}'
+  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson | jq -r '.k'
+  s3-turbo-list --delimiter '' --run-manifest run.json list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
+  s3-turbo-list manifest-summary run.json --json
 "#
             .to_string(),
         ),

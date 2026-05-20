@@ -191,6 +191,10 @@ fn test_cli_help_agent_local_commands() {
     assert_eq!(code, 0, "trace-summary --help should exit 0");
     assert!(stdout.contains("--machine-readable"));
 
+    let (code, stdout, _stderr) = run_cli(&["manifest-summary", "--help"]);
+    assert_eq!(code, 0, "manifest-summary --help should exit 0");
+    assert!(stdout.contains("--json"));
+
     let (code, stdout, _stderr) = run_cli(&["hints-merge", "--help"]);
     assert_eq!(code, 0, "hints-merge --help should exit 0");
     assert!(stdout.contains("--emit-manifest"));
@@ -252,6 +256,17 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--output-dir"));
     assert!(stdout.contains("--delimiter ''"));
+
+    let (code, stdout, stderr) = run_cli(&["recipes", "summary"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("--summary-only"));
+    assert!(stdout.contains("manifest-summary"));
+
+    let (code, stdout, stderr) = run_cli(&["recipes", "pipe"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("--output-format tsv"));
+    assert!(stdout.contains("--output-format ndjson"));
+    assert!(stdout.contains("manifest-summary"));
 
     let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -571,6 +586,114 @@ fn test_cli_summary_only_rejects_diff() {
     ]);
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stderr.contains("--summary-only is only supported with the list command"));
+}
+
+#[test]
+fn test_cli_rejects_agent_with_stdout_output_format() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--agent",
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "ndjson",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("--agent writes the run manifest to stdout"));
+}
+
+#[test]
+fn test_cli_dry_run_output_format_ndjson_plans_no_output_artifacts() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--agent",
+        "--output-dir",
+        "out",
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "ndjson",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["inputs"]["output_format"], "ndjson");
+    assert_eq!(json["outputs"]["parquet_file"], serde_json::Value::Null);
+    assert_eq!(json["outputs"]["ks_file"], serde_json::Value::Null);
+    assert!(json["file_conflicts"].as_array().unwrap().is_empty());
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|item| item
+        .as_str()
+        .unwrap()
+        .contains("--output-format tsv/ndjson streams list rows to stdout")));
+    assert!(warnings.iter().any(|item| item
+        .as_str()
+        .unwrap()
+        .contains("output path flags are ignored")));
+}
+
+#[test]
+fn test_cli_manifest_summary_human_and_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("run.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "tool_version": "0.1.15",
+  "status": "success",
+  "exit_code": 0,
+  "elapsed_secs": 1.25,
+  "command": ["s3-turbo-list", "--summary-only"],
+  "outputs": {
+    "parquet_file": null,
+    "ks_file": null,
+    "hints_file": null,
+    "trace_compat": null,
+    "log_file": null
+  },
+  "artifacts": [],
+  "metrics": {
+    "received_objects": 3,
+    "streamed_rows": 3,
+    "unique_prefixes": 2,
+    "parquet_rows": 0,
+    "ks_entries": 0,
+    "bytes_total": 600,
+    "summary_only": true,
+    "top_prefixes": [
+      {"prefix": "logs", "objects": 2, "bytes": 300},
+      {"prefix": "images", "objects": 1, "bytes": 300}
+    ]
+  },
+  "warnings": ["example warning"]
+}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap()],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Objects:      3"));
+    assert!(stdout.contains("Top prefixes:"));
+    assert!(stdout.contains("example warning"));
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap(), "--json"],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["streamed_rows"], 3);
+    assert_eq!(json["bytes_total"], 600);
+    assert_eq!(json["summary_only"], true);
+    assert_eq!(json["top_prefixes"][0]["prefix"], "logs");
 }
 
 #[test]

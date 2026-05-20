@@ -157,6 +157,10 @@ enum Commands {
         /// Source bucket to list
         #[arg(long)]
         bucket: String,
+
+        /// Output format for list results; parquet writes artifacts, tsv/ndjson stream rows to stdout
+        #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
+        output_format: ListOutputFormat,
     },
 
     /// Bi-directional fast list and diff results
@@ -309,6 +313,16 @@ enum Commands {
         /// Emit JSON report with stdout reserved for machine-readable output
         #[arg(long)]
         machine_readable: bool,
+    },
+
+    /// Summarize a local run manifest JSON file without contacting S3
+    ManifestSummary {
+        /// Run manifest JSON file written by --run-manifest
+        manifest_file: String,
+
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
     },
 
     /// Generate conservative next-run hints from a local trace and hints file
@@ -473,6 +487,43 @@ enum ReportFormat {
     Markdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ListOutputFormat {
+    Parquet,
+    Tsv,
+    Ndjson,
+}
+
+impl ListOutputFormat {
+    fn writes_artifacts(self) -> bool {
+        matches!(self, Self::Parquet)
+    }
+
+    fn writes_stdout_rows(self) -> bool {
+        matches!(self, Self::Tsv | Self::Ndjson)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Tsv => "tsv",
+            Self::Ndjson => "ndjson",
+        }
+    }
+}
+
+impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
+    fn from(format: ListOutputFormat) -> Self {
+        match format {
+            ListOutputFormat::Tsv => Self::Tsv,
+            ListOutputFormat::Ndjson => Self::Ndjson,
+            ListOutputFormat::Parquet => {
+                unreachable!("parquet output does not use the text data-map sink")
+            }
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ProfileCommands {
     /// List known endpoint profiles
@@ -542,6 +593,13 @@ fn main() {
                 *output_format,
                 *json || *machine_readable || cli.agent,
             );
+            return;
+        }
+        Commands::ManifestSummary {
+            manifest_file,
+            json,
+        } => {
+            run_manifest_summary(manifest_file, *json || cli.agent);
             return;
         }
         Commands::HintsRebalance {
@@ -635,6 +693,7 @@ fn main() {
     apply_output_dir_defaults(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_summary_only_command(&cli);
+    validate_output_format_command(&cli);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -777,7 +836,7 @@ fn main() {
 
     // Parse subcommand.
     let (mode, opt_region, opt_bucket, opt_target_region, opt_target_bucket) = match &cli.cmd {
-        Commands::List { region, bucket } => (
+        Commands::List { region, bucket, .. } => (
             RunMode::List,
             region.as_deref(),
             bucket.as_str(),
@@ -865,6 +924,7 @@ fn main() {
         }
         Commands::HintsMerge { .. }
         | Commands::TraceSummary { .. }
+        | Commands::ManifestSummary { .. }
         | Commands::HintsRebalance { .. }
         | Commands::InitConfig { .. }
         | Commands::Recipes { .. }
@@ -938,6 +998,8 @@ fn main() {
         .worker_threads(cfg.runtime.worker_threads)
         .build()
         .unwrap();
+
+    let list_output_format = list_output_format(&cli).unwrap_or(ListOutputFormat::Parquet);
 
     rt.block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
@@ -1119,6 +1181,11 @@ fn main() {
             });
         } else if cli.summary_only {
             set.spawn(async move { data_map::data_map_task_list_summary_only(data_map_ctx).await });
+        } else if list_output_format.writes_stdout_rows() {
+            let text_format = data_map::ListTextOutputFormat::from(list_output_format);
+            set.spawn(async move {
+                data_map::data_map_task_list_stdout(data_map_ctx, text_format).await
+            });
         } else {
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(
@@ -1246,8 +1313,8 @@ fn main() {
     let manifest_outputs = runtime_output_summary(
         &cli,
         &cfg,
-        (!cli.summary_only).then_some(filename_ks.as_str()),
-        (!cli.summary_only).then_some(filename_output.as_str()),
+        list_writes_artifacts(&cli).then_some(filename_ks.as_str()),
+        list_writes_artifacts(&cli).then_some(filename_output.as_str()),
     );
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
@@ -1294,6 +1361,8 @@ fn main() {
         println!("{}", agent::to_pretty_json(&manifest));
     } else if exit_code == agent::ExitCode::Success && cli.summary_only {
         print_summary(&manifest.metrics);
+    } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
+        // stdout is reserved for TSV/NDJSON rows.
     } else if exit_code == agent::ExitCode::Success {
         print_wrote_summary(&manifest.outputs);
     }
@@ -1409,6 +1478,22 @@ fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) 
         }
         Err(e) => {
             eprintln!("Trace summary failed: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+}
+
+fn run_manifest_summary(manifest_file: &str, json: bool) {
+    match local_tools::manifest_summary(manifest_file) {
+        Ok(report) => {
+            if json {
+                println!("{}", agent::to_pretty_json(&report));
+            } else {
+                print!("{}", local_tools::render_manifest_summary_text(&report));
+            }
+        }
+        Err(e) => {
+            eprintln!("Manifest summary failed: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -1536,12 +1621,12 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     let Some(output_dir) = cli.output_dir.as_deref() else {
         return;
     };
-    if cli.summary_only {
+    if !list_writes_artifacts(cli) {
         return;
     }
 
     match &cli.cmd {
-        Commands::List { region, bucket } => {
+        Commands::List { region, bucket, .. } => {
             let stem = output_stem(region.as_deref(), bucket, None, None);
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
@@ -1585,6 +1670,38 @@ fn validate_summary_only_command(cli: &Cli) {
         eprintln!("--summary-only is only supported with the list command");
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
+}
+
+fn validate_output_format_command(cli: &Cli) {
+    let Some(format) = list_output_format(cli) else {
+        return;
+    };
+    if cli.summary_only && format.writes_stdout_rows() {
+        eprintln!("--summary-only cannot be combined with --output-format tsv or ndjson");
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
+        eprintln!(
+            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
+fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
+    match &cli.cmd {
+        Commands::List { output_format, .. } => Some(*output_format),
+        _ => None,
+    }
+}
+
+fn list_writes_artifacts(cli: &Cli) -> bool {
+    if cli.summary_only {
+        return false;
+    }
+    list_output_format(cli)
+        .map(ListOutputFormat::writes_artifacts)
+        .unwrap_or(true)
 }
 
 fn output_stem(
@@ -2003,6 +2120,23 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                 .to_string(),
         );
     }
+    if list_output_format(cli)
+        .map(ListOutputFormat::writes_stdout_rows)
+        .unwrap_or(false)
+    {
+        warnings.push(
+            "--output-format tsv/ndjson streams list rows to stdout and does not write Parquet or KeySpace outputs"
+                .to_string(),
+        );
+        if cli.output_dir.is_some()
+            || cli.output_parquet_file.is_some()
+            || cli.output_ks_file.is_some()
+        {
+            warnings.push(
+                "output path flags are ignored when --output-format is tsv or ndjson".to_string(),
+            );
+        }
+    }
     warnings
 }
 
@@ -2051,13 +2185,18 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
     } else {
         cli.prefix.clone()
     };
-    let (mode, bucket, region, target_bucket, target_region) = match &cli.cmd {
-        Commands::List { region, bucket } => (
+    let (mode, bucket, region, target_bucket, target_region, output_format) = match &cli.cmd {
+        Commands::List {
+            region,
+            bucket,
+            output_format,
+        } => (
             "list".to_string(),
             Some(bucket.clone()),
             region.clone(),
             None,
             None,
+            Some(output_format.as_str().to_string()),
         ),
         Commands::Diff {
             region,
@@ -2070,11 +2209,13 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             region.clone(),
             Some(target_bucket.clone()),
             target_region.clone(),
+            None,
         ),
         Commands::CompatProbe { region, bucket, .. } => (
             "compat-probe".to_string(),
             Some(bucket.clone()),
             Some(region.clone()),
+            None,
             None,
             None,
         ),
@@ -2084,6 +2225,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             region.clone(),
             None,
             None,
+            None,
         ),
         Commands::DiscoverPrefixes { region, bucket, .. } => (
             "discover-prefixes".to_string(),
@@ -2091,21 +2233,35 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             region.clone(),
             None,
             None,
+            None,
         ),
-        Commands::HintsValidate { .. } => ("hints-validate".to_string(), None, None, None, None),
-        Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None),
-        Commands::TraceSummary { .. } => ("trace-summary".to_string(), None, None, None, None),
-        Commands::HintsRebalance { .. } => ("hints-rebalance".to_string(), None, None, None, None),
-        Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None),
-        Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None),
-        Commands::Cheatsheet => ("cheatsheet".to_string(), None, None, None, None),
-        Commands::Quickstart { .. } => ("quickstart".to_string(), None, None, None, None),
-        Commands::ConfigInspect { .. } => ("config-inspect".to_string(), None, None, None, None),
-        Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None),
-        Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None),
-        Commands::Completions { .. } => ("completions".to_string(), None, None, None, None),
-        Commands::Man => ("man".to_string(), None, None, None, None),
-        Commands::BenchmarkLocal { .. } => ("benchmark-local".to_string(), None, None, None, None),
+        Commands::HintsValidate { .. } => {
+            ("hints-validate".to_string(), None, None, None, None, None)
+        }
+        Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None, None),
+        Commands::TraceSummary { .. } => {
+            ("trace-summary".to_string(), None, None, None, None, None)
+        }
+        Commands::ManifestSummary { .. } => {
+            ("manifest-summary".to_string(), None, None, None, None, None)
+        }
+        Commands::HintsRebalance { .. } => {
+            ("hints-rebalance".to_string(), None, None, None, None, None)
+        }
+        Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
+        Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None, None),
+        Commands::Cheatsheet => ("cheatsheet".to_string(), None, None, None, None, None),
+        Commands::Quickstart { .. } => ("quickstart".to_string(), None, None, None, None, None),
+        Commands::ConfigInspect { .. } => {
+            ("config-inspect".to_string(), None, None, None, None, None)
+        }
+        Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
+        Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None, None),
+        Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
+        Commands::Man => ("man".to_string(), None, None, None, None, None),
+        Commands::BenchmarkLocal { .. } => {
+            ("benchmark-local".to_string(), None, None, None, None, None)
+        }
     };
 
     agent::CommandInputSummary {
@@ -2114,6 +2270,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         region,
         target_bucket,
         target_region,
+        output_format,
         prefix,
         delimiter: cli.delimiter.clone(),
         max_keys: cli.max_keys,
@@ -2130,7 +2287,7 @@ fn runtime_output_summary(
     ks_file: Option<&str>,
     parquet_file: Option<&str>,
 ) -> agent::OutputPathSummary {
-    if cli.summary_only {
+    if !list_writes_artifacts(cli) {
         return agent::OutputPathSummary {
             parquet_file: None,
             ks_file: None,
@@ -2186,13 +2343,13 @@ fn planned_output_paths(
     cli: &Cli,
     cfg: &S3TurboConfig,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    if cli.summary_only {
+    if !list_writes_artifacts(cli) {
         return (None, None, None);
     }
 
     let now = Local::now().format("%Y%m%d%H%M%S").to_string();
     match &cli.cmd {
-        Commands::List { region, bucket } => {
+        Commands::List { region, bucket, .. } => {
             let prefix = region
                 .as_ref()
                 .map(|r| format!("{}_", r))

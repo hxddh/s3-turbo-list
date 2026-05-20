@@ -1,5 +1,7 @@
 use dashmap::DashMap;
 use log::info;
+use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -41,6 +43,19 @@ struct ListStreamingStats {
 struct PrefixAggregate {
     objects: usize,
     bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListTextOutputFormat {
+    Tsv,
+    Ndjson,
+}
+
+#[derive(Serialize)]
+struct NdjsonRow<'a> {
+    k: &'a str,
+    s: u64,
+    m: u64,
 }
 
 // ── PrefixMap: dashmap-based concurrent object store ───────
@@ -493,6 +508,99 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
     }
 }
 
+pub async fn data_map_task_list_stdout(mut ctx: DataMapContext, format: ListTextOutputFormat) {
+    ctx.start();
+    ctx.g_state.wait_to_start().await;
+
+    info!("Data Map Task — list stdout {:?} started", format);
+
+    let stdout = tokio::io::stdout();
+    let mut writer = tokio::io::BufWriter::new(stdout);
+    let mut prefix_stats: BTreeMap<String, PrefixAggregate> = BTreeMap::new();
+    let started_at = Instant::now();
+    let mut last_ts = epoch_secs();
+    let mut stats = ListStreamingStats {
+        received_batches: 0,
+        received_objects: 0,
+        streamed_rows: 0,
+        bytes_total: 0,
+    };
+
+    loop {
+        let recv_result = ctx.data_map_channel.recv().await;
+
+        match recv_result {
+            Some(batch) => {
+                if !ingest_list_stdout_batch(
+                    &mut writer,
+                    format,
+                    &mut prefix_stats,
+                    &mut stats,
+                    batch,
+                )
+                .await
+                {
+                    ctx.g_state.inc_output_error();
+                    ctx.complete();
+                    ctx.quit();
+                    return;
+                }
+            }
+            None => {
+                info!("Data Map Task — list stdout channel disconnected, finalizing");
+                finalize_list_stdout(&ctx.g_state, &mut writer, &prefix_stats, stats, started_at)
+                    .await;
+                ctx.complete();
+                return;
+            }
+        }
+
+        if ctx.is_quit() {
+            info!("Data Map Task — list stdout force quit, finalizing");
+            finalize_list_stdout(&ctx.g_state, &mut writer, &prefix_stats, stats, started_at).await;
+            ctx.complete();
+            return;
+        } else if !ctx.all_list_tasks_is_running() {
+            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+                if !ingest_list_stdout_batch(
+                    &mut writer,
+                    format,
+                    &mut prefix_stats,
+                    &mut stats,
+                    batch,
+                )
+                .await
+                {
+                    ctx.g_state.inc_output_error();
+                    ctx.complete();
+                    ctx.quit();
+                    return;
+                }
+            }
+            info!("Data Map Task — list stdout all list tasks done, finalizing");
+            finalize_list_stdout(&ctx.g_state, &mut writer, &prefix_stats, stats, started_at).await;
+            ctx.complete();
+            ctx.quit();
+            return;
+        }
+
+        let now = epoch_secs();
+        if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
+            let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+            info!(
+                "Data Map Task — list stdout prefixes {}, received batches {}, received objects {}, streamed rows {}, bytes {}, {:.0} objects/sec",
+                prefix_stats.len(),
+                stats.received_batches,
+                stats.received_objects,
+                stats.streamed_rows,
+                stats.bytes_total,
+                stats.received_objects as f64 / elapsed
+            );
+            last_ts = now;
+        }
+    }
+}
+
 async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
     prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
@@ -517,6 +625,58 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet.write_batch(rows, OUTPUT_FLAG_EQUAL).await;
 }
 
+async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
+    writer: &mut W,
+    format: ListTextOutputFormat,
+    prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
+    stats: &mut ListStreamingStats,
+    batch: Vec<(ObjectKey, ObjectProps)>,
+) -> bool {
+    stats.received_batches += 1;
+    stats.received_objects += batch.len();
+
+    for (key, props) in batch {
+        if props.final_status_check() == MatchResult::Ignore {
+            continue;
+        }
+
+        let (prefix, _) = key.decode();
+        record_prefix_stat(prefix_stats, prefix, props.size());
+        stats.streamed_rows += 1;
+        stats.bytes_total = stats.bytes_total.saturating_add(props.size());
+
+        let line = match format {
+            ListTextOutputFormat::Tsv => format!(
+                "{}\t{}\t{}\n",
+                tsv_escape(key.as_str()),
+                props.size(),
+                props.last_modified()
+            ),
+            ListTextOutputFormat::Ndjson => {
+                let row = NdjsonRow {
+                    k: key.as_str(),
+                    s: props.size(),
+                    m: props.last_modified(),
+                };
+                match serde_json::to_string(&row) {
+                    Ok(rendered) => format!("{}\n", rendered),
+                    Err(e) => {
+                        log::error!("NDJSON serialization error for '{}': {}", key, e);
+                        return false;
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = writer.write_all(line.as_bytes()).await {
+            log::error!("Stdout write error: {}", e);
+            return false;
+        }
+    }
+
+    true
+}
+
 fn ingest_list_summary_batch(
     prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
     stats: &mut ListStreamingStats,
@@ -535,6 +695,27 @@ fn ingest_list_summary_batch(
     }
 }
 
+fn tsv_escape(value: &str) -> Cow<'_, str> {
+    if !value
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r'))
+    {
+        return Cow::Borrowed(value);
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
 fn record_prefix_stat(
     prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
     prefix: String,
@@ -543,6 +724,41 @@ fn record_prefix_stat(
     let entry = prefix_stats.entry(prefix).or_default();
     entry.objects += 1;
     entry.bytes = entry.bytes.saturating_add(size);
+}
+
+async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
+    g_state: &core::GlobalState,
+    writer: &mut W,
+    prefix_stats: &BTreeMap<String, PrefixAggregate>,
+    stats: ListStreamingStats,
+    started_at: Instant,
+) {
+    if let Err(e) = writer.flush().await {
+        log::error!("Stdout flush error: {}", e);
+        g_state.inc_output_error();
+    }
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    g_state.record_data_metrics(
+        stats.received_batches,
+        stats.received_objects,
+        stats.streamed_rows,
+        prefix_stats.len(),
+        0,
+        0,
+        stats.bytes_total,
+        top_prefixes(prefix_stats, 32),
+        false,
+    );
+    info!(
+        "Data Map Task — list stdout complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, bytes {}, elapsed {:.3}s, {:.0} objects/sec",
+        stats.streamed_rows,
+        stats.received_batches,
+        stats.received_objects,
+        prefix_stats.len(),
+        stats.bytes_total,
+        elapsed,
+        stats.received_objects as f64 / elapsed,
+    );
 }
 
 async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>(

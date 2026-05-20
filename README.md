@@ -78,6 +78,13 @@ s3-turbo-list --output-dir out --delimiter '' \
 # Count objects and bytes without writing Parquet/KS outputs
 s3-turbo-list --summary-only --delimiter '' \
   list --region us-east-2 --bucket my-bucket
+
+# Stream rows to shell tools without writing Parquet/KS outputs
+s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
+  --output-format ndjson > objects.ndjson
+s3-turbo-list --run-manifest run.json --delimiter '' \
+  list --region us-east-2 --bucket my-bucket --output-format tsv | wc -l
+s3-turbo-list manifest-summary run.json
 ```
 
 `init-config`, `quickstart`, `recipes`, and `cheatsheet` are local-only. They do
@@ -129,11 +136,21 @@ Output files (auto-named):
 
 - Default `list`: scans S3 and writes Parquet + KeySpace artifacts.  Use this
   for audit records, DuckDB/pandas analysis, and repeatable inventory files.
+- `list --output-format tsv`: scans S3 and streams
+  `<key><TAB><size><TAB><last_modified_epoch_secs>` rows to stdout.  It does
+  not write Parquet or KeySpace outputs.
+- `list --output-format ndjson`: scans S3 and streams one JSON object per row
+  to stdout, using compact keys: `k` for key, `s` for size, and `m` for
+  last-modified epoch seconds.  It does not write Parquet or KeySpace outputs.
 - `--summary-only`: scans S3 and reports aggregate metrics such as object
   count, total bytes, and top prefixes.  It does not write Parquet or KeySpace
   outputs.
 - `--dry-run`: does not contact S3.  It only resolves inputs, planned outputs,
   local hints, checkpoint identity, and warnings.
+
+TSV and NDJSON are list-only formats.  They reserve stdout for rows, so use
+`--run-manifest run.json` plus `s3-turbo-list manifest-summary run.json --json`
+when automation also needs a structured run summary.
 
 ### Read Parquet with Python / pyarrow
 

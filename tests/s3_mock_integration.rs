@@ -511,6 +511,167 @@ fn local_mock_summary_only_reports_metrics_without_outputs() {
 }
 
 #[test]
+fn local_mock_list_tsv_streams_rows_to_stdout_without_artifacts() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["logs/a.txt", "logs/b.txt"],
+                &[],
+                true,
+                Some("token-1"),
+            )),
+            Some("token-1") => MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                2,
+                &["images/c.jpg"],
+                &[],
+                false,
+                None,
+            )),
+            Some(_) => MockResponse::error(400, "InvalidToken", "unexpected continuation token"),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let manifest = dir.path().join("run.json");
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "tsv".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("--output-format tsv/ndjson streams list rows to stdout"),
+        "stderr should include pipe-output warning: {}",
+        stderr
+    );
+
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout should contain only TSV rows");
+    let first: Vec<_> = lines[0].split('\t').collect();
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0], "logs/a.txt");
+    assert_eq!(first[1], "100");
+    assert!(first[2].parse::<u64>().unwrap() > 0);
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("images/c.jpg\t100\t")));
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["metrics"]["streamed_rows"], 3);
+    assert_eq!(manifest_json["metrics"]["parquet_rows"], 0);
+    assert_eq!(manifest_json["metrics"]["ks_entries"], 0);
+    assert_eq!(manifest_json["metrics"]["summary_only"], false);
+    assert_eq!(manifest_json["metrics"]["bytes_total"], 301);
+    assert_eq!(manifest_json["inputs"]["output_format"], "tsv");
+    assert_eq!(manifest_json["outputs"]["parquet_file"], Value::Null);
+    assert_eq!(manifest_json["outputs"]["ks_file"], Value::Null);
+    assert!(manifest_json["artifacts"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/a.txt", "logs/b.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let manifest = dir.path().join("run.json");
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "ndjson".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let rows: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["k"], "logs/a.txt");
+    assert_eq!(rows[0]["s"], 100);
+    assert!(rows[0]["m"].as_u64().unwrap() > 0);
+
+    let summary_args = vec![
+        "manifest-summary".into(),
+        manifest.display().to_string(),
+        "--json".into(),
+    ];
+    let (code, summary_stdout, summary_stderr) = run_cli(&summary_args, dir.path());
+    assert_eq!(
+        code, 0,
+        "stdout: {}\nstderr: {}",
+        summary_stdout, summary_stderr
+    );
+    let summary: Value = serde_json::from_str(&summary_stdout).unwrap();
+    assert_eq!(summary["status"], "success");
+    assert_eq!(summary["run_status"], "success");
+    assert_eq!(summary["streamed_rows"], 2);
+    assert_eq!(summary["parquet_rows"], 0);
+    assert_eq!(summary["bytes_total"], 201);
+    assert_eq!(summary["outputs"]["parquet_file"], Value::Null);
+}
+
+#[test]
 fn local_mock_compat_probe_covers_head_list_and_pagination() {
     let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
         "HEAD" => MockResponse::empty_ok(),

@@ -14,8 +14,10 @@ s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list recipes agent-safe
 s3-turbo-list recipes summary
+s3-turbo-list recipes pipe
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
+s3-turbo-list manifest-summary run.json --json
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
@@ -120,6 +122,18 @@ total bytes, top prefixes, fatal listing errors, and output write errors.
 Use `--summary-only` when an agent needs aggregate object count, byte count, or
 top-prefix distribution without writing Parquet/KS artifacts.  This is not a
 dry-run: it scans S3 unless combined with `--dry-run`.
+
+Use `list --output-format ndjson` when an agent needs object rows as a stream:
+
+```bash
+s3-turbo-list --run-manifest run.json --delimiter '' \
+  list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
+s3-turbo-list manifest-summary run.json --json
+```
+
+TSV and NDJSON reserve stdout for rows.  Do not combine them with `--agent`;
+write `--run-manifest` to a file and summarize that manifest locally instead.
+`manifest-summary` is local-only and does not load credentials or contact S3.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.
