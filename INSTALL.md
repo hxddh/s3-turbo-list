@@ -77,10 +77,10 @@ changed since the run.
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.20-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.20-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.20-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.20-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.21-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.21-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.21-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.21-macos-x86_64` |
 
 To identify your platform:
 
@@ -116,8 +116,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.20-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.20-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.21-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.21-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -125,8 +125,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.20-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.20-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.21-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.21-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -138,18 +138,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.20-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.20-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.20-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.21-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.21-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.21-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.20-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.20-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.20-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.21-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.21-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.21-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -218,6 +218,7 @@ s3-turbo-list recipes aws-basic
 s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
 s3-turbo-list recipes verify
+s3-turbo-list recipes release-check
 s3-turbo-list recipes diff-safe
 
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \

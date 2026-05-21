@@ -8,15 +8,18 @@ Run the release environment checker first:
 
 ```bash
 ./scripts/check-release-env.sh
+s3-turbo-list recipes release-check
 ```
 
 It prints OS, architecture, Rust toolchain, C compilers, git state,
 and warns if an `aws-lc-sys` release build workaround is needed.
+The recipe prints the local-only command sequence without running cloud
+endpoint validation.
 
 ## 1. Local pre-release checks
 
 - [ ] Working tree clean (`git status --short` empty).
-- [ ] On the correct branch (typically `master`).
+- [ ] On the correct branch (typically `main` for release publication).
 - [ ] All commits intended for this release are present.
 - [ ] `scripts/check-release-env.sh` reports no blockers.
 
@@ -44,11 +47,16 @@ credentials or production bucket names.
 ```bash
 cargo fmt --check
 cargo check
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build
+cargo +1.75 check --locked  # advisory: reports dependency MSRV drift
 ```
 
 All must pass with zero errors and zero unexpected warnings.
+The MSRV command is advisory until the dependency lock is either restored to
+Rust 1.75-compatible transitive versions or the project deliberately raises its
+documented MSRV.
 
 ## 4. Examples static QA
 

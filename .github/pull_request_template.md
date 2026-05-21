@@ -2,6 +2,7 @@
 
 - [ ] `cargo fmt --check` passes.
 - [ ] `cargo check` passes.
+- [ ] `cargo clippy --all-targets -- -D warnings` passes.
 - [ ] `cargo test` passes (all tests).
 - [ ] `cargo build` succeeds.
 - [ ] Documentation updated if behaviour changed (`README.md`, `CHANGELOG.md`, `docs/`).

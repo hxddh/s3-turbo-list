@@ -1,5 +1,11 @@
 // All modules exported from the library crate (src/lib.rs).
 // The binary uses `s3_turbo_list::...` paths to avoid module duplication.
+#![allow(
+    clippy::borrowed_box,
+    clippy::if_same_then_else,
+    clippy::too_many_arguments
+)]
+
 use s3_turbo_list::{
     agent, auto_hints, checkpoint, config, core, data_map, diff, hints, local_tools, mon, profiles,
     tasks_s3, trace,

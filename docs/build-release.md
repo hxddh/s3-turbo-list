@@ -90,10 +90,10 @@ applies to `--release`.
 
 ```
 dist/
-├── s3-turbo-list-0.1.20-linux-x86_64
-├── s3-turbo-list-0.1.20-linux-x86_64.sha256
-├── s3-turbo-list-0.1.20-linux-aarch64
-└── s3-turbo-list-0.1.20-linux-aarch64.sha256
+├── s3-turbo-list-0.1.21-linux-x86_64
+├── s3-turbo-list-0.1.21-linux-x86_64.sha256
+├── s3-turbo-list-0.1.21-linux-aarch64
+└── s3-turbo-list-0.1.21-linux-aarch64.sha256
 ```
 
 ## Cross-compilation
@@ -109,8 +109,8 @@ TARGET=x86_64-unknown-linux-gnu BUILD_MODE=default ./scripts/build-release.sh
 After the build completes, verify the binary locally (no cloud endpoints):
 
 ```bash
-./dist/s3-turbo-list-0.1.20-linux-aarch64 --version
-./dist/s3-turbo-list-0.1.20-linux-aarch64 --help
+./dist/s3-turbo-list-0.1.21-linux-aarch64 --version
+./dist/s3-turbo-list-0.1.21-linux-aarch64 --help
 ```
 
 ## What NOT to do
@@ -119,8 +119,8 @@ After the build completes, verify the binary locally (no cloud endpoints):
 - **Do not run endpoint validation** as part of the release build — the
   binary verification step uses only `--help` and `--version`.
 - **Do not publish a GitHub release** before all checks pass:
-  `cargo fmt --check`, `cargo check`, `cargo test`, `cargo build`,
-  examples static QA, secret scan.
+  `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`, `cargo build`, examples static QA, secret scan.
 
 ## See also
 

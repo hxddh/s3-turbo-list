@@ -289,6 +289,13 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("SOURCE.last_modified"));
     assert!(stdout.contains("Rejected before network"));
 
+    let (code, stdout, stderr) = run_cli(&["recipes", "release-check"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("./scripts/check-release-env.sh"));
+    assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
+    assert!(stdout.contains("BUILD_MODE=clang"));
+    assert!(stdout.contains("do not contact S3-compatible cloud endpoints"));
+
     let (code, stdout, stderr) = run_cli(&["recipes", "diff-safe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Safe diff"));
@@ -306,6 +313,7 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("First run"));
     assert!(stdout.contains("--delimiter ''"));
     assert!(stdout.contains("recipes filter"));
+    assert!(stdout.contains("recipes release-check"));
 }
 
 #[test]
@@ -981,6 +989,12 @@ fn test_cli_manifest_summary_human_and_json() {
         serde_json::Value::Null
     );
     assert_eq!(json["check_passed"], true);
+    assert_eq!(json["check"]["ok"], true);
+    assert_eq!(json["check"]["errors"], 0);
+    assert_eq!(json["check"]["skipped"], 1);
+    assert_eq!(json["check"]["artifacts_checked"], 0);
+    assert_eq!(json["check"]["row_check"], "not_applicable");
+    assert_eq!(json["check"]["exit_code_check"], "ok");
     assert_eq!(json["top_prefixes"][0]["prefix"], "logs");
 
     let (code, stdout, stderr) = run_cli_in_dir(
@@ -1052,7 +1066,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.20",
+  "tool_version": "0.1.21",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,
@@ -1094,6 +1108,24 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
     assert_eq!(code, 6, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("artifact_size:ks"));
     assert!(stdout.contains("artifact_sha256:ks"));
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "manifest-summary",
+            manifest.to_str().unwrap(),
+            "--json",
+            "--check",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 6, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["check"]["ok"], false);
+    assert_eq!(json["check"]["artifacts_checked"], 1);
+    assert_eq!(json["check"]["artifacts_missing"], 0);
+    assert_eq!(json["check"]["row_check"], "ok");
+    assert_eq!(json["check"]["exit_code_check"], "ok");
+    assert!(json["check"]["errors"].as_u64().unwrap() >= 2);
 }
 
 #[test]
@@ -1150,6 +1182,9 @@ fn test_cli_manifest_summary_ndjson_row_check_is_not_applicable() {
         serde_json::Value::Null
     );
     assert_eq!(json["check_passed"], true);
+    assert_eq!(json["check"]["ok"], true);
+    assert_eq!(json["check"]["row_check"], "not_applicable");
+    assert_eq!(json["check"]["parquet_schema_check"], "not_applicable");
     assert!(json["checks"].as_array().unwrap().iter().any(|check| {
         check["name"] == "parquet_rows_match_streamed_rows" && check["status"] == "skip"
     }));

@@ -2,6 +2,18 @@
 // Integration tests in tests/ import from here.
 // The binary in src/main.rs also uses this crate via `use s3_turbo_list::...`.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::result_large_err,
+    clippy::should_implement_trait,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 // Public to integration tests (types needed to exercise pipelines):
 pub mod agent;
 pub mod auto_hints;

@@ -1,4 +1,6 @@
 // Integration tests for data_map aggregation and Parquet output pipeline.
+#![allow(clippy::io_other_error)]
+
 use arrow::array::RecordBatchReader;
 use parquet::basic::Compression;
 use parquet::file::reader::{FileReader, SerializedFileReader};

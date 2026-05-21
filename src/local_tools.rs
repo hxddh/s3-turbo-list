@@ -144,6 +144,7 @@ pub struct ManifestSummaryReport {
     pub artifacts: Vec<ManifestArtifactSummary>,
     pub warnings: Vec<String>,
     pub check_passed: bool,
+    pub check: ManifestCheckSummary,
     pub checks: Vec<ManifestCheck>,
 }
 
@@ -179,6 +180,19 @@ pub struct ManifestCheck {
     pub name: String,
     pub status: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestCheckSummary {
+    pub ok: bool,
+    pub errors: usize,
+    pub warnings: usize,
+    pub skipped: usize,
+    pub artifacts_checked: usize,
+    pub artifacts_missing: usize,
+    pub row_check: String,
+    pub parquet_schema_check: String,
+    pub exit_code_check: String,
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +485,7 @@ pub fn manifest_summary(
         verify_artifacts,
     );
     let check_passed = checks.iter().all(|check| check.status != "fail");
+    let check_summary = manifest_check_summary(check_passed, &checks, &artifacts);
 
     Ok(ManifestSummaryReport {
         status: "success".to_string(),
@@ -539,6 +554,7 @@ pub fn manifest_summary(
             })
             .unwrap_or_default(),
         check_passed,
+        check: check_summary,
         checks,
     })
 }
@@ -556,6 +572,43 @@ fn manifest_row_check_applies(output_format: Option<&str>, summary_only: bool) -
         return false;
     }
     matches!(output_format.unwrap_or("parquet"), "parquet")
+}
+
+fn manifest_check_summary(
+    check_passed: bool,
+    checks: &[ManifestCheck],
+    artifacts: &[ManifestArtifactSummary],
+) -> ManifestCheckSummary {
+    ManifestCheckSummary {
+        ok: check_passed,
+        errors: checks.iter().filter(|check| check.status == "fail").count(),
+        warnings: checks.iter().filter(|check| check.status == "warn").count(),
+        skipped: checks.iter().filter(|check| check.status == "skip").count(),
+        artifacts_checked: artifacts.len(),
+        artifacts_missing: checks
+            .iter()
+            .filter(|check| check.name.starts_with("artifact_exists:") && check.status == "fail")
+            .count(),
+        row_check: manifest_check_status(checks, "parquet_rows_match_streamed_rows"),
+        parquet_schema_check: manifest_check_status(checks, "artifact_parquet_schema:parquet"),
+        exit_code_check: manifest_check_status(checks, "exit_code"),
+    }
+}
+
+fn manifest_check_status(checks: &[ManifestCheck], name: &str) -> String {
+    checks
+        .iter()
+        .find(|check| check.name == name)
+        .map(|check| normalize_check_status(&check.status))
+        .unwrap_or_else(|| "not_applicable".to_string())
+}
+
+fn normalize_check_status(status: &str) -> String {
+    match status {
+        "ok" | "fail" | "warn" => status.to_string(),
+        "skip" => "not_applicable".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn manifest_checks(
@@ -882,6 +935,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
   pipe           Stream list results to shell tools or agents
   filter         Local object filter examples and limits
   verify         Validate a saved run manifest locally
+  release-check  Local pre-release checks without contacting S3
   diff-safe      Authoritative single-segment diff workflow
   large-bucket   Hints, trace, and output-dir workflow
   local-minio    Local MinIO endpoint example
@@ -952,6 +1006,26 @@ Pipe output with a manifest:
 "#
             .to_string(),
         ),
+        "release-check" | "ci" => Ok(
+            r#"Release check (local only):
+  ./scripts/check-release-env.sh
+  cargo fmt --check
+  cargo check
+  cargo clippy --all-targets -- -D warnings
+  cargo test
+  cargo build
+  cargo +1.75 check --locked  # advisory: reports dependency MSRV drift
+  for f in examples/*.sh; do bash -n "$f" || exit 1; done
+  python3 -m py_compile examples/read-parquet.py
+  python3 -m py_compile examples/inspect-trace.py
+
+Release build on Ubuntu 20.04 arm64:
+  BUILD_MODE=clang ./scripts/build-release.sh
+
+These commands do not contact S3-compatible cloud endpoints.
+"#
+            .to_string(),
+        ),
         "diff-safe" => Ok(
             r#"Safe diff:
   export AWS_PROFILE=default
@@ -1013,6 +1087,7 @@ Useful local commands:
   s3-turbo-list trace-summary trace.jsonl --machine-readable
   s3-turbo-list manifest-summary run.json --check
   s3-turbo-list recipes filter
+  s3-turbo-list recipes release-check
   s3-turbo-list recipes large-bucket
 "#
     .to_string()

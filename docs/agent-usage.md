@@ -17,6 +17,7 @@ s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
 s3-turbo-list recipes filter
 s3-turbo-list recipes verify
+s3-turbo-list recipes release-check
 s3-turbo-list recipes diff-safe
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
@@ -153,6 +154,10 @@ artifact paths on the local filesystem.  When the manifest includes artifact
 metadata, it also verifies current file size, SHA256, and Parquet row/schema
 metadata.  For `summary-only`, `tsv`, and `ndjson` manifests, Parquet row
 equality is reported as not applicable rather than a failure.
+
+With `--json`, the top-level `check` object gives agents stable pass/fail
+counts, artifact counts, and row/schema/exit-code status values without parsing
+human text.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.

@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.20'
+        default: 'v0.1.21'
 
 permissions:
   contents: write
@@ -56,6 +56,9 @@ jobs:
 
       - name: cargo check
         run: cargo check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test

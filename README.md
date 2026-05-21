@@ -96,7 +96,9 @@ credentials; use `--profile` only for endpoint compatibility presets such as
 ### Build from source
 
 ```bash
+cargo fmt --check
 cargo build
+cargo clippy --all-targets -- -D warnings
 
 # Release build (see BUILD.md for aarch64 workaround)
 cargo build --release
@@ -206,6 +208,10 @@ recorded artifact.  When recorded metadata is present, `--check` also verifies
 current artifact file size, SHA256, and Parquet row/schema metadata.  For
 `summary-only`, `tsv`, and `ndjson` runs, Parquet row equality is intentionally
 reported as not applicable.
+
+`manifest-summary --check --json` includes a stable `check` summary with
+machine-readable pass/fail counts, artifact counts, and row/schema/exit-code
+status values for CI and agent workflows.
 
 ### Read Parquet with Python / pyarrow
 
@@ -394,6 +400,7 @@ s3-turbo-list recipes
 s3-turbo-list recipes summary
 s3-turbo-list recipes filter
 s3-turbo-list recipes verify
+s3-turbo-list recipes release-check
 s3-turbo-list recipes diff-safe
 s3-turbo-list recipes large-bucket
 s3-turbo-list cheatsheet
