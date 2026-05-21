@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Object filters now accept only simple property comparisons and boolean/operator
   combinations over `SOURCE` and `TARGET`, rejecting function calls, method
   calls, indexing, arrays, maps, strings, and statements before any listing run.
+- README and agent documentation now describe supported `--filter` expressions
+  and rejection behavior.
 
 ## [0.1.19] - 2026-05-21
 

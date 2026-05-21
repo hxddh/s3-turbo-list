@@ -161,6 +161,21 @@ in dry-run and `doctor` until an endpoint URL is configured.  Placeholder
 endpoints from starter configs, such as `<account-id>` or `<region>`, are also
 reported locally before a real run.
 
+Object filters are validated before any listing run.  Agents can use simple
+numeric predicates such as:
+
+```bash
+s3-turbo-list --filter 'SOURCE.size > 1073741824' \
+  --run-manifest run.json --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+```
+
+In `list`, `SOURCE.size` and `SOURCE.last_modified` are available.  In `diff`,
+`TARGET.size` and `TARGET.last_modified` are also available.  Function calls,
+methods, strings, arrays, maps, indexing, statements, and large or deeply nested
+expressions are rejected with exit code `2`.  Treat a filter rejection as a
+local configuration error, not a network or provider failure.
+
 The `artifacts` array describes generated files:
 
 - `kind`: `parquet`, `ks`, `hints`, `trace`, or `log`

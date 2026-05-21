@@ -137,6 +137,38 @@ Output files (auto-named):
 - `<region>_<bucket>_<timestamp>.parquet` — object listing
 - `<region>_<bucket>_<timestamp>.ks` — keyspace counts
 
+### Object filters
+
+`--filter` applies a local object filter after S3 listing and before output.
+It does not reduce S3 ListObjectsV2 requests; use `--prefix`, `--delimiter`,
+and `--max-keys` for request-side shaping.
+
+Supported filter expressions are intentionally small:
+
+- Variables: `SOURCE` in `list`; `SOURCE` and `TARGET` in `diff`.
+- Properties: `size` and `last_modified`.
+- Operators: numeric comparison, arithmetic, `&&`, `||`, and `!`.
+
+Examples:
+
+```bash
+# Keep objects larger than 1 GiB
+s3-turbo-list --filter 'SOURCE.size > 1073741824' \
+  --delimiter '' list --region us-east-2 --bucket my-bucket
+
+# Keep recently modified objects by epoch seconds
+s3-turbo-list --filter 'SOURCE.last_modified >= 1715700000' \
+  --delimiter '' list --region us-east-2 --bucket my-bucket
+
+# Diff-only: compare source and target sizes
+s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
+  diff --bucket left-bucket --target-bucket right-bucket
+```
+
+Filters reject functions, methods, strings, arrays, maps, indexing, statements,
+and long or deeply nested expressions before any listing run.  Rejected filters
+exit with code `2`.
+
 ### Choosing an output mode
 
 - Default `list`: scans S3 and writes Parquet + KeySpace artifacts.  Use this
