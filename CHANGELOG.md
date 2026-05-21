@@ -11,13 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `manifest-summary --check --json` now includes a stable `check` summary with
   pass/fail counts, artifact counts, and row/schema/exit-code status values.
 - `recipes release-check` for local-only pre-release verification commands.
-- CI now runs clippy and an advisory Rust 1.75 MSRV check.
+- CI now runs clippy.
 
 ### Changed
 - Cheatsheet, release documentation, and PR guidance now include the local
   release-check and clippy verification paths.
-- `clap_mangen` is pinned to a Rust 1.75-compatible release while the broader
-  AWS SDK transitive dependency MSRV remains under review.
 
 ## [0.1.20] - 2026-05-21
 

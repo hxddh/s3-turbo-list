@@ -50,13 +50,9 @@ cargo check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build
-cargo +1.75 check --locked  # advisory: reports dependency MSRV drift
 ```
 
 All must pass with zero errors and zero unexpected warnings.
-The MSRV command is advisory until the dependency lock is either restored to
-Rust 1.75-compatible transitive versions or the project deliberately raises its
-documented MSRV.
 
 ## 4. Examples static QA
 

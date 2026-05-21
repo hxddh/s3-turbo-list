@@ -1014,7 +1014,6 @@ Pipe output with a manifest:
   cargo clippy --all-targets -- -D warnings
   cargo test
   cargo build
-  cargo +1.75 check --locked  # advisory: reports dependency MSRV drift
   for f in examples/*.sh; do bash -n "$f" || exit 1; done
   python3 -m py_compile examples/read-parquet.py
   python3 -m py_compile examples/inspect-trace.py

@@ -12,8 +12,7 @@ log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-# Keep this pinned until the project raises MSRV above Rust 1.75.
-clap_mangen = "=0.2.24"
+clap_mangen = "0.2"
 tokio = { version = "1", features = ["full"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
