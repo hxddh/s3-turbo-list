@@ -116,7 +116,7 @@ impl PrefixMap {
         &self,
         writer: &mut crate::utils::AsyncParquetOutput<W>,
         include_equal: bool,
-    ) -> DumpStats {
+    ) -> Result<DumpStats, String> {
         let mut ks_entries: Vec<(String, usize)> = Vec::new();
 
         for entry in self.inner.iter() {
@@ -145,21 +145,21 @@ impl PrefixMap {
 
             ks_entries.push((prefix, obj_map.get_count()));
 
-            writer.write_batch(plus, OUTPUT_FLAG_PLUS).await;
-            writer.write_batch(minus, OUTPUT_FLAG_MINUS).await;
-            writer.write_batch(astrisk, OUTPUT_FLAG_ASTRISK).await;
+            writer.write_batch(plus, OUTPUT_FLAG_PLUS).await?;
+            writer.write_batch(minus, OUTPUT_FLAG_MINUS).await?;
+            writer.write_batch(astrisk, OUTPUT_FLAG_ASTRISK).await?;
             if include_equal {
-                writer.write_batch(equal, OUTPUT_FLAG_EQUAL).await;
+                writer.write_batch(equal, OUTPUT_FLAG_EQUAL).await?;
             }
         }
 
         ks_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let _ = write_ks_entries(writer.ks_path(), &ks_entries).await;
+        let ks_count = write_ks_entries(writer.ks_path(), &ks_entries).await?;
 
-        DumpStats {
+        Ok(DumpStats {
             parquet_rows: writer.total_rows(),
-            ks_entries: ks_entries.len(),
-        }
+            ks_entries: ks_count,
+        })
     }
 }
 
@@ -370,8 +370,16 @@ pub async fn data_map_task_list_streaming(
 
         match recv_result {
             Some(batch) => {
-                ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
-                    .await;
+                if let Err(e) =
+                    ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
+                        .await
+                {
+                    log::error!("{}", e);
+                    ctx.g_state.inc_output_error();
+                    ctx.complete();
+                    ctx.quit();
+                    return;
+                }
             }
             None => {
                 info!("Data Map Task — list streaming channel disconnected, finalizing output");
@@ -408,8 +416,16 @@ pub async fn data_map_task_list_streaming(
             return;
         } else if !ctx.all_list_tasks_is_running() {
             while let Ok(batch) = ctx.data_map_channel.try_recv() {
-                ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
-                    .await;
+                if let Err(e) =
+                    ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
+                        .await
+                {
+                    log::error!("{}", e);
+                    ctx.g_state.inc_output_error();
+                    ctx.complete();
+                    ctx.quit();
+                    return;
+                }
             }
             info!("Data Map Task — list streaming all list tasks done, finalizing output");
             finalize_list_streaming_output(
@@ -606,7 +622,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
-) {
+) -> Result<(), String> {
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
@@ -622,7 +638,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     }
 
     stats.streamed_rows += rows.len();
-    parquet.write_batch(rows, OUTPUT_FLAG_EQUAL).await;
+    parquet.write_batch(rows, OUTPUT_FLAG_EQUAL).await
 }
 
 async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
@@ -772,8 +788,22 @@ async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>
     write_started_at: Instant,
 ) {
     let parquet_rows = parquet.total_rows();
-    let ks_entries = write_ks_counts(filename_ks, prefix_stats).await;
-    parquet.close().await;
+    let mut output_ok = true;
+    let ks_entries = match write_ks_counts(filename_ks, prefix_stats).await {
+        Ok(count) => count,
+        Err(e) => {
+            log::error!("{}", e);
+            output_ok = false;
+            0
+        }
+    };
+    if let Err(e) = parquet.close().await {
+        log::error!("{}", e);
+        output_ok = false;
+    }
+    if !output_ok {
+        g_state.inc_output_error();
+    }
 
     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
     let write_elapsed = write_started_at.elapsed().as_secs_f64();
@@ -871,8 +901,17 @@ async fn write_output(
         &output_config.compression,
         output_config.compression_level,
     );
-    let dump_stats = map.dump(&mut parquet, include_equal).await;
-    parquet.close().await;
+    let dump_stats = match map.dump(&mut parquet, include_equal).await {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::error!("{}", e);
+            return None;
+        }
+    };
+    if let Err(e) = parquet.close().await {
+        log::error!("{}", e);
+        return None;
+    }
     let stats = OutputWriteStats {
         parquet_rows: dump_stats.parquet_rows,
         ks_entries: dump_stats.ks_entries,
@@ -885,7 +924,10 @@ async fn write_output(
     Some(stats)
 }
 
-async fn write_ks_counts(path: &str, counts: &BTreeMap<String, PrefixAggregate>) -> usize {
+async fn write_ks_counts(
+    path: &str,
+    counts: &BTreeMap<String, PrefixAggregate>,
+) -> Result<usize, String> {
     let entries: Vec<(String, usize)> = counts
         .iter()
         .map(|(p, stats)| (p.clone(), stats.objects))
@@ -893,26 +935,22 @@ async fn write_ks_counts(path: &str, counts: &BTreeMap<String, PrefixAggregate>)
     write_ks_entries(path, &entries).await
 }
 
-async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> usize {
+async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> Result<usize, String> {
     match tokio::fs::File::create(path).await {
         Ok(ks_file) => {
             let mut buf = tokio::io::BufWriter::new(ks_file);
             for (prefix, count) in entries {
                 let line = format!("\"{}\",\"{}\"\n", prefix, count);
                 if let Err(e) = buf.write_all(line.as_bytes()).await {
-                    log::error!("Failed to write KS file {}: {}", path, e);
-                    break;
+                    return Err(format!("Failed to write KS file {}: {}", path, e));
                 }
             }
             if let Err(e) = buf.flush().await {
-                log::error!("Failed to flush KS file {}: {}", path, e);
+                return Err(format!("Failed to flush KS file {}: {}", path, e));
             }
-            entries.len()
+            Ok(entries.len())
         }
-        Err(e) => {
-            log::error!("Failed to create KS file {}: {}", path, e);
-            0
-        }
+        Err(e) => Err(format!("Failed to create KS file {}: {}", path, e)),
     }
 }
 

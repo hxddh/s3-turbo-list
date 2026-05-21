@@ -524,6 +524,56 @@ fn test_cli_dry_run_agent_stdout_json() {
 }
 
 #[test]
+fn test_cli_default_paths_sanitize_bucket_and_region_components() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--agent",
+        "--dry-run",
+        "--resume",
+        "list",
+        "--bucket",
+        "../evil/bucket",
+        "--region",
+        "us/east",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    for field in ["parquet_file", "ks_file"] {
+        let path = json["outputs"][field].as_str().unwrap();
+        assert!(
+            !path.contains('/'),
+            "{} should not contain slash: {}",
+            field,
+            path
+        );
+        assert!(path.contains("us_east_.._evil_bucket"), "{}", path);
+    }
+    let checkpoint = json["checkpoint"]["path"].as_str().unwrap();
+    assert!(!checkpoint.contains("../"), "{}", checkpoint);
+    assert!(
+        checkpoint.contains("us_east_.._evil_bucket"),
+        "{}",
+        checkpoint
+    );
+
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--agent",
+        "--dry-run",
+        "discover-prefixes",
+        "--bucket",
+        "../evil/bucket",
+        "--region",
+        "us/east",
+        "--toml",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["outputs"]["hints_file"],
+        "us_east_.._evil_bucket_prefixes.toml"
+    );
+}
+
+#[test]
 fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
     let (code, stdout, stderr) = run_cli_without_aws_env(&[
         "--profile",
@@ -826,6 +876,23 @@ fn test_cli_rejects_diff_with_explicit_hints_file() {
 }
 
 #[test]
+fn test_cli_rejects_diff_with_resume() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--resume",
+        "diff",
+        "--bucket",
+        "left",
+        "--target-bucket",
+        "right",
+    ]);
+
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("diff --resume is not supported yet"));
+    assert!(stderr.contains("v0.2.x"));
+}
+
+#[test]
 fn test_cli_manifest_summary_human_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("run.json");
@@ -958,7 +1025,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.18",
+  "tool_version": "0.1.19",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,

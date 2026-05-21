@@ -10,10 +10,42 @@ use s3_turbo_list::core::{
 };
 use s3_turbo_list::data_map::{ObjectMap, PrefixMap};
 use s3_turbo_list::utils::AsyncParquetOutput;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
 
 const EXPECTED_SCHEMA: [&str; 5] = ["Key", "Size", "LastModified", "ETag", "DiffFlag"];
+
+struct FailingAsyncWrite;
+
+impl AsyncWrite for FailingAsyncWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "intentional write failure",
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "intentional flush failure",
+        )))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "intentional shutdown failure",
+        )))
+    }
+}
 
 // ── Single prefix, single object ──────────────────────────
 
@@ -194,8 +226,8 @@ async fn test_diff_mode_includes_equal_rows() {
         let file = tokio::fs::File::create(&parquet_path).await.unwrap();
         let buf_writer = tokio::io::BufWriter::new(file);
         let mut writer = AsyncParquetOutput::new(buf_writer, ks_path.to_str().unwrap());
-        map.dump(&mut writer, true).await;
-        writer.close().await;
+        map.dump(&mut writer, true).await.unwrap();
+        writer.close().await.unwrap();
     }
 
     // Read back and verify DiffFlag distribution.
@@ -554,8 +586,8 @@ async fn test_parquet_output_schema() {
         props.size = 1024;
         props.last_modified = 1715700000;
 
-        writer.write_batch(vec![(key, props)], 1).await;
-        writer.close().await;
+        writer.write_batch(vec![(key, props)], 1).await.unwrap();
+        writer.close().await.unwrap();
     }
 
     // Read back and verify schema using std::fs::File (parquet ChunkReader impl).
@@ -578,6 +610,29 @@ async fn test_parquet_output_schema() {
     let batch = &batches[0];
     let batch = batch.as_ref().expect("batch should be Ok");
     assert_eq!(batch.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_parquet_output_write_error_is_reported_without_row_inflation() {
+    let mut writer = AsyncParquetOutput::new(FailingAsyncWrite, "failed.ks");
+    let key = ObjectKey::from("test/file.txt");
+    let mut props = ObjectProps::default();
+    props.size = 1024;
+
+    writer
+        .write_batch(vec![(key, props)], S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE)
+        .await
+        .unwrap();
+    assert_eq!(writer.total_rows(), 1);
+    let err = writer
+        .close()
+        .await
+        .expect_err("failing writer must report parquet close error");
+    assert!(
+        err.contains("Parquet close error") && err.contains("intentional write failure"),
+        "{}",
+        err
+    );
 }
 
 fn assert_list_output_consistency(

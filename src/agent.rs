@@ -321,9 +321,28 @@ pub struct DoctorCheck {
 }
 
 pub fn conventional_hints_path(bucket: &str, region: Option<&str>) -> String {
+    let bucket = sanitize_path_component(bucket);
     match region {
-        Some(r) => format!("{}_{}_hints.toml", r, bucket),
+        Some(r) => format!("{}_{}_hints.toml", sanitize_path_component(r), bucket),
         None => format!("{}_hints.toml", bucket),
+    }
+}
+
+pub fn sanitize_path_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
     }
 }
 

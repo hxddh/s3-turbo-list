@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Guardrails for `diff --resume`, which is deferred until paired diff/resume
+  coordination is implemented.
+
+### Changed
+- Parquet output errors are now treated as output failures instead of warnings.
+- Default checkpoint and conventional hints cache paths now sanitize bucket and
+  region path components.
+- Resume cursor advancement now uses the last processed object key instead of
+  relying on provider `KeyCount`.
+
+### Fixed
+- `auto-hints` now applies `max_prefix_depth` to generated boundaries instead of
+  accepting deeper prefixes unconditionally.
+- Local hints merge/rebalance outputs no longer write local-tool names into the
+  `scan_mode` field.
+
 ## [0.1.18] - 2026-05-20
 
 ### Added

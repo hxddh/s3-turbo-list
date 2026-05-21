@@ -701,6 +701,7 @@ fn main() {
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_diff_hints_command(&cli);
+    validate_diff_resume_command(&cli);
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -961,25 +962,22 @@ fn main() {
     // ── Phase 3: orchestration wiring ───────────────────────
     let g_tasks_count = if mode == RunMode::BiDir { 4 } else { 3 }; // list + data_map + mon (+right list)
 
-    let dt_str = Local::now().format("%Y%m%d%H%M%S").to_string();
-    let region_prefix: std::borrow::Cow<'_, str> = opt_region
-        .map(|r: &str| format!("{}_", r).into())
-        .unwrap_or_default();
+    let output_stem = output_stem(
+        opt_region,
+        opt_bucket,
+        opt_target_region.flatten(),
+        opt_target_bucket,
+    );
     let filename_ks = cfg
         .output
         .ks_file
         .clone()
-        .unwrap_or_else(|| format!("{}_{}_{}.ks", region_prefix, opt_bucket, dt_str));
+        .unwrap_or_else(|| format!("{}.ks", output_stem));
     let filename_output = cfg.output.parquet_file.clone().unwrap_or_else(|| {
         if mode == RunMode::List {
-            format!("{}_{}_{}.parquet", region_prefix, opt_bucket, dt_str)
+            format!("{}.parquet", output_stem)
         } else {
-            let tr = opt_target_region.and_then(|r| r).unwrap_or("");
-            let tb = opt_target_bucket.unwrap_or("");
-            format!(
-                "{}_{}_{}_{}_{}.parquet",
-                region_prefix, opt_bucket, tr, tb, dt_str
-            )
+            format!("{}.parquet", output_stem)
         }
     });
     ensure_output_dir(&cli);
@@ -1660,7 +1658,7 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
                 region.as_deref(),
                 bucket,
                 target_region.as_deref(),
-                Some(target_bucket),
+                Some(target_bucket.as_str()),
             );
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
@@ -1753,6 +1751,15 @@ fn validate_diff_hints_command(cli: &Cli) {
     }
 }
 
+fn validate_diff_resume_command(cli: &Cli) {
+    if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
+        eprintln!(
+            "diff --resume is not supported yet: paired diff/resume coordination is deferred to v0.2.x; remove --resume to run authoritative single-segment diff"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
 fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
     match &cli.cmd {
         Commands::List { output_format, .. } => Some(*output_format),
@@ -1773,9 +1780,25 @@ fn output_stem(
     region: Option<&str>,
     bucket: &str,
     target_region: Option<&str>,
-    target_bucket: Option<&String>,
+    target_bucket: Option<&str>,
 ) -> String {
     let now = Local::now().format("%Y%m%d%H%M%S");
+    output_stem_with_timestamp(
+        region,
+        bucket,
+        target_region,
+        target_bucket,
+        &now.to_string(),
+    )
+}
+
+fn output_stem_with_timestamp(
+    region: Option<&str>,
+    bucket: &str,
+    target_region: Option<&str>,
+    target_bucket: Option<&str>,
+    timestamp: &str,
+) -> String {
     let mut parts = Vec::new();
     if let Some(region) = region.filter(|r| !r.is_empty()) {
         parts.push(sanitize_path_component(region));
@@ -1787,21 +1810,22 @@ fn output_stem(
     if let Some(target_bucket) = target_bucket {
         parts.push(sanitize_path_component(target_bucket));
     }
-    parts.push(now.to_string());
+    parts.push(timestamp.to_string());
     parts.join("_")
 }
 
+fn prefixes_output_path(region: Option<&str>, bucket: &str, toml: bool) -> String {
+    let extension = if toml { "toml" } else { "txt" };
+    let mut parts = Vec::new();
+    if let Some(region) = region.filter(|r| !r.is_empty()) {
+        parts.push(sanitize_path_component(region));
+    }
+    parts.push(sanitize_path_component(bucket));
+    format!("{}_prefixes.{}", parts.join("_"), extension)
+}
+
 fn sanitize_path_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    agent::sanitize_path_component(value)
 }
 
 fn ensure_output_dir(cli: &Cli) {
@@ -2394,18 +2418,9 @@ fn runtime_output_summary(
             output,
             toml,
             ..
-        } => output.clone().or_else(|| {
-            Some(if let Some(r) = region {
-                format!(
-                    "{}_{}_prefixes.{}",
-                    r,
-                    bucket,
-                    if *toml { "toml" } else { "txt" }
-                )
-            } else {
-                format!("{}_prefixes.{}", bucket, if *toml { "toml" } else { "txt" })
-            })
-        }),
+        } => output
+            .clone()
+            .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
         _ => None,
     };
     let compat_output = match &cli.cmd {
@@ -2432,20 +2447,17 @@ fn planned_output_paths(
     let now = Local::now().format("%Y%m%d%H%M%S").to_string();
     match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let prefix = region
-                .as_ref()
-                .map(|r| format!("{}_", r))
-                .unwrap_or_default();
+            let stem = output_stem_with_timestamp(region.as_deref(), bucket, None, None, &now);
             let ks = cfg
                 .output
                 .ks_file
                 .clone()
-                .unwrap_or_else(|| format!("{}_{}_{}.ks", prefix, bucket, now));
+                .unwrap_or_else(|| format!("{}.ks", stem));
             let parquet = cfg
                 .output
                 .parquet_file
                 .clone()
-                .unwrap_or_else(|| format!("{}_{}_{}.parquet", prefix, bucket, now));
+                .unwrap_or_else(|| format!("{}.parquet", stem));
             (Some(ks), Some(parquet), None)
         }
         Commands::Diff {
@@ -2454,25 +2466,23 @@ fn planned_output_paths(
             target_region,
             target_bucket,
         } => {
-            let prefix = region
-                .as_ref()
-                .map(|r| format!("{}_", r))
-                .unwrap_or_default();
+            let stem = output_stem_with_timestamp(
+                region.as_deref(),
+                bucket,
+                target_region.as_deref(),
+                Some(target_bucket),
+                &now,
+            );
             let ks = cfg
                 .output
                 .ks_file
                 .clone()
-                .unwrap_or_else(|| format!("{}_{}_{}.ks", prefix, bucket, now));
-            let parquet = cfg.output.parquet_file.clone().unwrap_or_else(|| {
-                format!(
-                    "{}_{}_{}_{}_{}.parquet",
-                    prefix,
-                    bucket,
-                    target_region.as_deref().unwrap_or(""),
-                    target_bucket,
-                    now
-                )
-            });
+                .unwrap_or_else(|| format!("{}.ks", stem));
+            let parquet = cfg
+                .output
+                .parquet_file
+                .clone()
+                .unwrap_or_else(|| format!("{}.parquet", stem));
             (Some(ks), Some(parquet), None)
         }
         Commands::AutoHints {
@@ -2496,18 +2506,9 @@ fn planned_output_paths(
         } => (
             None,
             None,
-            output.clone().or_else(|| {
-                Some(if let Some(r) = region {
-                    format!(
-                        "{}_{}_prefixes.{}",
-                        r,
-                        bucket,
-                        if *toml { "toml" } else { "txt" }
-                    )
-                } else {
-                    format!("{}_prefixes.{}", bucket, if *toml { "toml" } else { "txt" })
-                })
-            }),
+            output
+                .clone()
+                .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
         ),
         _ => (None, None, None),
     }
@@ -2560,9 +2561,9 @@ fn load_hints(
 
     // 2. Try auto-hints cache at conventional path.
     let cache_filename = if let Some(r) = region {
-        format!("{}_{}_hints.toml", r, bucket)
+        agent::conventional_hints_path(bucket, Some(r))
     } else {
-        format!("{}_hints.toml", bucket)
+        agent::conventional_hints_path(bucket, None)
     };
 
     if let Ok(boundaries) = hints::parse_hints_file(&cache_filename) {

@@ -75,9 +75,13 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         self.total_rows
     }
 
-    pub async fn write_batch(&mut self, v: Vec<(ObjectKey, ObjectProps)>, diff_flag: u8) {
+    pub async fn write_batch(
+        &mut self,
+        v: Vec<(ObjectKey, ObjectProps)>,
+        diff_flag: u8,
+    ) -> Result<(), String> {
         if v.is_empty() {
-            return;
+            return Ok(());
         }
         let count = v.len();
         let mut vec_key: Vec<&str> = Vec::with_capacity(count);
@@ -104,13 +108,15 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
 
         match RecordBatch::try_new(Arc::clone(&self.schema_ref), columns) {
             Ok(batch) => {
-                if let Err(e) = self.writer.write(&batch).await {
-                    warn!("Parquet write error: {}", e);
-                }
+                self.writer
+                    .write(&batch)
+                    .await
+                    .map_err(|e| format!("Parquet write error: {}", e))?;
                 self.total_rows += count;
             }
-            Err(e) => warn!("RecordBatch error: {}", e),
+            Err(e) => return Err(format!("RecordBatch error: {}", e)),
         }
+        Ok(())
     }
 
     /// Flush the in-progress row group (streaming — keeps memory bounded).
@@ -121,11 +127,13 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         }
     }
 
-    pub async fn close(self) {
-        match self.writer.close().await {
-            Ok(_) => info!("Parquet file written: {} rows", self.total_rows),
-            Err(e) => warn!("Parquet close error: {}", e),
-        }
+    pub async fn close(self) -> Result<(), String> {
+        self.writer
+            .close()
+            .await
+            .map_err(|e| format!("Parquet close error: {}", e))?;
+        info!("Parquet file written: {} rows", self.total_rows);
+        Ok(())
     }
 }
 

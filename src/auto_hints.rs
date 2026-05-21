@@ -257,13 +257,10 @@ pub async fn generate_hints(options: GenerateHintsOptions<'_>) {
         segment_estimates: segment_estimates.clone(),
     };
 
-    let output_path = options.output.map(|o| o.to_string()).unwrap_or_else(|| {
-        if let Some(r) = options.region {
-            format!("{}_{}_hints.toml", r, options.bucket)
-        } else {
-            format!("{}_hints.toml", options.bucket)
-        }
-    });
+    let output_path = options
+        .output
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| crate::agent::conventional_hints_path(options.bucket, options.region));
 
     let toml_str = toml::to_string_pretty(&cache).expect("Failed to serialize hints cache");
     std::fs::write(&output_path, &toml_str).expect("Failed to write hints cache");
@@ -378,14 +375,10 @@ pub async fn discover_prefixes(options: DiscoverPrefixesOptions<'_>) {
     }
 
     let prefixes: Vec<String> = common_prefixes.into_iter().collect();
-    let output_path = options.output.map(|o| o.to_string()).unwrap_or_else(|| {
-        let extension = if options.toml { "toml" } else { "txt" };
-        if let Some(r) = options.region {
-            format!("{}_{}_prefixes.{}", r, options.bucket, extension)
-        } else {
-            format!("{}_prefixes.{}", options.bucket, extension)
-        }
-    });
+    let output_path = options
+        .output
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| prefixes_output_path(options.region, options.bucket, options.toml));
 
     if options.toml {
         let cache = PrefixDiscoveryCache {
@@ -536,12 +529,12 @@ fn print_estimate_summary(estimates: &[SegmentEstimate], sampled_mode: bool) {
 
 // ── Prefix splitting algorithm ─────────────────────────────
 
-/// Walk the prefix→count map and emit boundaries.  Prefixes with count >
-/// threshold are recursively split into sub-prefixes up to max_depth levels of
-/// '/' nesting.
+/// Walk the prefix→count map and emit ordered boundaries. Prefixes observed
+/// deeper than max_depth are coalesced to the configured depth so generated
+/// hints never exceed the documented depth limit.
 fn split_prefixes(
     counts: &BTreeMap<String, usize>,
-    threshold: usize,
+    _threshold: usize,
     max_depth: usize,
 ) -> Vec<String> {
     let mut split_points: BTreeMap<String, usize> = BTreeMap::new();
@@ -551,22 +544,45 @@ fn split_prefixes(
             continue;
         }
 
-        if count > threshold {
-            let depth = prefix.matches('/').count() + 1;
-            if depth < max_depth {
-                split_points.entry(prefix.clone()).or_insert(count);
-            } else {
-                split_points.entry(prefix.clone()).or_insert(count);
-            }
-        } else {
-            split_points.entry(prefix.clone()).or_insert(count);
+        let boundary = clamp_prefix_depth(prefix, max_depth);
+        if boundary.is_empty() {
+            continue;
         }
+        let entry = split_points.entry(boundary).or_insert(0);
+        *entry = entry.saturating_add(count);
     }
 
     // Convert split points to ordered boundary list.
     let mut boundaries: Vec<String> = split_points.keys().cloned().collect();
     boundaries.sort();
     boundaries
+}
+
+fn clamp_prefix_depth(prefix: &str, max_depth: usize) -> String {
+    if max_depth == 0 {
+        return String::new();
+    }
+    let has_trailing_slash = prefix.ends_with('/');
+    let segments: Vec<&str> = prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .take(max_depth)
+        .collect();
+    let mut boundary = segments.join("/");
+    if has_trailing_slash && !boundary.is_empty() {
+        boundary.push('/');
+    }
+    boundary
+}
+
+fn prefixes_output_path(region: Option<&str>, bucket: &str, toml: bool) -> String {
+    let extension = if toml { "toml" } else { "txt" };
+    let mut parts = Vec::new();
+    if let Some(region) = region.filter(|r| !r.is_empty()) {
+        parts.push(crate::agent::sanitize_path_component(region));
+    }
+    parts.push(crate::agent::sanitize_path_component(bucket));
+    format!("{}_prefixes.{}", parts.join("_"), extension)
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -618,6 +634,25 @@ mod tests {
         let counts = make_counts(&[("z/", 50), ("a/", 30), ("m/", 60)]);
         let b = split_prefixes(&counts, 100, 5);
         assert_eq!(b, vec!["a/", "m/", "z/"]);
+    }
+
+    #[test]
+    fn test_split_respects_max_prefix_depth() {
+        let counts = make_counts(&[("a/b/c/", 200), ("a/b/d/", 50), ("x/y/z", 20)]);
+        let b = split_prefixes(&counts, 100, 2);
+        assert_eq!(b, vec!["a/b/", "x/y"]);
+    }
+
+    #[test]
+    fn test_default_output_paths_sanitize_bucket_and_region() {
+        assert_eq!(
+            crate::agent::conventional_hints_path("../evil/bucket", Some("us/east")),
+            "us_east_.._evil_bucket_hints.toml"
+        );
+        assert_eq!(
+            prefixes_output_path(Some("us/east"), "../evil/bucket", true),
+            "us_east_.._evil_bucket_prefixes.toml"
+        );
     }
 
     #[test]

@@ -1372,7 +1372,7 @@ fn write_hints_cache(
         max_keys: None,
         max_prefix_entries: None,
         prefix_counts_truncated: false,
-        scan_mode: Some(bucket.to_string()),
+        scan_mode: None,
         sampled_objects: None,
         sampled_pages: None,
         sample_limit: None,

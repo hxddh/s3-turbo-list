@@ -117,9 +117,15 @@ async fn flat_list_run_to_complete(
     start: &str,
     until: Option<&str>,
 ) {
-    // If the CLI provided --start-after, it overrides the segment's start.
-    let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
     let mut continuation_token = ctx.continuation_token.clone();
+    // If the CLI provided --start-after, it overrides the segment's start.
+    // Continuation-token resume is a single-chain mode; do not also send
+    // start_after on the initial token request.
+    let mut start_after = if continuation_token.is_some() {
+        String::new()
+    } else {
+        ctx.start_after.as_deref().unwrap_or(start).to_string()
+    };
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(
@@ -328,15 +334,11 @@ async fn flat_list(
                 );
 
                 let mut batch: Vec<(ObjectKey, ObjectProps)> = Vec::new();
-                let mut remaining_keys = objects.key_count().unwrap_or(0) as usize;
 
                 for obj in objects.contents() {
                     let obj_key = match obj.key() {
                         Some(k) => k,
-                        None => {
-                            remaining_keys = remaining_keys.saturating_sub(1);
-                            continue;
-                        }
+                        None => continue,
                     };
 
                     // Segment ranges are (start_after, end_before].  The next
@@ -351,18 +353,16 @@ async fn flat_list(
                         }
                     }
 
-                    // Remember last key for resume-on-error.
-                    if remaining_keys == 1 {
-                        next_start = obj_key.to_string();
-                    }
+                    // Remember the last processed key for resume-on-error.
+                    // Some S3-compatible providers omit KeyCount, so this must
+                    // not depend on provider pagination metadata.
+                    next_start = obj_key.to_string();
 
                     let key: ObjectKey = obj_key.into();
                     let mut props: ObjectProps = obj.into();
                     props.set_dir(ctx.dir);
                     batch.push((key, props));
                     object_count = object_count.saturating_add(1);
-
-                    remaining_keys = remaining_keys.saturating_sub(1);
                 }
 
                 // Send batch to data_map via bounded channel.

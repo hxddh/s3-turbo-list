@@ -230,8 +230,13 @@ impl CheckpointJournal {
 
 /// Generate the checkpoint file path for a given bucket.
 pub fn checkpoint_path(bucket: &str, region: Option<&str>) -> String {
+    let bucket = crate::agent::sanitize_path_component(bucket);
     if let Some(r) = region {
-        format!("{}_{}_checkpoint.toml", r, bucket)
+        format!(
+            "{}_{}_checkpoint.toml",
+            crate::agent::sanitize_path_component(r),
+            bucket
+        )
     } else {
         format!("{}_checkpoint.toml", bucket)
     }
