@@ -893,6 +893,26 @@ fn test_cli_rejects_diff_with_resume() {
 }
 
 #[test]
+fn test_cli_rejects_unsupported_filter_syntax_before_network() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--filter",
+        "max(SOURCE.size, 1) > 0",
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("Filter error"), "{}", stderr);
+    assert!(
+        stderr.contains("function call \"max\" not allowed"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
 fn test_cli_manifest_summary_human_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("run.json");
@@ -1025,7 +1045,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.19",
+  "tool_version": "0.1.20",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,

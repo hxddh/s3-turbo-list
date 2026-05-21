@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Resource and syntax guardrails for `--filter` expressions: bounded expression
+  length, AST size, operation count, expression depth, and literal/container
+  sizes.
+
+### Changed
+- Object filters now accept only simple property comparisons and boolean/operator
+  combinations over `SOURCE` and `TARGET`, rejecting function calls, method
+  calls, indexing, arrays, maps, strings, and statements before any listing run.
+
 ## [0.1.19] - 2026-05-21
 
 ### Added

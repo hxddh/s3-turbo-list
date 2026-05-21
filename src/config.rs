@@ -440,11 +440,32 @@ impl S3TurboConfig {
 
 const OBJECT_FILTER_ALLOWED_VARIABLE: [&str; 2] = ["SOURCE", "TARGET"];
 const OBJECT_FILTER_ALLOWED_PROPERTY: [&str; 2] = ["size", "last_modified"];
+const OBJECT_FILTER_MAX_LEN: usize = 512;
+const OBJECT_FILTER_MAX_AST_NODES: usize = 128;
+const OBJECT_FILTER_MAX_OPERATIONS: u64 = 128;
+const OBJECT_FILTER_MAX_EXPR_DEPTH: usize = 24;
+const OBJECT_FILTER_MAX_STRING_SIZE: usize = 128;
 
 fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilter, String> {
+    if expr.len() > OBJECT_FILTER_MAX_LEN {
+        return Err(format!(
+            "Filter expression is too long: {} bytes, max {}",
+            expr.len(),
+            OBJECT_FILTER_MAX_LEN
+        ));
+    }
+    if expr.contains('"') || expr.contains('\'') {
+        return Err("Filter expression cannot contain string or character literals".to_string());
+    }
+
     let mut engine = Engine::new();
     engine
         .set_fail_on_invalid_map_property(true)
+        .set_max_operations(OBJECT_FILTER_MAX_OPERATIONS)
+        .set_max_call_levels(0)
+        .set_max_expr_depths(OBJECT_FILTER_MAX_EXPR_DEPTH, OBJECT_FILTER_MAX_EXPR_DEPTH)
+        .set_max_string_size(OBJECT_FILTER_MAX_STRING_SIZE)
+        .set_max_array_size(0)
         .set_max_variables(2)
         .set_max_map_size(2);
 
@@ -452,33 +473,40 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
         .compile_expression(expr)
         .map_err(|e| format!("Failed to compile filter expression: {}", e))?;
 
-    // Walk AST to validate allowed properties/variables.
+    // Walk AST to validate allowed properties/variables and keep the filter
+    // expression to simple property comparisons plus boolean/operator nodes.
     let mut check_failed = false;
+    let mut check_error = None;
+    let mut node_count = 0usize;
     ast.walk(&mut |nodes| {
-        let mut cont = true;
-        for node in nodes {
-            if let rhai::ASTNode::Expr(rhai::Expr::Property(props, _)) = node {
-                let prop = props.2.as_str();
-                if !OBJECT_FILTER_ALLOWED_PROPERTY.contains(&prop) {
-                    log::error!("object property \"{}\" not allowed in filter", prop);
-                    check_failed = true;
-                    cont = false;
-                }
-            }
-            if let rhai::ASTNode::Expr(rhai::Expr::Variable(names, _, _)) = node {
-                let name = names.1.as_str();
-                if !OBJECT_FILTER_ALLOWED_VARIABLE.contains(&name) {
-                    log::error!("variable \"{}\" not allowed in filter", name);
-                    check_failed = true;
-                    cont = false;
-                }
-            }
+        node_count = node_count.saturating_add(1);
+        if node_count > OBJECT_FILTER_MAX_AST_NODES {
+            log::error!(
+                "filter expression exceeds AST node limit {}",
+                OBJECT_FILTER_MAX_AST_NODES
+            );
+            check_error = Some("filter expression exceeds AST node limit".to_string());
+            check_failed = true;
+            return false;
         }
-        cont
+
+        let Some(node) = nodes.last() else {
+            return true;
+        };
+        if let Some(error) = validate_filter_ast_node(node) {
+            log::error!("{}", error);
+            check_error = Some(error);
+            check_failed = true;
+            return false;
+        }
+        true
     });
 
     if check_failed {
-        return Err("Filter expression contains disallowed properties or variables".into());
+        return Err(format!(
+            "Filter expression contains unsupported syntax or identifiers: {}",
+            check_error.unwrap_or_else(|| "unknown validation error".to_string())
+        ));
     }
 
     // Test with fake ObjectProps to catch runtime errors.
@@ -508,6 +536,98 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
             engine.eval_ast_with_scope::<bool>(&mut scope, &ast).ok()
         },
     )))
+}
+
+fn validate_filter_ast_node(node: &rhai::ASTNode<'_>) -> Option<String> {
+    match node {
+        rhai::ASTNode::Expr(expr) => validate_filter_expr(expr),
+        rhai::ASTNode::Stmt(stmt) => validate_filter_stmt(stmt),
+        _ => Some("unsupported filter AST node".to_string()),
+    }
+}
+
+fn validate_filter_stmt(stmt: &rhai::Stmt) -> Option<String> {
+    match stmt {
+        rhai::Stmt::Expr(_) | rhai::Stmt::Noop(_) => None,
+        rhai::Stmt::FnCall(call, _) if is_allowed_filter_operator(&call.name) => None,
+        _ => Some("filter expressions cannot contain statements".to_string()),
+    }
+}
+
+fn validate_filter_expr(expr: &rhai::Expr) -> Option<String> {
+    match expr {
+        rhai::Expr::BoolConstant(..)
+        | rhai::Expr::IntegerConstant(..)
+        | rhai::Expr::FloatConstant(..)
+        | rhai::Expr::Dot(..)
+        | rhai::Expr::And(..)
+        | rhai::Expr::Or(..) => None,
+        rhai::Expr::Property(props, _) => {
+            let prop = props.2.as_str();
+            if OBJECT_FILTER_ALLOWED_PROPERTY.contains(&prop) {
+                None
+            } else {
+                Some(format!(
+                    "object property \"{}\" not allowed in filter",
+                    prop
+                ))
+            }
+        }
+        rhai::Expr::Variable(names, _, _) => {
+            let name = names.1.as_str();
+            if OBJECT_FILTER_ALLOWED_VARIABLE.contains(&name) {
+                None
+            } else {
+                Some(format!("variable \"{}\" not allowed in filter", name))
+            }
+        }
+        rhai::Expr::FnCall(call, _) if is_allowed_filter_operator(&call.name) => None,
+        rhai::Expr::FnCall(call, _) => Some(format!(
+            "function call \"{}\" not allowed in filter",
+            call.name
+        )),
+        rhai::Expr::MethodCall(call, _) => Some(format!(
+            "method call \"{}\" not allowed in filter",
+            call.name
+        )),
+        rhai::Expr::StringConstant(..) | rhai::Expr::CharConstant(..) => {
+            Some("string and character literals are not supported in filters".to_string())
+        }
+        rhai::Expr::InterpolatedString(..) => {
+            Some("interpolated strings are not supported in filters".to_string())
+        }
+        rhai::Expr::Array(..)
+        | rhai::Expr::Map(..)
+        | rhai::Expr::Index(..)
+        | rhai::Expr::Coalesce(..) => {
+            Some("arrays, maps, indexing, and coalescing are not supported in filters".to_string())
+        }
+        rhai::Expr::DynamicConstant(..)
+        | rhai::Expr::Unit(..)
+        | rhai::Expr::ThisPtr(..)
+        | rhai::Expr::Stmt(..) => Some("unsupported filter expression syntax".to_string()),
+        rhai::Expr::Custom(..) => Some("custom syntax is not supported in filters".to_string()),
+        _ => Some("unsupported filter expression syntax".to_string()),
+    }
+}
+
+fn is_allowed_filter_operator(name: &str) -> bool {
+    matches!(
+        name,
+        ">" | ">="
+            | "<"
+            | "<="
+            | "=="
+            | "!="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "!"
+            | "unary-"
+            | "unary+"
+    )
 }
 
 #[allow(dead_code)] // Phase 5: standalone convenience wrapper
@@ -746,6 +866,45 @@ profile = "bos"
     #[test]
     fn test_filter_compile_rejects_disallowed_variable() {
         assert!(compile_filter("OTHER > 5").is_err());
+    }
+
+    #[test]
+    fn test_filter_compile_accepts_boolean_comparison_chain() {
+        let filter =
+            compile_filter("SOURCE.size > 1000 && SOURCE.last_modified >= 1715700000").unwrap();
+        let mut props = ObjectProps::default();
+        props.size = 2048;
+        props.last_modified = 1715700001;
+        assert_eq!(filter.evaluate(&props, None), Some(true));
+    }
+
+    #[test]
+    fn test_filter_compile_rejects_long_expression() {
+        let expr = format!("SOURCE.size > {}", "1".repeat(OBJECT_FILTER_MAX_LEN));
+        let err = compile_filter(&expr).unwrap_err();
+        assert!(err.contains("too long"), "{}", err);
+    }
+
+    #[test]
+    fn test_filter_compile_rejects_function_call() {
+        let err = compile_filter("max(SOURCE.size, 1) > 0").unwrap_err();
+        assert!(
+            err.contains("unsupported syntax") || err.contains("not allowed"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_filter_compile_rejects_string_literals() {
+        let err = compile_filter("SOURCE.size > 0 && \"x\" == \"x\"").unwrap_err();
+        assert!(
+            err.contains("unsupported syntax")
+                || err.contains("not supported")
+                || err.contains("cannot contain"),
+            "{}",
+            err
+        );
     }
 
     #[test]
