@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls, indexing, arrays, maps, strings, and statements before any listing run.
 - README and agent documentation now describe supported `--filter` expressions
   and rejection behavior.
+- `recipes filter` now provides local filter examples and the supported syntax
+  boundary.
 
 ## [0.1.19] - 2026-05-21
 

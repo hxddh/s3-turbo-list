@@ -880,6 +880,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
   aws-basic      Minimal AWS S3 dry-run and list
   summary        Count objects and bytes without Parquet/KS outputs
   pipe           Stream list results to shell tools or agents
+  filter         Local object filter examples and limits
   verify         Validate a saved run manifest locally
   diff-safe      Authoritative single-segment diff workflow
   large-bucket   Hints, trace, and output-dir workflow
@@ -917,6 +918,25 @@ Run: s3-turbo-list recipes <name>
   s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson | jq -r '.k'
   s3-turbo-list --delimiter '' --run-manifest run.json list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
   s3-turbo-list manifest-summary run.json --json
+"#
+            .to_string(),
+        ),
+        "filter" => Ok(
+            r#"Object filters:
+  # Filters are local: they run after S3 listing and before output.
+  # Use prefix/delimiter/max-keys for request-side shaping.
+
+  # Keep objects larger than 1 GiB
+  s3-turbo-list --filter 'SOURCE.size > 1073741824' --delimiter '' list --bucket my-bucket --region us-east-1
+
+  # Keep recently modified objects by epoch seconds
+  s3-turbo-list --filter 'SOURCE.last_modified >= 1715700000' --delimiter '' list --bucket my-bucket --region us-east-1
+
+  # Diff-only: keep rows where source and target sizes differ
+  s3-turbo-list --filter 'SOURCE.size != TARGET.size' diff --bucket left-bucket --target-bucket right-bucket
+
+Allowed: SOURCE/TARGET size and last_modified numeric comparisons, arithmetic, &&, ||, !.
+Rejected before network: functions, methods, strings, arrays, maps, indexing, statements, large/deep expressions.
 "#
             .to_string(),
         ),
@@ -992,6 +1012,7 @@ Useful local commands:
   s3-turbo-list hints-validate --hints-file hints.toml --json
   s3-turbo-list trace-summary trace.jsonl --machine-readable
   s3-turbo-list manifest-summary run.json --check
+  s3-turbo-list recipes filter
   s3-turbo-list recipes large-bucket
 "#
     .to_string()

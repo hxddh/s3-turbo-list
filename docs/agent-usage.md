@@ -15,6 +15,7 @@ s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list recipes agent-safe
 s3-turbo-list recipes summary
 s3-turbo-list recipes pipe
+s3-turbo-list recipes filter
 s3-turbo-list recipes verify
 s3-turbo-list recipes diff-safe
 s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1

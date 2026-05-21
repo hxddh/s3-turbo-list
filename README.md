@@ -392,6 +392,7 @@ For concise local help:
 ```bash
 s3-turbo-list recipes
 s3-turbo-list recipes summary
+s3-turbo-list recipes filter
 s3-turbo-list recipes verify
 s3-turbo-list recipes diff-safe
 s3-turbo-list recipes large-bucket

@@ -283,6 +283,12 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("--output-format ndjson"));
     assert!(stdout.contains("manifest-summary"));
 
+    let (code, stdout, stderr) = run_cli(&["recipes", "filter"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("SOURCE.size > 1073741824"));
+    assert!(stdout.contains("SOURCE.last_modified"));
+    assert!(stdout.contains("Rejected before network"));
+
     let (code, stdout, stderr) = run_cli(&["recipes", "diff-safe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Safe diff"));
@@ -299,6 +305,7 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("First run"));
     assert!(stdout.contains("--delimiter ''"));
+    assert!(stdout.contains("recipes filter"));
 }
 
 #[test]
