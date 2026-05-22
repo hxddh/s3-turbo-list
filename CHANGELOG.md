@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-05-22
+
 ### Added
 - `manifest-summary --check --json` now includes a stable `check` summary with
   pass/fail counts, artifact counts, and row/schema/exit-code status values.
