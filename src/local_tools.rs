@@ -1355,7 +1355,7 @@ fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
     let total_objects = segments.iter().map(|s| s.objects as u64).sum();
     let total_common_prefixes = segments.iter().map(|s| s.common_prefixes as u64).sum();
     let mut slowest_segments = segments.clone();
-    slowest_segments.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+    slowest_segments.sort_by_key(|segment| std::cmp::Reverse(segment.elapsed_ms));
     slowest_segments.truncate(5);
 
     let imbalance = summarize_imbalance(&segments);
