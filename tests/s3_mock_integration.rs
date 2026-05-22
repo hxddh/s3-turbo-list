@@ -257,6 +257,23 @@ fn list_bucket_xml(
     )
 }
 
+fn list_bucket_xml_without_key_count(
+    prefix: &str,
+    max_keys: i32,
+    contents: &[&str],
+    truncated: bool,
+    next_token: Option<&str>,
+) -> String {
+    let mut xml = list_bucket_xml(prefix, max_keys, contents, &[], truncated, next_token);
+    if let Some(start) = xml.find("<KeyCount>") {
+        if let Some(end) = xml[start..].find("</KeyCount>") {
+            let end = start + end + "</KeyCount>".len();
+            xml.replace_range(start..end, "");
+        }
+    }
+    xml
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -924,6 +941,110 @@ mode = "list"
         requests[0].query.get("start-after").map(String::as_str),
         Some("m/")
     );
+
+    let checkpoint_after = std::fs::read_to_string(&checkpoint).unwrap();
+    assert!(
+        checkpoint_after.contains("completed_indices = [\n    0,\n    1,\n]")
+            || checkpoint_after.contains("completed_indices = [0, 1]"),
+        "{}",
+        checkpoint_after
+    );
+}
+
+#[test]
+fn local_mock_resume_on_error_advances_without_key_count() {
+    let token_error_count = Arc::new(AtomicUsize::new(0));
+    let handler_token_error_count = token_error_count.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        if request.query.get("continuation-token").map(String::as_str) == Some("token-1") {
+            handler_token_error_count.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(3));
+            return MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &["timeout-late.txt"],
+                &[],
+                false,
+                None,
+            ));
+        }
+        if request.query.get("start-after").map(String::as_str) == Some("logs/b.txt") {
+            return MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                1000,
+                &["logs/c.txt"],
+                &[],
+                false,
+                None,
+            ));
+        }
+        if request.query.contains_key("start-after") {
+            return MockResponse::error(
+                500,
+                "UnexpectedStartAfter",
+                "retry should resume from the last processed key",
+            );
+        }
+        MockResponse::ok_xml(list_bucket_xml_without_key_count(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            2,
+            &["logs/a.txt", "logs/b.txt"],
+            true,
+            Some("token-1"),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("resume-no-key-count.parquet");
+    let ks = dir.path().join("resume-no-key-count.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        token_error_count.load(Ordering::SeqCst) > 0,
+        "mock should force an error on the token page"
+    );
+    assert_eq!(
+        parquet_keys(&parquet),
+        vec!["logs/a.txt", "logs/b.txt", "logs/c.txt"]
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests.iter().any(|request| {
+            request.query.get("start-after").map(String::as_str) == Some("logs/b.txt")
+                && !request.query.contains_key("continuation-token")
+        }),
+        "{:#?}",
+        requests
+    );
 }
 
 #[test]
@@ -999,6 +1120,82 @@ estimate_mode = "full"
     let mut keys = parquet_keys(&parquet);
     keys.sort();
     assert_eq!(keys, vec!["a.txt", "m/", "z.txt"]);
+}
+
+#[test]
+fn local_mock_multi_segment_boundaries_include_boundary_keys() {
+    let server = MockS3Server::start(|request, _sequence| {
+        let start_after = request.query.get("start-after").map(String::as_str);
+        let contents = match start_after {
+            None => vec!["a.txt", "m/", "n.txt"],
+            Some("m/") => vec!["n.txt", "t/", "u.txt"],
+            Some("t/") => vec!["z.txt"],
+            Some(other) => {
+                return MockResponse::error(
+                    500,
+                    "UnexpectedStartAfter",
+                    &format!("unexpected start-after {}", other),
+                );
+            }
+        };
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &contents,
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let parquet = dir.path().join("multi-boundary.parquet");
+    let ks = dir.path().join("multi-boundary.ks");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+total_objects = 5
+boundaries = ["m/", "t/"]
+generated_at = "2026-05-18T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut keys = parquet_keys(&parquet);
+    keys.sort();
+    assert_eq!(keys, vec!["a.txt", "m/", "n.txt", "t/", "z.txt"]);
 }
 
 #[test]

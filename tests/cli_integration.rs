@@ -865,6 +865,22 @@ fn test_cli_rejects_continuation_token_with_diff_or_hints() {
     ]);
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stderr.contains("single-chain only"));
+
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--dry-run",
+        "--no-auto-hints",
+        "--start-after",
+        "already-seen-key",
+        "--continuation-token",
+        "token-123",
+        "list",
+        "--bucket",
+        "my-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("--continuation-token cannot be combined with --start-after"));
 }
 
 #[test]
@@ -1066,7 +1082,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.21",
+  "tool_version": "0.1.22",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,

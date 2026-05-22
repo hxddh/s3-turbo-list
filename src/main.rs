@@ -20,7 +20,7 @@ use log::{error, info};
 use serde::Serialize;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ── CLI definition ─────────────────────────────────────────
@@ -1052,6 +1052,7 @@ fn main() {
         let mut set = tokio::task::JoinSet::new();
         let concurrency = cfg.runtime.max_concurrency;
         let channel_capacity = cfg.channel.capacity;
+        let sdk_config = core::S3TaskContext::load_sdk_config(&cfg.s3).await;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
             channel_capacity,
@@ -1120,6 +1121,7 @@ fn main() {
             opt_region,
             cfg.s3.endpoint_url.as_deref(),
             cfg.s3.force_path_style,
+            &sdk_config,
             &s3_cfg,
             tx.clone(),
             dir,
@@ -1156,6 +1158,7 @@ fn main() {
                 target_region,
                 cfg.s3.endpoint_url.as_deref(),
                 cfg.s3.force_path_style,
+                &sdk_config,
                 &cfg.s3,
                 tx.clone(),
                 core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
@@ -1252,10 +1255,11 @@ fn main() {
                 && g_state.all_list_tasks_is_running()
             {
                 if let Some(ref cp_path) = checkpoint_path_opt {
-                    let mut completed: Vec<usize> = left_checkpoint.lock().unwrap().clone();
-                    if let Some(ref right_cp) = right_checkpoint {
-                        completed.extend(right_cp.lock().unwrap().clone());
-                    }
+                    let completed = merged_completed_indices(
+                        checkpoint_journal.as_ref(),
+                        &left_checkpoint,
+                        right_checkpoint.as_ref(),
+                    );
                     let journal = checkpoint::CheckpointJournal {
                         bucket: opt_bucket.to_string(),
                         prefix: opt_prefix.clone(),
@@ -1273,10 +1277,11 @@ fn main() {
         // ── Final checkpoint save on successful completion ─
         if cli.resume {
             if let Some(ref cp_path) = checkpoint_path_opt {
-                let mut completed: Vec<usize> = left_checkpoint.lock().unwrap().clone();
-                if let Some(ref right_cp) = right_checkpoint {
-                    completed.extend(right_cp.lock().unwrap().clone());
-                }
+                let completed = merged_completed_indices(
+                    checkpoint_journal.as_ref(),
+                    &left_checkpoint,
+                    right_checkpoint.as_ref(),
+                );
                 if !completed.is_empty() {
                     let journal = checkpoint::CheckpointJournal {
                         bucket: opt_bucket.to_string(),
@@ -1764,6 +1769,23 @@ fn validate_diff_resume_command(cli: &Cli) {
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
+}
+
+fn merged_completed_indices(
+    checkpoint_journal: Option<&checkpoint::CheckpointJournal>,
+    left_checkpoint: &Arc<Mutex<Vec<usize>>>,
+    right_checkpoint: Option<&Arc<Mutex<Vec<usize>>>>,
+) -> Vec<usize> {
+    let mut completed = checkpoint_journal
+        .map(|journal| journal.completed_indices.clone())
+        .unwrap_or_default();
+    completed.extend(left_checkpoint.lock().unwrap().iter().copied());
+    if let Some(right_checkpoint) = right_checkpoint {
+        completed.extend(right_checkpoint.lock().unwrap().iter().copied());
+    }
+    completed.sort_unstable();
+    completed.dedup();
+    completed
 }
 
 fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {

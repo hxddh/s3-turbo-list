@@ -633,25 +633,8 @@ pub struct S3TaskContext {
 }
 
 impl S3TaskContext {
-    pub fn new(
-        bucket: &str,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-        force_path_style: bool,
-        s3_config: &S3Config,
-        data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
-        dir: u8,
-        g_state: GlobalState,
-        trace_writer: Option<Arc<dyn S3TraceWriter>>,
-        addressing_style: &str,
-        profile: Option<&str>,
-        delimiter: Option<&str>,
-        max_keys: Option<i32>,
-        start_after: Option<&str>,
-        continuation_token: Option<&str>,
-        checkpoint_completed: Arc<Mutex<Vec<usize>>>,
-    ) -> Self {
-        let loader = aws_config::from_env()
+    pub async fn load_sdk_config(s3_config: &S3Config) -> aws_config::SdkConfig {
+        aws_config::from_env()
             .retry_config(
                 aws_config::retry::RetryConfig::standard()
                     .with_max_attempts(s3_config.max_attempts)
@@ -674,13 +657,31 @@ impl S3TaskContext {
                         s3_config.operation_timeout_secs,
                     ))
                     .build(),
-            );
+            )
+            .load()
+            .await
+    }
 
-        let config = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move { loader.load().await })
-        });
-
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config);
+    pub fn new(
+        bucket: &str,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+        force_path_style: bool,
+        sdk_config: &aws_config::SdkConfig,
+        s3_config: &S3Config,
+        data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
+        dir: u8,
+        g_state: GlobalState,
+        trace_writer: Option<Arc<dyn S3TraceWriter>>,
+        addressing_style: &str,
+        profile: Option<&str>,
+        delimiter: Option<&str>,
+        max_keys: Option<i32>,
+        start_after: Option<&str>,
+        continuation_token: Option<&str>,
+        checkpoint_completed: Arc<Mutex<Vec<usize>>>,
+    ) -> Self {
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(sdk_config);
         if let Some(region_str) = region {
             s3_config_builder =
                 s3_config_builder.region(aws_sdk_s3::config::Region::new(region_str.to_owned()));

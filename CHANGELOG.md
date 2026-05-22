@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- S3 client setup now loads the AWS SDK config once in the async startup path
+  and reuses it for source/target clients instead of blocking inside
+  `S3TaskContext::new`.
+- Checkpoint saves now merge existing and newly completed segment indices and
+  write them in deterministic sorted order.
+
+### Fixed
+- Resume checkpoints no longer drop already completed segment indices when a
+  resumed run completes additional segments.
+- Added local mock regressions for continuation-token/start-after rejection,
+  missing `KeyCount` resume-on-error cursor advancement, and multi-segment
+  boundary-key inclusion.
+
 ## [0.1.21] - 2026-05-22
 
 ### Added
