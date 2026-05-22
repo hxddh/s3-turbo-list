@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-05-22
+
 ### Changed
 - S3 client setup now loads the AWS SDK config once in the async startup path
   and reuses it for source/target clients instead of blocking inside
