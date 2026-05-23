@@ -211,28 +211,50 @@ impl ObjectProps {
                 | OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL
                 | OBJECT_PROPS_STATUS_ETAG_NOT_MATCH
         ) {
-            return MatchResult::Astrisk;
+            return self.both_sides_or_ignore(MatchResult::Astrisk);
         }
         if self.status == OBJECT_PROPS_STATUS_MATCH {
-            return MatchResult::Equal;
+            return self.both_sides_or_ignore(MatchResult::Equal);
         }
         if self.status == OBJECT_PROPS_STATUS_OPEN {
-            assert!((self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) != OBJECT_PROPS_FLAG_DIR_BOTH);
+            if (self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) == OBJECT_PROPS_FLAG_DIR_BOTH {
+                log::warn!(
+                    "ObjectProps: flags {} status OPEN but both direction bits are set; ignoring row",
+                    self.flags
+                );
+                return MatchResult::Ignore;
+            }
             return if self.is_left() {
                 MatchResult::Plus
             } else if self.is_right() {
                 MatchResult::Minus
             } else {
-                panic!(
-                    "ObjectProps: flags {} status OPEN but no dir bit set",
+                log::warn!(
+                    "ObjectProps: flags {} status OPEN but no direction bit is set; ignoring row",
                     self.flags
-                )
+                );
+                MatchResult::Ignore
             };
         }
-        panic!(
-            "ObjectProps: unhandled flags {} status {}",
-            self.flags, self.status
+        log::warn!(
+            "ObjectProps: unhandled flags {} status {}; ignoring row",
+            self.flags,
+            self.status
         );
+        MatchResult::Ignore
+    }
+
+    fn both_sides_or_ignore(&self, result: MatchResult) -> MatchResult {
+        if (self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) == OBJECT_PROPS_FLAG_DIR_BOTH {
+            result
+        } else {
+            log::warn!(
+                "ObjectProps: flags {} status {} requires both direction bits; ignoring row",
+                self.flags,
+                self.status
+            );
+            MatchResult::Ignore
+        }
     }
 
     /// Match two ObjectProps (from left and right sides).  Self is the accumulator.
@@ -250,9 +272,14 @@ impl ObjectProps {
 
         let (left, right): (&ObjectProps, &ObjectProps) = if self.is_left() {
             (self, other)
-        } else {
-            assert!(self.is_right());
+        } else if self.is_right() {
             (other, self)
+        } else {
+            log::warn!(
+                "ObjectProps: cannot match accumulator with no direction bit set; marking row ignored"
+            );
+            self.status = OBJECT_PROPS_STATUS_FILTER_OUT;
+            return MatchResult::Ignore;
         };
 
         // Apply optional filter in diff mode.
@@ -1114,6 +1141,40 @@ mod tests {
 
         let result = left.r#match(&right);
         assert_eq!(result, MatchResult::Equal);
+    }
+
+    #[test]
+    fn test_object_props_final_status_open_without_direction_is_ignored() {
+        let mut props = ObjectProps::default();
+        props.status = OBJECT_PROPS_STATUS_OPEN;
+        assert_eq!(props.final_status_check(), MatchResult::Ignore);
+    }
+
+    #[test]
+    fn test_object_props_final_status_unknown_status_is_ignored() {
+        let mut props = ObjectProps::default();
+        props.set_dir(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
+        props.status = 99;
+        assert_eq!(props.final_status_check(), MatchResult::Ignore);
+    }
+
+    #[test]
+    fn test_object_props_final_status_match_without_both_sides_is_ignored() {
+        let props = ObjectProps::default();
+        assert_eq!(props.final_status_check(), MatchResult::Ignore);
+    }
+
+    #[test]
+    fn test_object_props_match_without_accumulator_direction_is_ignored() {
+        let mut accumulator = ObjectProps::default();
+        accumulator.status = OBJECT_PROPS_STATUS_OPEN;
+        let mut right = ObjectProps::default();
+        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
+        right.status = OBJECT_PROPS_STATUS_OPEN;
+
+        let result = accumulator.r#match(&right);
+        assert_eq!(result, MatchResult::Ignore);
+        assert_eq!(accumulator.final_status_check(), MatchResult::Ignore);
     }
 
     #[test]

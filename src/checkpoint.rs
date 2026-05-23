@@ -180,35 +180,6 @@ impl CheckpointJournal {
         }
     }
 
-    /// Filter a hints list to only include uncompleted segments.
-    /// Returns the list of boundaries that still need processing.
-    pub fn filter_uncompleted(&self, all_boundaries: &[String]) -> Vec<String> {
-        // Reconstruct all segment indices and filter out completed ones.
-        let total = all_boundaries.len() + 1; // N boundaries → N+1 segments
-        let mut remaining = Vec::new();
-
-        for i in 0..all_boundaries.len() {
-            if !self.completed_indices.contains(&i) {
-                remaining.push(all_boundaries[i].clone());
-            }
-        }
-
-        // Check if the last segment (index = boundaries.len()) is complete.
-        // If all segments complete, remaining will be empty.
-        if self.completed_indices.len() >= total {
-            info!("Checkpoint: all {} segments already completed", total);
-            return vec![];
-        }
-
-        info!(
-            "Checkpoint: {} of {} segments completed, {} remaining",
-            self.completed_indices.len(),
-            total,
-            remaining.len() + 1
-        );
-        remaining
-    }
-
     /// Create a new checkpoint journal for a run.
     #[allow(dead_code)] // Phase 5: used when creating fresh checkpoints (non-resume runs)
     pub fn new(
@@ -439,33 +410,5 @@ last_updated = "2026-01-01T00:00:00Z"
         let current_id = make_identity(Some("/"), None, None, None, None);
         let loaded = CheckpointJournal::load_and_verify(path_str, &current_id);
         assert!(loaded.is_none());
-    }
-
-    // ── Existing filter tests (updated for new struct) ─────
-
-    #[test]
-    fn test_filter_uncompleted() {
-        let boundaries = vec!["a/".to_string(), "b/".to_string(), "c/".to_string()];
-        let id = make_identity(None, None, None, None, None);
-        let journal = make_journal(id);
-        let remaining = journal.filter_uncompleted(&boundaries);
-        // Segment 0 and 2 done → boundaries 1 ("b/") and the final segment remain.
-        assert_eq!(remaining, vec!["b/".to_string()]);
-    }
-
-    #[test]
-    fn test_all_completed() {
-        let boundaries = vec!["a/".to_string()];
-        let id = make_identity(None, None, None, None, None);
-        let journal = CheckpointJournal {
-            bucket: "test".into(),
-            prefix: "".into(),
-            total_segments: 2,
-            completed_indices: vec![0, 1],
-            last_updated: String::new(),
-            identity: Some(id),
-        };
-        let remaining = journal.filter_uncompleted(&boundaries);
-        assert!(remaining.is_empty());
     }
 }

@@ -448,6 +448,10 @@ Diff mode intentionally uses authoritative single-segment listing in current
 releases.  Conventional hints caches are ignored for `diff`, and explicit
 `--hints-file` is rejected before any S3 request.  Paired-segment hinted diff
 coordination is planned for `v0.2.x`; use hints with `list` only for now.
+Unlike list-mode Parquet output, current diff mode holds the comparison map in
+memory until both sides finish so it can classify equal, left-only, right-only,
+and changed objects.  For very large bucket-to-bucket comparisons, plan memory
+capacity around the combined key count or split the comparison externally.
 
 ### Checkpoint / resume
 
@@ -684,7 +688,9 @@ Validation details:
    uses authoritative single-segment listing in current releases.  Conventional
    hints caches are ignored for `diff`, and `diff --hints-file` is rejected.
    Multi-segment diff coordination across left/right segment pairs is planned
-   for `v0.2.x`.
+   for `v0.2.x`.  Current diff mode also retains its comparison map in memory
+   until both sides complete; list-mode streaming output remains the bounded
+   memory path for very large single-bucket inventories.
 
 2. **Release build on Ubuntu 20.04 arm64 may require an `aws-lc-sys` workaround**
    documented in [`BUILD.md`](BUILD.md).  The `aws-lc-sys` crate detects a

@@ -19,6 +19,25 @@ const TOML_FIELDS: &[&str] = &[
     "segment_estimates",
 ];
 
+const TOML_ASSIGNMENT_FIELDS: &[&str] = &[
+    "bucket",
+    "region",
+    "total_objects",
+    "boundaries",
+    "generated_at",
+    "source_count",
+    "source_files",
+    "scan_mode",
+    "sampled_objects",
+    "sampled_pages",
+    "sample_limit",
+    "max_pages",
+    "estimate_mode",
+    "start_after",
+    "end_before",
+    "estimated_objects",
+];
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HintsFormat {
@@ -185,7 +204,7 @@ pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
 
     for line in trimmed.lines() {
         let stripped = line.trim();
-        if stripped.starts_with('[') && stripped.ends_with(']') && stripped.len() > 2 {
+        if is_toml_table_header(stripped) {
             return true;
         }
     }
@@ -200,7 +219,7 @@ pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
         if let Some((key, _)) = stripped.split_once('=') {
             toml_kv_count += 1;
             let k = key.trim();
-            if TOML_FIELDS.contains(&k) {
+            if TOML_ASSIGNMENT_FIELDS.contains(&k) {
                 known_field = true;
             }
         }
@@ -224,7 +243,7 @@ fn parse_toml_cache(path: &str, content: &str) -> Result<HintsCache, String> {
     let cached: HintsCache = toml::from_str(content).map_err(|e| {
         format!(
             "Hints file '{}' looks like a TOML hints cache but failed to parse: {}. \
-             If this is a plain hints file, remove any lines containing '=', '[', or ']'.",
+             If this is a plain hints file, remove TOML field assignments such as 'boundaries = [...]'.",
             path, e
         )
     })?;
@@ -353,7 +372,7 @@ fn validate_boundary_line(s: &str, line_no: usize) -> Result<(), String> {
         ));
     }
 
-    if s.starts_with('[') && s.ends_with(']') && s.len() > 2 {
+    if is_toml_table_header(s) {
         return Err(format!(
             "line {} looks like a TOML table header '{}'. Plain hints files should contain only object keys.",
             line_no + 1,
@@ -361,16 +380,39 @@ fn validate_boundary_line(s: &str, line_no: usize) -> Result<(), String> {
         ));
     }
 
-    if s.contains('=') && !s.starts_with('#') {
+    if looks_like_toml_assignment(s) {
         return Err(format!(
             "line {} looks like a TOML assignment '{}'. Plain hints files should contain only object keys. \
-             If this IS an object key containing '=', use TOML format instead.",
+             If this IS an object key containing '=', make sure the text before '=' is not a TOML hints field name.",
             line_no + 1,
             s
         ));
     }
 
     Ok(())
+}
+
+fn is_toml_table_header(s: &str) -> bool {
+    if s == "[[segment_estimates]]" {
+        return true;
+    }
+    let Some(inner) = s.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+        return false;
+    };
+    let inner = inner.trim();
+    !inner.is_empty()
+        && TOML_FIELDS.contains(&inner)
+        && inner.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+fn looks_like_toml_assignment(s: &str) -> bool {
+    let Some((key, _)) = s.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty()
+        && TOML_ASSIGNMENT_FIELDS.contains(&key)
+        && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 impl From<&HintsCache> for HintsMetadata {
@@ -415,6 +457,11 @@ mod tests {
     }
 
     #[test]
+    fn test_does_not_look_like_toml_plain_partition_keys() {
+        assert!(!looks_like_toml_hints("dt=2026-05-23/part=0/\n[backups]\n"));
+    }
+
+    #[test]
     fn test_parse_toml_hints_clean() {
         let content = r#"bucket = "b"
 region = "r"
@@ -453,6 +500,14 @@ generated_at = "2026-01-01T00:00:00Z"
         let (_dir, path) = write_tmp(content);
         let result = parse_hints_file(&path).unwrap();
         assert_eq!(result, vec!["alpha/", "beta/file-05.txt"]);
+    }
+
+    #[test]
+    fn test_parse_plain_hints_allows_partition_and_bracket_keys() {
+        let content = "dt=2026-05-23/part=0/\n[backups]\n";
+        let (_dir, path) = write_tmp(content);
+        let result = parse_hints_file(&path).unwrap();
+        assert_eq!(result, vec!["[backups]", "dt=2026-05-23/part=0/"]);
     }
 
     #[test]

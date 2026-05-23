@@ -93,7 +93,10 @@ For `diff`, dry-run reports `hints.source =
 intentionally ignored, and explicit `diff --hints-file` exits with code `2`
 before any S3 request.  Agents should treat current `diff` runs as
 authoritative single-segment comparisons until paired-segment diff coordination
-lands in `v0.2.x`.
+lands in `v0.2.x`.  Current diff mode retains its comparison map in memory until
+both sides complete; for very large bucket-to-bucket comparisons, agents should
+plan memory capacity from the combined key count or split the comparison into
+smaller external ranges.
 
 ## Run manifests
 

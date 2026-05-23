@@ -1082,7 +1082,7 @@ fn test_cli_manifest_summary_check_verifies_artifact_size_and_hash() {
         &manifest,
         format!(
             r#"{{
-  "tool_version": "0.1.22",
+  "tool_version": "0.1.23",
   "status": "success",
   "exit_code": 0,
   "elapsed_secs": 1.25,
@@ -1437,6 +1437,32 @@ fn test_cli_hints_validate_plain_success() {
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Boundary count"));
     assert!(stdout.contains("2"));
+}
+
+#[test]
+fn test_cli_hints_validate_plain_allows_partition_and_bracket_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hints.txt");
+    std::fs::write(&path, "dt=2026-05-23/part=0/\n[backups]\n").unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "hints-validate",
+        "--hints-file",
+        path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["format"], "plain");
+    assert_eq!(json["boundary_count"], 2);
+    let first = json["first_boundaries"].as_array().unwrap();
+    assert!(first
+        .iter()
+        .any(|value| value.as_str() == Some("dt=2026-05-23/part=0/")));
+    assert!(first
+        .iter()
+        .any(|value| value.as_str() == Some("[backups]")));
 }
 
 #[test]

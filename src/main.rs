@@ -993,22 +993,20 @@ fn main() {
     let interrupted = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
     let i = interrupted.clone();
-    ctrlc::set_handler(move || {
+    if let Err(e) = ctrlc::set_handler(move || {
         q.store(true, Ordering::SeqCst);
         i.store(true, Ordering::SeqCst);
-    })
-    .expect("failed to set ctrl-c signal handler");
+    }) {
+        eprintln!("Failed to set ctrl-c signal handler: {}", e);
+        std::process::exit(agent::ExitCode::InternalError.code());
+    }
 
     let g_state = core::GlobalState::new(quit, g_tasks_count);
     let run_started_at = chrono::Utc::now();
     let run_timer = Instant::now();
 
     // Build runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(cfg.runtime.worker_threads)
-        .build()
-        .unwrap();
+    let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
 
     let list_output_format = list_output_format(&cli).unwrap_or(ListOutputFormat::Parquet);
 
@@ -1409,6 +1407,17 @@ fn generate_man_page() {
         eprintln!("Man page write error: {}", e);
         std::process::exit(agent::ExitCode::OutputWrite.code());
     }
+}
+
+fn build_runtime_or_exit(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Runtime initialization error: {}", e);
+            std::process::exit(agent::ExitCode::InternalError.code());
+        })
 }
 
 fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: bool) {
@@ -2020,14 +2029,7 @@ fn run_benchmark_local(
     let parquet_path = parquet_file.display().to_string();
     let ks_path = ks_file.display().to_string();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(cfg.runtime.worker_threads)
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!("Benchmark runtime error: {}", e);
-            std::process::exit(agent::ExitCode::InternalError.code());
-        });
+    let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
 
     rt.block_on(async {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
@@ -2618,11 +2620,7 @@ fn run_compat_probe(
     output: Option<&str>,
     cfg: &S3TurboConfig,
 ) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .build()
-        .unwrap();
+    let rt = build_runtime_or_exit(2);
 
     rt.block_on(async {
         compat_probe::run_compat_probe(endpoint_url, region, bucket, addressing_style, output, cfg)
@@ -3101,11 +3099,7 @@ fn run_auto_hints(
     cli: &Cli,
     cfg: &S3TurboConfig,
 ) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .build()
-        .unwrap();
+    let rt = build_runtime_or_exit(2);
 
     let endpoint = cfg.s3.endpoint_url.as_deref();
     let fps = cfg.s3.force_path_style;
@@ -3161,11 +3155,7 @@ fn run_discover_prefixes(
     cli: &Cli,
     cfg: &S3TurboConfig,
 ) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .build()
-        .unwrap();
+    let rt = build_runtime_or_exit(2);
 
     let prefix = if cli.prefix == "/" {
         ""

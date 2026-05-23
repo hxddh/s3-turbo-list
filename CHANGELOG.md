@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-05-23
+
+### Changed
+- Plain-text hints now allow object keys that contain `=` or bracketed names
+  when they do not look like the tool's TOML hints schema.
+- Runtime initialization failures now exit with the stable internal-error code
+  instead of panicking.
+
+### Fixed
+- Fixed false TOML-syntax rejections for common partition-style hints such as
+  `dt=2026-05-23/part=0/`.
+- Fixed false TOML parsing for plain hints containing bracketed object keys such
+  as `[backups]`.
+- Unexpected object state in the output path is now logged and ignored instead
+  of aborting the process with a Rust panic exit code.
+- Removed an obsolete checkpoint helper whose segment-boundary semantics did
+  not match the production resume path.
+
 ## [0.1.22] - 2026-05-22
 
 ### Changed
