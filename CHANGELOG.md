@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-05-24
+
+### Changed
+- Changed the default Parquet output compression from `gzip(6)` to `zstd(3)`
+  based on the v0.1.26 local compression benchmark.
+- Updated starter configs and documentation to show the new `zstd(3)` default
+  and the explicit `--compression gzip --compression-level 6` fallback for
+  traditional gzip output.
+
 ## [0.1.26] - 2026-05-24
 
 ### Added

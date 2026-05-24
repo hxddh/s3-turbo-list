@@ -260,8 +260,8 @@ s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
 s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
 
-# Choose Parquet compression for a one-off local output
-s3-turbo-list --delimiter '' --compression zstd --compression-level 3 \
+# Use traditional gzip output for older downstream readers
+s3-turbo-list --delimiter '' --compression gzip --compression-level 6 \
   list --region us-east-2 --bucket my-bucket
 ```
 

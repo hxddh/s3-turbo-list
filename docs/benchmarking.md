@@ -68,21 +68,20 @@ The v0.1.26 release includes a local arm64 reference run in
 
 ## Compression Notes
 
-The default Parquet compression is `gzip(6)` because it is broadly supported and
-compresses well, but it can cost more CPU on large streaming outputs.  For local
-analysis pipelines, consider `zstd` for a better speed/ratio balance, `lz4` for
-fast local writes, or `snappy` when broad analytics compatibility matters more
-than compression ratio:
+The default Parquet compression is `zstd(3)`.  The v0.1.26 local benchmark
+showed a better speed/size balance than the previous `gzip(6)` default on the
+list-mode streaming output path.  For traditional gzip output, pass both codec
+and level explicitly:
 
 ```bash
-s3-turbo-list --compression zstd --compression-level 3 \
+s3-turbo-list --compression gzip --compression-level 6 \
   --delimiter '' list --bucket my-bucket --region us-east-1
 ```
 
 ```toml
 [output]
-compression = "zstd"
-compression_level = 3
+compression = "gzip"
+compression_level = 6
 ```
 
 Compression choice affects local CPU time and output size only; it does not

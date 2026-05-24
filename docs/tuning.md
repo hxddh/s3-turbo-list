@@ -15,8 +15,8 @@ for large listings.  Values come from `src/config.rs`.
 | `runtime.max_concurrency` | `100` | Max concurrent list operations; CLI override: `-c`, `--concurrency`. |
 | `channel.capacity` | `64` | Bounded channel capacity between list tasks and data-map output. |
 | `output.row_group_size` | `10000` | Parquet max row group size. |
-| `output.compression` | `gzip` | Parquet compression codec; CLI override: `--compression`. |
-| `output.compression_level` | `6` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
+| `output.compression` | `zstd` | Parquet compression codec; CLI override: `--compression`. |
+| `output.compression_level` | `3` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
 | `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
 | `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
 | `auto_hints.min_segment_size` | `1000` | Reserved segment-size tuning value. |

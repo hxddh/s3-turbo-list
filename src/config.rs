@@ -237,10 +237,10 @@ fn default_row_group_size() -> usize {
     10000
 }
 fn default_compression() -> String {
-    "gzip".to_string()
+    "zstd".to_string()
 }
 fn default_compression_level() -> u32 {
-    6
+    3
 }
 fn default_sample_threshold() -> usize {
     10000
@@ -669,6 +669,8 @@ mod tests {
         assert_eq!(config.runtime.worker_threads, 10);
         assert_eq!(config.runtime.max_concurrency, 100);
         assert_eq!(config.output.row_group_size, 10000);
+        assert_eq!(config.output.compression, "zstd");
+        assert_eq!(config.output.compression_level, 3);
         assert_eq!(config.channel.capacity, 64);
         assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
         assert!(config.s3.profile.is_none());

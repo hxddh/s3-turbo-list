@@ -453,8 +453,8 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
     assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["compression"], "gzip");
-    assert_eq!(json["compression_level"], 6);
+    assert_eq!(json["compression"], "zstd");
+    assert_eq!(json["compression_level"], 3);
     assert_eq!(json["objects"], 32);
     assert!(json["parquet_bytes_per_object"].as_f64().unwrap() > 0.0);
     assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
@@ -471,9 +471,9 @@ fn test_cli_benchmark_local_json_no_cloud() {
 fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
     let (code, stdout, stderr) = run_cli(&[
         "--compression",
-        "zstd",
+        "gzip",
         "--compression-level",
-        "3",
+        "6",
         "benchmark-local",
         "--objects",
         "32",
@@ -487,9 +487,19 @@ fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["compression"], "zstd");
-    assert_eq!(json["compression_level"], 3);
+    assert_eq!(json["compression"], "gzip");
+    assert_eq!(json["compression_level"], 6);
     assert_eq!(json["metrics"]["parquet_rows"], 32);
+}
+
+#[test]
+fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
+    assert_eq!(json["resolved_config"]["output"]["compression_level"], 3);
 }
 
 #[test]

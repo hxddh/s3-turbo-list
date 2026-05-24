@@ -1566,8 +1566,8 @@ operation_timeout_secs = 5
 
 [output]
 row_group_size = 10000
-compression = "gzip"
-compression_level = 6
+compression = "zstd"
+compression_level = 3
 
 [auto_hints]
 sample_threshold = 10000
