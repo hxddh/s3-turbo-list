@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-05-24
+
+### Added
+- `config-inspect --json` and `--agent --dry-run` reports now include
+  `config_source`, showing the explicit config path, loaded config path,
+  searched paths, source kind, and CLI config overrides.
+
+### Changed
+- Human `config-inspect` output now shows the loaded config file path, or `-`
+  when the command is using built-in defaults only.
+
 ## [0.1.27] - 2026-05-24
 
 ### Changed

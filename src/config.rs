@@ -201,6 +201,14 @@ pub struct S3TurboConfig {
     pub channel: ChannelConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfigLoadSummary {
+    pub explicit_config: Option<String>,
+    pub loaded_config: Option<String>,
+    pub loaded_config_kind: String,
+    pub searched: Vec<String>,
+}
+
 impl Default for S3TurboConfig {
     fn default() -> Self {
         Self {
@@ -263,6 +271,12 @@ fn default_channel_capacity() -> usize {
 impl S3TurboConfig {
     /// Load config from default locations, then merge CLI overrides.
     pub fn load(cli_config_path: Option<&str>) -> Result<Self, String> {
+        Self::load_with_summary(cli_config_path).map(|(config, _summary)| config)
+    }
+
+    pub fn load_with_summary(
+        cli_config_path: Option<&str>,
+    ) -> Result<(Self, ConfigLoadSummary), String> {
         let mut config = Self::default();
 
         let search_paths: Vec<PathBuf> = if let Some(p) = cli_config_path {
@@ -275,6 +289,8 @@ impl S3TurboConfig {
                     .join(".s3-turbo-list.toml"),
             ]
         };
+        let mut loaded_config = None;
+        let mut loaded_config_kind = "none".to_string();
 
         for path in &search_paths {
             if path.exists() {
@@ -284,11 +300,29 @@ impl S3TurboConfig {
                     .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
                 config.merge(file_config);
                 log::info!("Loaded config from {}", path.display());
+                loaded_config = Some(path.display().to_string());
+                loaded_config_kind = if cli_config_path.is_some() {
+                    "explicit".to_string()
+                } else if path == &PathBuf::from("./s3-turbo-list.toml") {
+                    "workspace".to_string()
+                } else {
+                    "home".to_string()
+                };
                 break;
             }
         }
 
-        Ok(config)
+        let summary = ConfigLoadSummary {
+            explicit_config: cli_config_path.map(str::to_string),
+            loaded_config,
+            loaded_config_kind,
+            searched: search_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        };
+
+        Ok((config, summary))
     }
 
     fn merge(&mut self, other: S3TurboConfig) {

@@ -688,10 +688,11 @@ fn main() {
     }
 
     // Load config.
-    let mut cfg = S3TurboConfig::load(cli.config.as_deref()).unwrap_or_else(|e| {
-        eprintln!("Config error: {}", e);
-        std::process::exit(agent::ExitCode::CliConfig.code());
-    });
+    let (mut cfg, config_load) = S3TurboConfig::load_with_summary(cli.config.as_deref())
+        .unwrap_or_else(|e| {
+            eprintln!("Config error: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        });
 
     cfg.apply_cli_overrides(
         cli.threads,
@@ -718,14 +719,19 @@ fn main() {
     validate_continuation_token_command(&cli, &cfg);
     validate_diff_hints_command(&cli);
     validate_diff_resume_command(&cli);
+    let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
-            let report = agent::config_inspect_report(&cfg);
+            let report = agent::config_inspect_report(&cfg, config_source.clone());
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else {
                 println!("s3-turbo-list {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "  config:       {}",
+                    report.config_source.loaded_config.as_deref().unwrap_or("-")
+                );
                 println!(
                     "  threads:      {}",
                     report.resolved_config.runtime.worker_threads
@@ -817,7 +823,7 @@ fn main() {
     }
 
     if cli.dry_run {
-        let report = build_plan_report(&cli, &cfg);
+        let report = build_plan_report(&cli, &cfg, config_source.clone());
         if let Some(path) = cli.plan_json.as_deref() {
             if let Err(e) = agent::write_json_file(path, &report) {
                 eprintln!("Plan write error: {}", e);
@@ -2164,7 +2170,11 @@ fn run_benchmark_local(
     }
 }
 
-fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
+fn build_plan_report(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+    config_source: agent::ConfigSourceSummary,
+) -> agent::PlanReport {
     let (planned_ks, planned_parquet, planned_hints) = planned_output_paths(cli, cfg);
     let outputs =
         runtime_output_summary(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref())
@@ -2245,12 +2255,60 @@ fn build_plan_report(cli: &Cli, cfg: &S3TurboConfig) -> agent::PlanReport {
         network: "none: dry-run only resolves local configuration and planned paths".to_string(),
         inputs,
         outputs,
+        config_source,
         resolved_config: cfg.into(),
         hints,
         checkpoint: agent::checkpoint_plan(cli.resume, checkpoint_path, current_identity.as_ref()),
         file_conflicts,
         warnings,
     }
+}
+
+fn cli_config_overrides(cli: &Cli) -> Vec<String> {
+    let mut overrides = Vec::new();
+    if cli.threads.is_some() {
+        overrides.push("threads".to_string());
+    }
+    if cli.concurrency.is_some() {
+        overrides.push("concurrency".to_string());
+    }
+    if cli.endpoint.is_some() {
+        overrides.push("endpoint_url".to_string());
+    }
+    if cli.force_path_style {
+        overrides.push("force_path_style".to_string());
+    }
+    if cli.addressing_style.is_some() {
+        overrides.push("addressing_style".to_string());
+    }
+    if cli.profile.is_some() {
+        overrides.push("profile".to_string());
+    }
+    if cli.debug_s3 {
+        overrides.push("debug_s3".to_string());
+    }
+    if cli.trace_compat.is_some() {
+        overrides.push("trace_compat".to_string());
+    }
+    if cli.start_after.is_some() {
+        overrides.push("start_after".to_string());
+    }
+    if cli.output_log_file.is_some() {
+        overrides.push("output_log_file".to_string());
+    }
+    if cli.output_ks_file.is_some() {
+        overrides.push("output_ks_file".to_string());
+    }
+    if cli.output_parquet_file.is_some() {
+        overrides.push("output_parquet_file".to_string());
+    }
+    if cli.compression.is_some() {
+        overrides.push("compression".to_string());
+    }
+    if cli.compression_level.is_some() {
+        overrides.push("compression_level".to_string());
+    }
+    overrides
 }
 
 fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {

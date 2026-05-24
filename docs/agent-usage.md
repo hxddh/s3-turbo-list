@@ -30,6 +30,10 @@ s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry
 
 `config-inspect --json` prints the resolved local configuration after TOML,
 CLI overrides, profile presets, and addressing-style normalization.
+It also includes `config_source`, which reports the explicit `--config` path
+when present, the config file actually loaded, the searched paths, the source
+kind (`explicit`, `workspace`, `home`, or `none`), and global CLI config
+overrides such as `compression` or `endpoint_url`.
 
 `doctor --local-only --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
@@ -74,6 +78,7 @@ The plan JSON includes:
 - `network`
 - `inputs`
 - `outputs`
+- `config_source`
 - `resolved_config`
 - `hints`
 - `checkpoint`

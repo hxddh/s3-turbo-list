@@ -77,10 +77,10 @@ changed since the run.
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-0.1.27-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.27-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-0.1.27-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-0.1.27-macos-x86_64` |
+| Linux x86_64 | `s3-turbo-list-0.1.28-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3-turbo-list-0.1.28-linux-aarch64` |
+| macOS Apple Silicon | `s3-turbo-list-0.1.28-macos-aarch64` |
+| macOS Intel | `s3-turbo-list-0.1.28-macos-x86_64` |
 
 To identify your platform:
 
@@ -116,8 +116,8 @@ prefix.
 ### Linux x86_64
 
 ```bash
-chmod +x s3-turbo-list-0.1.27-linux-x86_64
-sudo install -m 0755 s3-turbo-list-0.1.27-linux-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.28-linux-x86_64
+sudo install -m 0755 s3-turbo-list-0.1.28-linux-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 s3-turbo-list --help
 ```
@@ -125,8 +125,8 @@ s3-turbo-list --help
 ### Linux ARM64 / aarch64
 
 ```bash
-chmod +x s3-turbo-list-0.1.27-linux-aarch64
-sudo install -m 0755 s3-turbo-list-0.1.27-linux-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.28-linux-aarch64
+sudo install -m 0755 s3-turbo-list-0.1.28-linux-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -138,18 +138,18 @@ directory on your `PATH`.
 ### Apple Silicon
 
 ```bash
-chmod +x s3-turbo-list-0.1.27-macos-aarch64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.27-macos-aarch64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.27-macos-aarch64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.28-macos-aarch64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.28-macos-aarch64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.28-macos-aarch64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
 ### Intel
 
 ```bash
-chmod +x s3-turbo-list-0.1.27-macos-x86_64
-xattr -d com.apple.quarantine ./s3-turbo-list-0.1.27-macos-x86_64 2>/dev/null || true
-sudo install -m 0755 s3-turbo-list-0.1.27-macos-x86_64 /usr/local/bin/s3-turbo-list
+chmod +x s3-turbo-list-0.1.28-macos-x86_64
+xattr -d com.apple.quarantine ./s3-turbo-list-0.1.28-macos-x86_64 2>/dev/null || true
+sudo install -m 0755 s3-turbo-list-0.1.28-macos-x86_64 /usr/local/bin/s3-turbo-list
 s3-turbo-list --version
 ```
 
@@ -225,6 +225,10 @@ s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
   --bucket my-bucket \
   --region us-east-1
 ```
+
+The local JSON reports include a `config_source` section with the loaded config
+file path and global CLI config overrides, which helps automation explain the
+effective settings before a real scan.
 
 For full details on machine-readable plans, manifests, and exit codes, see
 [`docs/agent-usage.md`](docs/agent-usage.md).  Manifest artifact summaries

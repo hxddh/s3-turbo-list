@@ -1,5 +1,5 @@
 use crate::checkpoint::{CheckpointIdentity, CheckpointJournal};
-use crate::config::S3TurboConfig;
+use crate::config::{ConfigLoadSummary, S3TurboConfig};
 use crate::core::RunMetricsSnapshot;
 use crate::hints::{self, HintsEstimateSummary};
 use crate::profiles;
@@ -213,11 +213,33 @@ pub struct PlanReport {
     pub network: String,
     pub inputs: CommandInputSummary,
     pub outputs: OutputPathSummary,
+    pub config_source: ConfigSourceSummary,
     pub resolved_config: ResolvedConfigSummary,
     pub hints: HintsPlan,
     pub checkpoint: CheckpointPlan,
     pub file_conflicts: Vec<FileConflict>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigSourceSummary {
+    pub explicit_config: Option<String>,
+    pub loaded_config: Option<String>,
+    pub loaded_config_kind: String,
+    pub searched: Vec<String>,
+    pub cli_overrides: Vec<String>,
+}
+
+impl ConfigSourceSummary {
+    pub fn new(load: &ConfigLoadSummary, cli_overrides: Vec<String>) -> Self {
+        Self {
+            explicit_config: load.explicit_config.clone(),
+            loaded_config: load.loaded_config.clone(),
+            loaded_config_kind: load.loaded_config_kind.clone(),
+            searched: load.searched.clone(),
+            cli_overrides,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +322,7 @@ pub struct ConfigInspectReport {
     pub schema_version: &'static str,
     pub tool_version: &'static str,
     pub status: String,
+    pub config_source: ConfigSourceSummary,
     pub resolved_config: ResolvedConfigSummary,
 }
 
@@ -629,11 +652,15 @@ fn parquet_summary(path: &str) -> Result<ParquetArtifactSummary, String> {
     })
 }
 
-pub fn config_inspect_report(cfg: &S3TurboConfig) -> ConfigInspectReport {
+pub fn config_inspect_report(
+    cfg: &S3TurboConfig,
+    config_source: ConfigSourceSummary,
+) -> ConfigInspectReport {
     ConfigInspectReport {
         schema_version: AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
         status: "ok".to_string(),
+        config_source,
         resolved_config: cfg.into(),
     }
 }

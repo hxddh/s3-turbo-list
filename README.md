@@ -358,6 +358,9 @@ s3-turbo-list --dry-run --agent list \
   --output-ks-file out/list.ks
 ```
 
+The JSON preflight reports include `config_source`, so agents can see which
+TOML file was loaded and which global CLI flags overrode configuration values.
+
 For a real run, write a machine-readable manifest:
 
 ```bash

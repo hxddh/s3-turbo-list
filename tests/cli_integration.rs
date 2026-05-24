@@ -500,6 +500,77 @@ fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
     assert_eq!(json["resolved_config"]["output"]["compression_level"], 3);
+    assert!(!json["config_source"]["searched"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        json["config_source"]["cli_overrides"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_cli_config_inspect_json_reports_explicit_config_source_no_cloud() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3-turbo-list.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[runtime]
+worker_threads = 3
+
+[output]
+compression = "gzip"
+compression_level = 6
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "--config",
+        config_path.to_str().unwrap(),
+        "config-inspect",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["config_source"]["explicit_config"],
+        config_path.to_str().unwrap()
+    );
+    assert_eq!(
+        json["config_source"]["loaded_config"],
+        config_path.to_str().unwrap()
+    );
+    assert_eq!(json["config_source"]["loaded_config_kind"], "explicit");
+    assert_eq!(json["resolved_config"]["runtime"]["worker_threads"], 3);
+    assert_eq!(json["resolved_config"]["output"]["compression"], "gzip");
+    assert_eq!(json["resolved_config"]["output"]["compression_level"], 6);
+}
+
+#[test]
+fn test_cli_config_inspect_human_reports_loaded_config_no_cloud() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3-turbo-list.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[runtime]
+worker_threads = 4
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) =
+        run_cli(&["--config", config_path.to_str().unwrap(), "config-inspect"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("config:"));
+    assert!(stdout.contains(config_path.to_str().unwrap()));
 }
 
 #[test]
@@ -589,6 +660,13 @@ compression_level = 6
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
     assert_eq!(json["resolved_config"]["output"]["compression_level"], 3);
+    assert_eq!(
+        json["config_source"]["loaded_config"],
+        config_path.to_str().unwrap()
+    );
+    let overrides = json["config_source"]["cli_overrides"].as_array().unwrap();
+    assert!(overrides.iter().any(|value| value == "compression"));
+    assert!(overrides.iter().any(|value| value == "compression_level"));
 }
 
 #[test]
