@@ -42,6 +42,9 @@ checkpoint identity, output parent directories, and local file conflicts
 without creating Parquet/KS files and without making S3 requests.
 `--output-dir` is safe in dry-run: it plans Parquet/KS paths but does not create
 the directory until a real `list` or `diff` run.
+Compression choices are also visible in `resolved_config`: agents can use
+`--compression` and `--compression-level` for one-off Parquet output runs
+without editing TOML.
 
 `init-config`, `recipes`, `quickstart`, `cheatsheet`, `trace-summary`,
 `hints-merge`, and `hints-rebalance` are local tooling commands.  They are

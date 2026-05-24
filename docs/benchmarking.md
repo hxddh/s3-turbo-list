@@ -10,6 +10,8 @@ cargo build --release
   --objects 100000 \
   --batch-size 5000 \
   --prefixes 512 \
+  --compression gzip \
+  --compression-level 6 \
   --json
 ```
 
@@ -23,11 +25,13 @@ Environment overrides:
 
 ```bash
 OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
+COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
 ```
 
 The JSON report includes:
 
 - tool version
+- Parquet compression codec and level
 - object count, batch size, and prefix count
 - elapsed seconds and objects/sec
 - Parquet and KS byte sizes
@@ -40,11 +44,16 @@ has been explicitly authorized.
 
 ## Compression Notes
 
-The default Parquet compression is gzip because it is broadly supported and
+The default Parquet compression is `gzip(6)` because it is broadly supported and
 compresses well, but it can cost more CPU on large streaming outputs.  For local
-analysis pipelines, consider `zstd` for a better speed/ratio balance or `snappy`
-when write speed and downstream compatibility matter more than compression
-ratio:
+analysis pipelines, consider `zstd` for a better speed/ratio balance, `lz4` for
+fast local writes, or `snappy` when broad analytics compatibility matters more
+than compression ratio:
+
+```bash
+s3-turbo-list --compression zstd --compression-level 3 \
+  --delimiter '' list --bucket my-bucket --region us-east-1
+```
 
 ```toml
 [output]

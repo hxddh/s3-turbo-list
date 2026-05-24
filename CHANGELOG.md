@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-05-24
+
+### Added
+- Added global `--compression` and `--compression-level` flags for one-off
+  Parquet output codec selection without editing TOML.
+- `benchmark-local` reports the resolved Parquet compression codec and level,
+  and `scripts/benchmark-local.sh` accepts `COMPRESSION` and
+  `COMPRESSION_LEVEL` environment overrides.
+
+### Changed
+- Documented compression selection for local analytics workflows while keeping
+  the default Parquet compression at `gzip(6)`.
+
 ## [0.1.24] - 2026-05-24
 
 ### Changed

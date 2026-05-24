@@ -86,6 +86,14 @@ struct Cli {
     #[arg(long, global = true)]
     output_parquet_file: Option<String>,
 
+    /// Parquet compression codec: gzip, zstd, snappy, lz4, lz4_raw, brotli, or uncompressed
+    #[arg(long, global = true)]
+    compression: Option<String>,
+
+    /// Parquet compression level for codecs that support levels
+    #[arg(long, global = true)]
+    compression_level: Option<u32>,
+
     /// Directory for default Parquet and KeySpace outputs
     #[arg(long, global = true)]
     output_dir: Option<String>,
@@ -698,6 +706,8 @@ fn main() {
         cli.output_log_file.as_deref(),
         cli.output_ks_file.as_deref(),
         cli.output_parquet_file.as_deref(),
+        cli.compression.as_deref(),
+        cli.compression_level,
     );
     cfg.apply_profile_preset();
     cfg.normalize_addressing_style();
@@ -1992,6 +2002,8 @@ struct LocalBenchmarkReport {
     status: String,
     benchmark: String,
     network: String,
+    compression: String,
+    compression_level: u32,
     objects: usize,
     batch_size: usize,
     prefixes: usize,
@@ -2122,6 +2134,8 @@ fn run_benchmark_local(
         },
         benchmark: "local-list-streaming-output".to_string(),
         network: "none: synthetic local data only".to_string(),
+        compression: output_config.compression.clone(),
+        compression_level: output_config.compression_level,
         objects,
         batch_size,
         prefixes,

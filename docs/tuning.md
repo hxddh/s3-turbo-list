@@ -15,8 +15,8 @@ for large listings.  Values come from `src/config.rs`.
 | `runtime.max_concurrency` | `100` | Max concurrent list operations; CLI override: `-c`, `--concurrency`. |
 | `channel.capacity` | `64` | Bounded channel capacity between list tasks and data-map output. |
 | `output.row_group_size` | `10000` | Parquet max row group size. |
-| `output.compression` | `gzip` | Parquet compression codec. |
-| `output.compression_level` | `6` | Compression level for codecs that support levels. |
+| `output.compression` | `gzip` | Parquet compression codec; CLI override: `--compression`. |
+| `output.compression_level` | `6` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
 | `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
 | `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
 | `auto_hints.min_segment_size` | `1000` | Reserved segment-size tuning value. |
@@ -25,10 +25,10 @@ for large listings.  Values come from `src/config.rs`.
 For high-latency or cross-region endpoints, consider raising
 `s3.operation_timeout_secs` to `30` or `60` to reduce retry churn.
 
-## TOML-Only Settings
+## Config File Settings
 
-Some advanced settings do not have CLI flags.  Put them in a TOML config file
-and pass it with `--config`.
+Some advanced settings are easiest to keep in a TOML config file and pass with
+`--config`.  CLI flags take precedence for settings that have both forms.
 
 ```toml
 [s3]

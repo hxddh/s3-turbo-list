@@ -453,11 +453,38 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
     assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json["network"], "none: synthetic local data only");
+    assert_eq!(json["compression"], "gzip");
+    assert_eq!(json["compression_level"], 6);
     assert_eq!(json["objects"], 32);
     assert_eq!(json["metrics"]["received_objects"], 32);
     assert_eq!(json["metrics"]["streamed_rows"], 32);
     assert_eq!(json["metrics"]["parquet_rows"], 32);
     assert_eq!(json["metrics"]["ks_entries"], 4);
+}
+
+#[test]
+fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--compression",
+        "zstd",
+        "--compression-level",
+        "3",
+        "benchmark-local",
+        "--objects",
+        "32",
+        "--batch-size",
+        "8",
+        "--prefixes",
+        "4",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["network"], "none: synthetic local data only");
+    assert_eq!(json["compression"], "zstd");
+    assert_eq!(json["compression_level"], 3);
+    assert_eq!(json["metrics"]["parquet_rows"], 32);
 }
 
 #[test]
@@ -511,6 +538,42 @@ fn test_cli_dry_run_plan_json_list_no_cloud() {
     assert_eq!(json["file_conflicts"][0]["exists"], false);
     assert_eq!(json["file_conflicts"][0]["parent_exists"], true);
     assert_eq!(json["file_conflicts"][0]["parent_writable"], true);
+}
+
+#[test]
+fn test_cli_compression_flags_override_config_in_dry_run_no_cloud() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3-turbo-list.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[output]
+compression = "snappy"
+compression_level = 6
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--dry-run",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--compression",
+        "zstd",
+        "--compression-level",
+        "3",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
+    assert_eq!(json["resolved_config"]["output"]["compression_level"], 3);
 }
 
 #[test]

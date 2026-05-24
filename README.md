@@ -259,6 +259,10 @@ s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
 # Enable trace
 s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
+
+# Choose Parquet compression for a one-off local output
+s3-turbo-list --delimiter '' --compression zstd --compression-level 3 \
+  list --region us-east-2 --bucket my-bucket
 ```
 
 ### MinIO
@@ -410,7 +414,8 @@ s3-turbo-list cheatsheet
 
 ```bash
 # Synthetic local streaming-output benchmark; does not contact S3
-s3-turbo-list benchmark-local --objects 100000 --batch-size 5000 --json
+s3-turbo-list --compression zstd --compression-level 3 \
+  benchmark-local --objects 100000 --batch-size 5000 --json
 
 # Shell completions and man page
 s3-turbo-list completions bash > s3-turbo-list.bash

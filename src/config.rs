@@ -350,6 +350,8 @@ impl S3TurboConfig {
         log_file: Option<&str>,
         ks_file: Option<&str>,
         parquet_file: Option<&str>,
+        compression: Option<&str>,
+        compression_level: Option<u32>,
     ) {
         if let Some(t) = threads {
             self.runtime.worker_threads = t;
@@ -402,6 +404,12 @@ impl S3TurboConfig {
         }
         if let Some(pf) = parquet_file {
             self.output.parquet_file = Some(pf.to_string());
+        }
+        if let Some(codec) = compression {
+            self.output.compression = codec.to_string();
+        }
+        if let Some(level) = compression_level {
+            self.output.compression_level = level;
         }
     }
 
@@ -744,6 +752,8 @@ profile = "bos"
             Some("log.txt"),
             Some("ks.csv"),
             Some("out.parquet"),
+            Some("zstd"),
+            Some(3),
         );
         assert_eq!(config.runtime.worker_threads, 4);
         assert_eq!(config.runtime.max_concurrency, 200);
@@ -760,6 +770,8 @@ profile = "bos"
         assert_eq!(config.output.log_file.as_deref(), Some("log.txt"));
         assert_eq!(config.output.ks_file.as_deref(), Some("ks.csv"));
         assert_eq!(config.output.parquet_file.as_deref(), Some("out.parquet"));
+        assert_eq!(config.output.compression, "zstd");
+        assert_eq!(config.output.compression_level, 3);
     }
 
     #[test]
@@ -820,6 +832,8 @@ profile = "bos"
             None,
             None,
             None,
+            None,
+            None,
         );
         config.normalize_addressing_style();
         assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
@@ -839,6 +853,8 @@ profile = "bos"
             Some("virtual"),
             None,
             false,
+            None,
+            None,
             None,
             None,
             None,
