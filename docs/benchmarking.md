@@ -35,12 +35,36 @@ The JSON report includes:
 - object count, batch size, and prefix count
 - elapsed seconds and objects/sec
 - Parquet and KS byte sizes
+- per-object byte counts and local output MiB/sec rates for easier comparisons
 - data-map metrics: received batches, received objects, streamed rows,
   unique prefixes, Parquet rows, and KS entries
 
 Real endpoint benchmarks remain intentionally opt-in.  Do not use benchmark
 scripts against AWS, BOS, R2, B2, OSS, or other cloud endpoints unless the run
 has been explicitly authorized.
+
+## Compression Benchmark Matrix
+
+Use `scripts/benchmark-compression.sh` to compare common Parquet codecs on the
+same local synthetic dataset.  It runs `gzip(6)`, `zstd(3)`, `zstd(6)`, `lz4`,
+and `snappy`, then writes both a machine-readable JSON summary and a Markdown
+table:
+
+```bash
+./scripts/benchmark-compression.sh
+OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 \
+  OUT=benchmark-results/compression.json \
+  MARKDOWN=benchmark-results/compression.md \
+  ./scripts/benchmark-compression.sh
+```
+
+The benchmark does not contact S3.  It measures the local list-mode streaming
+output path, so the results are useful for comparing CPU and file-size tradeoffs
+in Parquet writing.  They do not predict end-to-end runtime when a real endpoint
+or network link is the bottleneck.
+
+The v0.1.26 release includes a local arm64 reference run in
+[`docs/validation-results/compression-benchmark-20260524.md`](validation-results/compression-benchmark-20260524.md).
 
 ## Compression Notes
 

@@ -456,6 +456,11 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["compression"], "gzip");
     assert_eq!(json["compression_level"], 6);
     assert_eq!(json["objects"], 32);
+    assert!(json["parquet_bytes_per_object"].as_f64().unwrap() > 0.0);
+    assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
+    assert!(json["parquet_mib_per_sec"].as_f64().unwrap() > 0.0);
+    assert!(json["output_mib_per_sec"].as_f64().unwrap() > 0.0);
+    assert_eq!(json["artifact_dir"], serde_json::Value::Null);
     assert_eq!(json["metrics"]["received_objects"], 32);
     assert_eq!(json["metrics"]["streamed_rows"], 32);
     assert_eq!(json["metrics"]["parquet_rows"], 32);

@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.1.25'
+        default: 'v0.1.26'
 
 permissions:
   contents: write

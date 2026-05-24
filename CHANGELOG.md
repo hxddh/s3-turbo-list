@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-05-24
+
+### Added
+- Added `scripts/benchmark-compression.sh` to compare `gzip(6)`, `zstd(3)`,
+  `zstd(6)`, `lz4`, and `snappy` with local synthetic data only.
+- `benchmark-local` now reports per-object byte counts, local output MiB/sec
+  rates, and the retained artifact directory when `--keep-artifacts` is used.
+
+### Changed
+- Expanded benchmarking documentation with a repeatable compression matrix while
+  keeping the default Parquet compression at `gzip(6)`.
+
 ## [0.1.25] - 2026-05-24
 
 ### Added

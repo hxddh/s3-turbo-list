@@ -2009,6 +2009,12 @@ struct LocalBenchmarkReport {
     prefixes: usize,
     elapsed_secs: f64,
     objects_per_sec: f64,
+    parquet_bytes_per_object: f64,
+    ks_bytes_per_object: f64,
+    output_bytes_per_object: f64,
+    parquet_mib_per_sec: f64,
+    output_mib_per_sec: f64,
+    artifact_dir: Option<String>,
     parquet_file: String,
     parquet_bytes: u64,
     ks_file: String,
@@ -2118,8 +2124,10 @@ fn run_benchmark_local(
         .map(|m| m.len())
         .unwrap_or(0);
     let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
+    let output_bytes = parquet_bytes.saturating_add(ks_bytes);
     let metrics = g_state.metrics_snapshot().into();
     let artifacts_kept = keep_artifacts;
+    let artifact_dir_summary = artifacts_kept.then(|| artifact_dir.display().to_string());
     if !artifacts_kept {
         let _ = std::fs::remove_dir_all(&artifact_dir);
     }
@@ -2141,6 +2149,12 @@ fn run_benchmark_local(
         prefixes,
         elapsed_secs,
         objects_per_sec: objects as f64 / elapsed_secs,
+        parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
+        ks_bytes_per_object: ks_bytes as f64 / objects as f64,
+        output_bytes_per_object: output_bytes as f64 / objects as f64,
+        parquet_mib_per_sec: parquet_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
+        output_mib_per_sec: output_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
+        artifact_dir: artifact_dir_summary,
         parquet_file: parquet_path,
         parquet_bytes,
         ks_file: ks_path,
