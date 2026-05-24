@@ -7,6 +7,12 @@ use log::{debug, error, info};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout_at, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentOutcome {
+    index: usize,
+    completed: bool,
+}
+
 // ── Public entry point ─────────────────────────────────────
 
 pub async fn flat_list_main_task(
@@ -47,9 +53,10 @@ async fn flat_reactor_task(
 
                 set.spawn(async move {
                     let end_ref: Option<&str> = end.as_deref();
-                    flat_list_run_to_complete(&task_ctx, index, &start_prefix, &start, end_ref)
-                        .await;
-                    index
+                    let completed =
+                        flat_list_run_to_complete(&task_ctx, index, &start_prefix, &start, end_ref)
+                            .await;
+                    SegmentOutcome { index, completed }
                 });
             } else {
                 break;
@@ -70,9 +77,16 @@ async fn flat_reactor_task(
         // with a heartbeat timeout so logs stay fresh.
         let heartbeat_dur = Duration::from_secs(core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS);
         match tokio::time::timeout(heartbeat_dur, set.join_next()).await {
-            Ok(Some(Ok(index))) => {
-                hints.finish(index);
-                ctx.checkpoint_completed.lock().unwrap().push(index);
+            Ok(Some(Ok(outcome))) => {
+                if outcome.completed {
+                    hints.finish(outcome.index);
+                    ctx.checkpoint_completed.lock().unwrap().push(outcome.index);
+                } else {
+                    debug!(
+                        "Segment {} did not complete successfully; not marking checkpoint progress",
+                        outcome.index
+                    );
+                }
             }
             Ok(Some(Err(e))) => {
                 error!("Task join error: {:?}", e);
@@ -116,7 +130,7 @@ async fn flat_list_run_to_complete(
     prefix: &str,
     start: &str,
     until: Option<&str>,
-) {
+) -> bool {
     let mut continuation_token = ctx.continuation_token.clone();
     // If the CLI provided --start-after, it overrides the segment's start.
     // Continuation-token resume is a single-chain mode; do not also send
@@ -139,7 +153,7 @@ async fn flat_list_run_to_complete(
         )
         .await
         {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(err) => {
                 let next_retry_attempt = retry_attempt.saturating_add(1);
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
@@ -163,7 +177,7 @@ async fn flat_list_run_to_complete(
                 if ctx.is_running() {
                     ctx.complete();
                 }
-                return;
+                return false;
             }
         }
     }

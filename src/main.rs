@@ -1248,9 +1248,12 @@ fn main() {
             }
 
             // Save checkpoint progress periodically (every 30s or on state change).
+            let progress_metrics = g_state.metrics_snapshot();
             if cli.resume
                 && last_checkpoint_save.elapsed().as_secs() >= 30
                 && g_state.all_list_tasks_is_running()
+                && progress_metrics.fatal_errors == 0
+                && progress_metrics.output_errors == 0
             {
                 if let Some(ref cp_path) = checkpoint_path_opt {
                     let completed = merged_completed_indices(
@@ -1275,26 +1278,33 @@ fn main() {
         // ── Final checkpoint save on successful completion ─
         if cli.resume {
             if let Some(ref cp_path) = checkpoint_path_opt {
-                let completed = merged_completed_indices(
-                    checkpoint_journal.as_ref(),
-                    &left_checkpoint,
-                    right_checkpoint.as_ref(),
-                );
-                if !completed.is_empty() {
-                    let journal = checkpoint::CheckpointJournal {
-                        bucket: opt_bucket.to_string(),
-                        prefix: opt_prefix.clone(),
-                        total_segments: original_hints_count,
-                        completed_indices: completed,
-                        last_updated: chrono::Local::now().to_rfc3339(),
-                        identity: Some(current_identity.clone()),
-                    };
-                    journal.save(cp_path);
+                let final_metrics = g_state.metrics_snapshot();
+                if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
                     info!(
-                        "Final checkpoint saved: {}/{} segments completed",
-                        journal.completed_indices.len(),
-                        journal.total_segments
+                        "Skipping final checkpoint save because run failed before producing reliable output"
                     );
+                } else {
+                    let completed = merged_completed_indices(
+                        checkpoint_journal.as_ref(),
+                        &left_checkpoint,
+                        right_checkpoint.as_ref(),
+                    );
+                    if !completed.is_empty() {
+                        let journal = checkpoint::CheckpointJournal {
+                            bucket: opt_bucket.to_string(),
+                            prefix: opt_prefix.clone(),
+                            total_segments: original_hints_count,
+                            completed_indices: completed,
+                            last_updated: chrono::Local::now().to_rfc3339(),
+                            identity: Some(current_identity.clone()),
+                        };
+                        journal.save(cp_path);
+                        info!(
+                            "Final checkpoint saved: {}/{} segments completed",
+                            journal.completed_indices.len(),
+                            journal.total_segments
+                        );
+                    }
                 }
             }
         }

@@ -333,6 +333,18 @@ fn parquet_keys(path: &std::path::Path) -> Vec<String> {
     keys
 }
 
+fn checkpoint_completed_indices(path: &std::path::Path) -> Option<Vec<u64>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&content).ok()?;
+    value.get("completed_indices")?.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(toml::Value::as_integer)
+            .map(|v| v as u64)
+            .collect()
+    })
+}
+
 #[test]
 fn local_mock_list_paginates_and_records_protocol_fields() {
     let server = MockS3Server::start(|request, _sequence| {
@@ -948,6 +960,143 @@ mode = "list"
             || checkpoint_after.contains("completed_indices = [0, 1]"),
         "{}",
         checkpoint_after
+    );
+}
+
+#[test]
+fn local_mock_resume_does_not_mark_failed_segment_completed() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.get("start-after").map(String::as_str) == Some("m/") {
+            return MockResponse::error(500, "InjectedFailure", "segment should fail");
+        }
+        MockResponse::error(
+            500,
+            "UnexpectedSegment",
+            "resume should only request the uncompleted m/ segment",
+        )
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    let parquet = dir.path().join("failed-segment.parquet");
+    let ks = dir.path().join("failed-segment.ks");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+total_objects = 2
+boundaries = ["m/"]
+generated_at = "2026-05-24T00:00:00Z"
+scan_mode = "full"
+estimate_mode = "full"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &checkpoint,
+        r#"bucket = "mock-bucket"
+prefix = ""
+total_segments = 2
+completed_indices = [0]
+last_updated = "2026-05-24T00:00:00Z"
+
+[identity]
+bucket = "mock-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = "/"
+addressing_style = "path"
+mode = "list"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(checkpoint_completed_indices(&checkpoint), Some(vec![0]));
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| { request.query.get("start-after").map(String::as_str) == Some("m/") }),
+        "{:#?}",
+        requests
+    );
+}
+
+#[test]
+fn local_mock_resume_skips_final_checkpoint_when_output_write_fails() {
+    let server = MockS3Server::start(|request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/a.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    let bad_parquet_path = dir.path().join("parquet-is-directory");
+    let ks = dir.path().join("output-failure.ks");
+    write_fast_config(&config);
+    std::fs::create_dir(&bad_parquet_path).unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--no-auto-hints".into(),
+        "--output-parquet-file".into(),
+        bad_parquet_path.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 5, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        !checkpoint.exists(),
+        "failed output should not create a completed checkpoint"
     );
 }
 

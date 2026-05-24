@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-05-24
+
+### Changed
+- Checkpoint progress now records only segments that finished successfully.
+- Final checkpoint saves are skipped when a run has fatal listing errors or
+  output-write errors, avoiding completed checkpoints for unreliable artifacts.
+
+### Fixed
+- Failed segments can no longer be marked complete simply because their task
+  joined.
+- Output failures during resume-enabled runs no longer create a checkpoint that
+  would cause a later resume to skip the scan.
+
 ## [0.1.23] - 2026-05-23
 
 ### Changed
