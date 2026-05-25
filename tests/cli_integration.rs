@@ -174,6 +174,7 @@ fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
     assert_eq!(code, 0, "benchmark-local --help should exit 0");
     assert!(stdout.contains("--objects"));
+    assert!(stdout.contains("--output-format"));
 
     let (code, stdout, _stderr) = run_cli(&["init-config", "--help"]);
     assert_eq!(code, 0, "init-config --help should exit 0");
@@ -455,7 +456,9 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["network"], "none: synthetic local data only");
     assert_eq!(json["compression"], "zstd");
     assert_eq!(json["compression_level"], 3);
+    assert_eq!(json["output_format"], "parquet");
     assert_eq!(json["objects"], 32);
+    assert!(json["rows_per_sec"].as_f64().unwrap() > 0.0);
     assert!(json["parquet_bytes_per_object"].as_f64().unwrap() > 0.0);
     assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
     assert!(json["parquet_mib_per_sec"].as_f64().unwrap() > 0.0);
@@ -465,6 +468,36 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["metrics"]["streamed_rows"], 32);
     assert_eq!(json["metrics"]["parquet_rows"], 32);
     assert_eq!(json["metrics"]["ks_entries"], 4);
+}
+
+#[test]
+fn test_cli_benchmark_local_ndjson_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&[
+        "benchmark-local",
+        "--objects",
+        "32",
+        "--batch-size",
+        "8",
+        "--prefixes",
+        "4",
+        "--output-format",
+        "ndjson",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["network"], "none: synthetic local data only");
+    assert_eq!(json["output_format"], "ndjson");
+    assert_eq!(json["parquet_file"], serde_json::Value::Null);
+    assert_eq!(json["ks_file"], serde_json::Value::Null);
+    assert!(json["text_bytes"].as_u64().unwrap() > 0);
+    assert!(json["text_bytes_per_object"].as_f64().unwrap() > 0.0);
+    assert!(json["text_mib_per_sec"].as_f64().unwrap() > 0.0);
+    assert_eq!(json["metrics"]["received_objects"], 32);
+    assert_eq!(json["metrics"]["streamed_rows"], 32);
+    assert_eq!(json["metrics"]["parquet_rows"], 0);
+    assert_eq!(json["metrics"]["ks_entries"], 0);
 }
 
 #[test]

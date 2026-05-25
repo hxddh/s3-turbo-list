@@ -127,11 +127,23 @@ check_not_contains() {
 }
 
 check_contains "CHANGELOG.md" "^## \\[${VERSION//./\\.}\\]" "CHANGELOG section for $VERSION"
+check_contains "Cargo.lock" "^version = \"${VERSION//./\\.}\"$" "Cargo.lock contains crate version $VERSION"
 check_contains "INSTALL.md" "s3-turbo-list-${VERSION}-linux-x86_64" "INSTALL linux x86_64 asset"
 check_contains "INSTALL.md" "s3-turbo-list-${VERSION}-linux-aarch64" "INSTALL linux aarch64 asset"
+check_contains "docs/build-release.md" "s3-turbo-list-${VERSION}-linux-aarch64" "build-release linux aarch64 asset"
 check_contains "AGENTS.md" "Current release tag: \`${TAG}\`" "AGENTS current release tag"
 check_contains ".github/workflows/release-assets.yml" "default: '${TAG}'" "release workflow default tag"
 check_not_contains ".github/workflows/release-assets.yml" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+" "hard-coded versioned release asset names"
+
+if awk '
+  $0 == "name = \"s3-turbo-list\"" { in_pkg=1; next }
+  in_pkg && $0 ~ /^version = / { print; exit }
+' Cargo.lock | grep -qx "version = \"$VERSION\""; then
+  echo "ok:      Cargo.lock s3-turbo-list package version"
+else
+  echo "MISSING: Cargo.lock s3-turbo-list package version $VERSION"
+  CHECK_FAILED=1
+fi
 
 if [ "$CHECK_FAILED" -ne 0 ]; then
   echo ""

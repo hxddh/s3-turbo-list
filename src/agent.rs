@@ -956,4 +956,41 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn redacts_endpoint_alias_and_preserves_diagnostic_values() {
+        let args = redact_command_args([
+            "s3-turbo-list",
+            "--endpoint=https://account.example.com",
+            "--profile",
+            "r2",
+            "list",
+            "--bucket",
+            "public-diagnostic-bucket",
+            "--region",
+            "auto",
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                "s3-turbo-list",
+                "--endpoint=<redacted>",
+                "--profile",
+                "r2",
+                "list",
+                "--bucket",
+                "public-diagnostic-bucket",
+                "--region",
+                "auto",
+            ]
+        );
+    }
+
+    #[test]
+    fn redacts_value_after_sensitive_flag_at_end_safely() {
+        let args = redact_command_args(["s3-turbo-list", "list", "--continuation-token"]);
+
+        assert_eq!(args, vec!["s3-turbo-list", "list", "--continuation-token"]);
+    }
 }

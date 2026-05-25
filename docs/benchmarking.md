@@ -1,8 +1,8 @@
 # Benchmarking
 
-v0.1.8 adds a local synthetic benchmark harness for the list-mode streaming
-output path.  It generates in-memory object batches and writes Parquet plus KS
-outputs through the normal data-map streaming code.  It does not contact S3.
+The local synthetic benchmark harness measures list-mode output paths without
+contacting S3.  It generates in-memory object batches and writes them through
+the normal data-map code.
 
 ```bash
 cargo build --release
@@ -10,6 +10,7 @@ cargo build --release
   --objects 100000 \
   --batch-size 5000 \
   --prefixes 512 \
+  --output-format parquet \
   --compression gzip \
   --compression-level 6 \
   --json
@@ -26,7 +27,12 @@ Environment overrides:
 ```bash
 OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
 COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
+OUTPUT_FORMAT=ndjson ./scripts/benchmark-local.sh
 ```
+
+`--output-format parquet` measures the Parquet plus KeySpace streaming path.
+`--output-format tsv` and `--output-format ndjson` measure the list stdout row
+formatters by writing rows to a temporary local file, not to the terminal.
 
 The JSON report includes:
 
@@ -35,7 +41,9 @@ The JSON report includes:
 - object count, batch size, and prefix count
 - elapsed seconds and objects/sec
 - Parquet and KS byte sizes
+- text output byte size for TSV/NDJSON runs
 - per-object byte counts and local output MiB/sec rates for easier comparisons
+- streamed rows/sec
 - data-map metrics: received batches, received objects, streamed rows,
   unique prefixes, Parquet rows, and KS entries
 

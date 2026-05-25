@@ -13,7 +13,20 @@ pub struct CompatProbeReport {
     pub overall_status: String,
 }
 
-#[derive(Debug, Serialize)]
+impl CompatProbeReport {
+    fn overall_status_for(results: &[ProbeTestResult]) -> &'static str {
+        let error_count = results.iter().filter(|r| r.status == "error").count();
+        if error_count == 0 {
+            "compatible"
+        } else if error_count < results.len() {
+            "partial"
+        } else {
+            "incompatible"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProbeTestResult {
     pub test: String,
     pub status: String,
@@ -214,14 +227,7 @@ pub async fn run_compat_probe(
         .await,
     );
 
-    let error_count = results.iter().filter(|r| r.status == "error").count();
-    let overall = if error_count == 0 {
-        "compatible"
-    } else if error_count < results.len() {
-        "partial"
-    } else {
-        "incompatible"
-    };
+    let overall = CompatProbeReport::overall_status_for(&results);
 
     let report = CompatProbeReport {
         endpoint_url: endpoint_url.to_string(),
@@ -492,5 +498,47 @@ fn probe_result_from<T, E: std::fmt::Debug>(
             contents_count: None,
             next_continuation_token_present: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompatProbeReport, ProbeTestResult};
+
+    fn result(status: &str) -> ProbeTestResult {
+        ProbeTestResult {
+            test: "probe".to_string(),
+            status: status.to_string(),
+            latency_ms: 1,
+            http_status: Some(200),
+            s3_error_code: None,
+            error_message: None,
+            request_id: None,
+            is_truncated: None,
+            key_count: None,
+            contents_count: None,
+            next_continuation_token_present: None,
+        }
+    }
+
+    #[test]
+    fn overall_status_allows_skipped_probe_without_degrading() {
+        let results = vec![result("ok"), result("skipped")];
+        assert_eq!(
+            CompatProbeReport::overall_status_for(&results),
+            "compatible"
+        );
+    }
+
+    #[test]
+    fn overall_status_distinguishes_partial_and_incompatible() {
+        let partial = vec![result("ok"), result("error")];
+        let incompatible = vec![result("error"), result("error")];
+
+        assert_eq!(CompatProbeReport::overall_status_for(&partial), "partial");
+        assert_eq!(
+            CompatProbeReport::overall_status_for(&incompatible),
+            "incompatible"
+        );
     }
 }

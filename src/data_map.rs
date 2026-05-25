@@ -524,14 +524,24 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
     }
 }
 
-pub async fn data_map_task_list_stdout(mut ctx: DataMapContext, format: ListTextOutputFormat) {
+pub async fn data_map_task_list_stdout(ctx: DataMapContext, format: ListTextOutputFormat) {
+    let stdout = tokio::io::stdout();
+    let writer = tokio::io::BufWriter::new(stdout);
+    data_map_task_list_text_writer(ctx, format, writer).await;
+}
+
+pub async fn data_map_task_list_text_writer<W>(
+    mut ctx: DataMapContext,
+    format: ListTextOutputFormat,
+    mut writer: W,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
     ctx.start();
     ctx.g_state.wait_to_start().await;
 
     info!("Data Map Task — list stdout {:?} started", format);
 
-    let stdout = tokio::io::stdout();
-    let mut writer = tokio::io::BufWriter::new(stdout);
     let mut prefix_stats: BTreeMap<String, PrefixAggregate> = BTreeMap::new();
     let started_at = Instant::now();
     let mut last_ts = epoch_secs();

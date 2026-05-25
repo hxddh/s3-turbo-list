@@ -6,6 +6,7 @@ BIN="${BIN:-$ROOT/target/release/s3-turbo-list}"
 OBJECTS="${OBJECTS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-5000}"
 PREFIXES="${PREFIXES:-512}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-parquet}"
 COMPRESSION="${COMPRESSION:-}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-}"
 OUT="${OUT:-$ROOT/benchmark-results-local.json}"
@@ -19,6 +20,7 @@ args=(
   --objects "$OBJECTS"
   --batch-size "$BATCH_SIZE"
   --prefixes "$PREFIXES"
+  --output-format "$OUTPUT_FORMAT"
   --output "$OUT"
   --json
 )

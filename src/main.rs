@@ -484,6 +484,10 @@ enum Commands {
         #[arg(long, default_value_t = 128)]
         prefixes: usize,
 
+        /// Local output path to benchmark
+        #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
+        output_format: ListOutputFormat,
+
         /// Emit JSON report
         #[arg(long)]
         json: bool,
@@ -527,6 +531,12 @@ impl ListOutputFormat {
             Self::Tsv => "tsv",
             Self::Ndjson => "ndjson",
         }
+    }
+}
+
+impl std::fmt::Display for ListOutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -793,12 +803,19 @@ fn main() {
             objects,
             batch_size,
             prefixes,
+            output_format,
             json,
             output,
             keep_artifacts,
         } => {
-            let report =
-                run_benchmark_local(*objects, *batch_size, *prefixes, *keep_artifacts, &cfg);
+            let report = run_benchmark_local(
+                *objects,
+                *batch_size,
+                *prefixes,
+                *output_format,
+                *keep_artifacts,
+                &cfg,
+            );
             if *json || output.is_some() {
                 let rendered = agent::to_pretty_json(&report);
                 if let Some(path) = output.as_deref() {
@@ -812,11 +829,21 @@ fn main() {
                 }
             } else {
                 println!(
-                    "local benchmark: {} objects in {:.3}s ({:.0} objects/sec)",
-                    report.objects, report.elapsed_secs, report.objects_per_sec
+                    "local benchmark: {} {} objects in {:.3}s ({:.0} objects/sec)",
+                    report.output_format,
+                    report.objects,
+                    report.elapsed_secs,
+                    report.objects_per_sec
                 );
-                println!("  parquet: {}", report.parquet_file);
-                println!("  ks:      {}", report.ks_file);
+                if let Some(path) = &report.parquet_file {
+                    println!("  parquet: {}", path);
+                }
+                if let Some(path) = &report.ks_file {
+                    println!("  ks:      {}", path);
+                }
+                if let Some(path) = &report.text_file {
+                    println!("  rows:    {}", path);
+                }
                 if !report.artifacts_kept {
                     println!("  artifacts removed");
                 }
@@ -2036,21 +2063,27 @@ struct LocalBenchmarkReport {
     network: String,
     compression: String,
     compression_level: u32,
+    output_format: String,
     objects: usize,
     batch_size: usize,
     prefixes: usize,
     elapsed_secs: f64,
     objects_per_sec: f64,
+    rows_per_sec: f64,
     parquet_bytes_per_object: f64,
     ks_bytes_per_object: f64,
+    text_bytes_per_object: f64,
     output_bytes_per_object: f64,
     parquet_mib_per_sec: f64,
+    text_mib_per_sec: f64,
     output_mib_per_sec: f64,
     artifact_dir: Option<String>,
-    parquet_file: String,
+    parquet_file: Option<String>,
     parquet_bytes: u64,
-    ks_file: String,
+    ks_file: Option<String>,
     ks_bytes: u64,
+    text_file: Option<String>,
+    text_bytes: u64,
     metrics: agent::MetricsSummary,
     artifacts_kept: bool,
 }
@@ -2059,6 +2092,7 @@ fn run_benchmark_local(
     objects: usize,
     batch_size: usize,
     prefixes: usize,
+    output_format: ListOutputFormat,
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
 ) -> LocalBenchmarkReport {
@@ -2081,6 +2115,11 @@ fn run_benchmark_local(
     });
     let parquet_file = artifact_dir.join("benchmark.parquet");
     let ks_file = artifact_dir.join("benchmark.ks");
+    let text_file = match output_format {
+        ListOutputFormat::Tsv => Some(artifact_dir.join("benchmark.tsv")),
+        ListOutputFormat::Ndjson => Some(artifact_dir.join("benchmark.ndjson")),
+        ListOutputFormat::Parquet => None,
+    };
 
     let quit = Arc::new(AtomicBool::new(false));
     let g_state = core::GlobalState::new(quit, 2);
@@ -2096,18 +2135,50 @@ fn run_benchmark_local(
             cfg.channel.capacity,
         );
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
-        let data_map_ks = ks_path.clone();
-        let data_map_parquet = parquet_path.clone();
-        let data_map_output_config = output_config.clone();
-        let data_map = tokio::spawn(async move {
-            data_map::data_map_task_list_streaming(
-                data_map_ctx,
-                &data_map_ks,
-                &data_map_parquet,
-                data_map_output_config,
-            )
-            .await;
-        });
+        let data_map = match output_format {
+            ListOutputFormat::Parquet => {
+                let data_map_ks = ks_path.clone();
+                let data_map_parquet = parquet_path.clone();
+                let data_map_output_config = output_config.clone();
+                tokio::spawn(async move {
+                    data_map::data_map_task_list_streaming(
+                        data_map_ctx,
+                        &data_map_ks,
+                        &data_map_parquet,
+                        data_map_output_config,
+                    )
+                    .await;
+                })
+            }
+            ListOutputFormat::Tsv | ListOutputFormat::Ndjson => {
+                let text_path = text_file
+                    .as_ref()
+                    .expect("text benchmark output path")
+                    .clone();
+                tokio::spawn(async move {
+                    let file = match tokio::fs::File::create(&text_path).await {
+                        Ok(file) => file,
+                        Err(e) => {
+                            eprintln!(
+                                "Benchmark setup error: failed to create {}: {}",
+                                text_path.display(),
+                                e
+                            );
+                            data_map_ctx.g_state.inc_output_error();
+                            data_map_ctx.g_state.quit();
+                            return;
+                        }
+                    };
+                    let writer = tokio::io::BufWriter::new(file);
+                    data_map::data_map_task_list_text_writer(
+                        data_map_ctx,
+                        data_map::ListTextOutputFormat::from(output_format),
+                        writer,
+                    )
+                    .await;
+                })
+            }
+        };
 
         let producer_state = g_state.clone();
         let producer = tokio::spawn(async move {
@@ -2156,8 +2227,15 @@ fn run_benchmark_local(
         .map(|m| m.len())
         .unwrap_or(0);
     let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
-    let output_bytes = parquet_bytes.saturating_add(ks_bytes);
-    let metrics = g_state.metrics_snapshot().into();
+    let text_bytes = text_file
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let output_bytes = parquet_bytes
+        .saturating_add(ks_bytes)
+        .saturating_add(text_bytes);
+    let metrics: agent::MetricsSummary = g_state.metrics_snapshot().into();
     let artifacts_kept = keep_artifacts;
     let artifact_dir_summary = artifacts_kept.then(|| artifact_dir.display().to_string());
     if !artifacts_kept {
@@ -2176,21 +2254,27 @@ fn run_benchmark_local(
         network: "none: synthetic local data only".to_string(),
         compression: output_config.compression.clone(),
         compression_level: output_config.compression_level,
+        output_format: output_format.to_string(),
         objects,
         batch_size,
         prefixes,
         elapsed_secs,
         objects_per_sec: objects as f64 / elapsed_secs,
+        rows_per_sec: metrics.streamed_rows as f64 / elapsed_secs,
         parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
         ks_bytes_per_object: ks_bytes as f64 / objects as f64,
+        text_bytes_per_object: text_bytes as f64 / objects as f64,
         output_bytes_per_object: output_bytes as f64 / objects as f64,
         parquet_mib_per_sec: parquet_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
+        text_mib_per_sec: text_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
         output_mib_per_sec: output_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
         artifact_dir: artifact_dir_summary,
-        parquet_file: parquet_path,
+        parquet_file: (output_format == ListOutputFormat::Parquet).then_some(parquet_path),
         parquet_bytes,
-        ks_file: ks_path,
+        ks_file: (output_format == ListOutputFormat::Parquet).then_some(ks_path),
         ks_bytes,
+        text_file: text_file.as_ref().map(|path| path.display().to_string()),
+        text_bytes,
         metrics,
         artifacts_kept,
     }

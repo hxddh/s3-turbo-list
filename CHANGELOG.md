@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `benchmark-local` can now measure `parquet`, `tsv`, and `ndjson` output
+  formats with synthetic local data, including streamed row throughput and
+  text output byte metrics for stdout row formats.
+- Release environment checks now validate more version metadata, including the
+  package version recorded in `Cargo.lock` and documented release asset names.
+
+### Changed
+- The local benchmark wrapper accepts `OUTPUT_FORMAT` for repeatable stdout
+  formatter benchmark runs without contacting S3.
+
+### Fixed
+- Added redaction regression coverage for endpoint alias arguments and dangling
+  sensitive flags in agent-facing command diagnostics.
+- Added compat-probe overall-status regression coverage after the module split.
+
 ## [0.2.0] - 2026-05-25
 
 ### Added
