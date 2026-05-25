@@ -1,5 +1,7 @@
 use crate::config::S3TurboConfig;
 use crate::trace::{S3CompatEvent, S3TraceWriter, StderrTraceWriter};
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_smithy_runtime_api::client::result::SdkError;
 use serde::Serialize;
 use std::time::Instant;
 
@@ -56,7 +58,7 @@ pub async fn run_compat_probe(
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
-) {
+) -> Result<(), String> {
     let trace_writer: Box<dyn S3TraceWriter> = Box::new(StderrTraceWriter);
 
     let loader = aws_config::from_env()
@@ -238,13 +240,14 @@ pub async fn run_compat_probe(
         overall_status: overall.to_string(),
     };
 
-    let json = serde_json::to_string_pretty(&report).unwrap();
+    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     if let Some(out_path) = output {
-        std::fs::write(out_path, &json).expect("Failed to write compat-probe report");
+        std::fs::write(out_path, &json).map_err(|e| e.to_string())?;
         println!("Compat-probe report written to {}", out_path);
     } else {
         println!("{}", json);
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,7 +435,7 @@ async fn timed_s3_call<F, Fut, T, E>(
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
+    E: ProbeErrorMetadata + std::fmt::Debug,
 {
     let start = Instant::now();
     let result = f().await;
@@ -448,9 +451,10 @@ where
         Ok(_) => {
             event.http_status = 200;
         }
-        Err(_) => {
+        Err(e) => {
             event.http_status = 0;
             event.fatal = true;
+            e.apply_to_event(&mut event);
         }
     }
 
@@ -499,6 +503,44 @@ fn probe_result_from<T, E: std::fmt::Debug>(
             next_continuation_token_present: None,
         },
     }
+}
+
+trait ProbeErrorMetadata {
+    fn apply_to_event(&self, event: &mut S3CompatEvent);
+}
+
+impl<E> ProbeErrorMetadata
+    for SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>
+where
+    E: ProvideErrorMetadata,
+{
+    fn apply_to_event(&self, event: &mut S3CompatEvent) {
+        event.s3_error_code = self.code().map(str::to_string);
+        event.s3_error_message = self.message().map(str::to_string);
+
+        match self {
+            SdkError::ServiceError(err) => {
+                event.http_status = err.raw().status().as_u16();
+                apply_response_headers(event, err.raw().headers());
+            }
+            SdkError::ResponseError(err) => {
+                event.http_status = err.raw().status().as_u16();
+                apply_response_headers(event, err.raw().headers());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_response_headers(
+    event: &mut S3CompatEvent,
+    headers: &aws_smithy_runtime_api::http::Headers,
+) {
+    event.request_id = headers
+        .get("x-amz-request-id")
+        .or_else(|| headers.get("x-amzn-requestid"))
+        .map(str::to_string);
+    event.request_id_2 = headers.get("x-amz-id-2").map(str::to_string);
 }
 
 #[cfg(test)]

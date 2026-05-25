@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-25
+
+### Fixed
+- `compat-probe` now fails before network setup with provider setup exit code
+  `3` when its explicit `--endpoint` still contains template placeholders.
+- `compat-probe` reports structured HTTP status, S3 error code, and request ID
+  metadata for modeled S3 service errors when the SDK exposes them.
+- `compat-probe --output` write failures now return the output-write exit code
+  instead of panicking.
+
 ## [0.2.1] - 2026-05-25
 
 ### Added

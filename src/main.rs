@@ -1842,21 +1842,33 @@ fn validate_diff_resume_command(cli: &Cli) {
 }
 
 fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
-    if !matches!(
-        cli.cmd,
-        Commands::List { .. }
-            | Commands::Diff { .. }
-            | Commands::AutoHints { .. }
-            | Commands::DiscoverPrefixes { .. }
-    ) {
-        return;
-    }
-
-    let warnings = profiles::endpoint_profile_guardrail_warnings(cfg);
+    let warnings = provider_setup_guardrail_warnings(cli, cfg);
     if let Some(error) = warnings.first() {
         eprintln!("Provider setup error: {}", error);
         std::process::exit(agent::ExitCode::ProviderSetup.code());
     }
+}
+
+fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    match &cli.cmd {
+        Commands::List { .. }
+        | Commands::Diff { .. }
+        | Commands::AutoHints { .. }
+        | Commands::DiscoverPrefixes { .. } => {
+            warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
+        }
+        Commands::CompatProbe { endpoint_url, .. } => {
+            if profiles::endpoint_url_has_template_placeholder(endpoint_url) {
+                warnings.push(format!(
+                    "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
+                    endpoint_url
+                ));
+            }
+        }
+        _ => {}
+    }
+    warnings
 }
 
 fn merged_completed_indices(
@@ -2445,7 +2457,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                 ));
             }
         }
-        warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
+        warnings.extend(provider_setup_guardrail_warnings(cli, cfg));
     }
     if cli.summary_only
         && (cli.output_dir.is_some()
@@ -2830,8 +2842,19 @@ fn run_compat_probe(
     let rt = build_runtime_or_exit(2);
 
     rt.block_on(async {
-        compat_probe::run_compat_probe(endpoint_url, region, bucket, addressing_style, output, cfg)
-            .await
+        if let Err(e) = compat_probe::run_compat_probe(
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            output,
+            cfg,
+        )
+        .await
+        {
+            eprintln!("Compat-probe output error: {}", e);
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
     });
 }
 

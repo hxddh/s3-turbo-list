@@ -51,10 +51,19 @@ an endpoint URL is configured.  Starter config placeholders such as
 `<account-id>` or `<region>` are also reported locally so agents do not launch a
 real run with an unedited template endpoint.
 
+`compat-probe` takes its endpoint from the command's explicit `--endpoint`
+argument.  It applies the same placeholder guard to that value and exits with
+provider setup code `3` before network setup when the endpoint still contains
+template markers such as `<account-id>`.  Literal but unreachable endpoints are
+left to the probe itself so connectivity failures remain part of the diagnostic
+report.
+
 ## Caveats
 
 - `profiles show` and `profiles list` are local-only commands.
 - `compat-probe` is still the explicit command for real endpoint validation.
+- `compat-probe` reports structured HTTP status, S3 error code, and request ID
+  metadata when the AWS SDK exposes those values for service errors.
 - R2, B2, and OSS presets are documented defaults, not a claim of full project
   validation.
 - The BOS profile does not enable a default pagination workaround.

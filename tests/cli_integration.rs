@@ -801,6 +801,73 @@ fn test_cli_provider_setup_error_uses_exit_code_3_no_cloud() {
 }
 
 #[test]
+fn test_cli_compat_probe_placeholder_endpoint_uses_exit_code_3_no_cloud() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "compat-probe",
+        "--endpoint",
+        "https://<account-id>.r2.cloudflarestorage.com",
+        "--region",
+        "auto",
+        "--bucket",
+        "agent-test-bucket",
+    ]);
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Provider setup error:"));
+    assert!(stderr.contains("still contains template placeholders"));
+}
+
+#[test]
+fn test_cli_compat_probe_dry_run_warns_for_placeholder_endpoint() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--agent",
+        "--dry-run",
+        "compat-probe",
+        "--endpoint",
+        "https://<account-id>.r2.cloudflarestorage.com",
+        "--region",
+        "auto",
+        "--bucket",
+        "agent-test-bucket",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("still contains template placeholders")
+    }));
+}
+
+#[test]
+fn test_cli_compat_probe_dry_run_uses_command_endpoint_for_profile_guardrail() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--profile",
+        "r2",
+        "--agent",
+        "--dry-run",
+        "compat-probe",
+        "--endpoint",
+        "https://account.example.com",
+        "--region",
+        "auto",
+        "--bucket",
+        "agent-test-bucket",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(!json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("requires an explicit endpoint URL")
+    }));
+}
+
+#[test]
 fn test_cli_default_paths_sanitize_bucket_and_region_components() {
     let (code, stdout, stderr) = run_cli_without_aws_env(&[
         "--agent",

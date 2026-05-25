@@ -890,6 +890,94 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 }
 
 #[test]
+fn local_mock_compat_probe_reports_s3_error_metadata() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(501, "NotImplemented", "delimiter is not supported")
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let report = dir.path().join("compat-errors.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "compat-probe".into(),
+        "--endpoint".into(),
+        server.endpoint(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output".into(),
+        report.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+    assert_eq!(report["overall_status"], "incompatible");
+    let tests = report["tests"].as_array().unwrap();
+    assert!(tests.iter().all(|test| test["status"] == "error"));
+    assert!(tests.iter().any(|test| {
+        test["http_status"] == 501
+            && test["s3_error_code"] == "NotImplemented"
+            && test["request_id"] == "mock-request"
+    }));
+}
+
+#[test]
+fn local_mock_compat_probe_output_write_failure_exits_without_panic() {
+    let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
+        "HEAD" => MockResponse::empty_ok(),
+        "GET" => MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1,
+            &["probe/a.txt"],
+            &[],
+            false,
+            None,
+        )),
+        _ => MockResponse::error(405, "MethodNotAllowed", "unexpected method"),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let not_a_dir = dir.path().join("not-a-dir");
+    let report = not_a_dir.join("compat.json");
+    std::fs::write(&not_a_dir, "file blocks directory creation").unwrap();
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "compat-probe".into(),
+        "--endpoint".into(),
+        server.endpoint(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output".into(),
+        report.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 5, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Compat-probe output error:"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
 fn local_mock_resume_keeps_original_segment_start_after() {
     let server = MockS3Server::start(|request, _sequence| {
         if request.query.get("start-after").map(String::as_str) != Some("m/") {
