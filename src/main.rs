@@ -720,6 +720,7 @@ fn main() {
     validate_diff_hints_command(&cli);
     validate_diff_resume_command(&cli);
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
+    let config_source_warnings = config_source.warnings.clone();
 
     match &cli.cmd {
         Commands::ConfigInspect { json } => {
@@ -757,6 +758,9 @@ fn main() {
                     "  addressing:   {}",
                     report.resolved_config.s3.addressing_style
                 );
+                for warning in &report.config_source.warnings {
+                    println!("  warning:      {}", warning);
+                }
             }
             return;
         }
@@ -836,7 +840,10 @@ fn main() {
         return;
     }
 
-    let run_warnings = runtime_guardrail_warnings(&cli, &cfg);
+    validate_provider_setup_or_exit(&cli, &cfg);
+
+    let mut run_warnings = config_source_warnings;
+    run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
     if !cli.agent {
         print_runtime_warnings(&run_warnings);
     }
@@ -1372,6 +1379,7 @@ fn main() {
         inputs: command_input_summary(&cli, &cfg),
         artifacts: agent::collect_artifacts(&manifest_outputs),
         outputs: manifest_outputs,
+        config_source,
         metrics: metrics.into(),
         checkpoint: agent::checkpoint_plan(
             cli.resume,
@@ -1806,6 +1814,24 @@ fn validate_diff_resume_command(cli: &Cli) {
     }
 }
 
+fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
+    if !matches!(
+        cli.cmd,
+        Commands::List { .. }
+            | Commands::Diff { .. }
+            | Commands::AutoHints { .. }
+            | Commands::DiscoverPrefixes { .. }
+    ) {
+        return;
+    }
+
+    let warnings = profiles::endpoint_profile_guardrail_warnings(cfg);
+    if let Some(error) = warnings.first() {
+        eprintln!("Provider setup error: {}", error);
+        std::process::exit(agent::ExitCode::ProviderSetup.code());
+    }
+}
+
 fn merged_completed_indices(
     checkpoint_journal: Option<&checkpoint::CheckpointJournal>,
     left_checkpoint: &Arc<Mutex<Vec<usize>>>,
@@ -2212,7 +2238,8 @@ fn build_plan_report(
         )
     };
     let file_conflicts = agent::output_conflicts(&outputs);
-    let mut warnings = runtime_guardrail_warnings(cli, cfg);
+    let mut warnings = config_source.warnings.clone();
+    warnings.extend(runtime_guardrail_warnings(cli, cfg));
     if matches!(cli.cmd, Commands::CompatProbe { .. }) {
         warnings.push(
             "compat-probe will contact the configured endpoint when not run with --dry-run"

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-05-25
+
+### Added
+- Run manifests now include `config_source`, matching dry-run plans and
+  config inspection reports.
+- `config_source` now carries warnings, including when an explicit `--config`
+  path was not found.
+
+### Changed
+- Real cloud-facing commands now fail before network setup with exit code `3`
+  for deterministic provider setup errors such as endpoint profiles that
+  require an explicit endpoint URL or endpoint URLs that still contain template
+  placeholders.
+- Config source classification now uses explicit search-path kinds instead of
+  relying on a fallback branch for home config files.
+
 ## [0.1.28] - 2026-05-24
 
 ### Added

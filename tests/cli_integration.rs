@@ -574,6 +574,33 @@ worker_threads = 4
 }
 
 #[test]
+fn test_cli_config_inspect_warns_for_missing_explicit_config_no_cloud() {
+    let config_path = "/tmp/s3-turbo-list-missing-test-config.toml";
+    let _ = std::fs::remove_file(config_path);
+
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect", "--json"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["config_source"]["explicit_config"], config_path);
+    assert_eq!(
+        json["config_source"]["loaded_config"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["config_source"]["loaded_config_kind"], "none");
+    assert!(json["config_source"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("was not found")));
+
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("config:       -"));
+    assert!(stdout.contains("warning:"));
+    assert!(stdout.contains("was not found"));
+}
+
+#[test]
 fn test_cli_dry_run_plan_json_list_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let plan_path = dir.path().join("plan.json");
@@ -624,6 +651,35 @@ fn test_cli_dry_run_plan_json_list_no_cloud() {
     assert_eq!(json["file_conflicts"][0]["exists"], false);
     assert_eq!(json["file_conflicts"][0]["parent_exists"], true);
     assert_eq!(json["file_conflicts"][0]["parent_writable"], true);
+}
+
+#[test]
+fn test_cli_dry_run_plan_warns_for_missing_explicit_config_no_cloud() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_config = dir.path().join("missing.toml");
+
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--dry-run",
+        "--config",
+        missing_config.to_str().unwrap(),
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["config_source"]["explicit_config"],
+        missing_config.to_str().unwrap()
+    );
+    assert!(json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| { warning.as_str().unwrap().contains("explicit config file") }));
 }
 
 #[test]
@@ -692,6 +748,23 @@ fn test_cli_dry_run_agent_stdout_json() {
         .as_str()
         .unwrap()
         .contains("auto-hints will scan S3 pages"));
+}
+
+#[test]
+fn test_cli_provider_setup_error_uses_exit_code_3_no_cloud() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--profile",
+        "r2",
+        "list",
+        "--bucket",
+        "agent-test-bucket",
+        "--region",
+        "auto",
+    ]);
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Provider setup error:"));
+    assert!(stderr.contains("requires an explicit endpoint URL"));
 }
 
 #[test]

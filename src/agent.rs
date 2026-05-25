@@ -228,6 +228,7 @@ pub struct ConfigSourceSummary {
     pub loaded_config_kind: String,
     pub searched: Vec<String>,
     pub cli_overrides: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 impl ConfigSourceSummary {
@@ -238,6 +239,7 @@ impl ConfigSourceSummary {
             loaded_config_kind: load.loaded_config_kind.clone(),
             searched: load.searched.clone(),
             cli_overrides,
+            warnings: load.warnings.clone(),
         }
     }
 }
@@ -293,6 +295,7 @@ pub struct RunManifest {
     pub command: Vec<String>,
     pub inputs: CommandInputSummary,
     pub outputs: OutputPathSummary,
+    pub config_source: ConfigSourceSummary,
     pub artifacts: Vec<ArtifactSummary>,
     pub metrics: MetricsSummary,
     pub checkpoint: CheckpointPlan,

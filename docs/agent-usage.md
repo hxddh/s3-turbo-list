@@ -34,6 +34,8 @@ It also includes `config_source`, which reports the explicit `--config` path
 when present, the config file actually loaded, the searched paths, the source
 kind (`explicit`, `workspace`, `home`, or `none`), and global CLI config
 overrides such as `compression` or `endpoint_url`.
+When an explicit `--config` path is missing, `config_source.warnings` reports
+that the command fell back to built-in defaults.
 
 `doctor --local-only --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
@@ -174,11 +176,14 @@ human text.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.
+Run manifests also include `config_source`, so a saved manifest is enough to
+see which TOML file and CLI overrides shaped the completed run.
 
 Endpoint compatibility profiles that require provider-specific endpoints warn
 in dry-run and `doctor` until an endpoint URL is configured.  Placeholder
 endpoints from starter configs, such as `<account-id>` or `<region>`, are also
-reported locally before a real run.
+reported locally before a real run.  Real cloud-facing commands stop with exit
+code `3` when these deterministic provider setup problems are still present.
 
 Object filters are validated before any listing run.  Agents can use simple
 numeric predicates such as:
@@ -213,7 +218,7 @@ The `artifacts` array describes generated files:
 | 0 | Success |
 | 1 | Unexpected internal error |
 | 2 | CLI/config/filter validation error |
-| 3 | Auth/profile/region/provider setup error |
+| 3 | Auth/profile/region/provider setup error detected before the scan |
 | 4 | Network timeout, retry exhaustion, or tracked fatal listing error |
 | 5 | Output filesystem, manifest, Parquet, or KS write error |
 | 6 | Data validation, schema, or checksum error |

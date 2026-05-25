@@ -207,6 +207,7 @@ pub struct ConfigLoadSummary {
     pub loaded_config: Option<String>,
     pub loaded_config_kind: String,
     pub searched: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 impl Default for S3TurboConfig {
@@ -279,20 +280,24 @@ impl S3TurboConfig {
     ) -> Result<(Self, ConfigLoadSummary), String> {
         let mut config = Self::default();
 
-        let search_paths: Vec<PathBuf> = if let Some(p) = cli_config_path {
-            vec![PathBuf::from(p)]
+        let search_paths: Vec<(PathBuf, &'static str)> = if let Some(p) = cli_config_path {
+            vec![(PathBuf::from(p), "explicit")]
         } else {
             vec![
-                PathBuf::from("./s3-turbo-list.toml"),
-                dirs_next::home_dir()
-                    .unwrap_or_default()
-                    .join(".s3-turbo-list.toml"),
+                (PathBuf::from("./s3-turbo-list.toml"), "workspace"),
+                (
+                    dirs_next::home_dir()
+                        .unwrap_or_default()
+                        .join(".s3-turbo-list.toml"),
+                    "home",
+                ),
             ]
         };
         let mut loaded_config = None;
         let mut loaded_config_kind = "none".to_string();
+        let mut warnings = Vec::new();
 
-        for path in &search_paths {
+        for (path, kind) in &search_paths {
             if path.exists() {
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
@@ -301,15 +306,16 @@ impl S3TurboConfig {
                 config.merge(file_config);
                 log::info!("Loaded config from {}", path.display());
                 loaded_config = Some(path.display().to_string());
-                loaded_config_kind = if cli_config_path.is_some() {
-                    "explicit".to_string()
-                } else if path == &PathBuf::from("./s3-turbo-list.toml") {
-                    "workspace".to_string()
-                } else {
-                    "home".to_string()
-                };
+                loaded_config_kind = (*kind).to_string();
                 break;
             }
+        }
+
+        if let (Some(explicit), None) = (cli_config_path, loaded_config.as_ref()) {
+            warnings.push(format!(
+                "explicit config file '{}' was not found; using built-in defaults",
+                explicit
+            ));
         }
 
         let summary = ConfigLoadSummary {
@@ -318,8 +324,9 @@ impl S3TurboConfig {
             loaded_config_kind,
             searched: search_paths
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|(path, _kind)| path.display().to_string())
                 .collect(),
+            warnings,
         };
 
         Ok((config, summary))

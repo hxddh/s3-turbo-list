@@ -770,6 +770,19 @@ fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
 
     let manifest_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        manifest_json["config_source"]["loaded_config"],
+        config.to_str().unwrap()
+    );
+    assert_eq!(
+        manifest_json["config_source"]["loaded_config_kind"],
+        "explicit"
+    );
+    assert!(manifest_json["config_source"]["cli_overrides"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "endpoint_url"));
     assert_eq!(manifest_json["inputs"]["continuation_token"], "seed-token");
     assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
 }
