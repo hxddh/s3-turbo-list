@@ -1858,13 +1858,13 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
         | Commands::DiscoverPrefixes { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
         }
-        Commands::CompatProbe { endpoint_url, .. } => {
-            if profiles::endpoint_url_has_template_placeholder(endpoint_url) {
-                warnings.push(format!(
-                    "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
-                    endpoint_url
-                ));
-            }
+        Commands::CompatProbe { endpoint_url, .. }
+            if profiles::endpoint_url_has_template_placeholder(endpoint_url) =>
+        {
+            warnings.push(format!(
+                "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
+                endpoint_url
+            ));
         }
         _ => {}
     }
