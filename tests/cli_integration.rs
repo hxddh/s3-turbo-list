@@ -1054,6 +1054,16 @@ fn test_cli_dry_run_continuation_token_is_single_chain_list() {
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["inputs"]["continuation_token"], "token-123");
+    assert!(json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item.as_str().unwrap().contains("--continuation-token") }));
+    assert!(!json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item.as_str().unwrap().contains("token-123") }));
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()

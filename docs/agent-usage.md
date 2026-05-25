@@ -91,6 +91,10 @@ Agents should treat `network` as authoritative for dry-run behavior.  Current
 dry-run reports `none: dry-run only resolves local configuration and planned
 paths`.
 
+The `command` array preserves the invoked argument shape for diagnostics, but
+sensitive option values are redacted.  Current redactions include
+`--endpoint-url`, `--endpoint`, and `--continuation-token` values.
+
 Agents should also inspect `warnings`.  For example, a warning that `--profile`
 is only an endpoint compatibility preset means credentials still come from
 `AWS_PROFILE` or the standard AWS SDK credential chain.
@@ -145,6 +149,10 @@ The manifest includes:
 The `metrics` object includes data-map counters such as received batches,
 received objects, streamed rows, unique prefixes, Parquet rows, KS entries,
 total bytes, top prefixes, fatal listing errors, and output write errors.
+
+The manifest `command` array uses the same sensitive value redaction as dry-run
+plans.  Use `inputs`, `outputs`, and `config_source` for exact structured run
+details instead of trying to recover secret-adjacent values from `command`.
 
 Use `--summary-only` when an agent needs aggregate object count, byte count, or
 top-prefix distribution without writing Parquet/KS artifacts.  This is not a

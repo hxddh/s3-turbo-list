@@ -662,12 +662,26 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
         let line = match format {
-            ListTextOutputFormat::Tsv => format!(
-                "{}\t{}\t{}\n",
-                tsv_escape(key.as_str()),
-                props.size(),
-                props.last_modified()
-            ),
+            ListTextOutputFormat::Tsv => {
+                let key = tsv_escape(key.as_str());
+                if writer.write_all(key.as_bytes()).await.is_err()
+                    || writer.write_all(b"\t").await.is_err()
+                    || writer
+                        .write_all(props.size().to_string().as_bytes())
+                        .await
+                        .is_err()
+                    || writer.write_all(b"\t").await.is_err()
+                    || writer
+                        .write_all(props.last_modified().to_string().as_bytes())
+                        .await
+                        .is_err()
+                    || writer.write_all(b"\n").await.is_err()
+                {
+                    log::error!("Stdout write error");
+                    return false;
+                }
+                continue;
+            }
             ListTextOutputFormat::Ndjson => {
                 let row = NdjsonRow {
                     k: key.as_str(),
@@ -675,7 +689,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
                     m: props.last_modified(),
                 };
                 match serde_json::to_string(&row) {
-                    Ok(rendered) => format!("{}\n", rendered),
+                    Ok(rendered) => rendered,
                     Err(e) => {
                         log::error!("NDJSON serialization error for '{}': {}", key, e);
                         return false;
@@ -687,6 +701,12 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         if let Err(e) = writer.write_all(line.as_bytes()).await {
             log::error!("Stdout write error: {}", e);
             return false;
+        }
+        if format == ListTextOutputFormat::Ndjson {
+            if let Err(e) = writer.write_all(b"\n").await {
+                log::error!("Stdout write error: {}", e);
+                return false;
+            }
         }
     }
 

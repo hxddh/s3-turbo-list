@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod auto_hints;
 pub mod checkpoint; // CheckpointIdentity, CheckpointJournal, checkpoint_path
+pub mod compat_probe;
 pub mod config;
 pub mod core; // ObjectKey, ObjectProps, MatchResult, KeySpaceHints, GlobalState, DataMapContext, MonContext, S3TaskContext
 pub mod data_map; // PrefixMap, ObjectMap, data_map_task

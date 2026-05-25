@@ -778,6 +778,21 @@ fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
         manifest_json["config_source"]["loaded_config_kind"],
         "explicit"
     );
+    assert!(manifest_json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "--endpoint-url"));
+    assert!(!manifest_json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some(server.endpoint().as_str())));
+    assert!(!manifest_json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("seed-token")));
     assert!(manifest_json["config_source"]["cli_overrides"]
         .as_array()
         .unwrap()

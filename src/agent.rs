@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const AGENT_SCHEMA_VERSION: &str = "s3-turbo-list.agent.v1";
+const REDACTED_ARG_VALUE: &str = "<redacted>";
+const SENSITIVE_VALUE_FLAGS: &[&str] = &["--continuation-token", "--endpoint-url", "--endpoint"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -21,6 +23,49 @@ pub enum ExitCode {
     OutputWrite = 5,
     DataValidation = 6,
     Interrupted = 7,
+}
+
+pub fn redacted_command_args() -> Vec<String> {
+    redact_command_args(std::env::args())
+}
+
+pub fn redact_command_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut redacted = Vec::new();
+    let mut redact_next = false;
+
+    for arg in args {
+        let arg = arg.into();
+        if redact_next {
+            redacted.push(REDACTED_ARG_VALUE.to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((flag, _value)) = arg.split_once('=') {
+            if is_sensitive_value_flag(flag) {
+                redacted.push(format!("{}={}", flag, REDACTED_ARG_VALUE));
+                continue;
+            }
+        }
+
+        if is_sensitive_value_flag(&arg) {
+            redacted.push(arg);
+            redact_next = true;
+            continue;
+        }
+
+        redacted.push(arg);
+    }
+
+    redacted
+}
+
+fn is_sensitive_value_flag(arg: &str) -> bool {
+    SENSITIVE_VALUE_FLAGS.contains(&arg)
 }
 
 impl ExitCode {
@@ -880,4 +925,35 @@ pub fn write_json_file<T: Serialize>(path: &str, value: &T) -> Result<(), String
 
 pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_command_args;
+
+    #[test]
+    fn redacts_sensitive_command_values() {
+        let args = redact_command_args([
+            "s3-turbo-list",
+            "--endpoint-url",
+            "https://account.example.com",
+            "--continuation-token=token-123",
+            "list",
+            "--bucket",
+            "bucket",
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                "s3-turbo-list",
+                "--endpoint-url",
+                "<redacted>",
+                "--continuation-token=<redacted>",
+                "list",
+                "--bucket",
+                "bucket",
+            ]
+        );
+    }
 }

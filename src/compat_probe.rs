@@ -1,0 +1,496 @@
+use crate::config::S3TurboConfig;
+use crate::trace::{S3CompatEvent, S3TraceWriter, StderrTraceWriter};
+use serde::Serialize;
+use std::time::Instant;
+
+#[derive(Debug, Serialize)]
+pub struct CompatProbeReport {
+    pub endpoint_url: String,
+    pub region: String,
+    pub bucket: String,
+    pub addressing_style: String,
+    pub tests: Vec<ProbeTestResult>,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProbeTestResult {
+    pub test: String,
+    pub status: String,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_continuation_token_present: Option<bool>,
+}
+
+pub async fn run_compat_probe(
+    endpoint_url: &str,
+    region: &str,
+    bucket: &str,
+    addressing_style: &str,
+    output: Option<&str>,
+    cfg: &S3TurboConfig,
+) {
+    let trace_writer: Box<dyn S3TraceWriter> = Box::new(StderrTraceWriter);
+
+    let loader = aws_config::from_env()
+        .retry_config(
+            aws_config::retry::RetryConfig::standard()
+                .with_max_attempts(cfg.s3.max_attempts)
+                .with_initial_backoff(std::time::Duration::from_secs(cfg.s3.initial_backoff_secs)),
+        )
+        .timeout_config(
+            aws_config::timeout::TimeoutConfigBuilder::new()
+                .connect_timeout(std::time::Duration::from_secs(cfg.s3.connect_timeout_secs))
+                .operation_timeout(std::time::Duration::from_secs(
+                    cfg.s3.operation_timeout_secs,
+                ))
+                .read_timeout(std::time::Duration::from_secs(
+                    cfg.s3.operation_timeout_secs,
+                ))
+                .operation_attempt_timeout(std::time::Duration::from_secs(
+                    cfg.s3.operation_timeout_secs,
+                ))
+                .build(),
+        );
+    let config = loader.load().await;
+    let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
+    s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
+    s3_cfg = s3_cfg.endpoint_url(endpoint_url.to_owned());
+    if addressing_style == "path" {
+        s3_cfg = s3_cfg.force_path_style(true);
+    }
+    let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
+    let mut results: Vec<ProbeTestResult> = Vec::new();
+
+    let (res, evt) = timed_s3_call(
+        || async { client.head_bucket().bucket(bucket).send().await },
+        "HeadBucket",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(probe_result_from("HeadBucket", res, evt));
+
+    let (res, evt) = timed_s3_call(
+        || async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1)
+                .send()
+                .await
+        },
+        "ListObjectsV2 (max-keys=1)",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(probe_result_from("ListObjectsV2 (max-keys=1)", res, evt));
+
+    let (res, evt) = timed_s3_call(
+        || async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix("")
+                .max_keys(1)
+                .send()
+                .await
+        },
+        "ListObjectsV2 with prefix",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(probe_result_from("ListObjectsV2 with prefix", res, evt));
+
+    let (res, evt) = timed_s3_call(
+        || async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .delimiter("/")
+                .max_keys(1)
+                .send()
+                .await
+        },
+        "ListObjectsV2 with delimiter",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(probe_result_from("ListObjectsV2 with delimiter", res, evt));
+
+    let (res, evt) = timed_s3_call(
+        || async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+                .max_keys(1)
+                .send()
+                .await
+        },
+        "ListObjectsV2 (encoding-type=url)",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(probe_result_from(
+        "ListObjectsV2 (encoding-type=url)",
+        res,
+        evt,
+    ));
+
+    let (res, mut evt) = timed_s3_call(
+        || async {
+            let resp = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(3)
+                .send()
+                .await?;
+            Ok::<
+                _,
+                aws_sdk_s3::error::SdkError<
+                    aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+                >,
+            >(resp)
+        },
+        "ListObjectsV2 pagination check",
+        endpoint_url,
+        region,
+        bucket,
+        addressing_style,
+        trace_writer.as_ref(),
+        None,
+    )
+    .await;
+    results.push(
+        pagination_probe_result(
+            &client,
+            endpoint_url,
+            region,
+            bucket,
+            addressing_style,
+            trace_writer.as_ref(),
+            res,
+            &mut evt,
+        )
+        .await,
+    );
+
+    let error_count = results.iter().filter(|r| r.status == "error").count();
+    let overall = if error_count == 0 {
+        "compatible"
+    } else if error_count < results.len() {
+        "partial"
+    } else {
+        "incompatible"
+    };
+
+    let report = CompatProbeReport {
+        endpoint_url: endpoint_url.to_string(),
+        region: region.to_string(),
+        bucket: bucket.to_string(),
+        addressing_style: addressing_style.to_string(),
+        tests: results,
+        overall_status: overall.to_string(),
+    };
+
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    if let Some(out_path) = output {
+        std::fs::write(out_path, &json).expect("Failed to write compat-probe report");
+        println!("Compat-probe report written to {}", out_path);
+    } else {
+        println!("{}", json);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pagination_probe_result(
+    client: &aws_sdk_s3::Client,
+    endpoint_url: &str,
+    region: &str,
+    bucket: &str,
+    addressing_style: &str,
+    trace_writer: &dyn S3TraceWriter,
+    res: Result<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+        aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
+    >,
+    evt: &mut S3CompatEvent,
+) -> ProbeTestResult {
+    match &res {
+        Ok(resp) => {
+            let key_count = resp.key_count().unwrap_or(0);
+            let is_truncated = resp.is_truncated().unwrap_or(false);
+            let content_count = resp.contents().len() as i32;
+            let next_token = resp.next_continuation_token().map(|t| t.to_string());
+            evt.key_count = Some(key_count);
+            evt.contents_count = Some(content_count);
+            evt.is_truncated = is_truncated;
+            evt.next_continuation_token = next_token.clone();
+            evt.next_continuation_token_present = Some(next_token.is_some());
+            if !is_truncated && content_count < 3 {
+                ProbeTestResult {
+                    test: "ListObjectsV2 pagination check".to_string(),
+                    status: "skipped".to_string(),
+                    latency_ms: evt.latency_ms,
+                    http_status: Some(200),
+                    s3_error_code: None,
+                    error_message: Some(format!(
+                        "insufficient_objects: only {} objects; need >= max_keys (3) to test pagination",
+                        content_count
+                    )),
+                    request_id: evt.request_id.clone(),
+                    is_truncated: Some(is_truncated),
+                    key_count: Some(key_count),
+                    contents_count: Some(content_count),
+                    next_continuation_token_present: Some(false),
+                }
+            } else if is_truncated {
+                pagination_second_page_result(
+                    client,
+                    endpoint_url,
+                    region,
+                    bucket,
+                    addressing_style,
+                    trace_writer,
+                    evt,
+                    key_count,
+                    content_count,
+                    next_token,
+                )
+                .await
+            } else {
+                let mut result =
+                    probe_result_from::<
+                        (),
+                        aws_sdk_s3::error::SdkError<
+                            aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+                        >,
+                    >("ListObjectsV2 pagination check", Ok(()), evt.clone());
+                result.is_truncated = Some(is_truncated);
+                result.key_count = Some(key_count);
+                result.contents_count = Some(content_count);
+                result.next_continuation_token_present = Some(false);
+                result
+            }
+        }
+        Err(_) => probe_result_from("ListObjectsV2 pagination check", res, evt.clone()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pagination_second_page_result(
+    client: &aws_sdk_s3::Client,
+    endpoint_url: &str,
+    region: &str,
+    bucket: &str,
+    addressing_style: &str,
+    trace_writer: &dyn S3TraceWriter,
+    evt: &S3CompatEvent,
+    key_count: i32,
+    content_count: i32,
+    next_token: Option<String>,
+) -> ProbeTestResult {
+    let is_truncated = evt.is_truncated;
+    match next_token {
+        Some(token) => {
+            let (second_res, second_evt) = timed_s3_call(
+                || {
+                    let token_for_request = token.clone();
+                    async move {
+                        client
+                            .list_objects_v2()
+                            .bucket(bucket)
+                            .max_keys(3)
+                            .continuation_token(token_for_request)
+                            .send()
+                            .await
+                    }
+                },
+                "ListObjectsV2 pagination check (page 2)",
+                endpoint_url,
+                region,
+                bucket,
+                addressing_style,
+                trace_writer,
+                Some(&token),
+            )
+            .await;
+
+            match second_res {
+                Ok(second_resp) => {
+                    let second_key_count = second_resp.key_count().unwrap_or(0);
+                    let second_content_count = second_resp.contents().len() as i32;
+                    ProbeTestResult {
+                        test: "ListObjectsV2 pagination check".to_string(),
+                        status: "ok".to_string(),
+                        latency_ms: evt.latency_ms + second_evt.latency_ms,
+                        http_status: Some(200),
+                        s3_error_code: None,
+                        error_message: Some(format!(
+                            "page_1_keys={}, page_2_keys={}",
+                            content_count, second_content_count
+                        )),
+                        request_id: second_evt.request_id.clone(),
+                        is_truncated: Some(is_truncated),
+                        key_count: Some(key_count + second_key_count),
+                        contents_count: Some(content_count + second_content_count),
+                        next_continuation_token_present: Some(true),
+                    }
+                }
+                Err(e) => ProbeTestResult {
+                    test: "ListObjectsV2 pagination check".to_string(),
+                    status: "error".to_string(),
+                    latency_ms: evt.latency_ms + second_evt.latency_ms,
+                    http_status: if second_evt.http_status != 0 {
+                        Some(second_evt.http_status)
+                    } else {
+                        None
+                    },
+                    s3_error_code: second_evt.s3_error_code,
+                    error_message: Some(format!("page_2_error: {:?}", e)),
+                    request_id: second_evt.request_id,
+                    is_truncated: Some(is_truncated),
+                    key_count: Some(key_count),
+                    contents_count: Some(content_count),
+                    next_continuation_token_present: Some(true),
+                },
+            }
+        }
+        None => ProbeTestResult {
+            test: "ListObjectsV2 pagination check".to_string(),
+            status: "error".to_string(),
+            latency_ms: evt.latency_ms,
+            http_status: Some(200),
+            s3_error_code: None,
+            error_message: Some(
+                "is_truncated=true but next_continuation_token is absent".to_string(),
+            ),
+            request_id: evt.request_id.clone(),
+            is_truncated: Some(is_truncated),
+            key_count: Some(key_count),
+            contents_count: Some(content_count),
+            next_continuation_token_present: Some(false),
+        },
+    }
+}
+
+async fn timed_s3_call<F, Fut, T, E>(
+    f: F,
+    test_name: &str,
+    endpoint_url: &str,
+    region: &str,
+    bucket: &str,
+    addressing_style: &str,
+    trace_writer: &dyn S3TraceWriter,
+    continuation_token: Option<&str>,
+) -> (Result<T, E>, S3CompatEvent)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    let start = Instant::now();
+    let result = f().await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let mut event = S3CompatEvent::new(test_name, endpoint_url, bucket, "");
+    event.region = Some(region.to_string());
+    event.addressing_style = addressing_style.to_string();
+    event.latency_ms = latency_ms;
+    event.continuation_token = continuation_token.map(|token| token.to_string());
+
+    match &result {
+        Ok(_) => {
+            event.http_status = 200;
+        }
+        Err(_) => {
+            event.http_status = 0;
+            event.fatal = true;
+        }
+    }
+
+    trace_writer.write_event(event.clone());
+    (result, event)
+}
+
+fn probe_result_from<T, E: std::fmt::Debug>(
+    test_name: &str,
+    result: Result<T, E>,
+    event: S3CompatEvent,
+) -> ProbeTestResult {
+    match result {
+        Ok(_) => ProbeTestResult {
+            test: test_name.to_string(),
+            status: "ok".to_string(),
+            latency_ms: event.latency_ms,
+            http_status: if event.http_status != 0 {
+                Some(event.http_status)
+            } else {
+                Some(200)
+            },
+            s3_error_code: event.s3_error_code,
+            error_message: event.s3_error_message,
+            request_id: event.request_id,
+            is_truncated: None,
+            key_count: None,
+            contents_count: None,
+            next_continuation_token_present: None,
+        },
+        Err(e) => ProbeTestResult {
+            test: test_name.to_string(),
+            status: "error".to_string(),
+            latency_ms: event.latency_ms,
+            http_status: if event.http_status != 0 {
+                Some(event.http_status)
+            } else {
+                None
+            },
+            s3_error_code: event.s3_error_code,
+            error_message: Some(format!("{:?}", e)),
+            request_id: event.request_id,
+            is_truncated: None,
+            key_count: None,
+            contents_count: None,
+            next_continuation_token_present: None,
+        },
+    }
+}
