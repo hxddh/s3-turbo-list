@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-25
+
 ### Added
 - Dry-run plans and run manifests now redact sensitive command argument values
   such as endpoint URLs and continuation tokens while preserving the command
