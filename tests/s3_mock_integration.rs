@@ -166,7 +166,7 @@ fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
 fn write_response(stream: &mut TcpStream, response: MockResponse) {
     let body = response.body.as_bytes();
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nx-amz-request-id: mock-request\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nx-amz-request-id: mock-request\r\nx-amz-id-2: mock-request-2\r\nConnection: close\r\n\r\n",
         response.status,
         response.reason,
         body.len()
@@ -925,7 +925,9 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     assert!(tests.iter().any(|test| {
         test["http_status"] == 501
             && test["s3_error_code"] == "NotImplemented"
+            && test["error_kind"] == "service"
             && test["request_id"] == "mock-request"
+            && test["request_id_2"] == "mock-request-2"
     }));
 }
 

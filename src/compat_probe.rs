@@ -40,7 +40,11 @@ pub struct ProbeTestResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id_2: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,7 +290,9 @@ async fn pagination_probe_result(
                         "insufficient_objects: only {} objects; need >= max_keys (3) to test pagination",
                         content_count
                     )),
+                    error_kind: None,
                     request_id: evt.request_id.clone(),
+                    request_id_2: evt.request_id_2.clone(),
                     is_truncated: Some(is_truncated),
                     key_count: Some(key_count),
                     contents_count: Some(content_count),
@@ -378,7 +384,9 @@ async fn pagination_second_page_result(
                             "page_1_keys={}, page_2_keys={}",
                             content_count, second_content_count
                         )),
+                        error_kind: None,
                         request_id: second_evt.request_id.clone(),
+                        request_id_2: second_evt.request_id_2.clone(),
                         is_truncated: Some(is_truncated),
                         key_count: Some(key_count + second_key_count),
                         contents_count: Some(content_count + second_content_count),
@@ -396,7 +404,9 @@ async fn pagination_second_page_result(
                     },
                     s3_error_code: second_evt.s3_error_code,
                     error_message: Some(format!("page_2_error: {:?}", e)),
+                    error_kind: e.error_kind().map(str::to_string),
                     request_id: second_evt.request_id,
+                    request_id_2: second_evt.request_id_2,
                     is_truncated: Some(is_truncated),
                     key_count: Some(key_count),
                     contents_count: Some(content_count),
@@ -413,7 +423,9 @@ async fn pagination_second_page_result(
             error_message: Some(
                 "is_truncated=true but next_continuation_token is absent".to_string(),
             ),
+            error_kind: Some("pagination".to_string()),
             request_id: evt.request_id.clone(),
+            request_id_2: evt.request_id_2.clone(),
             is_truncated: Some(is_truncated),
             key_count: Some(key_count),
             contents_count: Some(content_count),
@@ -462,7 +474,7 @@ where
     (result, event)
 }
 
-fn probe_result_from<T, E: std::fmt::Debug>(
+fn probe_result_from<T, E: ProbeErrorMetadata + std::fmt::Debug>(
     test_name: &str,
     result: Result<T, E>,
     event: S3CompatEvent,
@@ -479,7 +491,9 @@ fn probe_result_from<T, E: std::fmt::Debug>(
             },
             s3_error_code: event.s3_error_code,
             error_message: event.s3_error_message,
+            error_kind: None,
             request_id: event.request_id,
+            request_id_2: event.request_id_2,
             is_truncated: None,
             key_count: None,
             contents_count: None,
@@ -496,7 +510,9 @@ fn probe_result_from<T, E: std::fmt::Debug>(
             },
             s3_error_code: event.s3_error_code,
             error_message: Some(format!("{:?}", e)),
+            error_kind: e.error_kind().map(str::to_string),
             request_id: event.request_id,
+            request_id_2: event.request_id_2,
             is_truncated: None,
             key_count: None,
             contents_count: None,
@@ -507,6 +523,7 @@ fn probe_result_from<T, E: std::fmt::Debug>(
 
 trait ProbeErrorMetadata {
     fn apply_to_event(&self, event: &mut S3CompatEvent);
+    fn error_kind(&self) -> Option<&'static str>;
 }
 
 impl<E> ProbeErrorMetadata
@@ -529,6 +546,17 @@ where
             }
             _ => {}
         }
+    }
+
+    fn error_kind(&self) -> Option<&'static str> {
+        Some(match self {
+            SdkError::ConstructionFailure(_) => "construction",
+            SdkError::TimeoutError(_) => "timeout",
+            SdkError::DispatchFailure(_) => "dispatch",
+            SdkError::ResponseError(_) => "response",
+            SdkError::ServiceError(_) => "service",
+            _ => "unknown",
+        })
     }
 }
 
@@ -555,7 +583,9 @@ mod tests {
             http_status: Some(200),
             s3_error_code: None,
             error_message: None,
+            error_kind: None,
             request_id: None,
+            request_id_2: None,
             is_truncated: None,
             key_count: None,
             contents_count: None,

@@ -3,6 +3,7 @@ use log::info;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -661,6 +662,8 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
+    let mut out = Vec::with_capacity(batch.len().saturating_mul(96).min(1024 * 1024));
+
     for (key, props) in batch {
         if props.final_status_check() == MatchResult::Ignore {
             continue;
@@ -671,26 +674,21 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         stats.streamed_rows += 1;
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
-        let line = match format {
+        match format {
             ListTextOutputFormat::Tsv => {
                 let key = tsv_escape(key.as_str());
-                if writer.write_all(key.as_bytes()).await.is_err()
-                    || writer.write_all(b"\t").await.is_err()
-                    || writer
-                        .write_all(props.size().to_string().as_bytes())
-                        .await
-                        .is_err()
-                    || writer.write_all(b"\t").await.is_err()
-                    || writer
-                        .write_all(props.last_modified().to_string().as_bytes())
-                        .await
-                        .is_err()
-                    || writer.write_all(b"\n").await.is_err()
+                if writeln!(
+                    &mut out,
+                    "{}\t{}\t{}",
+                    key,
+                    props.size(),
+                    props.last_modified()
+                )
+                .is_err()
                 {
-                    log::error!("Stdout write error");
+                    log::error!("TSV rendering error");
                     return false;
                 }
-                continue;
             }
             ListTextOutputFormat::Ndjson => {
                 let row = NdjsonRow {
@@ -698,25 +696,19 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
                     s: props.size(),
                     m: props.last_modified(),
                 };
-                match serde_json::to_string(&row) {
-                    Ok(rendered) => rendered,
-                    Err(e) => {
-                        log::error!("NDJSON serialization error for '{}': {}", key, e);
-                        return false;
-                    }
+                if let Err(e) = serde_json::to_writer(&mut out, &row) {
+                    log::error!("NDJSON serialization error for '{}': {}", key, e);
+                    return false;
                 }
+                out.push(b'\n');
             }
-        };
+        }
+    }
 
-        if let Err(e) = writer.write_all(line.as_bytes()).await {
+    if !out.is_empty() {
+        if let Err(e) = writer.write_all(&out).await {
             log::error!("Stdout write error: {}", e);
             return false;
-        }
-        if format == ListTextOutputFormat::Ndjson {
-            if let Err(e) = writer.write_all(b"\n").await {
-                log::error!("Stdout write error: {}", e);
-                return false;
-            }
         }
     }
 

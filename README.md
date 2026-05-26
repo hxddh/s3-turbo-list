@@ -433,6 +433,8 @@ s3-turbo-list man > s3-turbo-list.1
 The helper script `scripts/benchmark-local.sh` writes a machine-readable
 local benchmark report.  See [`docs/benchmarking.md`](docs/benchmarking.md)
 and [`docs/endpoint-profiles.md`](docs/endpoint-profiles.md).
+The `compat-probe` JSON report fields are documented in
+[`docs/compat-probe.md`](docs/compat-probe.md).
 
 The local S3 protocol mock used by integration tests is documented in
 [`docs/local-s3-mock.md`](docs/local-s3-mock.md).  It validates CLI behavior

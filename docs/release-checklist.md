@@ -54,6 +54,12 @@ cargo build
 
 All must pass with zero errors and zero unexpected warnings.
 
+GitHub Actions installs the current stable Rust toolchain during CI and release
+asset builds.  Local `cargo clippy` can lag or lead the GitHub stable toolchain;
+if a release workflow fails on a new lint, make the smallest source fix, push
+`main`, move the release tag to the fixed commit, replace the local
+linux-aarch64 asset, and rerun the release asset workflow.
+
 ## 4. Examples static QA
 
 ```bash
@@ -93,7 +99,77 @@ verification automatically.  Output lands in `dist/`.
 - [ ] `./dist/<binary> --help` runs successfully.
 - [ ] `./dist/<binary> --version` prints the correct version.
 
-## 9. GitHub private repo dry run
+## 7. Create and Push the Tag
+
+```bash
+git tag -a "v${VERSION}" -m "Release v${VERSION}"
+git push origin main
+git push origin "v${VERSION}"
+```
+
+## 8. Create Release and Upload linux-aarch64
+
+On the Oracle arm64 host, upload the locally built Linux ARM64 binary first:
+
+```bash
+gh release create "v${VERSION}" \
+  "dist/s3-turbo-list-${VERSION}-linux-aarch64" \
+  "dist/s3-turbo-list-${VERSION}-linux-aarch64.sha256" \
+  --repo hxddh/s3-turbo-list \
+  --verify-tag \
+  --title "v${VERSION}" \
+  --notes-file /tmp/s3-turbo-list-v${VERSION}-notes.md
+```
+
+If the release already exists after a rerun or fix, replace just the local
+linux-aarch64 assets:
+
+```bash
+gh release upload "v${VERSION}" \
+  "dist/s3-turbo-list-${VERSION}-linux-aarch64" \
+  "dist/s3-turbo-list-${VERSION}-linux-aarch64.sha256" \
+  --repo hxddh/s3-turbo-list \
+  --clobber
+```
+
+## 9. Build Cross-Platform Release Assets
+
+Trigger the repository workflow after the linux-aarch64 asset exists:
+
+```bash
+gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
+gh run watch --repo hxddh/s3-turbo-list --exit-status
+```
+
+The workflow builds Linux x86_64, macOS Apple Silicon, and macOS Intel assets,
+downloads the existing linux-aarch64 asset, generates the combined
+`SHA256SUMS`, verifies it, and uploads the complete release asset set.
+
+## 10. Post-Release Verification
+
+Download and verify the published assets from GitHub:
+
+```bash
+rm -rf "/tmp/s3tl-v${VERSION}-verify"
+mkdir -p "/tmp/s3tl-v${VERSION}-verify"
+gh release download "v${VERSION}" \
+  --repo hxddh/s3-turbo-list \
+  --dir "/tmp/s3tl-v${VERSION}-verify"
+cd "/tmp/s3tl-v${VERSION}-verify"
+sha256sum -c SHA256SUMS
+chmod +x "s3-turbo-list-${VERSION}-linux-aarch64"
+./"s3-turbo-list-${VERSION}-linux-aarch64" --version
+./"s3-turbo-list-${VERSION}-linux-aarch64" --help >/tmp/s3tl-help.txt
+```
+
+- [ ] Release is not draft and not prerelease.
+- [ ] Release contains four platform binaries plus `SHA256SUMS`.
+- [ ] `sha256sum -c SHA256SUMS` reports `OK` for all four binaries.
+- [ ] Current-platform binary prints the correct version.
+- [ ] Current-platform binary `--help` runs without cloud access.
+- [ ] `main`, `origin/main`, and the release tag point to the intended commit.
+
+## 11. GitHub private repo dry run
 
 Before pushing to a public repository:
 
@@ -101,24 +177,3 @@ Before pushing to a public repository:
 - [ ] Push the release branch.
 - [ ] Verify CI passes on the private repo.
 - [ ] Download the CI artifact and verify the binary runs.
-
-## 10. Tag creation
-
-```bash
-git tag -a "v${VERSION}" -m "s3-turbo-list v${VERSION}"
-git push origin "v${VERSION}"
-```
-
-## 11. GitHub release draft
-
-- [ ] Create a GitHub Release from the tag.
-- [ ] Attach the binary and checksum file.
-- [ ] Copy the relevant section from `CHANGELOG.md` into the release notes.
-
-## 12. Post-release verification
-
-- [ ] Download the release binary from GitHub.
-- [ ] Verify checksum matches.
-- [ ] Run `s3-turbo-list --version`.
-- [ ] Run `s3-turbo-list --help` (no cloud endpoints).
-- [ ] Confirm the version string in `Cargo.toml` matches the tag.

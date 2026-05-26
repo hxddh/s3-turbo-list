@@ -25,6 +25,12 @@ echo ""
 echo "--- Rust ---"
 echo "rustc:   $(rustc --version 2>/dev/null || echo 'NOT FOUND')"
 echo "cargo:   $(cargo --version 2>/dev/null || echo 'NOT FOUND')"
+if [ -f "rust-toolchain.toml" ] || [ -f "rust-toolchain" ]; then
+  echo "toolchain file: present"
+else
+  echo "toolchain file: none"
+  echo "note:    CI release workflows install the current stable toolchain; local clippy can drift from GitHub stable."
+fi
 
 # ── C compilers ────────────────────────────────────────────
 echo ""

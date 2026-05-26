@@ -63,7 +63,8 @@ report.
 - `profiles show` and `profiles list` are local-only commands.
 - `compat-probe` is still the explicit command for real endpoint validation.
 - `compat-probe` reports structured HTTP status, S3 error code, and request ID
-  metadata when the AWS SDK exposes those values for service errors.
+  metadata when the AWS SDK exposes those values for service errors.  See
+  [`compat-probe`](compat-probe.md) for the report field contract.
 - R2, B2, and OSS presets are documented defaults, not a claim of full project
   validation.
 - The BOS profile does not enable a default pagination workaround.

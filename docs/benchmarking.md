@@ -30,6 +30,10 @@ COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
 OUTPUT_FORMAT=ndjson ./scripts/benchmark-local.sh
 ```
 
+For stdout formatter changes, run each format at least three times and compare
+medians against the previous release binary.  This keeps single-run CPU noise
+from driving release decisions.
+
 `--output-format parquet` measures the Parquet plus KeySpace streaming path.
 `--output-format tsv` and `--output-format ndjson` measure the list stdout row
 formatters by writing rows to a temporary local file, not to the terminal.
@@ -73,6 +77,8 @@ or network link is the bottleneck.
 
 The v0.1.26 release includes a local arm64 reference run in
 [`docs/validation-results/compression-benchmark-20260524.md`](validation-results/compression-benchmark-20260524.md).
+The v0.2.3 release includes a local stdout formatter reference run in
+[`docs/validation-results/output-benchmark-20260525.md`](validation-results/output-benchmark-20260525.md).
 
 ## Compression Notes
 

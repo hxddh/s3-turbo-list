@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-25
+
+### Added
+- Added a documented `compat-probe` JSON report contract, including stable
+  guidance for structured diagnostics fields.
+- `compat-probe` reports now include `error_kind` and the secondary S3 request
+  ID (`request_id_2`) when available from SDK service errors.
+- Added a v0.2.3 local stdout formatter benchmark note comparing TSV/NDJSON
+  output against the published v0.2.2 binary.
+
+### Changed
+- Reduced list TSV/NDJSON stdout hot-path write overhead by rendering each
+  received batch into a reusable byte buffer before a single async write.
+- Release documentation now reflects the actual tag, linux-aarch64 upload,
+  cross-platform asset workflow, and post-release verification process.
+- The release environment checker now notes whether the repo pins a Rust
+  toolchain and documents that GitHub release workflows use current stable.
+
 ## [0.2.2] - 2026-05-25
 
 ### Fixed
