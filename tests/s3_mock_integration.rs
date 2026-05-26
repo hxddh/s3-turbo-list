@@ -922,13 +922,20 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     assert_eq!(report["overall_status"], "incompatible");
     let tests = report["tests"].as_array().unwrap();
     assert!(tests.iter().all(|test| test["status"] == "error"));
-    assert!(tests.iter().any(|test| {
-        test["http_status"] == 501
-            && test["s3_error_code"] == "NotImplemented"
-            && test["error_kind"] == "service"
-            && test["request_id"] == "mock-request"
-            && test["request_id_2"] == "mock-request-2"
-    }));
+    let service_error = tests
+        .iter()
+        .find(|test| test["s3_error_code"] == "NotImplemented")
+        .expect("compat-probe should expose a modeled S3 service error");
+    assert_eq!(service_error["status"], "error");
+    assert_eq!(service_error["http_status"], 501);
+    assert_eq!(service_error["s3_error_code"], "NotImplemented");
+    assert_eq!(service_error["error_kind"], "service");
+    assert_eq!(service_error["request_id"], "mock-request");
+    assert_eq!(service_error["request_id_2"], "mock-request-2");
+    assert!(service_error
+        .as_object()
+        .unwrap()
+        .contains_key("error_message"));
 }
 
 #[test]

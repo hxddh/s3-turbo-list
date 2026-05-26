@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-26
+
+### Added
+- Added `scripts/verify-release-assets.sh` to verify a published GitHub
+  release's asset set, combined `SHA256SUMS`, and current-platform binary
+  locally without contacting S3 endpoints.
+- Added a minimal `compat-probe` JSON report example covering success and
+  modeled service-error diagnostics.
+
+### Changed
+- Split the release asset workflow into a single Linux source-validation job
+  and platform-specific release build jobs to avoid repeating the full test
+  suite on every asset platform.
+- Expanded release documentation with workflow step inspection and dereferenced
+  annotated tag verification.
+- Documented the v0.2.3 stdout formatter benchmark gains in the benchmarking
+  guide.
+
+### Fixed
+- Strengthened compat-probe integration coverage for the stable diagnostic
+  fields `http_status`, `s3_error_code`, `error_kind`, `request_id`, and
+  `request_id_2`.
+
 ## [0.2.3] - 2026-05-25
 
 ### Added

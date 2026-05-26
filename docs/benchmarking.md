@@ -79,6 +79,11 @@ The v0.1.26 release includes a local arm64 reference run in
 [`docs/validation-results/compression-benchmark-20260524.md`](validation-results/compression-benchmark-20260524.md).
 The v0.2.3 release includes a local stdout formatter reference run in
 [`docs/validation-results/output-benchmark-20260525.md`](validation-results/output-benchmark-20260525.md).
+In that run, the v0.2.3 batch-buffered stdout path improved median local TSV
+formatter time by about 8.2% and NDJSON formatter time by about 9.4% versus the
+published v0.2.2 binary.  These numbers isolate local rendering and file
+output; real endpoint latency or network throughput can dominate end-to-end
+runtime.
 
 ## Compression Notes
 

@@ -90,10 +90,10 @@ applies to `--release`.
 
 ```
 dist/
-├── s3-turbo-list-0.2.3-linux-x86_64
-├── s3-turbo-list-0.2.3-linux-x86_64.sha256
-├── s3-turbo-list-0.2.3-linux-aarch64
-└── s3-turbo-list-0.2.3-linux-aarch64.sha256
+├── s3-turbo-list-0.2.4-linux-x86_64
+├── s3-turbo-list-0.2.4-linux-x86_64.sha256
+├── s3-turbo-list-0.2.4-linux-aarch64
+└── s3-turbo-list-0.2.4-linux-aarch64.sha256
 ```
 
 ## Cross-compilation
@@ -109,8 +109,8 @@ TARGET=x86_64-unknown-linux-gnu BUILD_MODE=default ./scripts/build-release.sh
 After the build completes, verify the binary locally (no cloud endpoints):
 
 ```bash
-./dist/s3-turbo-list-0.2.3-linux-aarch64 --version
-./dist/s3-turbo-list-0.2.3-linux-aarch64 --help
+./dist/s3-turbo-list-0.2.4-linux-aarch64 --version
+./dist/s3-turbo-list-0.2.4-linux-aarch64 --help
 ```
 
 ## What NOT to do
@@ -128,3 +128,4 @@ After the build completes, verify the binary locally (no cloud endpoints):
 - [`docs/release-checklist.md`](release-checklist.md) — full release process.
 - [`scripts/check-release-env.sh`](../scripts/check-release-env.sh) — environment checker.
 - [`scripts/build-release.sh`](../scripts/build-release.sh) — release build script.
+- [`scripts/verify-release-assets.sh`](../scripts/verify-release-assets.sh) — published release asset verifier.

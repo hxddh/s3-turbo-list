@@ -141,25 +141,26 @@ gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION
 gh run watch --repo hxddh/s3-turbo-list --exit-status
 ```
 
-The workflow builds Linux x86_64, macOS Apple Silicon, and macOS Intel assets,
+The workflow first validates the release source once on Linux, then builds
+Linux x86_64, macOS Apple Silicon, and macOS Intel assets.  The finalize job
 downloads the existing linux-aarch64 asset, generates the combined
 `SHA256SUMS`, verifies it, and uploads the complete release asset set.
+
+If a workflow appears stuck, inspect individual job steps:
+
+```bash
+gh run view "$RUN_ID" \
+  --repo hxddh/s3-turbo-list \
+  --json status,conclusion,jobs
+```
 
 ## 10. Post-Release Verification
 
 Download and verify the published assets from GitHub:
 
 ```bash
-rm -rf "/tmp/s3tl-v${VERSION}-verify"
-mkdir -p "/tmp/s3tl-v${VERSION}-verify"
-gh release download "v${VERSION}" \
-  --repo hxddh/s3-turbo-list \
-  --dir "/tmp/s3tl-v${VERSION}-verify"
-cd "/tmp/s3tl-v${VERSION}-verify"
-sha256sum -c SHA256SUMS
-chmod +x "s3-turbo-list-${VERSION}-linux-aarch64"
-./"s3-turbo-list-${VERSION}-linux-aarch64" --version
-./"s3-turbo-list-${VERSION}-linux-aarch64" --help >/tmp/s3tl-help.txt
+./scripts/verify-release-assets.sh "v${VERSION}"
+git rev-parse main origin/main "v${VERSION}^{}"
 ```
 
 - [ ] Release is not draft and not prerelease.
@@ -167,7 +168,8 @@ chmod +x "s3-turbo-list-${VERSION}-linux-aarch64"
 - [ ] `sha256sum -c SHA256SUMS` reports `OK` for all four binaries.
 - [ ] Current-platform binary prints the correct version.
 - [ ] Current-platform binary `--help` runs without cloud access.
-- [ ] `main`, `origin/main`, and the release tag point to the intended commit.
+- [ ] `main`, `origin/main`, and the dereferenced release tag point to the
+      intended commit.
 
 ## 11. GitHub private repo dry run
 

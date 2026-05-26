@@ -58,6 +58,39 @@ left to the probe so transport failures remain part of the diagnostic report.
 | `contents_count` | integer, optional | stable | Number of object entries observed during pagination tests. |
 | `next_continuation_token_present` | boolean, optional | stable | Whether a continuation token was present. |
 
+Minimal report shape:
+
+```json
+{
+  "endpoint_url": "https://example.invalid",
+  "region": "us-east-1",
+  "bucket": "my-bucket",
+  "addressing_style": "path",
+  "tests": [
+    {
+      "test": "HeadBucket",
+      "status": "ok",
+      "latency_ms": 42,
+      "http_status": 200,
+      "request_id": "REQ123",
+      "request_id_2": "EXTENDED123"
+    },
+    {
+      "test": "ListObjectsV2 basic",
+      "status": "error",
+      "latency_ms": 35,
+      "http_status": 501,
+      "s3_error_code": "NotImplemented",
+      "error_kind": "service",
+      "error_message": "service-specific debug text",
+      "request_id": "REQ456",
+      "request_id_2": "EXTENDED456"
+    }
+  ],
+  "overall_status": "partial"
+}
+```
+
 `error_kind` values are SDK-level categories:
 
 | Value | Meaning |
