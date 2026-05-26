@@ -629,6 +629,67 @@ fn local_mock_list_tsv_streams_rows_to_stdout_without_artifacts() {
 }
 
 #[test]
+fn local_mock_list_tsv_escapes_control_chars_and_preserves_rows() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &[
+                "plain.txt",
+                "tab\tkey.txt",
+                "line\nkey.txt",
+                "slash\\key.txt",
+            ],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "tsv".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("plain.txt\t100\t")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("tab\\tkey.txt\t101\t")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("line\\nkey.txt\t102\t")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("slash\\\\key.txt\t103\t")));
+}
+
+#[test]
 fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");
@@ -673,6 +734,7 @@ fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it()
 
     let rows: Vec<Value> = stdout
         .lines()
+        .inspect(|line| assert!(!line.is_empty()))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(rows.len(), 2);

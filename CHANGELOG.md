@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-26
+
+### Added
+- Added `scripts/benchmark-output-formats.sh` to run repeated local
+  `benchmark-local` comparisons across Parquet, TSV, and NDJSON output formats
+  and write JSON plus Markdown median summaries.
+- Added macOS test coverage back to CI and release source validation after the
+  v0.2.4 release workflow split.
+
+### Changed
+- `manifest-summary --check` now explicitly reports that Parquet row/schema
+  checks are not applicable for stdout row formats while artifact size/hash
+  checks still apply when artifacts are recorded.
+- Benchmarking documentation now covers the combined output-format benchmark
+  script.
+
+### Fixed
+- Strengthened TSV/NDJSON stdout regression coverage for row preservation,
+  TSV control-character escaping, and NDJSON line parseability.
+
 ## [0.2.4] - 2026-05-26
 
 ### Added

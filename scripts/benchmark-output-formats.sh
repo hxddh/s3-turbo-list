@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${BIN:-$ROOT/target/release/s3-turbo-list}"
+OBJECTS="${OBJECTS:-100000}"
+BATCH_SIZE="${BATCH_SIZE:-5000}"
+PREFIXES="${PREFIXES:-512}"
+RUNS="${RUNS:-3}"
+OUT="${OUT:-$ROOT/benchmark-results-output-formats.json}"
+MARKDOWN="${MARKDOWN:-${OUT%.json}.md}"
+FORMATS="${FORMATS:-parquet tsv ndjson}"
+COMPRESSION="${COMPRESSION:-zstd}"
+COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-3}"
+KEEP_ARTIFACTS="${KEEP_ARTIFACTS:-false}"
+
+if [[ ! -x "$BIN" ]]; then
+  build_mode="${BUILD_MODE:-default}"
+  arch="$(uname -m)"
+  if [[ "$build_mode" == "default" && ( "$arch" == "aarch64" || "$arch" == "arm64" ) ]] && command -v clang >/dev/null 2>&1; then
+    build_mode="clang"
+  fi
+  BUILD_MODE="$build_mode" "$ROOT/scripts/build-release.sh" >/dev/null
+  BIN="$ROOT/target/release/s3-turbo-list"
+fi
+
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/s3-turbo-list-output-formats.XXXXXX")"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+run_case() {
+  local format="$1"
+  local run="$2"
+  local output="$TMPDIR/${format}-${run}.json"
+  local args=(
+    --compression "$COMPRESSION"
+    --compression-level "$COMPRESSION_LEVEL"
+    benchmark-local
+    --objects "$OBJECTS"
+    --batch-size "$BATCH_SIZE"
+    --prefixes "$PREFIXES"
+    --output-format "$format"
+    --output "$output"
+    --json
+  )
+  if [[ "$KEEP_ARTIFACTS" == "true" ]]; then
+    args+=("--keep-artifacts")
+  fi
+  "$BIN" "${args[@]}" >/dev/null
+}
+
+for format in $FORMATS; do
+  for run in $(seq 1 "$RUNS"); do
+    run_case "$format" "$run"
+  done
+done
+
+python3 - "$TMPDIR" "$OUT" "$MARKDOWN" "$FORMATS" <<'PY'
+import json
+import pathlib
+import statistics
+import sys
+
+tmpdir = pathlib.Path(sys.argv[1])
+out_path = pathlib.Path(sys.argv[2])
+md_path = pathlib.Path(sys.argv[3])
+formats = sys.argv[4].split()
+
+def median(values):
+    return statistics.median(values) if values else 0
+
+format_results = []
+for fmt in formats:
+    runs = []
+    for path in sorted(tmpdir.glob(f"{fmt}-*.json")):
+        runs.append(json.loads(path.read_text()))
+    if not runs:
+        continue
+    format_results.append({
+        "output_format": fmt,
+        "runs": runs,
+        "median_elapsed_secs": median([item["elapsed_secs"] for item in runs]),
+        "median_objects_per_sec": median([item["objects_per_sec"] for item in runs]),
+        "median_output_mib_per_sec": median([item["output_mib_per_sec"] for item in runs]),
+        "median_output_bytes_per_object": median([item["output_bytes_per_object"] for item in runs]),
+    })
+
+first = format_results[0]["runs"][0] if format_results else {}
+summary = {
+    "schema_version": "s3-turbo-list.output-format-benchmark.v1",
+    "tool_version": first.get("tool_version"),
+    "network": "none: synthetic local data only",
+    "objects": first.get("objects", 0),
+    "batch_size": first.get("batch_size", 0),
+    "prefixes": first.get("prefixes", 0),
+    "runs_per_format": len(format_results[0]["runs"]) if format_results else 0,
+    "results": format_results,
+}
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+lines = [
+    "# Output Format Benchmark",
+    "",
+    f"- Tool version: `{summary['tool_version']}`",
+    f"- Network: `{summary['network']}`",
+    f"- Objects: `{summary['objects']}`",
+    f"- Batch size: `{summary['batch_size']}`",
+    f"- Prefixes: `{summary['prefixes']}`",
+    f"- Runs per format: `{summary['runs_per_format']}`",
+    "",
+    "| Format | Median seconds | Median objects/sec | Median output MiB/sec | Median bytes/object |",
+    "|---|---:|---:|---:|---:|",
+]
+for item in format_results:
+    lines.append(
+        "| {fmt} | {elapsed:.4f} | {ops:.0f} | {mib:.2f} | {bpo:.2f} |".format(
+            fmt=item["output_format"],
+            elapsed=item["median_elapsed_secs"],
+            ops=item["median_objects_per_sec"],
+            mib=item["median_output_mib_per_sec"],
+            bpo=item["median_output_bytes_per_object"],
+        )
+    )
+
+md_path.parent.mkdir(parents=True, exist_ok=True)
+md_path.write_text("\n".join(lines) + "\n")
+PY
+
+echo "wrote $OUT"
+echo "wrote $MARKDOWN"

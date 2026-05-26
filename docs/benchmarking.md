@@ -22,6 +22,16 @@ Or use the wrapper:
 ./scripts/benchmark-local.sh
 ```
 
+To compare all local output formats with repeated runs and median summaries:
+
+```bash
+./scripts/benchmark-output-formats.sh
+RUNS=5 OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 \
+  OUT=benchmark-results/output-formats.json \
+  MARKDOWN=benchmark-results/output-formats.md \
+  ./scripts/benchmark-output-formats.sh
+```
+
 Environment overrides:
 
 ```bash
@@ -50,6 +60,11 @@ The JSON report includes:
 - streamed rows/sec
 - data-map metrics: received batches, received objects, streamed rows,
   unique prefixes, Parquet rows, and KS entries
+
+`scripts/benchmark-output-formats.sh` writes a combined JSON summary with schema
+`s3-turbo-list.output-format-benchmark.v1` and a Markdown table containing
+median elapsed seconds, objects/sec, output MiB/sec, and bytes/object for each
+format.
 
 Real endpoint benchmarks remain intentionally opt-in.  Do not use benchmark
 scripts against AWS, BOS, R2, B2, OSS, or other cloud endpoints unless the run

@@ -682,6 +682,18 @@ fn manifest_checks(
                 }
             ),
         });
+        checks.push(ManifestCheck {
+            name: "artifact_parquet_metadata:parquet".to_string(),
+            status: "skip".to_string(),
+            message: format!(
+                "Parquet row and schema metadata checks are not applicable for {} output; recorded artifact existence, size, and sha256 checks still apply when artifacts are present",
+                if summary_only {
+                    "summary-only".to_string()
+                } else {
+                    output_format.unwrap_or("unknown").to_string()
+                }
+            ),
+        });
     }
 
     for artifact in artifacts {
@@ -854,6 +866,9 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
         ));
     } else {
         out.push_str("  Row check:    parquet_rows == streamed_rows: not applicable\n");
+        out.push_str(
+            "  Artifact check: Parquet row/schema checks are not applicable; recorded artifact size/hash checks still apply\n",
+        );
     }
     out.push_str(&format!(
         "  Check:        {}\n",

@@ -60,6 +60,10 @@ if a release workflow fails on a new lint, make the smallest source fix, push
 `main`, move the release tag to the fixed commit, replace the local
 linux-aarch64 asset, and rerun the release asset workflow.
 
+The regular CI workflow runs the full Ubuntu check suite plus a macOS test job.
+The release asset workflow repeats source validation before building platform
+artifacts, while platform build jobs remain focused on release binary creation.
+
 ## 4. Examples static QA
 
 ```bash

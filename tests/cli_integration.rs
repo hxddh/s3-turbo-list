@@ -1346,7 +1346,7 @@ fn test_cli_manifest_summary_human_and_json() {
     assert_eq!(json["check_passed"], true);
     assert_eq!(json["check"]["ok"], true);
     assert_eq!(json["check"]["errors"], 0);
-    assert_eq!(json["check"]["skipped"], 1);
+    assert_eq!(json["check"]["skipped"], 2);
     assert_eq!(json["check"]["artifacts_checked"], 0);
     assert_eq!(json["check"]["row_check"], "not_applicable");
     assert_eq!(json["check"]["exit_code_check"], "ok");
@@ -1543,6 +1543,21 @@ fn test_cli_manifest_summary_ndjson_row_check_is_not_applicable() {
     assert!(json["checks"].as_array().unwrap().iter().any(|check| {
         check["name"] == "parquet_rows_match_streamed_rows" && check["status"] == "skip"
     }));
+    assert!(json["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "artifact_parquet_metadata:parquet"
+            && check["status"] == "skip"
+            && check["message"]
+                .as_str()
+                .unwrap()
+                .contains("size, and sha256 checks still apply")
+    }));
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &["manifest-summary", manifest.to_str().unwrap(), "--check"],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Parquet row/schema checks are not applicable"));
 }
 
 #[test]

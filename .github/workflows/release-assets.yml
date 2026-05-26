@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Release tag to build assets for'
         required: true
-        default: 'v0.2.4'
+        default: 'v0.2.5'
 
 permissions:
   contents: write
@@ -18,8 +18,15 @@ env:
 
 jobs:
   validate:
-    name: Validate release source
-    runs-on: ubuntu-latest
+    name: Validate release source (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: macos
+            runner: macos-15
 
     steps:
       - uses: actions/checkout@v6
@@ -33,12 +40,15 @@ jobs:
           rustup default stable
 
       - name: cargo fmt --check
+        if: matrix.platform == 'linux'
         run: cargo fmt --check
 
       - name: cargo check
+        if: matrix.platform == 'linux'
         run: cargo check
 
       - name: cargo clippy
+        if: matrix.platform == 'linux'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test

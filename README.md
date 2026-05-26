@@ -433,6 +433,8 @@ s3-turbo-list man > s3-turbo-list.1
 The helper script `scripts/benchmark-local.sh` writes a machine-readable
 local benchmark report.  See [`docs/benchmarking.md`](docs/benchmarking.md)
 and [`docs/endpoint-profiles.md`](docs/endpoint-profiles.md).
+Use `scripts/benchmark-output-formats.sh` when comparing local Parquet, TSV,
+and NDJSON formatter throughput across repeated runs.
 The `compat-probe` JSON report fields are documented in
 [`docs/compat-probe.md`](docs/compat-probe.md).
 

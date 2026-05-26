@@ -147,6 +147,12 @@ else
   echo "MISSING: release asset verifier executable"
   CHECK_FAILED=1
 fi
+if [ -x "scripts/benchmark-output-formats.sh" ]; then
+  echo "ok:      output format benchmark script executable"
+else
+  echo "MISSING: output format benchmark script executable"
+  CHECK_FAILED=1
+fi
 
 if awk '
   $0 == "name = \"s3-turbo-list\"" { in_pkg=1; next }
