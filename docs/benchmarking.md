@@ -64,7 +64,9 @@ The JSON report includes:
 `scripts/benchmark-output-formats.sh` writes a combined JSON summary with schema
 `s3-turbo-list.output-format-benchmark.v1` and a Markdown table containing
 median elapsed seconds, objects/sec, output MiB/sec, and bytes/object for each
-format.
+format.  The report also records reproducibility metadata: git commit and dirty
+state, UTC start time, platform, Rust host triple, build profile, binary path,
+compression settings, and the local `benchmark-local` command template.
 
 Real endpoint benchmarks remain intentionally opt-in.  Do not use benchmark
 scripts against AWS, BOS, R2, B2, OSS, or other cloud endpoints unless the run

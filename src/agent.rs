@@ -988,6 +988,30 @@ mod tests {
     }
 
     #[test]
+    fn redacts_compat_probe_endpoint_value() {
+        let args = redact_command_args([
+            "s3-turbo-list",
+            "compat-probe",
+            "--endpoint",
+            "https://account.example.com",
+            "--bucket",
+            "diagnostic-bucket",
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                "s3-turbo-list",
+                "compat-probe",
+                "--endpoint",
+                "<redacted>",
+                "--bucket",
+                "diagnostic-bucket",
+            ]
+        );
+    }
+
+    #[test]
     fn redacts_value_after_sensitive_flag_at_end_safely() {
         let args = redact_command_args(["s3-turbo-list", "list", "--continuation-token"]);
 

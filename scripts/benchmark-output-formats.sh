@@ -13,6 +13,20 @@ FORMATS="${FORMATS:-parquet tsv ndjson}"
 COMPRESSION="${COMPRESSION:-zstd}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-3}"
 KEEP_ARTIFACTS="${KEEP_ARTIFACTS:-false}"
+RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+GIT_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+GIT_DIRTY="false"
+if ! git -C "$ROOT" diff --quiet --ignore-submodules -- 2>/dev/null || \
+  ! git -C "$ROOT" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+  GIT_DIRTY="true"
+fi
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+RUSTC_HOST=""
+if command -v rustc >/dev/null 2>&1; then
+  RUSTC_HOST="$(rustc -vV 2>/dev/null | awk '/^host:/ { print $2 }')"
+fi
+BUILD_PROFILE="${BUILD_PROFILE:-release}"
 
 if [[ ! -x "$BIN" ]]; then
   build_mode="${BUILD_MODE:-default}"
@@ -54,7 +68,9 @@ for format in $FORMATS; do
   done
 done
 
-python3 - "$TMPDIR" "$OUT" "$MARKDOWN" "$FORMATS" <<'PY'
+python3 - "$TMPDIR" "$OUT" "$MARKDOWN" "$FORMATS" "$BIN" "$RUN_STARTED_AT" \
+  "$GIT_COMMIT" "$GIT_DIRTY" "$OS_NAME" "$ARCH_NAME" "$RUSTC_HOST" \
+  "$BUILD_PROFILE" "$COMPRESSION" "$COMPRESSION_LEVEL" "$KEEP_ARTIFACTS" <<'PY'
 import json
 import pathlib
 import statistics
@@ -64,6 +80,17 @@ tmpdir = pathlib.Path(sys.argv[1])
 out_path = pathlib.Path(sys.argv[2])
 md_path = pathlib.Path(sys.argv[3])
 formats = sys.argv[4].split()
+bin_path = pathlib.Path(sys.argv[5])
+started_at = sys.argv[6]
+git_commit = sys.argv[7] or None
+git_dirty = sys.argv[8] == "true"
+os_name = sys.argv[9]
+arch_name = sys.argv[10]
+rustc_host = sys.argv[11] or None
+build_profile = sys.argv[12]
+compression = sys.argv[13]
+compression_level = int(sys.argv[14])
+keep_artifacts = sys.argv[15] == "true"
 
 def median(values):
     return statistics.median(values) if values else 0
@@ -85,10 +112,36 @@ for fmt in formats:
     })
 
 first = format_results[0]["runs"][0] if format_results else {}
+command_template = (
+    "{bin} --compression {compression} --compression-level {level} "
+    "benchmark-local --objects {objects} --batch-size {batch_size} "
+    "--prefixes {prefixes} --output-format <format> --output <tmp-json> --json"
+).format(
+    bin=str(bin_path),
+    compression=compression,
+    level=compression_level,
+    objects=first.get("objects", 0),
+    batch_size=first.get("batch_size", 0),
+    prefixes=first.get("prefixes", 0),
+)
+if keep_artifacts:
+    command_template += " --keep-artifacts"
 summary = {
     "schema_version": "s3-turbo-list.output-format-benchmark.v1",
     "tool_version": first.get("tool_version"),
     "network": "none: synthetic local data only",
+    "started_at": started_at,
+    "git_commit": git_commit,
+    "git_dirty": git_dirty,
+    "os": os_name,
+    "arch": arch_name,
+    "rustc_host": rustc_host,
+    "build_profile": build_profile,
+    "binary": str(bin_path),
+    "compression": compression,
+    "compression_level": compression_level,
+    "keep_artifacts": keep_artifacts,
+    "command_template": command_template,
     "objects": first.get("objects", 0),
     "batch_size": first.get("batch_size", 0),
     "prefixes": first.get("prefixes", 0),
@@ -104,6 +157,14 @@ lines = [
     "",
     f"- Tool version: `{summary['tool_version']}`",
     f"- Network: `{summary['network']}`",
+    f"- Started at: `{summary['started_at']}`",
+    f"- Git commit: `{summary['git_commit']}`",
+    f"- Git dirty: `{str(summary['git_dirty']).lower()}`",
+    f"- Platform: `{summary['os']} {summary['arch']}`",
+    f"- Rust host: `{summary['rustc_host']}`",
+    f"- Build profile: `{summary['build_profile']}`",
+    f"- Binary: `{summary['binary']}`",
+    f"- Compression: `{summary['compression']}:{summary['compression_level']}`",
     f"- Objects: `{summary['objects']}`",
     f"- Batch size: `{summary['batch_size']}`",
     f"- Prefixes: `{summary['prefixes']}`",

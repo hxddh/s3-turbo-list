@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-05-26
+
+### Added
+- Added stable `compat-probe` diagnostic codes and next-step recommendations
+  for common S3 service errors, HTTP status classes, transport failures,
+  timeouts, invalid responses, and pagination metadata inconsistencies.
+- Added reproducibility metadata to `scripts/benchmark-output-formats.sh`
+  reports, including git commit, dirty state, platform, Rust host, build
+  profile, binary path, compression settings, timestamp, and command template.
+
+### Fixed
+- Strengthened stdout row-format regression coverage for empty TSV/NDJSON
+  list results so empty buckets do not emit blank rows.
+
 ## [0.2.5] - 2026-05-26
 
 ### Added

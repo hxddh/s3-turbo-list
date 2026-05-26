@@ -42,6 +42,10 @@ pub struct ProbeTestResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id_2: Option<String>,
@@ -291,6 +295,8 @@ async fn pagination_probe_result(
                         content_count
                     )),
                     error_kind: None,
+                    diagnostic_code: None,
+                    recommendation: None,
                     request_id: evt.request_id.clone(),
                     request_id_2: evt.request_id_2.clone(),
                     is_truncated: Some(is_truncated),
@@ -385,6 +391,8 @@ async fn pagination_second_page_result(
                             content_count, second_content_count
                         )),
                         error_kind: None,
+                        diagnostic_code: None,
+                        recommendation: None,
                         request_id: second_evt.request_id.clone(),
                         request_id_2: second_evt.request_id_2.clone(),
                         is_truncated: Some(is_truncated),
@@ -393,25 +401,29 @@ async fn pagination_second_page_result(
                         next_continuation_token_present: Some(true),
                     }
                 }
-                Err(e) => ProbeTestResult {
-                    test: "ListObjectsV2 pagination check".to_string(),
-                    status: "error".to_string(),
-                    latency_ms: evt.latency_ms + second_evt.latency_ms,
-                    http_status: if second_evt.http_status != 0 {
-                        Some(second_evt.http_status)
-                    } else {
-                        None
-                    },
-                    s3_error_code: second_evt.s3_error_code,
-                    error_message: Some(format!("page_2_error: {:?}", e)),
-                    error_kind: e.error_kind().map(str::to_string),
-                    request_id: second_evt.request_id,
-                    request_id_2: second_evt.request_id_2,
-                    is_truncated: Some(is_truncated),
-                    key_count: Some(key_count),
-                    contents_count: Some(content_count),
-                    next_continuation_token_present: Some(true),
-                },
+                Err(e) => {
+                    let http_status = http_status_option(second_evt.http_status);
+                    let error_kind = e.error_kind();
+                    let (diagnostic_code, recommendation) =
+                        diagnostic_for(error_kind, http_status, second_evt.s3_error_code.as_deref());
+                    ProbeTestResult {
+                        test: "ListObjectsV2 pagination check".to_string(),
+                        status: "error".to_string(),
+                        latency_ms: evt.latency_ms + second_evt.latency_ms,
+                        http_status,
+                        s3_error_code: second_evt.s3_error_code,
+                        error_message: Some(format!("page_2_error: {:?}", e)),
+                        error_kind: error_kind.map(str::to_string),
+                        diagnostic_code: Some(diagnostic_code.to_string()),
+                        recommendation: Some(recommendation.to_string()),
+                        request_id: second_evt.request_id,
+                        request_id_2: second_evt.request_id_2,
+                        is_truncated: Some(is_truncated),
+                        key_count: Some(key_count),
+                        contents_count: Some(content_count),
+                        next_continuation_token_present: Some(true),
+                    }
+                }
             }
         }
         None => ProbeTestResult {
@@ -424,6 +436,11 @@ async fn pagination_second_page_result(
                 "is_truncated=true but next_continuation_token is absent".to_string(),
             ),
             error_kind: Some("pagination".to_string()),
+            diagnostic_code: Some("pagination_token_missing".to_string()),
+            recommendation: Some(
+                "Endpoint returned is_truncated=true without a continuation token; pagination is not safe for full listings"
+                    .to_string(),
+            ),
             request_id: evt.request_id.clone(),
             request_id_2: evt.request_id_2.clone(),
             is_truncated: Some(is_truncated),
@@ -492,6 +509,8 @@ fn probe_result_from<T, E: ProbeErrorMetadata + std::fmt::Debug>(
             s3_error_code: event.s3_error_code,
             error_message: event.s3_error_message,
             error_kind: None,
+            diagnostic_code: None,
+            recommendation: None,
             request_id: event.request_id,
             request_id_2: event.request_id_2,
             is_truncated: None,
@@ -499,24 +518,125 @@ fn probe_result_from<T, E: ProbeErrorMetadata + std::fmt::Debug>(
             contents_count: None,
             next_continuation_token_present: None,
         },
-        Err(e) => ProbeTestResult {
-            test: test_name.to_string(),
-            status: "error".to_string(),
-            latency_ms: event.latency_ms,
-            http_status: if event.http_status != 0 {
-                Some(event.http_status)
-            } else {
-                None
-            },
-            s3_error_code: event.s3_error_code,
-            error_message: Some(format!("{:?}", e)),
-            error_kind: e.error_kind().map(str::to_string),
-            request_id: event.request_id,
-            request_id_2: event.request_id_2,
-            is_truncated: None,
-            key_count: None,
-            contents_count: None,
-            next_continuation_token_present: None,
+        Err(e) => {
+            let http_status = http_status_option(event.http_status);
+            let error_kind = e.error_kind();
+            let (diagnostic_code, recommendation) =
+                diagnostic_for(error_kind, http_status, event.s3_error_code.as_deref());
+            ProbeTestResult {
+                test: test_name.to_string(),
+                status: "error".to_string(),
+                latency_ms: event.latency_ms,
+                http_status,
+                s3_error_code: event.s3_error_code,
+                error_message: Some(format!("{:?}", e)),
+                error_kind: error_kind.map(str::to_string),
+                diagnostic_code: Some(diagnostic_code.to_string()),
+                recommendation: Some(recommendation.to_string()),
+                request_id: event.request_id,
+                request_id_2: event.request_id_2,
+                is_truncated: None,
+                key_count: None,
+                contents_count: None,
+                next_continuation_token_present: None,
+            }
+        }
+    }
+}
+
+fn http_status_option(status: u16) -> Option<u16> {
+    if status != 0 {
+        Some(status)
+    } else {
+        None
+    }
+}
+
+fn diagnostic_for(
+    error_kind: Option<&str>,
+    http_status: Option<u16>,
+    s3_error_code: Option<&str>,
+) -> (&'static str, &'static str) {
+    match s3_error_code {
+        Some("SignatureDoesNotMatch") => {
+            return (
+                "signature_mismatch",
+                "Check credentials, region, endpoint URL, clock skew, and addressing style",
+            );
+        }
+        Some("InvalidAccessKeyId") | Some("AccessDenied") => {
+            return (
+                "access_denied",
+                "Check credentials, bucket permissions, and whether the selected profile is valid for this endpoint",
+            );
+        }
+        Some("NoSuchBucket") => {
+            return (
+                "bucket_not_found",
+                "Check bucket name, account/project scope, region, and addressing style",
+            );
+        }
+        Some("NotImplemented") | Some("NotSupported") => {
+            return (
+                "operation_not_supported",
+                "Endpoint does not implement this S3 operation or option; inspect which probe test failed before full listing",
+            );
+        }
+        Some("PermanentRedirect") | Some("AuthorizationHeaderMalformed") => {
+            return (
+                "region_or_endpoint_mismatch",
+                "Check region, endpoint URL, and provider-specific region requirements",
+            );
+        }
+        _ => {}
+    }
+
+    match http_status {
+        Some(301) | Some(307) | Some(308) => (
+            "redirect",
+            "Check endpoint URL, region, and whether the provider requires a different host",
+        ),
+        Some(400) => (
+            "bad_request",
+            "Check endpoint URL, region, bucket name, and addressing style",
+        ),
+        Some(401) | Some(403) => (
+            "access_denied",
+            "Check credentials, permissions, bucket policy, and provider profile selection",
+        ),
+        Some(404) => (
+            "not_found",
+            "Check bucket name, endpoint URL, region, and addressing style",
+        ),
+        Some(405) | Some(501) => (
+            "operation_not_supported",
+            "Endpoint responded but does not support this S3 operation or option",
+        ),
+        Some(status) if status >= 500 => (
+            "server_error",
+            "Endpoint returned a server-side error; retry later or check provider status/logs",
+        ),
+        _ => match error_kind {
+            Some("timeout") => (
+                "timeout",
+                "Check endpoint reachability and consider increasing connect or operation timeout settings",
+            ),
+            Some("dispatch") => (
+                "transport_failure",
+                "Check DNS, TLS certificates, proxy/firewall rules, and endpoint reachability",
+            ),
+            Some("response") => (
+                "invalid_response",
+                "Endpoint responded with data the S3 SDK could not parse; check S3 compatibility and error body format",
+            ),
+            Some("construction") => (
+                "request_construction",
+                "Check local configuration values used to construct the S3 request",
+            ),
+            _ => (
+                "unknown_error",
+                "Inspect error_message and rerun with trace diagnostics if more detail is needed",
+            ),
         },
     }
 }
@@ -573,7 +693,7 @@ fn apply_response_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::{CompatProbeReport, ProbeTestResult};
+    use super::{diagnostic_for, CompatProbeReport, ProbeTestResult};
 
     fn result(status: &str) -> ProbeTestResult {
         ProbeTestResult {
@@ -584,6 +704,8 @@ mod tests {
             s3_error_code: None,
             error_message: None,
             error_kind: None,
+            diagnostic_code: None,
+            recommendation: None,
             request_id: None,
             request_id_2: None,
             is_truncated: None,
@@ -612,5 +734,30 @@ mod tests {
             CompatProbeReport::overall_status_for(&incompatible),
             "incompatible"
         );
+    }
+
+    #[test]
+    fn diagnostic_for_prefers_s3_error_code() {
+        let (code, recommendation) =
+            diagnostic_for(Some("service"), Some(403), Some("SignatureDoesNotMatch"));
+
+        assert_eq!(code, "signature_mismatch");
+        assert!(recommendation.contains("region"));
+    }
+
+    #[test]
+    fn diagnostic_for_classifies_transport_failures_without_http_status() {
+        let (code, recommendation) = diagnostic_for(Some("dispatch"), None, None);
+
+        assert_eq!(code, "transport_failure");
+        assert!(recommendation.contains("DNS"));
+    }
+
+    #[test]
+    fn diagnostic_for_http_5xx_takes_precedence_over_response_kind() {
+        let (code, recommendation) = diagnostic_for(Some("response"), Some(502), None);
+
+        assert_eq!(code, "server_error");
+        assert!(recommendation.contains("server-side"));
     }
 }

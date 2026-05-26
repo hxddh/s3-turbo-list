@@ -763,6 +763,50 @@ fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it()
 }
 
 #[test]
+fn local_mock_list_stdout_formats_emit_no_blank_rows_for_empty_results() {
+    for format in ["tsv", "ndjson"] {
+        let server = MockS3Server::start(|request, _sequence| {
+            assert_eq!(request.method, "GET");
+            MockResponse::ok_xml(list_bucket_xml(
+                request
+                    .query
+                    .get("prefix")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                1000,
+                &[],
+                &[],
+                false,
+                None,
+            ))
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        write_fast_config(&config);
+
+        let args = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "mock-bucket".into(),
+            "--region".into(),
+            "us-east-1".into(),
+            "--output-format".into(),
+            format.into(),
+        ];
+        let (code, stdout, stderr) = run_cli(&args, dir.path());
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        assert!(stdout.is_empty(), "{format} should not emit blank rows");
+    }
+}
+
+#[test]
 fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");
@@ -992,6 +1036,11 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     assert_eq!(service_error["http_status"], 501);
     assert_eq!(service_error["s3_error_code"], "NotImplemented");
     assert_eq!(service_error["error_kind"], "service");
+    assert_eq!(service_error["diagnostic_code"], "operation_not_supported");
+    assert!(service_error["recommendation"]
+        .as_str()
+        .unwrap()
+        .contains("does not implement"));
     assert_eq!(service_error["request_id"], "mock-request");
     assert_eq!(service_error["request_id_2"], "mock-request-2");
     assert!(service_error

@@ -50,6 +50,8 @@ left to the probe so transport failures remain part of the diagnostic report.
 | `http_status` | integer, optional | stable | HTTP status when the SDK exposes one. |
 | `s3_error_code` | string, optional | stable | Modeled S3 error code, such as `AccessDenied` or `NotImplemented`. |
 | `error_kind` | string, optional | stable | SDK failure category. |
+| `diagnostic_code` | string, optional | stable | s3-turbo-list diagnostic category for the failure. |
+| `recommendation` | string, optional | stable intent | Human-readable next step associated with `diagnostic_code`. |
 | `error_message` | string, optional | unstable text | Debug/fallback error detail for humans. |
 | `request_id` | string, optional | stable | `x-amz-request-id` or equivalent. |
 | `request_id_2` | string, optional | stable | Extended S3 request ID, usually `x-amz-id-2`. |
@@ -82,6 +84,8 @@ Minimal report shape:
       "http_status": 501,
       "s3_error_code": "NotImplemented",
       "error_kind": "service",
+      "diagnostic_code": "operation_not_supported",
+      "recommendation": "Endpoint does not implement this S3 operation or option; inspect which probe test failed before full listing",
       "error_message": "service-specific debug text",
       "request_id": "REQ456",
       "request_id_2": "EXTENDED456"
@@ -103,6 +107,27 @@ Minimal report shape:
 | `pagination` | The endpoint returned inconsistent pagination metadata. |
 | `unknown` | Future SDK error variant not classified by this release. |
 
+`diagnostic_code` values are s3-turbo-list categories intended for automation
+and operator triage:
+
+| Value | Typical cause |
+|---|---|
+| `signature_mismatch` | Credentials, region, endpoint, clock skew, or addressing style do not match the provider's signing expectations. |
+| `access_denied` | Credentials are invalid or lack bucket/list permissions. |
+| `bucket_not_found` | Bucket name, account/project scope, region, or addressing style is wrong. |
+| `region_or_endpoint_mismatch` | Provider redirected the request or rejected the signing region. |
+| `operation_not_supported` | Endpoint does not support the S3 operation or option used by that probe step. |
+| `redirect` | Endpoint responded with an HTTP redirect. |
+| `bad_request` | Endpoint rejected the request shape before a more specific S3 code was available. |
+| `not_found` | Endpoint returned HTTP 404 without a modeled S3 error code. |
+| `server_error` | Endpoint returned HTTP 5xx. |
+| `timeout` | SDK timeout before a complete response. |
+| `transport_failure` | DNS, TCP, TLS, proxy, firewall, or other transport failure before HTTP metadata was available. |
+| `invalid_response` | Endpoint responded with data the S3 SDK could not parse as the expected S3 response. |
+| `request_construction` | Local SDK request construction failed before dispatch. |
+| `pagination_token_missing` | Endpoint reported truncation without a continuation token. |
+| `unknown_error` | No stable category matched. |
+
 ## Stability Guidance
 
 - Existing report fields are intended to remain backward compatible through the
@@ -110,6 +135,6 @@ Minimal report shape:
 - New diagnostic fields may be added as optional fields.
 - Missing optional fields mean the SDK or endpoint did not provide that
   metadata; missing is not the same as an empty string.
-- Automation should prefer `status`, `http_status`, `s3_error_code`, and
-  `error_kind` over parsing `error_message`.
+- Automation should prefer `status`, `http_status`, `s3_error_code`,
+  `error_kind`, and `diagnostic_code` over parsing `error_message`.
 - `error_message` is a fallback debug string and is not stable for scripts.
