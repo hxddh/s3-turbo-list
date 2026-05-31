@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-05-31
+
 ### Added
 - Added `benchmark-local --producers` and producer send-wait reporting to help
   measure local data-map channel backpressure without contacting S3 endpoints.

@@ -49,8 +49,8 @@ Medians over three runs:
 | TSV | 0.6097 | 0.3739 | -38.7% | 1,640,226 | 2,674,417 | +63.1% |
 | NDJSON | 0.5861 | 0.3341 | -43.0% | 1,706,204 | 2,992,718 | +75.4% |
 
-The candidate binary still reports tool version `0.2.6` because the release
-version has not been bumped on this branch.
+After the release-prep version bump, the candidate binary reports tool version
+`0.2.7`.
 
 ## Interpretation
 
