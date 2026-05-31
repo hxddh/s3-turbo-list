@@ -87,6 +87,11 @@ impl ObjectKey {
             })
     }
 
+    /// Borrow just the `prefix` portion of this key. Top-level objects use `"/"` as prefix.
+    pub fn prefix(&self) -> &str {
+        self.0.rsplit_once('/').map_or("/", |(p, _)| p)
+    }
+
     pub fn encode(prefix: &ObjectPrefix, name: &ObjectName) -> Self {
         if prefix == "/" {
             return Self(name.to_string());
@@ -998,6 +1003,7 @@ mod tests {
         let key = ObjectKey::from("test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "/");
+        assert_eq!(key.prefix(), "/");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "test.jpg");
@@ -1008,6 +1014,7 @@ mod tests {
         let key = ObjectKey::from("a/b/c/test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "a/b/c");
+        assert_eq!(key.prefix(), "a/b/c");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "a/b/c/test.jpg");

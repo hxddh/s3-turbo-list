@@ -418,7 +418,8 @@ s3-turbo-list cheatsheet
 ```bash
 # Synthetic local streaming-output benchmark; does not contact S3
 s3-turbo-list --compression zstd --compression-level 3 \
-  benchmark-local --objects 100000 --batch-size 5000 --output-format parquet --json
+  benchmark-local --objects 100000 --batch-size 5000 --producers 1 \
+  --output-format parquet --json
 
 # Measure the local NDJSON row formatter without contacting S3
 s3-turbo-list benchmark-local \

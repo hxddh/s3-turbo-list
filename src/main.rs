@@ -19,7 +19,7 @@ use core::RunMode;
 use log::{error, info};
 use serde::Serialize;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -484,6 +484,10 @@ enum Commands {
         #[arg(long, default_value_t = 128)]
         prefixes: usize,
 
+        /// Number of synthetic producer tasks sending into the data-map channel
+        #[arg(long, default_value_t = 1)]
+        producers: usize,
+
         /// Local output path to benchmark
         #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
         output_format: ListOutputFormat,
@@ -803,6 +807,7 @@ fn main() {
             objects,
             batch_size,
             prefixes,
+            producers,
             output_format,
             json,
             output,
@@ -812,6 +817,7 @@ fn main() {
                 *objects,
                 *batch_size,
                 *prefixes,
+                *producers,
                 *output_format,
                 *keep_artifacts,
                 &cfg,
@@ -2079,6 +2085,9 @@ struct LocalBenchmarkReport {
     objects: usize,
     batch_size: usize,
     prefixes: usize,
+    producers: usize,
+    channel_capacity: usize,
+    producer_send_wait_secs: f64,
     elapsed_secs: f64,
     objects_per_sec: f64,
     rows_per_sec: f64,
@@ -2104,6 +2113,7 @@ fn run_benchmark_local(
     objects: usize,
     batch_size: usize,
     prefixes: usize,
+    producers: usize,
     output_format: ListOutputFormat,
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
@@ -2111,6 +2121,7 @@ fn run_benchmark_local(
     let objects = objects.max(1);
     let batch_size = batch_size.max(1);
     let prefixes = prefixes.max(1);
+    let producers = producers.max(1);
     let suffix = format!(
         "{}-{}",
         std::process::id(),
@@ -2139,12 +2150,14 @@ fn run_benchmark_local(
     let output_config = cfg.output.clone();
     let parquet_path = parquet_file.display().to_string();
     let ks_path = ks_file.display().to_string();
+    let channel_capacity = cfg.channel.capacity;
+    let send_wait_nanos = Arc::new(AtomicU64::new(0));
 
     let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
 
     rt.block_on(async {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
-            cfg.channel.capacity,
+            channel_capacity,
         );
         let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
         let data_map = match output_format {
@@ -2193,32 +2206,53 @@ fn run_benchmark_local(
         };
 
         let producer_state = g_state.clone();
+        let send_wait_nanos = Arc::clone(&send_wait_nanos);
         let producer = tokio::spawn(async move {
             producer_state.list_task_start(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
             producer_state.wait_to_start().await;
-            let mut sent = 0usize;
-            while sent < objects {
-                let take = (objects - sent).min(batch_size);
-                let mut batch = Vec::with_capacity(take);
-                for offset in 0..take {
-                    let index = sent + offset;
-                    let prefix_index = index % prefixes;
-                    let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
-                    let key = core::ObjectKey::from(key_text.as_str());
-                    let mut etag = [0u8; 16];
-                    etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                    etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
-                    let props = core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
-                        1024 + (index % 4096) as u64,
-                        etag,
-                    );
-                    batch.push((key, props));
+            let mut handles = Vec::with_capacity(producers);
+            for producer_index in 0..producers {
+                let tx = tx.clone();
+                let send_wait_nanos = Arc::clone(&send_wait_nanos);
+                let start = objects.saturating_mul(producer_index) / producers;
+                let end = objects.saturating_mul(producer_index + 1) / producers;
+                handles.push(tokio::spawn(async move {
+                    let mut sent = start;
+                    while sent < end {
+                        let take = (end - sent).min(batch_size);
+                        let mut batch = Vec::with_capacity(take);
+                        for offset in 0..take {
+                            let index = sent + offset;
+                            let prefix_index = index % prefixes;
+                            let key_text =
+                                format!("prefix-{}/object-{:012}.dat", prefix_index, index);
+                            let key = core::ObjectKey::from(key_text.as_str());
+                            let mut etag = [0u8; 16];
+                            etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                            etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
+                            let props = core::ObjectProps::new_open(
+                                core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+                                1024 + (index % 4096) as u64,
+                                etag,
+                            );
+                            batch.push((key, props));
+                        }
+                        let send_started = Instant::now();
+                        if tx.send(batch).await.is_err() {
+                            break;
+                        }
+                        let waited = send_started.elapsed().as_nanos().min(u128::from(u64::MAX));
+                        send_wait_nanos.fetch_add(waited as u64, Ordering::Relaxed);
+                        sent += take;
+                    }
+                }));
+            }
+            drop(tx);
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    eprintln!("Benchmark producer worker failed: {}", e);
+                    producer_state.inc_fatal_error();
                 }
-                if tx.send(batch).await.is_err() {
-                    break;
-                }
-                sent += take;
             }
             producer_state.list_task_complete(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
         });
@@ -2235,6 +2269,7 @@ fn run_benchmark_local(
     rt.shutdown_background();
 
     let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
+    let producer_send_wait_secs = send_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
     let parquet_bytes = std::fs::metadata(&parquet_file)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -2270,6 +2305,9 @@ fn run_benchmark_local(
         objects,
         batch_size,
         prefixes,
+        producers,
+        channel_capacity,
+        producer_send_wait_secs,
         elapsed_secs,
         objects_per_sec: objects as f64 / elapsed_secs,
         rows_per_sec: metrics.streamed_rows as f64 / elapsed_secs,

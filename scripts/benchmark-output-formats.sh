@@ -6,6 +6,7 @@ BIN="${BIN:-$ROOT/target/release/s3-turbo-list}"
 OBJECTS="${OBJECTS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-5000}"
 PREFIXES="${PREFIXES:-512}"
+PRODUCERS="${PRODUCERS:-1}"
 RUNS="${RUNS:-3}"
 OUT="${OUT:-$ROOT/benchmark-results-output-formats.json}"
 MARKDOWN="${MARKDOWN:-${OUT%.json}.md}"
@@ -52,6 +53,7 @@ run_case() {
     --objects "$OBJECTS"
     --batch-size "$BATCH_SIZE"
     --prefixes "$PREFIXES"
+    --producers "$PRODUCERS"
     --output-format "$format"
     --output "$output"
     --json
@@ -70,7 +72,8 @@ done
 
 python3 - "$TMPDIR" "$OUT" "$MARKDOWN" "$FORMATS" "$BIN" "$RUN_STARTED_AT" \
   "$GIT_COMMIT" "$GIT_DIRTY" "$OS_NAME" "$ARCH_NAME" "$RUSTC_HOST" \
-  "$BUILD_PROFILE" "$COMPRESSION" "$COMPRESSION_LEVEL" "$KEEP_ARTIFACTS" <<'PY'
+  "$BUILD_PROFILE" "$COMPRESSION" "$COMPRESSION_LEVEL" "$KEEP_ARTIFACTS" \
+  "$PRODUCERS" <<'PY'
 import json
 import pathlib
 import statistics
@@ -91,6 +94,7 @@ build_profile = sys.argv[12]
 compression = sys.argv[13]
 compression_level = int(sys.argv[14])
 keep_artifacts = sys.argv[15] == "true"
+producers = int(sys.argv[16])
 
 def median(values):
     return statistics.median(values) if values else 0
@@ -115,7 +119,8 @@ first = format_results[0]["runs"][0] if format_results else {}
 command_template = (
     "{bin} --compression {compression} --compression-level {level} "
     "benchmark-local --objects {objects} --batch-size {batch_size} "
-    "--prefixes {prefixes} --output-format <format> --output <tmp-json> --json"
+    "--prefixes {prefixes} --producers {producers} "
+    "--output-format <format> --output <tmp-json> --json"
 ).format(
     bin=str(bin_path),
     compression=compression,
@@ -123,6 +128,7 @@ command_template = (
     objects=first.get("objects", 0),
     batch_size=first.get("batch_size", 0),
     prefixes=first.get("prefixes", 0),
+    producers=producers,
 )
 if keep_artifacts:
     command_template += " --keep-artifacts"
@@ -145,6 +151,7 @@ summary = {
     "objects": first.get("objects", 0),
     "batch_size": first.get("batch_size", 0),
     "prefixes": first.get("prefixes", 0),
+    "producers": first.get("producers", producers),
     "runs_per_format": len(format_results[0]["runs"]) if format_results else 0,
     "results": format_results,
 }
@@ -168,6 +175,7 @@ lines = [
     f"- Objects: `{summary['objects']}`",
     f"- Batch size: `{summary['batch_size']}`",
     f"- Prefixes: `{summary['prefixes']}`",
+    f"- Producers: `{summary['producers']}`",
     f"- Runs per format: `{summary['runs_per_format']}`",
     "",
     "| Format | Median seconds | Median objects/sec | Median output MiB/sec | Median bytes/object |",

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `benchmark-local --producers` and producer send-wait reporting to help
+  measure local data-map channel backpressure without contacting S3 endpoints.
+
+### Changed
+- Reduced list output hot-path prefix accounting overhead by borrowing object
+  prefixes, avoiding discarded object-name allocations, and using hash-based
+  prefix aggregation while preserving sorted KeySpace output.
+
 ## [0.2.6] - 2026-05-26
 
 ### Added

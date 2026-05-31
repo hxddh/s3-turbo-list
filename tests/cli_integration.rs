@@ -446,6 +446,8 @@ fn test_cli_benchmark_local_json_no_cloud() {
         "8",
         "--prefixes",
         "4",
+        "--producers",
+        "2",
         "--json",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -458,6 +460,9 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["compression_level"], 3);
     assert_eq!(json["output_format"], "parquet");
     assert_eq!(json["objects"], 32);
+    assert_eq!(json["producers"], 2);
+    assert!(json["channel_capacity"].as_u64().unwrap() > 0);
+    assert!(json["producer_send_wait_secs"].as_f64().unwrap() >= 0.0);
     assert!(json["rows_per_sec"].as_f64().unwrap() > 0.0);
     assert!(json["parquet_bytes_per_object"].as_f64().unwrap() > 0.0);
     assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);

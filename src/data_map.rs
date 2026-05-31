@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use log::info;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -45,6 +45,8 @@ struct PrefixAggregate {
     objects: usize,
     bytes: u64,
 }
+
+type PrefixStats = HashMap<String, PrefixAggregate>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListTextOutputFormat {
@@ -355,7 +357,7 @@ pub async fn data_map_task_list_streaming(
         output_config.compression_level,
     );
 
-    let mut prefix_stats: BTreeMap<String, PrefixAggregate> = BTreeMap::new();
+    let mut prefix_stats: PrefixStats = HashMap::new();
     let started_at = Instant::now();
     let write_started_at = Instant::now();
     let mut last_ts = epoch_secs();
@@ -467,7 +469,7 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
 
     info!("Data Map Task — list summary-only started");
 
-    let mut prefix_stats: BTreeMap<String, PrefixAggregate> = BTreeMap::new();
+    let mut prefix_stats: PrefixStats = HashMap::new();
     let started_at = Instant::now();
     let mut last_ts = epoch_secs();
     let mut stats = ListStreamingStats {
@@ -543,7 +545,7 @@ pub async fn data_map_task_list_text_writer<W>(
 
     info!("Data Map Task — list stdout {:?} started", format);
 
-    let mut prefix_stats: BTreeMap<String, PrefixAggregate> = BTreeMap::new();
+    let mut prefix_stats: PrefixStats = HashMap::new();
     let started_at = Instant::now();
     let mut last_ts = epoch_secs();
     let mut stats = ListStreamingStats {
@@ -630,7 +632,7 @@ pub async fn data_map_task_list_text_writer<W>(
 
 async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
-    prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &mut PrefixStats,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
 ) -> Result<(), String> {
@@ -639,8 +641,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     let mut rows = Vec::with_capacity(batch.len());
     for (key, props) in batch {
-        let (prefix, _) = key.decode();
-        record_prefix_stat(prefix_stats, prefix, props.size());
+        record_prefix_stat(prefix_stats, key.prefix(), props.size());
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
         if props.final_status_check() != MatchResult::Ignore {
@@ -655,7 +656,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     writer: &mut W,
     format: ListTextOutputFormat,
-    prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &mut PrefixStats,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
 ) -> bool {
@@ -669,8 +670,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
             continue;
         }
 
-        let (prefix, _) = key.decode();
-        record_prefix_stat(prefix_stats, prefix, props.size());
+        record_prefix_stat(prefix_stats, key.prefix(), props.size());
         stats.streamed_rows += 1;
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
@@ -716,7 +716,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 }
 
 fn ingest_list_summary_batch(
-    prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &mut PrefixStats,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
 ) {
@@ -725,8 +725,7 @@ fn ingest_list_summary_batch(
 
     for (key, props) in batch {
         if props.final_status_check() != MatchResult::Ignore {
-            let (prefix, _) = key.decode();
-            record_prefix_stat(prefix_stats, prefix, props.size());
+            record_prefix_stat(prefix_stats, key.prefix(), props.size());
             stats.streamed_rows += 1;
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
         }
@@ -754,12 +753,11 @@ fn tsv_escape(value: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-fn record_prefix_stat(
-    prefix_stats: &mut BTreeMap<String, PrefixAggregate>,
-    prefix: String,
-    size: u64,
-) {
-    let entry = prefix_stats.entry(prefix).or_default();
+fn record_prefix_stat(prefix_stats: &mut PrefixStats, prefix: &str, size: u64) {
+    let entry = match prefix_stats.get_mut(prefix) {
+        Some(entry) => entry,
+        None => prefix_stats.entry(prefix.to_string()).or_default(),
+    };
     entry.objects += 1;
     entry.bytes = entry.bytes.saturating_add(size);
 }
@@ -767,7 +765,7 @@ fn record_prefix_stat(
 async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
     g_state: &core::GlobalState,
     writer: &mut W,
-    prefix_stats: &BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &PrefixStats,
     stats: ListStreamingStats,
     started_at: Instant,
 ) {
@@ -804,7 +802,7 @@ async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>
     g_state: &core::GlobalState,
     filename_ks: &str,
     filename_output: &str,
-    prefix_stats: &BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &PrefixStats,
     stats: ListStreamingStats,
     started_at: Instant,
     write_started_at: Instant,
@@ -861,7 +859,7 @@ async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>
 
 fn finalize_list_summary_only(
     g_state: &core::GlobalState,
-    prefix_stats: &BTreeMap<String, PrefixAggregate>,
+    prefix_stats: &PrefixStats,
     stats: ListStreamingStats,
     started_at: Instant,
 ) {
@@ -946,14 +944,12 @@ async fn write_output(
     Some(stats)
 }
 
-async fn write_ks_counts(
-    path: &str,
-    counts: &BTreeMap<String, PrefixAggregate>,
-) -> Result<usize, String> {
-    let entries: Vec<(String, usize)> = counts
+async fn write_ks_counts(path: &str, counts: &PrefixStats) -> Result<usize, String> {
+    let mut entries: Vec<(String, usize)> = counts
         .iter()
         .map(|(p, stats)| (p.clone(), stats.objects))
         .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     write_ks_entries(path, &entries).await
 }
 
@@ -1016,10 +1012,7 @@ fn log_data_map_final(
     }
 }
 
-fn top_prefixes(
-    prefix_stats: &BTreeMap<String, PrefixAggregate>,
-    limit: usize,
-) -> Vec<core::PrefixMetric> {
+fn top_prefixes(prefix_stats: &PrefixStats, limit: usize) -> Vec<core::PrefixMetric> {
     let mut entries: Vec<_> = prefix_stats
         .iter()
         .map(|(prefix, stats)| core::PrefixMetric {

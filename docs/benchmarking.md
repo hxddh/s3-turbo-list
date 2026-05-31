@@ -10,6 +10,7 @@ cargo build --release
   --objects 100000 \
   --batch-size 5000 \
   --prefixes 512 \
+  --producers 1 \
   --output-format parquet \
   --compression gzip \
   --compression-level 6 \
@@ -36,6 +37,7 @@ Environment overrides:
 
 ```bash
 OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
+PRODUCERS=8 OBJECTS=1000000 ./scripts/benchmark-local.sh
 COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
 OUTPUT_FORMAT=ndjson ./scripts/benchmark-local.sh
 ```
@@ -53,11 +55,13 @@ The JSON report includes:
 - tool version
 - Parquet compression codec and level
 - object count, batch size, and prefix count
+- synthetic producer count and configured channel capacity
 - elapsed seconds and objects/sec
 - Parquet and KS byte sizes
 - text output byte size for TSV/NDJSON runs
 - per-object byte counts and local output MiB/sec rates for easier comparisons
 - streamed rows/sec
+- cumulative producer send-wait seconds, useful when exploring channel backpressure
 - data-map metrics: received batches, received objects, streamed rows,
   unique prefixes, Parquet rows, and KS entries
 
@@ -66,7 +70,8 @@ The JSON report includes:
 median elapsed seconds, objects/sec, output MiB/sec, and bytes/object for each
 format.  The report also records reproducibility metadata: git commit and dirty
 state, UTC start time, platform, Rust host triple, build profile, binary path,
-compression settings, and the local `benchmark-local` command template.
+compression settings, producer count, and the local `benchmark-local` command
+template.
 
 Real endpoint benchmarks remain intentionally opt-in.  Do not use benchmark
 scripts against AWS, BOS, R2, B2, OSS, or other cloud endpoints unless the run
