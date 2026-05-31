@@ -59,6 +59,14 @@ struct NdjsonRow<'a> {
     m: u64,
 }
 
+#[derive(Default)]
+struct DiffDumpBatches {
+    plus: Vec<(ObjectKey, ObjectProps)>,
+    minus: Vec<(ObjectKey, ObjectProps)>,
+    astrisk: Vec<(ObjectKey, ObjectProps)>,
+    equal: Vec<(ObjectKey, ObjectProps)>,
+}
+
 // ── PrefixMap: single-consumer diff object store ───────────
 
 pub struct PrefixMap {
@@ -108,31 +116,16 @@ impl PrefixMap {
             .collect();
 
         for (prefix, obj_map) in entries {
-            let mut plus: Vec<(ObjectKey, ObjectProps)> = Vec::new();
-            let mut minus: Vec<(ObjectKey, ObjectProps)> = Vec::new();
-            let mut astrisk: Vec<(ObjectKey, ObjectProps)> = Vec::new();
-            let mut equal: Vec<(ObjectKey, ObjectProps)> = Vec::new();
+            let (object_count, batches) = obj_map.classify_for_dump(&prefix, include_equal);
+            ks_entries.push((prefix, object_count));
 
-            for (name, props) in obj_map.snapshot() {
-                let key = ObjectKey::encode(&prefix, &name);
-
-                match props.final_status_check() {
-                    MatchResult::Plus => plus.push((key, props)),
-                    MatchResult::Minus => minus.push((key, props)),
-                    MatchResult::Astrisk => astrisk.push((key, props)),
-                    MatchResult::Equal if include_equal => equal.push((key, props)),
-                    MatchResult::Ignore => {}
-                    _ => {}
-                }
-            }
-
-            ks_entries.push((prefix, obj_map.get_count()));
-
-            writer.write_batch(plus, OUTPUT_FLAG_PLUS).await?;
-            writer.write_batch(minus, OUTPUT_FLAG_MINUS).await?;
-            writer.write_batch(astrisk, OUTPUT_FLAG_ASTRISK).await?;
+            writer.write_batch(batches.plus, OUTPUT_FLAG_PLUS).await?;
+            writer.write_batch(batches.minus, OUTPUT_FLAG_MINUS).await?;
+            writer
+                .write_batch(batches.astrisk, OUTPUT_FLAG_ASTRISK)
+                .await?;
             if include_equal {
-                writer.write_batch(equal, OUTPUT_FLAG_EQUAL).await?;
+                writer.write_batch(batches.equal, OUTPUT_FLAG_EQUAL).await?;
             }
         }
 
@@ -189,11 +182,21 @@ impl ObjectMap {
         }
     }
 
-    fn snapshot(&self) -> Vec<(ObjectName, ObjectProps)> {
-        self.inner()
-            .iter()
-            .map(|(name, props)| (name.clone(), props.clone()))
-            .collect()
+    fn classify_for_dump(&self, prefix: &String, include_equal: bool) -> (usize, DiffDumpBatches) {
+        let inner = self.inner();
+        let mut batches = DiffDumpBatches::default();
+        for (name, props) in inner.iter() {
+            let key = ObjectKey::encode(prefix, name);
+            match props.final_status_check() {
+                MatchResult::Plus => batches.plus.push((key, props.clone())),
+                MatchResult::Minus => batches.minus.push((key, props.clone())),
+                MatchResult::Astrisk => batches.astrisk.push((key, props.clone())),
+                MatchResult::Equal if include_equal => batches.equal.push((key, props.clone())),
+                MatchResult::Ignore => {}
+                _ => {}
+            }
+        }
+        (inner.len(), batches)
     }
 
     fn inner(&self) -> MutexGuard<'_, HashMap<ObjectName, ObjectProps>> {

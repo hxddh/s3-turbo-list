@@ -42,6 +42,7 @@ PRODUCERS=8 OBJECTS=1000000 ./scripts/benchmark-local.sh
 COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
 OUTPUT_FORMAT=ndjson ./scripts/benchmark-local.sh
 BENCHMARK=diff-map OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
+BENCHMARK=diff-output OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
 ```
 
 For stdout formatter changes, run each format at least three times and compare
@@ -55,6 +56,9 @@ formatters by writing rows to a temporary local file, not to the terminal.
 `--benchmark diff-map` measures only the local diff data-map construction path:
 it inserts the requested object count for both left and right sides into the
 in-memory prefix/object map and does not write output artifacts.
+`--benchmark diff-output` measures local diff construction plus `PrefixMap`
+dump, Parquet output, and KeySpace output. It uses a mixed synthetic diff
+distribution with equal, plus, minus, and changed objects.
 
 The JSON report includes:
 

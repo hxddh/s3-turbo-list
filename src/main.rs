@@ -546,6 +546,7 @@ impl ListOutputFormat {
 enum LocalBenchmarkKind {
     ListOutput,
     DiffMap,
+    DiffOutput,
 }
 
 impl LocalBenchmarkKind {
@@ -553,6 +554,7 @@ impl LocalBenchmarkKind {
         match self {
             Self::ListOutput => "list-output",
             Self::DiffMap => "diff-map",
+            Self::DiffOutput => "diff-output",
         }
     }
 }
@@ -2143,8 +2145,18 @@ fn run_benchmark_local(
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
 ) -> LocalBenchmarkReport {
-    if benchmark == LocalBenchmarkKind::DiffMap {
-        return run_benchmark_local_diff_map(objects, batch_size, prefixes, keep_artifacts, cfg);
+    if matches!(
+        benchmark,
+        LocalBenchmarkKind::DiffMap | LocalBenchmarkKind::DiffOutput
+    ) {
+        return run_benchmark_local_diff(
+            benchmark,
+            objects,
+            batch_size,
+            prefixes,
+            keep_artifacts,
+            cfg,
+        );
     }
 
     let objects = objects.max(1);
@@ -2359,7 +2371,8 @@ fn run_benchmark_local(
     }
 }
 
-fn run_benchmark_local_diff_map(
+fn run_benchmark_local_diff(
+    benchmark: LocalBenchmarkKind,
     objects: usize,
     batch_size: usize,
     prefixes: usize,
@@ -2374,34 +2387,100 @@ fn run_benchmark_local_diff_map(
     let mut received_batches = 0usize;
     let mut received_objects = 0usize;
 
-    for side in [
-        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-    ] {
-        let mut sent = 0usize;
-        while sent < objects {
-            let take = (objects - sent).min(batch_size);
-            let mut batch = Vec::with_capacity(take);
-            for offset in 0..take {
-                let index = sent + offset;
-                let prefix_index = index % prefixes;
-                let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
-                let key = core::ObjectKey::from(key_text.as_str());
-                let mut etag = [0u8; 16];
-                etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
-                let props = core::ObjectProps::new_open(side, 1024 + (index % 4096) as u64, etag);
-                batch.push((key, props));
-            }
-            data_map::insert_batch_grouped(&map, batch);
+    let mut sent = 0usize;
+    while sent < objects {
+        let take = (objects - sent).min(batch_size);
+        let (left, right) = synthetic_diff_batches(sent, take, prefixes, benchmark);
+        if !left.is_empty() {
+            received_objects += left.len();
             received_batches += 1;
-            received_objects += take;
-            sent += take;
+            data_map::insert_batch_grouped(&map, left);
+        }
+        if !right.is_empty() {
+            received_objects += right.len();
+            received_batches += 1;
+            data_map::insert_batch_grouped(&map, right);
+        }
+        sent += take;
+    }
+
+    let (unique_prefixes, unique_objects) = map.get_stats();
+    let mut parquet_file = None;
+    let mut ks_file = None;
+    let mut parquet_bytes = 0u64;
+    let mut ks_bytes = 0u64;
+    let mut parquet_rows = 0usize;
+    let mut ks_entries = 0usize;
+    let mut artifact_dir_summary = None;
+
+    if benchmark == LocalBenchmarkKind::DiffOutput {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let artifact_dir =
+            std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
+        std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
+            eprintln!(
+                "Benchmark setup error: failed to create {}: {}",
+                artifact_dir.display(),
+                e
+            );
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        });
+        let parquet_path = artifact_dir.join("diff.parquet");
+        let ks_path = artifact_dir.join("diff.ks");
+        let output_config = cfg.output.clone();
+        let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
+        rt.block_on(async {
+            let output = tokio::fs::File::create(&parquet_path)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "Benchmark setup error: failed to create {}: {}",
+                        parquet_path.display(),
+                        e
+                    );
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                });
+            let writer = tokio::io::BufWriter::with_capacity(100 * 1_048_576, output);
+            let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
+                writer,
+                &ks_path.display().to_string(),
+                output_config.row_group_size,
+                &output_config.compression,
+                output_config.compression_level,
+            );
+            let stats = map.dump(&mut parquet, true).await.unwrap_or_else(|e| {
+                eprintln!("Benchmark output error: {}", e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            });
+            parquet_rows = stats.parquet_rows;
+            ks_entries = stats.ks_entries;
+            parquet.close().await.unwrap_or_else(|e| {
+                eprintln!("Benchmark output error: {}", e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            });
+        });
+        rt.shutdown_background();
+        parquet_bytes = std::fs::metadata(&parquet_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        ks_bytes = std::fs::metadata(&ks_path).map(|m| m.len()).unwrap_or(0);
+        parquet_file = Some(parquet_path.display().to_string());
+        ks_file = Some(ks_path.display().to_string());
+        if keep_artifacts {
+            artifact_dir_summary = Some(artifact_dir.display().to_string());
+        } else {
+            let _ = std::fs::remove_dir_all(&artifact_dir);
+            parquet_file = None;
+            ks_file = None;
         }
     }
 
     let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
-    let (unique_prefixes, unique_objects) = map.get_stats();
+    let output_bytes = parquet_bytes.saturating_add(ks_bytes);
     let metrics = agent::MetricsSummary {
         fatal_errors: 0,
         output_errors: 0,
@@ -2412,8 +2491,8 @@ fn run_benchmark_local_diff_map(
         received_objects,
         streamed_rows: unique_objects,
         unique_prefixes,
-        parquet_rows: 0,
-        ks_entries: 0,
+        parquet_rows,
+        ks_entries,
         bytes_total: 0,
         top_prefixes: Vec::new(),
         summary_only: false,
@@ -2423,11 +2502,11 @@ fn run_benchmark_local_diff_map(
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
         status: "ok".to_string(),
-        benchmark: LocalBenchmarkKind::DiffMap.to_string(),
+        benchmark: benchmark.to_string(),
         network: "none: synthetic local data only".to_string(),
         compression: cfg.output.compression.clone(),
         compression_level: cfg.output.compression_level,
-        output_format: "diff-map".to_string(),
+        output_format: benchmark.to_string(),
         objects,
         batch_size,
         prefixes,
@@ -2437,23 +2516,107 @@ fn run_benchmark_local_diff_map(
         elapsed_secs,
         objects_per_sec: received_objects as f64 / elapsed_secs,
         rows_per_sec: unique_objects as f64 / elapsed_secs,
-        parquet_bytes_per_object: 0.0,
-        ks_bytes_per_object: 0.0,
+        parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
+        ks_bytes_per_object: ks_bytes as f64 / objects as f64,
         text_bytes_per_object: 0.0,
-        output_bytes_per_object: 0.0,
-        parquet_mib_per_sec: 0.0,
+        output_bytes_per_object: output_bytes as f64 / objects as f64,
+        parquet_mib_per_sec: parquet_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
         text_mib_per_sec: 0.0,
-        output_mib_per_sec: 0.0,
-        artifact_dir: None,
-        parquet_file: None,
-        parquet_bytes: 0,
-        ks_file: None,
-        ks_bytes: 0,
+        output_mib_per_sec: output_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
+        artifact_dir: artifact_dir_summary,
+        parquet_file,
+        parquet_bytes,
+        ks_file,
+        ks_bytes,
         text_file: None,
         text_bytes: 0,
         metrics,
         artifacts_kept: keep_artifacts,
     }
+}
+
+type SyntheticObjectBatch = Vec<(core::ObjectKey, core::ObjectProps)>;
+type SyntheticDiffBatches = (SyntheticObjectBatch, SyntheticObjectBatch);
+
+fn synthetic_diff_batches(
+    start: usize,
+    take: usize,
+    prefixes: usize,
+    benchmark: LocalBenchmarkKind,
+) -> SyntheticDiffBatches {
+    let mut left = Vec::with_capacity(take);
+    let mut right = Vec::with_capacity(take);
+    for offset in 0..take {
+        let index = start + offset;
+        let prefix_index = index % prefixes;
+        let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
+        let key = core::ObjectKey::from(key_text.as_str());
+        let mut etag = [0u8; 16];
+        etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
+        etag[15] = etag[15].max(1);
+        let size = 1024 + (index % 4096) as u64;
+        if benchmark == LocalBenchmarkKind::DiffMap {
+            left.push((
+                key.clone(),
+                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
+            ));
+            right.push((
+                key,
+                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
+            ));
+            continue;
+        }
+
+        match index % 4 {
+            0 => {
+                left.push((
+                    key.clone(),
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                        size,
+                        etag,
+                    ),
+                ));
+                right.push((
+                    key,
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                        size,
+                        etag,
+                    ),
+                ));
+            }
+            1 => left.push((
+                key,
+                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
+            )),
+            2 => right.push((
+                key,
+                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
+            )),
+            _ => {
+                left.push((
+                    key.clone(),
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                        size,
+                        etag,
+                    ),
+                ));
+                etag[0] = etag[0].wrapping_add(1);
+                right.push((
+                    key,
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                        size + 1,
+                        etag,
+                    ),
+                ));
+            }
+        }
+    }
+    (left, right)
 }
 
 fn build_plan_report(

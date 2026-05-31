@@ -274,6 +274,134 @@ async fn test_diff_mode_includes_equal_rows() {
     );
 }
 
+#[tokio::test]
+async fn test_diff_mode_mixed_large_dataset_counts_flags_and_ks() {
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("diff_mixed.parquet");
+    let ks_path = dir.path().join("diff_mixed.ks");
+    let map = PrefixMap::new();
+    let prefixes = ["alpha", "beta", "gamma", "omega"];
+    let total = 4096usize;
+    let mut expected_prefix_counts = std::collections::BTreeMap::new();
+
+    for index in 0..total {
+        let prefix = prefixes[index % prefixes.len()];
+        *expected_prefix_counts
+            .entry(prefix.to_string())
+            .or_insert(0usize) += 1;
+        let key = ObjectKey::from(format!("{}/object-{:06}.dat", prefix, index).as_str());
+        let mut etag = [0u8; 16];
+        etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        etag[15] = etag[15].max(1);
+        let size = 1000 + index as u64;
+        match index % 4 {
+            0 => {
+                let (prefix, name) = key.decode();
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name.clone(),
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
+                    )],
+                );
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name,
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
+                    )],
+                );
+            }
+            1 => {
+                let (prefix, name) = key.decode();
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name,
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
+                    )],
+                );
+            }
+            2 => {
+                let (prefix, name) = key.decode();
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name,
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
+                    )],
+                );
+            }
+            _ => {
+                let (prefix, name) = key.decode();
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name.clone(),
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
+                    )],
+                );
+                etag[0] = etag[0].wrapping_add(1);
+                map.bulk_insert(
+                    &prefix,
+                    vec![(
+                        name,
+                        ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size + 1, etag),
+                    )],
+                );
+            }
+        }
+    }
+
+    {
+        let file = tokio::fs::File::create(&parquet_path).await.unwrap();
+        let buf_writer = tokio::io::BufWriter::new(file);
+        let mut writer = AsyncParquetOutput::new_with_options(
+            buf_writer,
+            ks_path.to_str().unwrap(),
+            512,
+            "snappy",
+            3,
+        );
+        let stats = map.dump(&mut writer, true).await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(stats.parquet_rows, total);
+        assert_eq!(stats.ks_entries, prefixes.len());
+    }
+
+    let std_file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut flag_counts = std::collections::BTreeMap::<u8, usize>::new();
+    let mut total_rows = 0usize;
+    for batch in reader {
+        let batch = batch.unwrap();
+        total_rows += batch.num_rows();
+        let flags = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .unwrap();
+        for i in 0..flags.len() {
+            *flag_counts.entry(flags.value(i)).or_default() += 1;
+        }
+    }
+    assert_eq!(total_rows, total);
+    assert_eq!(flag_counts.get(&0), Some(&(total / 4)));
+    assert_eq!(flag_counts.get(&1), Some(&(total / 4)));
+    assert_eq!(flag_counts.get(&2), Some(&(total / 4)));
+    assert_eq!(flag_counts.get(&3), Some(&(total / 4)));
+
+    let ks = std::fs::read_to_string(&ks_path).unwrap();
+    let expected_ks = expected_prefix_counts
+        .iter()
+        .map(|(prefix, count)| format!("\"{}\",\"{}\"\n", prefix, count))
+        .collect::<String>();
+    assert_eq!(ks, expected_ks);
+}
+
 // ── List streaming output uses DiffFlag=0 and writes KS counts ─────────────
 
 #[tokio::test]

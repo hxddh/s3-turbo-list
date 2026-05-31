@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `benchmark-local --benchmark diff-output` to measure local diff
+  data-map construction plus Parquet/KeySpace output with mixed synthetic
+  equal, plus, minus, and changed objects without cloud requests.
+- Added large mixed diff output regression coverage for DiffFlag distribution,
+  Parquet row counts, and sorted KeySpace counts.
+
+### Changed
+- Reduced diff dump-stage allocation by classifying per-prefix objects directly
+  from the object map instead of first cloning a full object snapshot.
+
 ## [0.2.8] - 2026-05-31
 
 ### Added
