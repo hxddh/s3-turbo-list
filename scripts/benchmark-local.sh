@@ -7,6 +7,7 @@ OBJECTS="${OBJECTS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-5000}"
 PREFIXES="${PREFIXES:-512}"
 PRODUCERS="${PRODUCERS:-1}"
+BENCHMARK="${BENCHMARK:-list-output}"
 OUTPUT_FORMAT="${OUTPUT_FORMAT:-parquet}"
 COMPRESSION="${COMPRESSION:-}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-}"
@@ -18,6 +19,7 @@ fi
 
 args=(
   benchmark-local
+  --benchmark "$BENCHMARK"
   --objects "$OBJECTS"
   --batch-size "$BATCH_SIZE"
   --prefixes "$PREFIXES"

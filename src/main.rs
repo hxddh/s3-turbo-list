@@ -472,6 +472,10 @@ enum Commands {
 
     /// Run a local synthetic streaming-output benchmark without contacting S3
     BenchmarkLocal {
+        /// Local benchmark scenario to run
+        #[arg(long, value_enum, default_value_t = LocalBenchmarkKind::ListOutput)]
+        benchmark: LocalBenchmarkKind,
+
         /// Number of synthetic objects to write
         #[arg(long, default_value_t = 10_000)]
         objects: usize,
@@ -535,6 +539,27 @@ impl ListOutputFormat {
             Self::Tsv => "tsv",
             Self::Ndjson => "ndjson",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LocalBenchmarkKind {
+    ListOutput,
+    DiffMap,
+}
+
+impl LocalBenchmarkKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ListOutput => "list-output",
+            Self::DiffMap => "diff-map",
+        }
+    }
+}
+
+impl std::fmt::Display for LocalBenchmarkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -804,6 +829,7 @@ fn main() {
             return;
         }
         Commands::BenchmarkLocal {
+            benchmark,
             objects,
             batch_size,
             prefixes,
@@ -814,6 +840,7 @@ fn main() {
             keep_artifacts,
         } => {
             let report = run_benchmark_local(
+                *benchmark,
                 *objects,
                 *batch_size,
                 *prefixes,
@@ -836,10 +863,7 @@ fn main() {
             } else {
                 println!(
                     "local benchmark: {} {} objects in {:.3}s ({:.0} objects/sec)",
-                    report.output_format,
-                    report.objects,
-                    report.elapsed_secs,
-                    report.objects_per_sec
+                    report.benchmark, report.objects, report.elapsed_secs, report.objects_per_sec
                 );
                 if let Some(path) = &report.parquet_file {
                     println!("  parquet: {}", path);
@@ -2110,6 +2134,7 @@ struct LocalBenchmarkReport {
 }
 
 fn run_benchmark_local(
+    benchmark: LocalBenchmarkKind,
     objects: usize,
     batch_size: usize,
     prefixes: usize,
@@ -2118,6 +2143,10 @@ fn run_benchmark_local(
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
 ) -> LocalBenchmarkReport {
+    if benchmark == LocalBenchmarkKind::DiffMap {
+        return run_benchmark_local_diff_map(objects, batch_size, prefixes, keep_artifacts, cfg);
+    }
+
     let objects = objects.max(1);
     let batch_size = batch_size.max(1);
     let prefixes = prefixes.max(1);
@@ -2297,7 +2326,7 @@ fn run_benchmark_local(
         } else {
             "error".to_string()
         },
-        benchmark: "local-list-streaming-output".to_string(),
+        benchmark: LocalBenchmarkKind::ListOutput.to_string(),
         network: "none: synthetic local data only".to_string(),
         compression: output_config.compression.clone(),
         compression_level: output_config.compression_level,
@@ -2327,6 +2356,103 @@ fn run_benchmark_local(
         text_bytes,
         metrics,
         artifacts_kept,
+    }
+}
+
+fn run_benchmark_local_diff_map(
+    objects: usize,
+    batch_size: usize,
+    prefixes: usize,
+    keep_artifacts: bool,
+    cfg: &S3TurboConfig,
+) -> LocalBenchmarkReport {
+    let objects = objects.max(1);
+    let batch_size = batch_size.max(1);
+    let prefixes = prefixes.max(1);
+    let started = Instant::now();
+    let map = data_map::PrefixMap::new();
+    let mut received_batches = 0usize;
+    let mut received_objects = 0usize;
+
+    for side in [
+        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+    ] {
+        let mut sent = 0usize;
+        while sent < objects {
+            let take = (objects - sent).min(batch_size);
+            let mut batch = Vec::with_capacity(take);
+            for offset in 0..take {
+                let index = sent + offset;
+                let prefix_index = index % prefixes;
+                let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
+                let key = core::ObjectKey::from(key_text.as_str());
+                let mut etag = [0u8; 16];
+                etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
+                let props = core::ObjectProps::new_open(side, 1024 + (index % 4096) as u64, etag);
+                batch.push((key, props));
+            }
+            data_map::insert_batch_grouped(&map, batch);
+            received_batches += 1;
+            received_objects += take;
+            sent += take;
+        }
+    }
+
+    let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
+    let (unique_prefixes, unique_objects) = map.get_stats();
+    let metrics = agent::MetricsSummary {
+        fatal_errors: 0,
+        output_errors: 0,
+        stream_timeouts: 0,
+        s3_client_timeouts: 0,
+        s3_client_generic_errors: 0,
+        received_batches,
+        received_objects,
+        streamed_rows: unique_objects,
+        unique_prefixes,
+        parquet_rows: 0,
+        ks_entries: 0,
+        bytes_total: 0,
+        top_prefixes: Vec::new(),
+        summary_only: false,
+    };
+
+    LocalBenchmarkReport {
+        schema_version: agent::AGENT_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: "ok".to_string(),
+        benchmark: LocalBenchmarkKind::DiffMap.to_string(),
+        network: "none: synthetic local data only".to_string(),
+        compression: cfg.output.compression.clone(),
+        compression_level: cfg.output.compression_level,
+        output_format: "diff-map".to_string(),
+        objects,
+        batch_size,
+        prefixes,
+        producers: 1,
+        channel_capacity: cfg.channel.capacity,
+        producer_send_wait_secs: 0.0,
+        elapsed_secs,
+        objects_per_sec: received_objects as f64 / elapsed_secs,
+        rows_per_sec: unique_objects as f64 / elapsed_secs,
+        parquet_bytes_per_object: 0.0,
+        ks_bytes_per_object: 0.0,
+        text_bytes_per_object: 0.0,
+        output_bytes_per_object: 0.0,
+        parquet_mib_per_sec: 0.0,
+        text_mib_per_sec: 0.0,
+        output_mib_per_sec: 0.0,
+        artifact_dir: None,
+        parquet_file: None,
+        parquet_bytes: 0,
+        ks_file: None,
+        ks_bytes: 0,
+        text_file: None,
+        text_bytes: 0,
+        metrics,
+        artifacts_kept: keep_artifacts,
     }
 }
 

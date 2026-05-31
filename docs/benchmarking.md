@@ -7,6 +7,7 @@ the normal data-map code.
 ```bash
 cargo build --release
 ./target/release/s3-turbo-list benchmark-local \
+  --benchmark list-output \
   --objects 100000 \
   --batch-size 5000 \
   --prefixes 512 \
@@ -40,19 +41,25 @@ OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
 PRODUCERS=8 OBJECTS=1000000 ./scripts/benchmark-local.sh
 COMPRESSION=zstd COMPRESSION_LEVEL=3 ./scripts/benchmark-local.sh
 OUTPUT_FORMAT=ndjson ./scripts/benchmark-local.sh
+BENCHMARK=diff-map OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
 ```
 
 For stdout formatter changes, run each format at least three times and compare
 medians against the previous release binary.  This keeps single-run CPU noise
 from driving release decisions.
 
+`--benchmark list-output` is the default. In that mode,
 `--output-format parquet` measures the Parquet plus KeySpace streaming path.
 `--output-format tsv` and `--output-format ndjson` measure the list stdout row
 formatters by writing rows to a temporary local file, not to the terminal.
+`--benchmark diff-map` measures only the local diff data-map construction path:
+it inserts the requested object count for both left and right sides into the
+in-memory prefix/object map and does not write output artifacts.
 
 The JSON report includes:
 
 - tool version
+- benchmark scenario name
 - Parquet compression codec and level
 - object count, batch size, and prefix count
 - synthetic producer count and configured channel capacity
@@ -106,6 +113,8 @@ formatter time by about 8.2% and NDJSON formatter time by about 9.4% versus the
 published v0.2.2 binary.  These numbers isolate local rendering and file
 output; real endpoint latency or network throughput can dominate end-to-end
 runtime.
+The v0.2.8 development cycle adds a diff data-map construction baseline in
+[`docs/validation-results/diff-map-benchmark-20260531.md`](validation-results/diff-map-benchmark-20260531.md).
 
 ## Compression Notes
 

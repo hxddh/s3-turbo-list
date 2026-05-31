@@ -506,6 +506,37 @@ fn test_cli_benchmark_local_ndjson_no_cloud() {
 }
 
 #[test]
+fn test_cli_benchmark_local_diff_map_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&[
+        "benchmark-local",
+        "--benchmark",
+        "diff-map",
+        "--objects",
+        "32",
+        "--batch-size",
+        "8",
+        "--prefixes",
+        "4",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["network"], "none: synthetic local data only");
+    assert_eq!(json["benchmark"], "diff-map");
+    assert_eq!(json["output_format"], "diff-map");
+    assert_eq!(json["objects"], 32);
+    assert_eq!(json["metrics"]["received_batches"], 8);
+    assert_eq!(json["metrics"]["received_objects"], 64);
+    assert_eq!(json["metrics"]["streamed_rows"], 32);
+    assert_eq!(json["metrics"]["unique_prefixes"], 4);
+    assert_eq!(json["metrics"]["parquet_rows"], 0);
+    assert_eq!(json["parquet_file"], serde_json::Value::Null);
+    assert_eq!(json["text_file"], serde_json::Value::Null);
+    assert!(json["objects_per_sec"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
 fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
     let (code, stdout, stderr) = run_cli(&[
         "--compression",

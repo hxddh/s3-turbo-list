@@ -1,11 +1,9 @@
-use dashmap::DashMap;
 use log::info;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
@@ -61,45 +59,26 @@ struct NdjsonRow<'a> {
     m: u64,
 }
 
-// ── PrefixMap: dashmap-based concurrent object store ───────
+// ── PrefixMap: single-consumer diff object store ───────────
 
 pub struct PrefixMap {
-    /// dashmap<prefix, ObjectMap> — sharded lock-free.
-    inner: DashMap<String, ObjectMap>,
-    count: Arc<AtomicUsize>,
+    inner: Mutex<HashMap<String, ObjectMap>>,
 }
 
 impl PrefixMap {
     pub fn new() -> Self {
         Self {
-            inner: DashMap::new(),
-            count: Arc::new(AtomicUsize::new(0)),
+            inner: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn get_count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
-    }
-
-    pub fn inc_count(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        self.inner().len()
     }
 
     /// Get or create the ObjectMap for a prefix.
     pub fn get_object_map(&self, prefix: &str) -> ObjectMap {
-        if let Some(entry) = self.inner.get(prefix) {
-            return entry.clone();
-        }
-        let new_map = ObjectMap::new();
-        match self.inner.entry(prefix.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let map = new_map.clone();
-                entry.insert(map.clone());
-                self.inc_count();
-                map
-            }
-        }
+        self.inner().entry(prefix.to_string()).or_default().clone()
     }
 
     /// Bulk insert a batch of objects for a prefix.
@@ -109,8 +88,9 @@ impl PrefixMap {
     }
 
     pub fn get_stats(&self) -> (usize, usize) {
-        let prefix_count = self.get_count();
-        let obj_count: usize = self.inner.iter().map(|e| e.value().get_count()).sum();
+        let inner = self.inner();
+        let prefix_count = inner.len();
+        let obj_count: usize = inner.values().map(ObjectMap::get_count).sum();
         (prefix_count, obj_count)
     }
 
@@ -121,19 +101,19 @@ impl PrefixMap {
         include_equal: bool,
     ) -> Result<DumpStats, String> {
         let mut ks_entries: Vec<(String, usize)> = Vec::new();
+        let entries: Vec<(String, ObjectMap)> = self
+            .inner()
+            .iter()
+            .map(|(prefix, obj_map)| (prefix.clone(), obj_map.clone()))
+            .collect();
 
-        for entry in self.inner.iter() {
-            let prefix = entry.key().clone();
-            let obj_map = entry.value();
-
+        for (prefix, obj_map) in entries {
             let mut plus: Vec<(ObjectKey, ObjectProps)> = Vec::new();
             let mut minus: Vec<(ObjectKey, ObjectProps)> = Vec::new();
             let mut astrisk: Vec<(ObjectKey, ObjectProps)> = Vec::new();
             let mut equal: Vec<(ObjectKey, ObjectProps)> = Vec::new();
 
-            for obj_entry in obj_map.inner.iter() {
-                let name = obj_entry.key().clone();
-                let props = obj_entry.value().clone();
+            for (name, props) in obj_map.snapshot() {
                 let key = ObjectKey::encode(&prefix, &name);
 
                 match props.final_status_check() {
@@ -164,6 +144,12 @@ impl PrefixMap {
             ks_entries: ks_count,
         })
     }
+
+    fn inner(&self) -> MutexGuard<'_, HashMap<String, ObjectMap>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl std::fmt::Display for PrefixMap {
@@ -177,36 +163,49 @@ impl std::fmt::Display for PrefixMap {
 
 #[derive(Clone)]
 pub struct ObjectMap {
-    inner: Arc<DashMap<ObjectName, ObjectProps>>,
-    count: Arc<AtomicUsize>,
+    inner: Arc<Mutex<HashMap<ObjectName, ObjectProps>>>,
 }
 
 impl ObjectMap {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(DashMap::new()),
-            count: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn get_count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
+        self.inner().len()
     }
 
-    pub fn inc_count(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Bulk insert with concurrent dedup/matching.
+    /// Bulk insert with dedup/matching.
     pub fn bulk_insert(&self, _prefix: &str, items: Vec<(ObjectName, ObjectProps)>) {
+        let mut inner = self.inner();
         for (name, props) in items {
-            if let Some(mut existing) = self.inner.get_mut(&name) {
+            if let Some(existing) = inner.get_mut(&name) {
                 existing.r#match(&props);
             } else {
-                self.inner.insert(name, props);
-                self.inc_count();
+                inner.insert(name, props);
             }
         }
+    }
+
+    fn snapshot(&self) -> Vec<(ObjectName, ObjectProps)> {
+        self.inner()
+            .iter()
+            .map(|(name, props)| (name.clone(), props.clone()))
+            .collect()
+    }
+
+    fn inner(&self) -> MutexGuard<'_, HashMap<ObjectName, ObjectProps>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for ObjectMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -887,7 +886,7 @@ fn finalize_list_summary_only(
     );
 }
 
-fn insert_batch_grouped(map: &PrefixMap, batch: Vec<(ObjectKey, ObjectProps)>) {
+pub fn insert_batch_grouped(map: &PrefixMap, batch: Vec<(ObjectKey, ObjectProps)>) {
     let mut grouped: HashMap<String, Vec<(ObjectName, ObjectProps)>> = HashMap::new();
     for (key, props) in batch {
         let (prefix, name) = key.decode();

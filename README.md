@@ -425,6 +425,10 @@ s3-turbo-list --compression zstd --compression-level 3 \
 s3-turbo-list benchmark-local \
   --objects 100000 --batch-size 5000 --output-format ndjson --json
 
+# Measure local diff data-map construction without writing artifacts
+s3-turbo-list benchmark-local \
+  --benchmark diff-map --objects 100000 --batch-size 5000 --json
+
 # Shell completions and man page
 s3-turbo-list completions bash > s3-turbo-list.bash
 s3-turbo-list completions zsh > _s3-turbo-list
