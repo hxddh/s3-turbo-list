@@ -13,7 +13,7 @@ allocation by classifying objects directly from the per-prefix map.
 BUILD_MODE=clang ./scripts/build-release.sh
 
 BENCHMARK=diff-output OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 \
-  OUT=/tmp/s3-turbo-list-v029-diff-output.json \
+  OUT=/tmp/s3-turbo-list-v029-release-diff-output.json \
   ./scripts/benchmark-local.sh
 
 BENCHMARK=diff-map OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 \
@@ -30,16 +30,16 @@ artifacts unless `--keep-artifacts` is used.
 
 | Benchmark | Elapsed secs | Input side-rows/sec | Unique rows/sec | Received side-rows | Unique rows | Parquet rows | KS entries |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| diff-output | 2.765 | 542,426 | 361,617 | 1,500,000 | 1,000,000 | 1,000,000 | 1,024 |
+| diff-output | 2.847 | 526,835 | 351,223 | 1,500,000 | 1,000,000 | 1,000,000 | 1,024 |
 | diff-map | 1.869 | 1,069,911 | 534,956 | 2,000,000 | 1,000,000 | 0 | 0 |
 
-`diff-output` wrote 11,073,827 Parquet bytes and 19,370 KeySpace bytes,
-for 11.09 output bytes per unique object with zstd level 3.
+`diff-output` wrote 11,060,590 Parquet bytes and 19,370 KeySpace bytes,
+for 11.08 output bytes per unique object with zstd level 3.
 
 ## Notes
 
-- The reported `tool_version` is `0.2.8` because this benchmark was run before
-  the v0.2.9 version bump and release preparation.
+- The reported `tool_version` for the release-prep `diff-output` run is
+  `0.2.9`.
 - `diff-map` measures construction only. It does not write Parquet or KeySpace
   output, so it is an orientation point rather than a direct throughput target
   for the full output path.
