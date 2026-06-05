@@ -744,19 +744,11 @@ incompatibilities were documented.  Full details in
 
 ## Roadmap
 
-| Priority | Item | Status |
-|---|---|---|
-| ✅ Done | README / docs polish | This document |
-| ✅ Done | Validation (MinIO, AWS S3, BOS) | Complete |
-| ✅ Done | Release packaging | v0.1.1+ multi-platform release assets published |
-| ✅ Done | Release / compat hardening | Versioned workflow, checks, compat-probe, output config |
-| ✅ Done | Large-run readiness | data_map batch insertion metrics, hints validation, sampled auto-hints |
-| ✅ Done | Streaming readiness | list-mode streaming Parquet output, segment estimates, release/test hardening |
-| ✅ Done | Benchmark harness | Local synthetic streaming-output benchmark plus JSON report |
-| ✅ Done | CLI help polish | Shell completions and man page generation |
-| ✅ Done | Optional endpoint compatibility profiles | Per-provider presets and local profile inspection |
-| ✅ Done | Local S3 protocol mock | Local correctness harness for ListObjectsV2, compat-probe, retry, and checkpoint/resume |
-| ✅ Done | Hints correctness / prefix discovery | Boundary key correctness, `--no-auto-hints`, prefix-scoped auto-hints, CommonPrefixes discovery |
-| ✅ Done | Trace-driven hints tooling | Local hints merge, trace summary, conservative rebalance, and agent-readable manifests |
-| ✅ Done | Beginner-friendly local UX | init-config, quickstart, recipes, cheatsheet, output-dir, doctor simple output |
-| 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |
+Core listing, diff, checkpoint/resume, local benchmarking, release packaging,
+endpoint profiles, local S3 mock coverage, trace tooling, and beginner-friendly
+local commands are implemented.
+
+Current direction:
+- `diff` remains authoritative single-segment by design.
+- Real endpoint benchmark templates remain opt-in and require explicit
+  authorization before any cloud request.

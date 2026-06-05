@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Inlined the remaining diff lifecycle log messages and removed the placeholder
+  `diff` library module plus its trivial integration test.
+- Replaced the long README roadmap table with a compact current-direction note.
+
 ## [0.2.11] - 2026-06-05
 
 ### Changed

@@ -7,8 +7,8 @@
 )]
 
 use s3_turbo_list::{
-    agent, auto_hints, checkpoint, compat_probe, config, core, data_map, diff, hints, local_tools,
-    mon, profiles, tasks_s3, trace,
+    agent, auto_hints, checkpoint, compat_probe, config, core, data_map, hints, local_tools, mon,
+    profiles, tasks_s3, trace,
 };
 
 use chrono::Local;
@@ -1331,7 +1331,7 @@ fn main() {
 
         // ── Diff mode lifecycle ───────────────────────────
         if mode == RunMode::BiDir {
-            diff::init_diff_state();
+            info!("Diff mode initialized — objects from both sides will be compared by data_map");
         }
 
         // Drop the original sender so the channel closes when all list tasks
@@ -1422,7 +1422,7 @@ fn main() {
 
         // ── Diff mode completion notice ────────────────────
         if mode == RunMode::BiDir {
-            info!("{}", diff::diff_complete_notice());
+            info!("diff mode comparison complete — data_map will finalize output");
         }
 
         info!("All tasks completed.");

@@ -22,7 +22,6 @@ pub mod compat_probe;
 pub mod config;
 pub mod core; // ObjectKey, ObjectProps, MatchResult, KeySpaceHints, GlobalState, DataMapContext, MonContext, S3TaskContext
 pub mod data_map; // PrefixMap, ObjectMap, data_map_task
-pub mod diff; // init_diff_state, diff_complete_notice
 pub mod error; // FlatRuntimeError, error code constants
 pub mod hints;
 pub mod local_tools;
