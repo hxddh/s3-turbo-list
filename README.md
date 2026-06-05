@@ -476,8 +476,9 @@ s3-turbo-list diff \
 
 Diff mode intentionally uses authoritative single-segment listing in current
 releases.  Conventional hints caches are ignored for `diff`, and explicit
-`--hints-file` is rejected before any S3 request.  Paired-segment hinted diff
-coordination is planned for `v0.2.x`; use hints with `list` only for now.
+`--hints-file` is rejected before any S3 request.  Diff keeps this
+single-segment behavior by design so left-only and right-only objects cannot be
+hidden by mismatched segment boundaries; use hints with `list` only.
 Unlike list-mode Parquet output, current diff mode holds the comparison map in
 memory until both sides finish so it can classify equal, left-only, right-only,
 and changed objects.  For very large bucket-to-bucket comparisons, plan memory
@@ -714,11 +715,11 @@ Validation details:
 
 ## Known limitations
 
-1. **Hinted multi-segment diff paired coordination is deferred.**  Diff mode
-   uses authoritative single-segment listing in current releases.  Conventional
-   hints caches are ignored for `diff`, and `diff --hints-file` is rejected.
-   Multi-segment diff coordination across left/right segment pairs is planned
-   for `v0.2.x`.  Current diff mode also retains its comparison map in memory
+1. **Diff is authoritative single-segment by design.**  Conventional hints
+   caches are ignored for `diff`, and `diff --hints-file` / `diff --resume`
+   are rejected before any S3 request.  This keeps bucket-to-bucket comparison
+   complete and avoids hiding left-only or right-only objects behind mismatched
+   segment boundaries.  Current diff mode retains its comparison map in memory
    until both sides complete; list-mode streaming output remains the bounded
    memory path for very large single-bucket inventories.
 
@@ -758,5 +759,4 @@ incompatibilities were documented.  Full details in
 | ✅ Done | Hints correctness / prefix discovery | Boundary key correctness, `--no-auto-hints`, prefix-scoped auto-hints, CommonPrefixes discovery |
 | ✅ Done | Trace-driven hints tooling | Local hints merge, trace summary, conservative rebalance, and agent-readable manifests |
 | ✅ Done | Beginner-friendly local UX | init-config, quickstart, recipes, cheatsheet, output-dir, doctor simple output |
-| 📋 Planned | Paired-segment diff coordination | Multi-segment diff with proper per-segment DiffFlag |
 | 📋 Later | Real endpoint benchmark templates | Cloud runs remain opt-in and require explicit authorization |

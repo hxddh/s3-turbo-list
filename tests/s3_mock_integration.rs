@@ -1747,7 +1747,15 @@ estimate_mode = "full"
         .any(|warning| warning
             .as_str()
             .unwrap()
-            .contains("hinted multi-segment diff paired coordination is deferred")));
+            .contains("authoritative single-segment mode")));
+    assert!(manifest_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap()
+            .contains("left-only or right-only")));
 }
 
 #[test]

@@ -148,7 +148,8 @@ gh run watch --repo hxddh/s3-turbo-list --exit-status
 The workflow first validates the release source once on Linux, then builds
 Linux x86_64, macOS Apple Silicon, and macOS Intel assets.  The finalize job
 downloads the existing linux-aarch64 asset, generates the combined
-`SHA256SUMS`, verifies it, and uploads the complete release asset set.
+`SHA256SUMS` plus the linux-aarch64 single-file checksum, verifies the combined
+checksum file, and uploads the complete release asset set.
 
 If a workflow appears stuck, inspect individual job steps:
 
@@ -168,7 +169,8 @@ git rev-parse main origin/main "v${VERSION}^{}"
 ```
 
 - [ ] Release is not draft and not prerelease.
-- [ ] Release contains four platform binaries plus `SHA256SUMS`.
+- [ ] Release contains four platform binaries, `SHA256SUMS`, and
+      `s3-turbo-list-${VERSION}-linux-aarch64.sha256`.
 - [ ] `sha256sum -c SHA256SUMS` reports `OK` for all four binaries.
 - [ ] Current-platform binary prints the correct version.
 - [ ] Current-platform binary `--help` runs without cloud access.

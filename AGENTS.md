@@ -147,8 +147,8 @@ Other documented options include GCC 10+ or disabling ASM.
 - Single-segment BOS listing works.
 - Hinted multi-segment listing is safe on AWS S3 and MinIO.
 - Hinted multi-segment listing is not authoritative on BOS until BOS fixes the service-side pagination compatibility issue.
-- Single-segment diff is validated and is the authoritative default.
-- Multi-segment diff coordination/testing remains deferred to `v0.2.x`.
+- Diff is authoritative single-segment by design.
+- `diff --hints-file` and `diff --resume` are intentionally unsupported to avoid incomplete left-only or right-only results from mismatched segment boundaries.
 - Release artifacts in `dist/` are generated and ignored.
 - `target/` is generated and ignored.
 

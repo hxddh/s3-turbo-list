@@ -107,12 +107,14 @@ segments, and identity match details.
 For `diff`, dry-run reports `hints.source =
 "disabled_for_diff_single_segment"`.  Conventional hints caches are
 intentionally ignored, and explicit `diff --hints-file` exits with code `2`
-before any S3 request.  Agents should treat current `diff` runs as
-authoritative single-segment comparisons until paired-segment diff coordination
-lands in `v0.2.x`.  Current diff mode retains its comparison map in memory until
-both sides complete; for very large bucket-to-bucket comparisons, agents should
-plan memory capacity from the combined key count or split the comparison into
-smaller external ranges.
+before any S3 request.  Agents should treat `diff` runs as authoritative
+single-segment comparisons by design.  `diff --resume` is also intentionally
+unsupported because partial paired checkpointing can hide left-only or
+right-only objects.  Current diff mode retains its comparison map in memory
+until both sides complete; for very large bucket-to-bucket comparisons, agents
+should plan memory capacity from the combined key count or split the comparison
+into smaller external ranges when the business workflow can tolerate external
+partitioning.
 
 ## Run manifests
 

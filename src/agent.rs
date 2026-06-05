@@ -511,7 +511,7 @@ pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>
         boundary_count: report.as_ref().map(|r| r.boundary_count),
         estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
         warnings: vec![
-            "diff uses single-segment authoritative mode; conventional hints cache is ignored until paired-segment diff coordination is implemented"
+            "diff uses authoritative single-segment mode; conventional hints caches are intentionally ignored for diff to avoid incomplete left-only or right-only results"
                 .to_string(),
         ],
     }

@@ -1351,9 +1351,10 @@ fn test_cli_rejects_diff_with_explicit_hints_file() {
     ]);
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("diff with --hints-file is not supported yet"));
-    assert!(stderr.contains("v0.2.x"));
-    assert!(stderr.contains("single-segment diff"));
+    assert!(stderr.contains("diff with --hints-file is unsupported by design"));
+    assert!(stderr.contains("authoritative single-segment comparison"));
+    assert!(stderr.contains("left-only or right-only"));
+    assert!(!stderr.contains("v0.2.x"));
 }
 
 #[test]
@@ -1369,8 +1370,10 @@ fn test_cli_rejects_diff_with_resume() {
     ]);
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("diff --resume is not supported yet"));
-    assert!(stderr.contains("v0.2.x"));
+    assert!(stderr.contains("diff --resume is unsupported by design"));
+    assert!(stderr.contains("authoritative single-segment comparison"));
+    assert!(stderr.contains("partial paired comparisons"));
+    assert!(!stderr.contains("v0.2.x"));
 }
 
 #[test]
@@ -1865,13 +1868,19 @@ estimate_mode = "full"
             warning
                 .as_str()
                 .unwrap()
-                .contains("conventional hints cache is ignored")
+                .contains("conventional hints caches are intentionally ignored")
         }));
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
             .unwrap()
-            .contains("hinted multi-segment diff paired coordination is deferred")
+            .contains("authoritative single-segment mode")
+    }));
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("left-only or right-only")
     }));
 }
 

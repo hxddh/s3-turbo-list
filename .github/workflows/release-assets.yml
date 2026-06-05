@@ -199,6 +199,7 @@ jobs:
           cat SHA256SUMS
           echo "=== Verification ==="
           sha256sum -c SHA256SUMS
+          sha256sum "s3-turbo-list-${VERSION}-linux-aarch64" > "s3-turbo-list-${VERSION}-linux-aarch64.sha256"
           ls -lh
 
       - name: List flat directory for debugging
@@ -207,6 +208,10 @@ jobs:
           ls -lh flat/
           echo "=== SHA256SUMS content ==="
           cat flat/SHA256SUMS
+          echo "=== linux-aarch64 SHA256 content ==="
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          cat "flat/s3-turbo-list-${VERSION}-linux-aarch64.sha256"
 
       - name: Upload new assets to release
         run: |

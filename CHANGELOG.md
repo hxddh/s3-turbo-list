@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Clarified that `diff` is authoritative single-segment by design and removed
+  roadmap language that implied future hinted multi-segment diff support.
+- Release asset finalization now generates and uploads the linux-aarch64
+  single-file checksum expected by the published release verifier.
+
 ## [0.2.10] - 2026-06-05
 
 ### Added

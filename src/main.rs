@@ -1887,7 +1887,7 @@ fn validate_diff_hints_command(cli: &Cli) {
     }
     if cli.hints_file.is_some() {
         eprintln!(
-            "diff with --hints-file is not supported yet: hinted multi-segment diff paired coordination is deferred to v0.2.x; remove --hints-file to run authoritative single-segment diff"
+            "diff with --hints-file is unsupported by design: diff uses authoritative single-segment comparison to avoid incomplete left-only or right-only results; remove --hints-file to run diff"
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
@@ -1896,7 +1896,7 @@ fn validate_diff_hints_command(cli: &Cli) {
 fn validate_diff_resume_command(cli: &Cli) {
     if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
         eprintln!(
-            "diff --resume is not supported yet: paired diff/resume coordination is deferred to v0.2.x; remove --resume to run authoritative single-segment diff"
+            "diff --resume is unsupported by design: diff uses authoritative single-segment comparison and does not checkpoint partial paired comparisons; remove --resume to run diff"
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
@@ -2895,7 +2895,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     }
     if matches!(cli.cmd, Commands::Diff { .. }) {
         warnings.push(
-            "diff uses single-segment authoritative mode; hinted multi-segment diff paired coordination is deferred to v0.2.x"
+            "diff uses authoritative single-segment mode; hints and resume are intentionally unsupported for diff to avoid incomplete left-only or right-only results"
                 .to_string(),
         );
     }
