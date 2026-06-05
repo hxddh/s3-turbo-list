@@ -492,6 +492,10 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         producers: usize,
 
+        /// Synthetic diff data shape for diff-output benchmarks
+        #[arg(long, value_enum, default_value_t = LocalDiffShape::Mixed)]
+        diff_shape: LocalDiffShape,
+
         /// Local output path to benchmark
         #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
         output_format: ListOutputFormat,
@@ -560,6 +564,29 @@ impl LocalBenchmarkKind {
 }
 
 impl std::fmt::Display for LocalBenchmarkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LocalDiffShape {
+    Mixed,
+    AllEqual,
+    AllChanged,
+}
+
+impl LocalDiffShape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::AllEqual => "all-equal",
+            Self::AllChanged => "all-changed",
+        }
+    }
+}
+
+impl std::fmt::Display for LocalDiffShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -836,6 +863,7 @@ fn main() {
             batch_size,
             prefixes,
             producers,
+            diff_shape,
             output_format,
             json,
             output,
@@ -847,6 +875,7 @@ fn main() {
                 *batch_size,
                 *prefixes,
                 *producers,
+                *diff_shape,
                 *output_format,
                 *keep_artifacts,
                 &cfg,
@@ -2141,6 +2170,7 @@ fn run_benchmark_local(
     batch_size: usize,
     prefixes: usize,
     producers: usize,
+    diff_shape: LocalDiffShape,
     output_format: ListOutputFormat,
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
@@ -2154,6 +2184,7 @@ fn run_benchmark_local(
             objects,
             batch_size,
             prefixes,
+            diff_shape,
             keep_artifacts,
             cfg,
         );
@@ -2376,6 +2407,7 @@ fn run_benchmark_local_diff(
     objects: usize,
     batch_size: usize,
     prefixes: usize,
+    diff_shape: LocalDiffShape,
     keep_artifacts: bool,
     cfg: &S3TurboConfig,
 ) -> LocalBenchmarkReport {
@@ -2390,7 +2422,7 @@ fn run_benchmark_local_diff(
     let mut sent = 0usize;
     while sent < objects {
         let take = (objects - sent).min(batch_size);
-        let (left, right) = synthetic_diff_batches(sent, take, prefixes, benchmark);
+        let (left, right) = synthetic_diff_batches(sent, take, prefixes, benchmark, diff_shape);
         if !left.is_empty() {
             received_objects += left.len();
             received_batches += 1;
@@ -2543,6 +2575,7 @@ fn synthetic_diff_batches(
     take: usize,
     prefixes: usize,
     benchmark: LocalBenchmarkKind,
+    diff_shape: LocalDiffShape,
 ) -> SyntheticDiffBatches {
     let mut left = Vec::with_capacity(take);
     let mut right = Vec::with_capacity(take);
@@ -2568,8 +2601,8 @@ fn synthetic_diff_batches(
             continue;
         }
 
-        match index % 4 {
-            0 => {
+        match diff_shape {
+            LocalDiffShape::AllEqual => {
                 left.push((
                     key.clone(),
                     core::ObjectProps::new_open(
@@ -2587,15 +2620,7 @@ fn synthetic_diff_batches(
                     ),
                 ));
             }
-            1 => left.push((
-                key,
-                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
-            )),
-            2 => right.push((
-                key,
-                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
-            )),
-            _ => {
+            LocalDiffShape::AllChanged => {
                 left.push((
                     key.clone(),
                     core::ObjectProps::new_open(
@@ -2614,6 +2639,61 @@ fn synthetic_diff_batches(
                     ),
                 ));
             }
+            LocalDiffShape::Mixed => match index % 4 {
+                0 => {
+                    left.push((
+                        key.clone(),
+                        core::ObjectProps::new_open(
+                            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                            size,
+                            etag,
+                        ),
+                    ));
+                    right.push((
+                        key,
+                        core::ObjectProps::new_open(
+                            core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                            size,
+                            etag,
+                        ),
+                    ));
+                }
+                1 => left.push((
+                    key,
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                        size,
+                        etag,
+                    ),
+                )),
+                2 => right.push((
+                    key,
+                    core::ObjectProps::new_open(
+                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                        size,
+                        etag,
+                    ),
+                )),
+                _ => {
+                    left.push((
+                        key.clone(),
+                        core::ObjectProps::new_open(
+                            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                            size,
+                            etag,
+                        ),
+                    ));
+                    etag[0] = etag[0].wrapping_add(1);
+                    right.push((
+                        key,
+                        core::ObjectProps::new_open(
+                            core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                            size + 1,
+                            etag,
+                        ),
+                    ));
+                }
+            },
         }
     }
     (left, right)

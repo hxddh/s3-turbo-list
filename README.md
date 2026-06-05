@@ -433,6 +433,11 @@ s3-turbo-list benchmark-local \
 s3-turbo-list benchmark-local \
   --benchmark diff-output --objects 100000 --batch-size 5000 --json
 
+# Compare a specific local diff output shape
+s3-turbo-list benchmark-local \
+  --benchmark diff-output --diff-shape all-changed \
+  --objects 100000 --batch-size 5000 --json
+
 # Shell completions and man page
 s3-turbo-list completions bash > s3-turbo-list.bash
 s3-turbo-list completions zsh > _s3-turbo-list
