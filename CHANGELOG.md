@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-06-05
+
 ### Added
 - Added `benchmark-local --diff-shape mixed|all-equal|all-changed` for local
   diff-output benchmarks, keeping the benchmark-only shape selection separate
