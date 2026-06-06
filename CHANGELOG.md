@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-06-06
+
 ### Changed
 - Reduced release-version maintenance by replacing versioned install/build
   examples with template-based asset names.
