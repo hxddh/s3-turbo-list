@@ -196,6 +196,19 @@ impl ObjectProps {
         }
     }
 
+    pub fn append_etag_string(&self, out: &mut String) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        out.reserve(32 + usize::from(self.etag_parts != 0) * 11);
+        for byte in self.etag_md5 {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        if self.etag_parts != 0 {
+            let _ = std::fmt::Write::write_fmt(out, format_args!("-{}", self.etag_parts));
+        }
+    }
+
     /// Final status check — used at dump time.
     pub fn final_status_check(&self) -> MatchResult {
         // In list mode, apply optional filter here.

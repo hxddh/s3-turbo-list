@@ -129,6 +129,9 @@ output; real endpoint latency or network throughput can dominate end-to-end
 runtime.
 The v0.2.8 development cycle adds a diff data-map construction baseline in
 [`docs/validation-results/diff-map-benchmark-20260531.md`](validation-results/diff-map-benchmark-20260531.md).
+The v0.2.15 development cycle includes a list-mode Parquet hot-path comparison
+in
+[`docs/validation-results/list-output-hot-path-benchmark-20260606.md`](validation-results/list-output-hot-path-benchmark-20260606.md).
 
 ## Compression Notes
 

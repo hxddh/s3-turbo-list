@@ -641,18 +641,18 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
-    let mut rows = Vec::with_capacity(batch.len());
-    for (key, props) in batch {
+    for (key, props) in &batch {
         record_prefix_stat(prefix_stats, key.prefix(), props.size());
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
-
-        if props.final_status_check() != MatchResult::Ignore {
-            rows.push((key, props));
-        }
     }
 
-    stats.streamed_rows += rows.len();
-    parquet.write_batch(rows, OUTPUT_FLAG_EQUAL).await
+    let written = parquet
+        .write_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |_, props| {
+            props.final_status_check() != MatchResult::Ignore
+        })
+        .await?;
+    stats.streamed_rows += written;
+    Ok(())
 }
 
 async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(

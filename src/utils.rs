@@ -1,5 +1,5 @@
 use arrow_array::array::ArrayRef;
-use arrow_array::array::{StringArray, UInt64Array, UInt8Array};
+use arrow_array::builder::{StringBuilder, UInt64Builder, UInt8Builder};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use log::{info, warn};
@@ -80,30 +80,57 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         v: Vec<(ObjectKey, ObjectProps)>,
         diff_flag: u8,
     ) -> Result<(), String> {
+        self.write_batch_filtered(v, diff_flag, |_, _| true).await?;
+        Ok(())
+    }
+
+    pub async fn write_batch_filtered<F>(
+        &mut self,
+        v: Vec<(ObjectKey, ObjectProps)>,
+        diff_flag: u8,
+        mut include: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(&ObjectKey, &ObjectProps) -> bool,
+    {
         if v.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        let count = v.len();
-        let mut vec_key: Vec<&str> = Vec::with_capacity(count);
-        let mut vec_size: Vec<u64> = Vec::with_capacity(count);
-        let mut vec_last_modified: Vec<u64> = Vec::with_capacity(count);
-        let mut vec_etag: Vec<String> = Vec::with_capacity(count);
-        let mut vec_diff_flag: Vec<u8> = Vec::with_capacity(count);
+
+        let key_bytes = v.iter().map(|(key, _)| key.as_str().len()).sum();
+        let mut key_builder = StringBuilder::with_capacity(v.len(), key_bytes);
+        let mut size_builder = UInt64Builder::with_capacity(v.len());
+        let mut last_modified_builder = UInt64Builder::with_capacity(v.len());
+        let mut etag_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(36));
+        let mut diff_flag_builder = UInt8Builder::with_capacity(v.len());
+        let mut etag = String::with_capacity(43);
+        let mut count = 0usize;
 
         for (key, props) in &v {
-            vec_key.push(key.as_str());
-            vec_size.push(props.size());
-            vec_last_modified.push(props.last_modified());
-            vec_etag.push(props.etag_string());
-            vec_diff_flag.push(diff_flag);
+            if !include(key, props) {
+                continue;
+            }
+
+            key_builder.append_value(key.as_str());
+            size_builder.append_value(props.size());
+            last_modified_builder.append_value(props.last_modified());
+            props.append_etag_string(&mut etag);
+            etag_builder.append_value(&etag);
+            etag.clear();
+            diff_flag_builder.append_value(diff_flag);
+            count += 1;
+        }
+
+        if count == 0 {
+            return Ok(0);
         }
 
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec_key)) as ArrayRef,
-            Arc::new(UInt64Array::from(vec_size)) as ArrayRef,
-            Arc::new(UInt64Array::from(vec_last_modified)) as ArrayRef,
-            Arc::new(StringArray::from(vec_etag)) as ArrayRef,
-            Arc::new(UInt8Array::from(vec_diff_flag)) as ArrayRef,
+            Arc::new(key_builder.finish()) as ArrayRef,
+            Arc::new(size_builder.finish()) as ArrayRef,
+            Arc::new(last_modified_builder.finish()) as ArrayRef,
+            Arc::new(etag_builder.finish()) as ArrayRef,
+            Arc::new(diff_flag_builder.finish()) as ArrayRef,
         ];
 
         match RecordBatch::try_new(Arc::clone(&self.schema_ref), columns) {
@@ -116,7 +143,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             }
             Err(e) => return Err(format!("RecordBatch error: {}", e)),
         }
-        Ok(())
+        Ok(count)
     }
 
     /// Flush the in-progress row group (streaming — keeps memory bounded).
