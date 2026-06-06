@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-06-06
+
 ### Changed
 - Reduced list-mode Parquet output overhead by building Arrow arrays directly
   from incoming batches and avoiding the intermediate filtered row vector.
