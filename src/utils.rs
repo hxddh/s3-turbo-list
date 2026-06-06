@@ -97,8 +97,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             return Ok(0);
         }
 
-        let key_bytes = v.iter().map(|(key, _)| key.as_str().len()).sum();
-        let mut key_builder = StringBuilder::with_capacity(v.len(), key_bytes);
+        let mut key_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(40));
         let mut size_builder = UInt64Builder::with_capacity(v.len());
         let mut last_modified_builder = UInt64Builder::with_capacity(v.len());
         let mut etag_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(36));

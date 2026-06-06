@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Reduced list-mode Parquet ingestion overhead by folding prefix/byte
+  accounting into the writer selection pass.
+- Removed the Parquet writer's per-batch key-length pre-scan, keeping list
+  output on a single main batch traversal.
+
 ## [0.2.15] - 2026-06-06
 
 ### Changed

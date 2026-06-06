@@ -641,13 +641,10 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
-    for (key, props) in &batch {
-        record_prefix_stat(prefix_stats, key.prefix(), props.size());
-        stats.bytes_total = stats.bytes_total.saturating_add(props.size());
-    }
-
     let written = parquet
-        .write_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |_, props| {
+        .write_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
+            record_prefix_stat(prefix_stats, key.prefix(), props.size());
+            stats.bytes_total = stats.bytes_total.saturating_add(props.size());
             props.final_status_check() != MatchResult::Ignore
         })
         .await?;
