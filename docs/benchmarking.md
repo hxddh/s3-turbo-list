@@ -22,6 +22,9 @@ Or use the wrapper:
 
 ```bash
 ./scripts/benchmark-local.sh
+
+# Ubuntu 20.04 arm64 may need the same aws-lc-sys workaround as release builds:
+BUILD_MODE=clang ./scripts/benchmark-local.sh
 ```
 
 To compare all local output formats with repeated runs and median summaries:
@@ -45,6 +48,12 @@ BENCHMARK=diff-map OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benc
 BENCHMARK=diff-output OBJECTS=1000000 BATCH_SIZE=10000 PREFIXES=1024 ./scripts/benchmark-local.sh
 BENCHMARK=diff-output DIFF_SHAPE=all-changed OBJECTS=1000000 ./scripts/benchmark-local.sh
 ```
+
+All benchmark wrapper scripts use `scripts/build-release.sh` when the default
+release binary is missing, so `BUILD_MODE=clang|gcc10|no-asm` has the same
+meaning as in release builds.  To compare a published or previously built
+binary, set `BIN=/path/to/s3-turbo-list`; when `BIN` is set, the wrappers use
+that binary as-is and fail if it is not executable.
 
 For stdout formatter changes, run each format at least three times and compare
 medians against the previous release binary.  This keeps single-run CPU noise

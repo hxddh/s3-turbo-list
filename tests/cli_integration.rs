@@ -295,6 +295,9 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("./scripts/check-release-env.sh"));
     assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
     assert!(stdout.contains("BUILD_MODE=clang"));
+    assert!(stdout.contains("Benchmark smoke checks"));
+    assert!(stdout.contains("OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh"));
+    assert!(stdout.contains("BIN=./target/release/s3-turbo-list"));
     assert!(stdout.contains("gh workflow run release-assets.yml"));
     assert!(stdout.contains("./scripts/verify-release-assets.sh"));
     assert!(stdout.contains("do not contact S3-compatible cloud endpoints"));

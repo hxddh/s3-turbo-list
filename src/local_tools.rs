@@ -1034,6 +1034,10 @@ Pipe output with a manifest:
   python3 -m py_compile examples/read-parquet.py
   python3 -m py_compile examples/inspect-trace.py
 
+Benchmark smoke checks:
+  BUILD_MODE=clang OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh
+  BIN=./target/release/s3-turbo-list OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh
+
 Release build on Ubuntu 20.04 arm64:
   BUILD_MODE=clang ./scripts/build-release.sh
 

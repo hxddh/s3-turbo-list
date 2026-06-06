@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Benchmark wrapper scripts now use the release build script when the default
+  release binary is missing, so `BUILD_MODE` workarounds are consistent with
+  release builds.
+- Benchmark wrappers now fail clearly when an explicit `BIN` points to a
+  non-executable path instead of silently building another binary.
+- Documented benchmark `BUILD_MODE` and `BIN` usage, and added benchmark smoke
+  commands to the release-check recipe.
+
 ## [0.2.13] - 2026-06-06
 
 ### Changed

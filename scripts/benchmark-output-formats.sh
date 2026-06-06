@@ -2,7 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BIN:-$ROOT/target/release/s3-turbo-list}"
+if [[ -n "${BIN+x}" ]]; then
+  BIN_WAS_SET=1
+else
+  BIN_WAS_SET=0
+  BIN="$ROOT/target/release/s3-turbo-list"
+fi
 OBJECTS="${OBJECTS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-5000}"
 PREFIXES="${PREFIXES:-512}"
@@ -30,12 +35,11 @@ fi
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 
 if [[ ! -x "$BIN" ]]; then
-  build_mode="${BUILD_MODE:-default}"
-  arch="$(uname -m)"
-  if [[ "$build_mode" == "default" && ( "$arch" == "aarch64" || "$arch" == "arm64" ) ]] && command -v clang >/dev/null 2>&1; then
-    build_mode="clang"
+  if [[ "$BIN_WAS_SET" == "1" ]]; then
+    echo "ERROR: BIN is set but is not executable: $BIN" >&2
+    exit 1
   fi
-  BUILD_MODE="$build_mode" "$ROOT/scripts/build-release.sh" >/dev/null
+  BUILD_MODE="${BUILD_MODE:-default}" "$ROOT/scripts/build-release.sh" >/dev/null
   BIN="$ROOT/target/release/s3-turbo-list"
 fi
 
