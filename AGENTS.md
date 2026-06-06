@@ -11,7 +11,8 @@ Repository:
 - Local path: `/home/ubuntu/s3-turbo-list`
 - GitHub: `https://github.com/hxddh/s3-turbo-list`
 - Main branch: `main`
-- Current release tag: `v0.2.12`
+- Current release source: use the latest git tag / GitHub Release as the
+  release source of truth.
 
 ## Required Reading
 

@@ -142,7 +142,8 @@ Trigger the repository workflow after the linux-aarch64 asset exists:
 
 ```bash
 gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
-gh run watch --repo hxddh/s3-turbo-list --exit-status
+RUN_ID="$(gh run list --repo hxddh/s3-turbo-list --workflow release-assets.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run watch "$RUN_ID" --repo hxddh/s3-turbo-list --exit-status
 ```
 
 The workflow first validates the release source once on Linux, then builds
@@ -157,6 +158,15 @@ If a workflow appears stuck, inspect individual job steps:
 gh run view "$RUN_ID" \
   --repo hxddh/s3-turbo-list \
   --json status,conclusion,jobs
+```
+
+For a compact status summary during long release builds:
+
+```bash
+gh run view "$RUN_ID" \
+  --repo hxddh/s3-turbo-list \
+  --json status,conclusion,jobs \
+  --jq '.status + " " + (.conclusion // ""), (.jobs[] | [.name,.status,.conclusion] | @tsv)'
 ```
 
 ## 10. Post-Release Verification

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Reduced release-version maintenance by replacing versioned install/build
+  examples with template-based asset names.
+- Release asset workflow now requires an explicit tag and checks it against
+  `Cargo.toml` before building.
+- Release preflight checks now flag stale hard-coded release asset versions
+  instead of requiring docs and agent notes to repeat the current version.
+
 ## [0.2.12] - 2026-06-05
 
 ### Changed

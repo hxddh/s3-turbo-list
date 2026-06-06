@@ -90,10 +90,10 @@ applies to `--release`.
 
 ```
 dist/
-├── s3-turbo-list-0.2.12-linux-x86_64
-├── s3-turbo-list-0.2.12-linux-x86_64.sha256
-├── s3-turbo-list-0.2.12-linux-aarch64
-└── s3-turbo-list-0.2.12-linux-aarch64.sha256
+├── s3-turbo-list-<version>-linux-x86_64
+├── s3-turbo-list-<version>-linux-x86_64.sha256
+├── s3-turbo-list-<version>-linux-aarch64
+└── s3-turbo-list-<version>-linux-aarch64.sha256
 ```
 
 ## Cross-compilation
@@ -109,8 +109,9 @@ TARGET=x86_64-unknown-linux-gnu BUILD_MODE=default ./scripts/build-release.sh
 After the build completes, verify the binary locally (no cloud endpoints):
 
 ```bash
-./dist/s3-turbo-list-0.2.12-linux-aarch64 --version
-./dist/s3-turbo-list-0.2.12-linux-aarch64 --help
+VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+./dist/s3-turbo-list-${VERSION}-linux-aarch64 --version
+./dist/s3-turbo-list-${VERSION}-linux-aarch64 --help
 ```
 
 ## What NOT to do

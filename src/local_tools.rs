@@ -1023,6 +1023,7 @@ Pipe output with a manifest:
         ),
         "release-check" | "ci" => Ok(
             r#"Release check (local only):
+  VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
   ./scripts/check-release-env.sh
   cargo fmt --check
   cargo check
@@ -1035,6 +1036,13 @@ Pipe output with a manifest:
 
 Release build on Ubuntu 20.04 arm64:
   BUILD_MODE=clang ./scripts/build-release.sh
+
+Release publication checks:
+  gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
+  RUN_ID=$(gh run list --repo hxddh/s3-turbo-list --workflow release-assets.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+  gh run view "$RUN_ID" --repo hxddh/s3-turbo-list --json status,conclusion,jobs
+  ./scripts/verify-release-assets.sh "v${VERSION}"
+  git rev-parse main origin/main "v${VERSION}^{}"
 
 These commands do not contact S3-compatible cloud endpoints.
 "#
