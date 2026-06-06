@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-06-06
+
 ### Changed
 - Reduced list-mode Parquet ingestion overhead by folding prefix/byte
   accounting into the writer selection pass.
