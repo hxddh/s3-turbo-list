@@ -135,6 +135,9 @@ in
 The v0.2.16 development cycle includes a follow-up single-pass list-mode
 Parquet comparison in
 [`docs/validation-results/list-parquet-single-pass-benchmark-20260606.md`](validation-results/list-parquet-single-pass-benchmark-20260606.md).
+The v0.2.17 development cycle includes a list-output inclusion fast-path
+comparison in
+[`docs/validation-results/list-output-include-fast-path-benchmark-20260607.md`](validation-results/list-output-include-fast-path-benchmark-20260607.md).
 
 ## Compression Notes
 

@@ -645,7 +645,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         .write_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
             record_prefix_stat(prefix_stats, key.prefix(), props.size());
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
-            props.final_status_check() != MatchResult::Ignore
+            props.include_in_list_output()
         })
         .await?;
     stats.streamed_rows += written;
@@ -665,7 +665,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     let mut out = Vec::with_capacity(batch.len().saturating_mul(96).min(1024 * 1024));
 
     for (key, props) in batch {
-        if props.final_status_check() == MatchResult::Ignore {
+        if !props.include_in_list_output() {
             continue;
         }
 
@@ -723,7 +723,7 @@ fn ingest_list_summary_batch(
     stats.received_objects += batch.len();
 
     for (key, props) in batch {
-        if props.final_status_check() != MatchResult::Ignore {
+        if props.include_in_list_output() {
             record_prefix_stat(prefix_stats, key.prefix(), props.size());
             stats.streamed_rows += 1;
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Reduced list-mode output filtering overhead by using a lightweight list-only
+  inclusion check instead of the diff-oriented final status state machine.
+
 ## [0.2.16] - 2026-06-06
 
 ### Changed

@@ -209,6 +209,23 @@ impl ObjectProps {
         }
     }
 
+    pub(crate) fn include_in_list_output(&self) -> bool {
+        if self.is_diff_mode() {
+            return false;
+        }
+        if let Some(filter) = OBJECT_FILTER.get() {
+            if filter.evaluate(self, None) == Some(false) {
+                return false;
+            }
+        }
+        if self.status != OBJECT_PROPS_STATUS_OPEN {
+            return false;
+        }
+
+        let dir = self.flags & OBJECT_PROPS_FLAG_DIR_BOTH;
+        dir == OBJECT_PROPS_FLAG_DIR_LEFT || dir == OBJECT_PROPS_FLAG_DIR_RIGHT
+    }
+
     /// Final status check — used at dump time.
     pub fn final_status_check(&self) -> MatchResult {
         // In list mode, apply optional filter here.
@@ -1168,6 +1185,35 @@ mod tests {
         let mut props = ObjectProps::default();
         props.status = OBJECT_PROPS_STATUS_OPEN;
         assert_eq!(props.final_status_check(), MatchResult::Ignore);
+    }
+
+    #[test]
+    fn test_object_props_list_output_includes_open_list_object() {
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [1u8; 16]);
+        assert!(props.include_in_list_output());
+    }
+
+    #[test]
+    fn test_object_props_list_output_excludes_filter_out_status() {
+        let mut props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [1u8; 16]);
+        props.status = OBJECT_PROPS_STATUS_FILTER_OUT;
+        assert!(!props.include_in_list_output());
+    }
+
+    #[test]
+    fn test_object_props_list_output_excludes_invalid_direction_state() {
+        let mut props = ObjectProps::default();
+        props.status = OBJECT_PROPS_STATUS_OPEN;
+        assert!(!props.include_in_list_output());
+
+        props.set_dir(S3_TASK_CONTEXT_DIR_LEFT | S3_TASK_CONTEXT_DIR_RIGHT);
+        assert!(!props.include_in_list_output());
+    }
+
+    #[test]
+    fn test_object_props_list_output_excludes_diff_mode() {
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [1u8; 16]);
+        assert!(!props.include_in_list_output());
     }
 
     #[test]
