@@ -887,13 +887,23 @@ fn finalize_list_summary_only(
 }
 
 pub fn insert_batch_grouped(map: &PrefixMap, batch: Vec<(ObjectKey, ObjectProps)>) {
-    let mut grouped: HashMap<String, Vec<(ObjectName, ObjectProps)>> = HashMap::new();
+    // S3 pages arrive in lexicographic key order, so objects sharing a prefix
+    // form contiguous runs; flush per run instead of re-grouping the whole
+    // batch through an intermediate HashMap.
+    let mut run_prefix: Option<String> = None;
+    let mut run_items: Vec<(ObjectName, ObjectProps)> = Vec::new();
     for (key, props) in batch {
-        let (prefix, name) = key.decode();
-        grouped.entry(prefix).or_default().push((name, props));
+        let (prefix, name) = key.into_decoded();
+        if run_prefix.as_deref() != Some(prefix.as_str()) {
+            if let Some(done) = run_prefix.take() {
+                map.bulk_insert(&done, std::mem::take(&mut run_items));
+            }
+            run_prefix = Some(prefix);
+        }
+        run_items.push((name, props));
     }
-    for (prefix, items) in grouped {
-        map.bulk_insert(&prefix, items);
+    if let Some(done) = run_prefix {
+        map.bulk_insert(&done, run_items);
     }
 }
 

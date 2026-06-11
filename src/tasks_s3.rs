@@ -372,16 +372,19 @@ async fn flat_list(
                         }
                     }
 
-                    // Remember the last processed key for resume-on-error.
-                    // Some S3-compatible providers omit KeyCount, so this must
-                    // not depend on provider pagination metadata.
-                    next_start = obj_key.to_string();
-
                     let key: ObjectKey = obj_key.into();
                     let mut props: ObjectProps = obj.into();
                     props.set_dir(ctx.dir);
                     batch.push((key, props));
                     object_count = object_count.saturating_add(1);
+                }
+
+                // Remember the last processed key for resume-on-error.
+                // Some S3-compatible providers omit KeyCount, so this must
+                // not depend on provider pagination metadata.
+                if let Some((key, _)) = batch.last() {
+                    next_start.clear();
+                    next_start.push_str(key.as_str());
                 }
 
                 // Send batch to data_map via bounded channel.

@@ -87,6 +87,20 @@ impl ObjectKey {
             })
     }
 
+    /// Consuming variant of [`decode`](Self::decode): reuses this key's
+    /// allocation for the prefix, so only the name is newly allocated.
+    pub fn into_decoded(self) -> (ObjectPrefix, ObjectName) {
+        match self.0.rfind('/') {
+            Some(pos) => {
+                let mut prefix = self.0;
+                let name = prefix.split_off(pos + 1);
+                prefix.truncate(pos);
+                (prefix, name)
+            }
+            None => ("/".to_owned(), self.0),
+        }
+    }
+
     /// Borrow just the `prefix` portion of this key. Top-level objects use `"/"` as prefix.
     pub fn prefix(&self) -> &str {
         self.0.rsplit_once('/').map_or("/", |(p, _)| p)
@@ -1082,6 +1096,14 @@ mod tests {
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "a/b/c/test.jpg");
+    }
+
+    #[test]
+    fn test_object_key_into_decoded_matches_decode() {
+        for raw in ["test.jpg", "a/b/c/test.jpg", "dir/", "a//b", "/leading"] {
+            let key = ObjectKey::from(raw);
+            assert_eq!(key.decode(), ObjectKey::from(raw).into_decoded(), "{raw}");
+        }
     }
 
     #[test]
