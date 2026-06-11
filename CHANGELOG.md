@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-06-11
+
 ### Changed
 - Treat `--delimiter ""` as recursive ListObjectsV2 listing by omitting the
   delimiter request parameter, improving compatibility with S3-compatible
