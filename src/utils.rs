@@ -102,7 +102,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         let mut last_modified_builder = UInt64Builder::with_capacity(v.len());
         let mut etag_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(36));
         let mut diff_flag_builder = UInt8Builder::with_capacity(v.len());
-        let mut etag = String::with_capacity(43);
+        let mut etag_buf = [0u8; 43];
         let mut count = 0usize;
 
         for (key, props) in &v {
@@ -113,9 +113,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             key_builder.append_value(key.as_str());
             size_builder.append_value(props.size());
             last_modified_builder.append_value(props.last_modified());
-            props.append_etag_string(&mut etag);
-            etag_builder.append_value(&etag);
-            etag.clear();
+            let etag = props.write_etag_to_buffer(&mut etag_buf);
+            etag_builder.append_value(etag);
             diff_flag_builder.append_value(diff_flag);
             count += 1;
         }

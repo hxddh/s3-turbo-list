@@ -138,6 +138,9 @@ Parquet comparison in
 The v0.2.17 development cycle includes a list-output inclusion fast-path
 comparison in
 [`docs/validation-results/list-output-include-fast-path-benchmark-20260607.md`](validation-results/list-output-include-fast-path-benchmark-20260607.md).
+The v0.2.18 development cycle includes a list-mode Parquet ETag buffer
+comparison in
+[`docs/validation-results/list-parquet-etag-buffer-benchmark-20260611.md`](validation-results/list-parquet-etag-buffer-benchmark-20260611.md).
 
 ## Compression Notes
 

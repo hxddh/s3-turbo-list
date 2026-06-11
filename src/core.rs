@@ -209,6 +209,40 @@ impl ObjectProps {
         }
     }
 
+    pub(crate) fn write_etag_to_buffer<'a>(&self, buf: &'a mut [u8; 43]) -> &'a str {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut pos = 0usize;
+        for byte in self.etag_md5 {
+            buf[pos] = HEX[(byte >> 4) as usize];
+            buf[pos + 1] = HEX[(byte & 0x0f) as usize];
+            pos += 2;
+        }
+
+        if self.etag_parts != 0 {
+            buf[pos] = b'-';
+            pos += 1;
+
+            let mut parts = self.etag_parts;
+            let mut digits = [0u8; 10];
+            let mut digit_count = 0usize;
+            while parts >= 10 {
+                digits[digit_count] = b'0' + (parts % 10) as u8;
+                parts /= 10;
+                digit_count += 1;
+            }
+            digits[digit_count] = b'0' + parts as u8;
+            digit_count += 1;
+
+            for digit in digits[..digit_count].iter().rev() {
+                buf[pos] = *digit;
+                pos += 1;
+            }
+        }
+
+        std::str::from_utf8(&buf[..pos]).expect("ETag formatter emits ASCII")
+    }
+
     pub(crate) fn include_in_list_output(&self) -> bool {
         if self.is_diff_mode() {
             return false;
@@ -1214,6 +1248,45 @@ mod tests {
     fn test_object_props_list_output_excludes_diff_mode() {
         let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [1u8; 16]);
         assert!(!props.include_in_list_output());
+    }
+
+    #[test]
+    fn test_object_props_fast_etag_matches_plain_etag_string() {
+        let props = ObjectProps::new_open(
+            S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+            100,
+            [
+                0x00, 0x01, 0x02, 0x03, 0x0a, 0x0b, 0x0c, 0x0d, 0x10, 0x11, 0x12, 0x13, 0xfa, 0xfb,
+                0xfc, 0xff,
+            ],
+        );
+        let mut buf = [0u8; 43];
+        assert_eq!(props.write_etag_to_buffer(&mut buf), props.etag_string());
+    }
+
+    #[test]
+    fn test_object_props_fast_etag_matches_multipart_etag_string() {
+        let mut props =
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [0xabu8; 16]);
+        props.etag_parts = 12_345;
+        let mut buf = [0u8; 43];
+        assert_eq!(props.write_etag_to_buffer(&mut buf), props.etag_string());
+    }
+
+    #[test]
+    fn test_object_props_fast_etag_matches_max_parts_etag_string() {
+        let mut props =
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [0xffu8; 16]);
+        props.etag_parts = u32::MAX;
+        let mut buf = [0u8; 43];
+        assert_eq!(props.write_etag_to_buffer(&mut buf), props.etag_string());
+    }
+
+    #[test]
+    fn test_object_props_fast_etag_matches_zero_etag_string() {
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [0u8; 16]);
+        let mut buf = [0u8; 43];
+        assert_eq!(props.write_etag_to_buffer(&mut buf), props.etag_string());
     }
 
     #[test]
