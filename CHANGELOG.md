@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-06-11
+
 ### Changed
 - Reduced list-mode Parquet ETag rendering overhead by formatting ETags into a
   fixed stack buffer before appending them to Arrow string builders.
