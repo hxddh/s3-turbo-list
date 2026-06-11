@@ -1592,9 +1592,9 @@ connect_timeout_secs = 60
 operation_timeout_secs = 5
 
 [output]
-row_group_size = 10000
+row_group_size = 100000
 compression = "zstd"
-compression_level = 3
+compression_level = 1
 
 [auto_hints]
 sample_threshold = 10000

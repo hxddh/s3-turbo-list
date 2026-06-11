@@ -13,8 +13,8 @@ cargo build --release
   --prefixes 512 \
   --producers 1 \
   --output-format parquet \
-  --compression gzip \
-  --compression-level 6 \
+  --compression zstd \
+  --compression-level 1 \
   --json
 ```
 
@@ -144,7 +144,7 @@ comparison in
 
 ## Compression Notes
 
-The default Parquet compression is `zstd(3)`.  The v0.1.26 local benchmark
+The default Parquet compression is `zstd(1)`.  The v0.1.26 local benchmark
 showed a better speed/size balance than the previous `gzip(6)` default on the
 list-mode streaming output path.  For traditional gzip output, pass both codec
 and level explicitly:

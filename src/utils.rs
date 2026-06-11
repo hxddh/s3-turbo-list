@@ -19,6 +19,53 @@ pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
     writer: AsyncArrowWriter<W>,
     ks_path: String,
     total_rows: usize,
+    row_group_size: usize,
+    list_batch: Option<ListParquetBatch>,
+}
+
+struct ListParquetBatch {
+    key_builder: StringBuilder,
+    size_builder: UInt64Builder,
+    last_modified_builder: UInt64Builder,
+    etag_builder: StringBuilder,
+    diff_flag_builder: UInt8Builder,
+    rows: usize,
+}
+
+impl ListParquetBatch {
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            key_builder: StringBuilder::with_capacity(rows, rows.saturating_mul(40)),
+            size_builder: UInt64Builder::with_capacity(rows),
+            last_modified_builder: UInt64Builder::with_capacity(rows),
+            etag_builder: StringBuilder::with_capacity(rows, rows.saturating_mul(36)),
+            diff_flag_builder: UInt8Builder::with_capacity(rows),
+            rows: 0,
+        }
+    }
+
+    fn append(&mut self, key: &ObjectKey, props: &ObjectProps, diff_flag: u8) {
+        let mut etag_buf = [0u8; 43];
+        self.key_builder.append_value(key.as_str());
+        self.size_builder.append_value(props.size());
+        self.last_modified_builder
+            .append_value(props.last_modified());
+        let etag = props.write_etag_to_buffer(&mut etag_buf);
+        self.etag_builder.append_value(etag);
+        self.diff_flag_builder.append_value(diff_flag);
+        self.rows += 1;
+    }
+
+    fn finish(mut self, schema_ref: SchemaRef) -> Result<RecordBatch, String> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.key_builder.finish()) as ArrayRef,
+            Arc::new(self.size_builder.finish()) as ArrayRef,
+            Arc::new(self.last_modified_builder.finish()) as ArrayRef,
+            Arc::new(self.etag_builder.finish()) as ArrayRef,
+            Arc::new(self.diff_flag_builder.finish()) as ArrayRef,
+        ];
+        RecordBatch::try_new(schema_ref, columns).map_err(|e| format!("RecordBatch error: {}", e))
+    }
 }
 
 impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
@@ -63,6 +110,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             writer,
             ks_path: ks_path.to_string(),
             total_rows: 0,
+            row_group_size: row_group_size.max(1),
+            list_batch: None,
         }
     }
 
@@ -73,6 +122,11 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
     #[allow(dead_code)] // Phase 5: used in monitoring and streaming row-group flushes
     pub fn total_rows(&self) -> usize {
         self.total_rows
+            + self
+                .list_batch
+                .as_ref()
+                .map(|batch| batch.rows)
+                .unwrap_or(0)
     }
 
     pub async fn write_batch(
@@ -144,6 +198,59 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         Ok(count)
     }
 
+    pub async fn write_list_batch_filtered<F>(
+        &mut self,
+        v: Vec<(ObjectKey, ObjectProps)>,
+        diff_flag: u8,
+        mut include: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(&ObjectKey, &ObjectProps) -> bool,
+    {
+        let mut count = 0usize;
+        for (key, props) in &v {
+            if !include(key, props) {
+                continue;
+            }
+
+            self.ensure_list_batch();
+            let batch = self
+                .list_batch
+                .as_mut()
+                .expect("list batch must exist after ensure");
+            batch.append(key, props, diff_flag);
+            count += 1;
+
+            if batch.rows >= self.row_group_size {
+                self.flush_list_batch().await?;
+            }
+        }
+        Ok(count)
+    }
+
+    fn ensure_list_batch(&mut self) {
+        if self.list_batch.is_none() {
+            self.list_batch = Some(ListParquetBatch::with_capacity(self.row_group_size));
+        }
+    }
+
+    async fn flush_list_batch(&mut self) -> Result<(), String> {
+        let Some(batch) = self.list_batch.take() else {
+            return Ok(());
+        };
+        if batch.rows == 0 {
+            return Ok(());
+        }
+        let rows = batch.rows;
+        let record_batch = batch.finish(Arc::clone(&self.schema_ref))?;
+        self.writer
+            .write(&record_batch)
+            .await
+            .map_err(|e| format!("Parquet write error: {}", e))?;
+        self.total_rows += rows;
+        Ok(())
+    }
+
     /// Flush the in-progress row group (streaming — keeps memory bounded).
     #[allow(dead_code)] // Phase 5: used in streaming row-group flushes
     pub async fn flush_row_group(&mut self) {
@@ -152,7 +259,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         }
     }
 
-    pub async fn close(self) -> Result<(), String> {
+    pub async fn close(mut self) -> Result<(), String> {
+        self.flush_list_batch().await?;
         self.writer
             .close()
             .await

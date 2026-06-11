@@ -347,7 +347,8 @@ async fn flat_list(
                     None,
                 );
 
-                let mut batch: Vec<(ObjectKey, ObjectProps)> = Vec::new();
+                let mut batch: Vec<(ObjectKey, ObjectProps)> =
+                    Vec::with_capacity(objects.contents().len());
 
                 for obj in objects.contents() {
                     let obj_key = match obj.key() {

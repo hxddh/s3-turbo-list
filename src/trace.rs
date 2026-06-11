@@ -240,6 +240,13 @@ impl S3TraceWriter for NoopTraceWriter {
 /// Returns a single [`Box<dyn S3TraceWriter>`] that fans events to all
 /// enabled outputs.  Panics if file creation fails.
 pub fn create_trace_writer(trace_compat: Option<&str>, debug_s3: bool) -> Box<dyn S3TraceWriter> {
+    create_trace_writer_opt(trace_compat, debug_s3).unwrap_or_else(|| Box::new(NoopTraceWriter))
+}
+
+pub fn create_trace_writer_opt(
+    trace_compat: Option<&str>,
+    debug_s3: bool,
+) -> Option<Box<dyn S3TraceWriter>> {
     let mut composite = CompositeTraceWriter::new();
 
     if let Some(path) = trace_compat {
@@ -253,9 +260,9 @@ pub fn create_trace_writer(trace_compat: Option<&str>, debug_s3: bool) -> Box<dy
     }
 
     if composite.is_empty() {
-        Box::new(NoopTraceWriter)
+        None
     } else {
-        Box::new(composite)
+        Some(Box::new(composite))
     }
 }
 
@@ -367,6 +374,7 @@ mod tests {
         let w = create_trace_writer(None, false);
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         // just should not panic
+        assert!(create_trace_writer_opt(None, false).is_none());
 
         // File only
         let dir = tempfile::tempdir().unwrap();
@@ -377,6 +385,7 @@ mod tests {
         assert!(std::fs::read_to_string(p_str)
             .unwrap()
             .contains("\"operation\":\"X\""));
+        assert!(create_trace_writer_opt(Some(p_str), false).is_some());
     }
 
     #[test]

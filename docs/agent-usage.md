@@ -50,7 +50,7 @@ without creating Parquet/KS files and without making S3 requests.
 the directory until a real `list` or `diff` run.
 Compression choices are also visible in `resolved_config`: agents can use
 `--compression` and `--compression-level` for one-off Parquet output runs
-without editing TOML.  The default is `zstd(3)`; use
+without editing TOML.  The default is `zstd(1)`; use
 `--compression gzip --compression-level 6` when a downstream reader requires
 traditional gzip output.
 

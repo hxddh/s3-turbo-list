@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Improved default list-mode Parquet throughput by using larger row groups and
+  the faster default `zstd(1)` compression level.
+- Reduced list-mode Parquet writer overhead by accumulating rows into
+  row-group-sized Arrow batches before writing.
+- Avoided disabled S3 trace event construction on the list path unless
+  compatibility tracing or S3 debug logging is enabled.
+
 ## [0.2.18] - 2026-06-11
 
 ### Changed

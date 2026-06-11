@@ -14,9 +14,9 @@ for large listings.  Values come from `src/config.rs`.
 | `runtime.worker_threads` | `10` | Tokio worker threads; CLI override: `-T`, `--threads`. |
 | `runtime.max_concurrency` | `100` | Max concurrent list operations; CLI override: `-c`, `--concurrency`. |
 | `channel.capacity` | `64` | Bounded channel capacity between list tasks and data-map output. |
-| `output.row_group_size` | `10000` | Parquet max row group size. |
+| `output.row_group_size` | `100000` | Parquet max row group size. |
 | `output.compression` | `zstd` | Parquet compression codec; CLI override: `--compression`. |
-| `output.compression_level` | `3` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
+| `output.compression_level` | `1` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
 | `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
 | `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
 | `auto_hints.min_segment_size` | `1000` | Reserved segment-size tuning value. |
@@ -42,9 +42,9 @@ worker_threads = 8
 max_concurrency = 32
 
 [output]
-row_group_size = 50000
+row_group_size = 100000
 compression = "zstd"
-compression_level = 3
+compression_level = 1
 
 [auto_hints]
 sample_threshold = 10000

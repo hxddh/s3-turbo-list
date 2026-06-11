@@ -1169,11 +1169,9 @@ fn main() {
 
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
-        let trace_writer: Option<Arc<dyn S3TraceWriter>> = {
-            let writer =
-                trace::create_trace_writer(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3);
-            Some(Arc::from(writer))
-        };
+        let trace_writer: Option<Arc<dyn S3TraceWriter>> =
+            trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3)
+                .map(Arc::from);
 
         // ── Load or generate KeySpace hints ─────────────────
         let hints_disabled_for_diff = mode == RunMode::BiDir;

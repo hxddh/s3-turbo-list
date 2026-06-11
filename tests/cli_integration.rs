@@ -462,7 +462,7 @@ fn test_cli_benchmark_local_json_no_cloud() {
     assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json["network"], "none: synthetic local data only");
     assert_eq!(json["compression"], "zstd");
-    assert_eq!(json["compression_level"], 3);
+    assert_eq!(json["compression_level"], 1);
     assert_eq!(json["output_format"], "parquet");
     assert_eq!(json["objects"], 32);
     assert_eq!(json["producers"], 2);
@@ -648,7 +648,7 @@ fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
-    assert_eq!(json["resolved_config"]["output"]["compression_level"], 3);
+    assert_eq!(json["resolved_config"]["output"]["compression_level"], 1);
     assert!(!json["config_source"]["searched"]
         .as_array()
         .unwrap()
