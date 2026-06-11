@@ -69,6 +69,8 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: macos-x86_64
@@ -128,22 +130,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v7
         with:
           path: artifacts
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "Release assets for ${TAG}" > /tmp/release-notes.md
+          fi
+          cat /tmp/release-notes.md
+
       - name: Ensure GitHub release exists
         run: |
           TAG="${{ inputs.tag }}"
           if gh release view "$TAG" --repo hxddh/s3-turbo-list >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
+            echo "Release $TAG already exists — refreshing notes"
+            gh release edit "$TAG" \
+              --repo hxddh/s3-turbo-list \
+              --notes-file /tmp/release-notes.md
           else
             gh release create "$TAG" \
               --repo hxddh/s3-turbo-list \
               --verify-tag \
               --title "$TAG" \
-              --notes "Release assets for $TAG"
+              --notes-file /tmp/release-notes.md
           fi
         env:
           GH_TOKEN: ${{ github.token }}
@@ -157,15 +180,18 @@ jobs:
           # Collect all new binaries from the build matrix
           find artifacts -type f -name 's3-turbo-list-*' ! -name '*.sha256' -exec cp {} flat/ \;
 
-          # Download existing linux-aarch64 asset from the release. On this
-          # project the arm64 Linux asset is built on the Oracle arm host and
-          # uploaded before this workflow fills in the remaining platforms.
-          if ! gh release download "${{ inputs.tag }}" \
-            --repo hxddh/s3-turbo-list \
-            --dir flat \
-            --pattern "s3-turbo-list-${VERSION}-linux-aarch64"; then
-            echo "::error::Missing s3-turbo-list-${VERSION}-linux-aarch64. Build and upload the Oracle arm64 asset before finalizing release assets."
-            exit 1
+          # The linux-aarch64 asset is normally built by the matrix on the
+          # ubuntu-24.04-arm runner. As a fallback (e.g. arm runners
+          # unavailable), accept a pre-uploaded release asset built on an
+          # external arm64 host.
+          if [ ! -s "flat/s3-turbo-list-${VERSION}-linux-aarch64" ]; then
+            if ! gh release download "${{ inputs.tag }}" \
+              --repo hxddh/s3-turbo-list \
+              --dir flat \
+              --pattern "s3-turbo-list-${VERSION}-linux-aarch64"; then
+              echo "::error::Missing s3-turbo-list-${VERSION}-linux-aarch64 from both the build matrix and the release. Build and upload the arm64 asset, then rerun."
+              exit 1
+            fi
           fi
         env:
           GH_TOKEN: ${{ github.token }}

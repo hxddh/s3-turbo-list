@@ -111,34 +111,16 @@ git push origin main
 git push origin "v${VERSION}"
 ```
 
-## 8. Create Release and Upload linux-aarch64
-
-On the Oracle arm64 host, upload the locally built Linux ARM64 binary first:
-
-```bash
-gh release create "v${VERSION}" \
-  "dist/s3-turbo-list-${VERSION}-linux-aarch64" \
-  "dist/s3-turbo-list-${VERSION}-linux-aarch64.sha256" \
-  --repo hxddh/s3-turbo-list \
-  --verify-tag \
-  --title "v${VERSION}" \
-  --notes-file /tmp/s3-turbo-list-v${VERSION}-notes.md
-```
-
-If the release already exists after a rerun or fix, replace just the local
-linux-aarch64 assets:
+If the environment cannot push tags (managed environments allow branch
+pushes only), trigger the `release-tag.yml` workflow instead:
 
 ```bash
-gh release upload "v${VERSION}" \
-  "dist/s3-turbo-list-${VERSION}-linux-aarch64" \
-  "dist/s3-turbo-list-${VERSION}-linux-aarch64.sha256" \
-  --repo hxddh/s3-turbo-list \
-  --clobber
+gh workflow run release-tag.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
 ```
 
-## 9. Build Cross-Platform Release Assets
+## 8. Build Release Assets
 
-Trigger the repository workflow after the linux-aarch64 asset exists:
+Trigger the release asset workflow:
 
 ```bash
 gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
@@ -146,11 +128,18 @@ RUN_ID="$(gh run list --repo hxddh/s3-turbo-list --workflow release-assets.yml -
 gh run watch "$RUN_ID" --repo hxddh/s3-turbo-list --exit-status
 ```
 
-The workflow first validates the release source once on Linux, then builds
-Linux x86_64, macOS Apple Silicon, and macOS Intel assets.  The finalize job
-downloads the existing linux-aarch64 asset, generates the combined
-`SHA256SUMS` plus the linux-aarch64 single-file checksum, verifies the combined
-checksum file, and uploads the complete release asset set.
+The workflow validates the release source, then builds all four platform
+assets in the matrix: Linux x86_64, Linux aarch64 (native `ubuntu-24.04-arm`
+runner), macOS Apple Silicon, and macOS Intel.  The finalize job creates the
+GitHub release with notes extracted from `CHANGELOG.md`, generates the
+combined `SHA256SUMS` plus the linux-aarch64 single-file checksum, verifies
+the combined checksum file, and uploads the complete release asset set.
+
+If arm64 runners are unavailable, build the linux-aarch64 asset on an
+external arm64 host (see [`docs/build-release.md`](build-release.md) for the
+aws-lc-sys workaround on older toolchains), upload it to the release with
+`gh release upload`, and rerun the workflow — the finalize job accepts a
+pre-uploaded linux-aarch64 asset as a fallback.
 
 If a workflow appears stuck, inspect individual job steps:
 
