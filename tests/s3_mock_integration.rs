@@ -469,6 +469,67 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
 }
 
 #[test]
+fn local_mock_list_empty_delimiter_omits_request_parameter() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(request.method, "GET");
+        assert!(
+            !request.query.contains_key("delimiter"),
+            "{:?}",
+            request.query
+        );
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/a.txt", "logs/nested/b.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--delimiter".into(),
+        "".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    assert_eq!(
+        parquet_keys(&parquet),
+        vec!["logs/a.txt", "logs/nested/b.txt"]
+    );
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.query.contains_key("delimiter")));
+}
+
+#[test]
 fn local_mock_summary_only_reports_metrics_without_outputs() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");
@@ -1510,6 +1571,11 @@ estimate_mode = "full"
 #[test]
 fn local_mock_multi_segment_boundaries_include_boundary_keys() {
     let server = MockS3Server::start(|request, _sequence| {
+        assert!(
+            !request.query.contains_key("delimiter"),
+            "{:?}",
+            request.query
+        );
         let start_after = request.query.get("start-after").map(String::as_str);
         let contents = match start_after {
             None => vec!["a.txt", "m/", "n.txt"],
@@ -1563,6 +1629,8 @@ estimate_mode = "full"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "--delimiter".into(),
+        "".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--output-parquet-file".into(),
@@ -1812,6 +1880,66 @@ fn local_mock_auto_hints_uses_prefix_and_max_keys() {
     let rendered = std::fs::read_to_string(hints).unwrap();
     assert!(rendered.contains("prefix = \"logs/\""));
     assert!(rendered.contains("max_keys = 2"));
+}
+
+#[test]
+fn local_mock_auto_hints_empty_delimiter_omits_request_parameter() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(
+            request.query.get("prefix").map(String::as_str),
+            Some("logs/")
+        );
+        assert!(
+            !request.query.contains_key("delimiter"),
+            "{:?}",
+            request.query
+        );
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/a.txt", "logs/nested/b.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("auto-hints.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--prefix".into(),
+        "logs/".into(),
+        "--delimiter".into(),
+        "".into(),
+        "auto-hints".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output".into(),
+        hints.display().to_string(),
+        "--max-pages".into(),
+        "1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    assert!(std::fs::read_to_string(hints)
+        .unwrap()
+        .contains("total_objects = 2"));
 }
 
 #[test]

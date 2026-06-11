@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Treat `--delimiter ""` as recursive ListObjectsV2 listing by omitting the
+  delimiter request parameter, improving compatibility with S3-compatible
+  providers that reject `delimiter=`.
+- Added dry-run guidance when a list run falls back to a single ListObjectsV2
+  chain, making the hints-based high-throughput path easier to identify.
+- Documented third-party OSS hints benchmarks and the recommended
+  `auto-hints` plus moderate-concurrency list workflow for large buckets.
+
 ## [0.2.19] - 2026-06-11
 
 ### Changed

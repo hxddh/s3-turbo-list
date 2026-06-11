@@ -129,7 +129,9 @@ cargo run -- --delimiter '' list --region us-east-2 --bucket my-bucket --prefix 
 
 The default delimiter is `/`, which performs hierarchical listing and returns
 top-level objects plus `CommonPrefixes`.  Use `--delimiter ''` for a recursive
-full-bucket object inventory.
+full-bucket object inventory.  Empty delimiter is omitted from ListObjectsV2
+requests, matching the standard recursive listing behavior expected by
+S3-compatible providers.
 
 `--continuation-token` is a single-chain ListObjectsV2 resume tool.  Use it
 only with `list` and `--no-auto-hints`; it is intentionally rejected with
@@ -538,7 +540,10 @@ estimated_objects = 18000
 
 Generate hints automatically:
 ```bash
-s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
+s3-turbo-list --delimiter '' auto-hints \
+  --region us-east-2 \
+  --bucket my-bucket \
+  -o hints.toml
 ```
 
 Generate hints for one prefix subtree:
@@ -559,11 +564,27 @@ s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
 
 For very large buckets, generate an estimated hints file from a bounded sample:
 ```bash
-s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
+s3-turbo-list --delimiter '' auto-hints \
+  --region us-east-2 \
+  --bucket my-bucket \
   -o hints.sampled.toml \
   --sample-limit 1000000 \
   --max-pages 1000
 ```
+
+For repeated full-bucket inventories on large buckets, generate hints once and
+then run list with moderate segment concurrency:
+
+```bash
+s3-turbo-list --delimiter '' auto-hints \
+  --region us-east-2 --bucket my-bucket -o hints.toml
+s3-turbo-list --delimiter '' -c 8 -T 4 \
+  --hints-file hints.toml \
+  list --region us-east-2 --bucket my-bucket
+```
+
+On an OSS bucket with about 1,000,000 objects, this pattern reduced a hot
+single-chain scan from about 46.7s to about 18.0s in third-party testing.
 
 Hints boundaries are lexicographic cut points, not directories.  A boundary may
 also be a real object key; v0.1.10 treats that object as part of the preceding

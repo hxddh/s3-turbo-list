@@ -208,7 +208,11 @@ async fn flat_list(
         request = request.continuation_token(token);
     }
 
-    if let Some(ref delim) = ctx.delimiter {
+    if let Some(delim) = ctx
+        .delimiter
+        .as_deref()
+        .filter(|delimiter| !delimiter.is_empty())
+    {
         request = request.delimiter(delim);
     }
     if let Some(mk) = ctx.max_keys {

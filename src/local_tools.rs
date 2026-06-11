@@ -1063,9 +1063,9 @@ These commands do not contact S3-compatible cloud endpoints.
         ),
         "large-bucket" => Ok(
             r#"Large bucket:
-  s3-turbo-list auto-hints --bucket my-bucket --region us-east-1 --sample-limit 1000000 -o hints.toml
+  s3-turbo-list --delimiter '' auto-hints --bucket my-bucket --region us-east-1 --sample-limit 1000000 -o hints.toml
   s3-turbo-list hints-validate --hints-file hints.toml --json
-  s3-turbo-list --output-dir out --delimiter '' --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
+  s3-turbo-list --output-dir out --delimiter '' -c 8 -T 4 --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
   s3-turbo-list trace-summary out/trace.jsonl --machine-readable
 "#
             .to_string(),

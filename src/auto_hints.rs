@@ -331,8 +331,10 @@ pub async fn discover_prefixes(options: DiscoverPrefixesOptions<'_>) {
     let mut request = client
         .list_objects_v2()
         .bucket(options.bucket)
-        .prefix(options.prefix)
-        .delimiter(options.delimiter);
+        .prefix(options.prefix);
+    if !options.delimiter.is_empty() {
+        request = request.delimiter(options.delimiter);
+    }
     if let Some(max_keys) = options.max_keys {
         request = request.max_keys(max_keys);
     }

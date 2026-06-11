@@ -2762,6 +2762,28 @@ fn build_plan_report(
                 .to_string(),
         );
     }
+    if inputs.mode == "list"
+        && matches!(
+            hints.source.as_str(),
+            "single_segment_fallback" | "disabled_single_segment_fallback"
+        )
+    {
+        warnings.push(
+            "list is planned as a single ListObjectsV2 chain; --concurrency only improves throughput when hints provide multiple key-space segments"
+                .to_string(),
+        );
+    }
+    if cli.delimiter.is_empty()
+        && matches!(
+            cli.cmd,
+            Commands::List { .. } | Commands::AutoHints { .. } | Commands::DiscoverPrefixes { .. }
+        )
+    {
+        warnings.push(
+            "--delimiter '' means recursive listing and is omitted from ListObjectsV2 requests for S3-compatible provider compatibility"
+                .to_string(),
+        );
+    }
     if cli.summary_only {
         warnings.push(
             "summary-only will scan S3 ListObjectsV2 pages when not run with --dry-run, but it will not write Parquet or KeySpace outputs"

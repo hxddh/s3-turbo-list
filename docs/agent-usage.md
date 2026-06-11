@@ -104,6 +104,12 @@ count, warnings, and estimate summary metadata.  When `--resume` is set and a
 checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 
+For large buckets, agents should prefer the simple high-throughput path:
+generate hints with `--delimiter '' auto-hints`, validate them locally, then run
+`list` with `--delimiter '' --hints-file hints.toml -c 8 -T 4` as a conservative
+starting point.  Empty delimiter is omitted from ListObjectsV2 requests, which
+keeps recursive listing compatible with providers that reject `delimiter=`.
+
 For `diff`, dry-run reports `hints.source =
 "disabled_for_diff_single_segment"`.  Conventional hints caches are
 intentionally ignored, and explicit `diff --hints-file` exits with code `2`
