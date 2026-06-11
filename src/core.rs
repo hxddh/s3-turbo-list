@@ -715,6 +715,26 @@ impl GlobalState {
     }
 }
 
+/// Build an S3 client from a shared SDK config plus per-run overrides.
+pub fn build_s3_client(
+    sdk_config: &aws_config::SdkConfig,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+    force_path_style: bool,
+) -> aws_sdk_s3::Client {
+    let mut builder = aws_sdk_s3::config::Builder::from(sdk_config);
+    if let Some(region_str) = region {
+        builder = builder.region(aws_sdk_s3::config::Region::new(region_str.to_owned()));
+    }
+    if let Some(endpoint_url) = endpoint {
+        builder = builder.endpoint_url(endpoint_url.to_owned());
+    }
+    if force_path_style {
+        builder = builder.force_path_style(true);
+    }
+    aws_sdk_s3::Client::from_conf(builder.build())
+}
+
 // ── S3TaskContext ──────────────────────────────────────────
 
 #[derive(Clone)]
@@ -791,19 +811,7 @@ impl S3TaskContext {
         continuation_token: Option<&str>,
         checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     ) -> Self {
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(sdk_config);
-        if let Some(region_str) = region {
-            s3_config_builder =
-                s3_config_builder.region(aws_sdk_s3::config::Region::new(region_str.to_owned()));
-        }
-        if let Some(endpoint_url) = endpoint {
-            s3_config_builder = s3_config_builder.endpoint_url(endpoint_url.to_owned());
-        }
-        if force_path_style {
-            s3_config_builder = s3_config_builder.force_path_style(true);
-        }
-
-        let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+        let s3_client = build_s3_client(sdk_config, region, endpoint, force_path_style);
 
         Self {
             s3_bucket_name: bucket.to_string(),

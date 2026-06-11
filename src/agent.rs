@@ -473,7 +473,13 @@ pub fn detect_hints_plan(
                 .map(|r| format!("{:?}", r.format).to_lowercase()),
             boundary_count: report.as_ref().map(|r| r.boundary_count),
             estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
-            warnings: report.map(|r| r.warnings).unwrap_or_default(),
+            warnings: report.map(|r| r.warnings).unwrap_or_else(|| {
+                vec![
+                    "no cached hints; flat list runs probe bucket structure at startup \
+                     and cache the discovered boundaries here"
+                        .to_string(),
+                ]
+            }),
         };
     }
 

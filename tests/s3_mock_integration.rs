@@ -472,6 +472,11 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
 fn local_mock_list_empty_delimiter_omits_request_parameter() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Startup structural discovery probe — flat namespace, no
+            // CommonPrefixes, so the run falls back to a single segment.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
         assert!(
             !request.query.contains_key("delimiter"),
             "{:?}",
@@ -523,10 +528,100 @@ fn local_mock_list_empty_delimiter_omits_request_parameter() {
         parquet_keys(&parquet),
         vec!["logs/a.txt", "logs/nested/b.txt"]
     );
-    assert!(server
-        .requests()
+    // The only delimiter-bearing request is the single discovery probe;
+    // listing requests omit the empty delimiter entirely.
+    let requests = server.requests();
+    let probes: Vec<_> = requests
         .iter()
-        .all(|request| !request.query.contains_key("delimiter")));
+        .filter(|r| r.query.contains_key("delimiter"))
+        .collect();
+    assert_eq!(probes.len(), 1, "{:#?}", probes);
+    assert_eq!(probes[0].query.get("delimiter").map(String::as_str), Some("/"));
+}
+
+#[test]
+fn local_mock_list_startup_discovery_splits_segments() {
+    let all_keys = ["a/1.txt", "a/x/2.txt", "b/3.txt", "c.txt"];
+    let server = MockS3Server::start(move |request, _sequence| {
+        assert_eq!(request.method, "GET");
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Startup structural discovery probe.
+            let children: &[&str] = match request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or("")
+            {
+                "" => &["a/", "b/"],
+                "a/" => &["a/x/"],
+                _ => &[],
+            };
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], children, false, None));
+        }
+        // Flat listing request from one of the segments.
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let keys: Vec<&str> = all_keys
+            .iter()
+            .copied()
+            .filter(|key| *key > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &keys, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--delimiter".into(),
+        "".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Segments stream concurrently, so output order is not deterministic.
+    let mut keys = parquet_keys(&parquet);
+    keys.sort();
+    assert_eq!(keys, all_keys);
+
+    let requests = server.requests();
+    let probes: Vec<_> = requests
+        .iter()
+        .filter(|r| r.query.contains_key("delimiter"))
+        .collect();
+    let lists: Vec<_> = requests
+        .iter()
+        .filter(|r| !r.query.contains_key("delimiter"))
+        .collect();
+    // BFS probes: root, a/, b/, a/x/. Boundaries a/, a/x/, b/ → 4 segments.
+    assert_eq!(probes.len(), 4, "{:#?}", probes);
+    assert_eq!(lists.len(), 4, "{:#?}", lists);
+
+    // Discovered boundaries are cached for future runs (incl. --resume).
+    let cache = dir.path().join("us-east-1_mock-bucket_hints.toml");
+    let cache_content = std::fs::read_to_string(&cache).unwrap();
+    assert!(cache_content.contains("a/x/"), "{}", cache_content);
 }
 
 #[test]

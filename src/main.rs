@@ -1183,7 +1183,78 @@ fn main() {
             cli.no_auto_hints || hints_disabled_for_diff,
             hints_disabled_for_diff,
         );
+        // ── Startup structural discovery ─────────────────────
+        // When no hints exist for a flat (delimiter='') list run, probe the
+        // bucket's CommonPrefix structure once at startup so the first run
+        // lists in parallel without a prior auto-hints invocation. The
+        // boundaries are persisted to the conventional hints cache, so
+        // subsequent runs (including --resume) reload identical segments
+        // through the existing cache path.
+        let mut ks_list = ks_list;
+        if ks_list.is_empty()
+            && mode == RunMode::List
+            && !cli.no_auto_hints
+            && cli.hints_file.is_none()
+            && cli.delimiter.is_empty()
+            && cli.continuation_token.is_none()
+            && cfg.s3.start_after.is_none()
+        {
+            info!("Probing bucket structure for startup key-space boundaries");
+            let probe_client = core::build_s3_client(
+                &sdk_config,
+                opt_region,
+                cfg.s3.endpoint_url.as_deref(),
+                cfg.s3.force_path_style,
+            );
+            let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
+            let boundaries = auto_hints::discover_startup_boundaries(
+                &probe_client,
+                opt_bucket,
+                &opt_prefix,
+                target_boundaries,
+            )
+            .await;
+            if boundaries.is_empty() {
+                info!(
+                    "Startup discovery found no prefix structure — using single-segment listing"
+                );
+            } else {
+                info!(
+                    "Startup discovery found {} key-space boundaries",
+                    boundaries.len()
+                );
+                match auto_hints::write_startup_hints_cache(
+                    opt_bucket,
+                    opt_region,
+                    &opt_prefix,
+                    &boundaries,
+                ) {
+                    Ok(path) => info!("Startup hints cached to {} for future runs", path),
+                    Err(e) => {
+                        log::warn!("{} — resume runs may not see identical segments", e)
+                    }
+                }
+                ks_list = boundaries;
+            }
+        }
+        let ks_list = ks_list;
         let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
+
+        // Discard a resume journal whose segment count does not match the
+        // current hints — completed indices would otherwise skip the wrong
+        // segments and silently drop keys.
+        let checkpoint_journal = checkpoint_journal.filter(|cj| {
+            if cj.total_segments == original_hints_count {
+                return true;
+            }
+            log::warn!(
+                "Checkpoint segment count {} does not match current hints ({}) — \
+                 discarding checkpoint and starting fresh",
+                cj.total_segments,
+                original_hints_count
+            );
+            false
+        });
 
         // Filter out completed segments when resuming.
         let hints = if let Some(ref cj) = checkpoint_journal {
@@ -3247,12 +3318,9 @@ fn load_hints(
         return boundaries;
     }
 
-    // 3. Single-segment fallback.
-    info!(
-        "No hints available. Run 's3-turbo-list auto-hints --bucket {}' first for \
-         optimal performance. Using single-segment fallback.",
-        bucket
-    );
+    // 3. No hints — the caller may attempt startup structural discovery
+    //    before falling back to a single segment.
+    info!("No hints file or cached hints found for bucket '{}'", bucket);
     vec![]
 }
 
