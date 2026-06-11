@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-11
+
+### Added
+- Startup structural discovery: flat (`--delimiter ''`) list runs without
+  hints now probe the bucket's CommonPrefix structure at startup (a bounded
+  BFS of single-page delimiter probes) and list the discovered segments in
+  parallel.  First runs no longer require a prior `auto-hints` invocation.
+  Discovered boundaries are persisted to the conventional hints cache so
+  subsequent runs — including `--resume` — reload identical segments.
+  Disabled automatically for `--no-auto-hints`, explicit `--hints-file`,
+  `--start-after`, `--continuation-token`, diff mode, and the `bos` profile
+  (documented provider-side pagination incompatibility).
+
+### Changed
+- Replaced the Rhai-based `--filter` engine with a direct expression
+  parser/evaluator.  The accepted grammar, validation errors, and exit-code
+  behavior are unchanged; per-object evaluation no longer pays interpreter
+  dispatch or per-call scope allocations, and dropping the dependency makes
+  the binary smaller and builds faster.
+- Removed per-object allocations from the list ingest hot path: resume keys
+  are tracked once per page, diff-mode batches are grouped by contiguous
+  prefix runs without an intermediate HashMap, and key decoding reuses the
+  key's allocation.
+- Relaxed atomic memory ordering on informational counters (error/timeout
+  tallies, data metrics, HTTP status tracker).
+- Hid the developer-only `benchmark-local` subcommand from `--help` output;
+  it remains available and unchanged for benchmarking scripts.
+- Slimmed README to the product surface; moved the trace schema to
+  `docs/trace-reference.md` and segmented-listing/hints details to
+  `docs/tuning.md`.  Documented the frozen CLI surface in CONTRIBUTING.
+
+### Fixed
+- Resume journals whose segment count no longer matches the current hints
+  are discarded with a warning instead of silently skipping the wrong
+  segments.
+
 ## [0.2.20] - 2026-06-11
 
 ### Changed

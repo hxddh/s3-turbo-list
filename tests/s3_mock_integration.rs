@@ -536,7 +536,10 @@ fn local_mock_list_empty_delimiter_omits_request_parameter() {
         .filter(|r| r.query.contains_key("delimiter"))
         .collect();
     assert_eq!(probes.len(), 1, "{:#?}", probes);
-    assert_eq!(probes[0].query.get("delimiter").map(String::as_str), Some("/"));
+    assert_eq!(
+        probes[0].query.get("delimiter").map(String::as_str),
+        Some("/")
+    );
 }
 
 #[test]

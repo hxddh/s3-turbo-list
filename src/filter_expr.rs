@@ -589,8 +589,14 @@ mod tests {
         assert_eq!(eval_list("SOURCE.size < 1000", &p), Some(false));
         assert_eq!(eval_list("SOURCE.size == 2048", &p), Some(true));
         assert_eq!(eval_list("SOURCE.size != 2048", &p), Some(false));
-        assert_eq!(eval_list("SOURCE.last_modified >= 1715700000", &p), Some(true));
-        assert_eq!(eval_list("SOURCE.last_modified <= 1715700000", &p), Some(false));
+        assert_eq!(
+            eval_list("SOURCE.last_modified >= 1715700000", &p),
+            Some(true)
+        );
+        assert_eq!(
+            eval_list("SOURCE.last_modified <= 1715700000", &p),
+            Some(false)
+        );
     }
 
     #[test]
@@ -639,8 +645,14 @@ mod tests {
     #[test]
     fn test_target_in_diff_mode() {
         let f = FilterExpr::compile("SOURCE.size > TARGET.size", true).unwrap();
-        assert_eq!(f.evaluate(&props(2000, 0), Some(&props(1000, 0))), Some(true));
-        assert_eq!(f.evaluate(&props(500, 0), Some(&props(1000, 0))), Some(false));
+        assert_eq!(
+            f.evaluate(&props(2000, 0), Some(&props(1000, 0))),
+            Some(true)
+        );
+        assert_eq!(
+            f.evaluate(&props(500, 0), Some(&props(1000, 0))),
+            Some(false)
+        );
         // No target at runtime → error, not a panic.
         assert_eq!(f.evaluate(&props(2000, 0), None), None);
     }

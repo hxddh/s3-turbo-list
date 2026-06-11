@@ -3,6 +3,79 @@
 This page lists runtime defaults and advanced configuration knobs that matter
 for large listings.  Values come from `src/config.rs`.
 
+## How segmented listing works
+
+Parallelism happens between key-space segments, not inside a single
+ListObjectsV2 continuation chain.  `--concurrency` only helps when there are
+enough segment boundaries to keep workers busy.
+
+Where boundaries come from, in precedence order:
+
+1. **Explicit `--hints-file`** — full control for repeated inventories.
+2. **Cached hints** at the conventional path
+   (`<region>_<bucket>_hints.toml`), written by `auto-hints` or by startup
+   discovery on a previous run.
+3. **Startup structural discovery** (flat `--delimiter ''` list runs only) —
+   a bounded set of delimiter probes (one ListObjectsV2 page each, at most
+   3 levels deep) finds real `CommonPrefixes` boundaries at run start and
+   caches them at the conventional path.  Costs at most a second or two of
+   startup; first runs list in parallel with no prior steps.
+4. **Single segment** — flat namespaces with no `/` structure, runs with
+   `--no-auto-hints`, `--start-after`, or `--continuation-token`, and `diff`
+   (always single-segment by design).
+
+Hints boundaries are lexicographic cut points, not directories.  A boundary
+may also be a real object key; it is treated as part of the preceding segment
+so adjacent `start-after` segments do not drop it.  Folder marker objects such
+as `logs/` are ordinary keys for correctness purposes.
+
+## Hints files
+
+Two formats are accepted by `--hints-file` and the conventional cache path:
+
+**Plain text** (one boundary per line):
+
+```
+alpha/
+beta/
+logs/
+```
+
+**TOML** (written by `auto-hints`, `discover-prefixes --toml`, startup
+discovery, and `hints-merge`):
+
+```toml
+bucket = "my-bucket"
+region = "us-east-2"
+total_objects = 50000
+boundaries = ["alpha/", "beta/", "logs/"]
+generated_at = "2026-05-14T12:00:00Z"
+scan_mode = "full"
+```
+
+Generation workflows:
+
+```bash
+# Object-count-aware hints from a full or sampled sequential scan
+s3-turbo-list --delimiter '' auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
+s3-turbo-list --delimiter '' auto-hints --region us-east-2 --bucket my-bucket \
+  -o hints.sampled.toml --sample-limit 1000000 --max-pages 1000
+
+# Delimiter-based CommonPrefixes discovery
+s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
+  --region us-east-2 --bucket my-bucket -o logs-prefixes.txt
+
+# Validate / merge locally (no S3 access)
+s3-turbo-list hints-validate --hints-file hints.toml
+s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
+```
+
+In sampled mode the TOML `total_objects` field is the sampled count, not the
+bucket total, and segment estimates are marked as sampled.  Prefix-scoped
+hints generated with `--prefix` are valid for that subtree only.  `auto-hints`
+performs one sequential scan; `--threads`/`--concurrency` do not parallelise
+it.
+
 ## Core Defaults
 
 | Config key | Default | Notes |

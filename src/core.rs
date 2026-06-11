@@ -617,11 +617,13 @@ impl GlobalState {
             .store(streamed_rows, Ordering::Relaxed);
         self.data_unique_prefixes
             .store(unique_prefixes, Ordering::Relaxed);
-        self.data_parquet_rows.store(parquet_rows, Ordering::Relaxed);
+        self.data_parquet_rows
+            .store(parquet_rows, Ordering::Relaxed);
         self.data_ks_entries.store(ks_entries, Ordering::Relaxed);
         self.data_bytes_total.store(bytes_total, Ordering::Relaxed);
         *self.data_top_prefixes.lock().unwrap() = top_prefixes;
-        self.data_summary_only.store(summary_only, Ordering::Relaxed);
+        self.data_summary_only
+            .store(summary_only, Ordering::Relaxed);
     }
     pub fn metrics_snapshot(&self) -> RunMetricsSnapshot {
         RunMetricsSnapshot {

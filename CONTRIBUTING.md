@@ -59,6 +59,20 @@ provider behaves identically.
   as a provider-side incompatibility — do not silently paper over it in
   the tool.
 
+## Product scope: the CLI surface is frozen
+
+s3-turbo-list deliberately stays small.  The subcommand list and the global
+flag set are **frozen**: pull requests adding new subcommands, new global
+flags, or new configuration knobs need an exceptional, documented case and
+maintainer sign-off before any implementation work.
+
+- Prefer making the **default path** faster or smarter over adding an option.
+  (Example: startup structural discovery replaced the need for a "run
+  auto-hints first" step instead of adding a flag for it.)
+- Prefer removing or consolidating options over extending them.
+- Performance claims need numbers: a `benchmark-local` comparison or a real
+  endpoint measurement in the PR description.
+
 ## Code style
 
 - Follow `rustfmt` defaults (`cargo fmt`).

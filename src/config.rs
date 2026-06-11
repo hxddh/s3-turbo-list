@@ -509,9 +509,7 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
     })?;
 
     Ok(ObjectFilter::new(Box::new(
-        move |source: &ObjectProps, target: Option<&ObjectProps>| {
-            compiled.evaluate(source, target)
-        },
+        move |source: &ObjectProps, target: Option<&ObjectProps>| compiled.evaluate(source, target),
     )))
 }
 

@@ -471,6 +471,8 @@ enum Commands {
     Man,
 
     /// Run a local synthetic streaming-output benchmark without contacting S3
+    /// (developer tool; hidden from help)
+    #[command(hide = true)]
     BenchmarkLocal {
         /// Local benchmark scenario to run
         #[arg(long, value_enum, default_value_t = LocalBenchmarkKind::ListOutput)]
@@ -1191,9 +1193,14 @@ fn main() {
         // subsequent runs (including --resume) reload identical segments
         // through the existing cache path.
         let mut ks_list = ks_list;
+        // BOS is excluded: it has a documented start_after + continuation-token
+        // incompatibility, so automatically switching BOS runs to hinted
+        // multi-segment listing would silently produce non-authoritative output.
+        let bos_profile = cfg.s3.profile.as_deref() == Some("bos");
         if ks_list.is_empty()
             && mode == RunMode::List
             && !cli.no_auto_hints
+            && !bos_profile
             && cli.hints_file.is_none()
             && cli.delimiter.is_empty()
             && cli.continuation_token.is_none()
@@ -3320,7 +3327,10 @@ fn load_hints(
 
     // 3. No hints — the caller may attempt startup structural discovery
     //    before falling back to a single segment.
-    info!("No hints file or cached hints found for bucket '{}'", bucket);
+    info!(
+        "No hints file or cached hints found for bucket '{}'",
+        bucket
+    );
     vec![]
 }
 
