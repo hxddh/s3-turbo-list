@@ -1,6 +1,5 @@
 use crate::core::{ObjectFilter, ObjectProps, RunMode, OBJECT_FILTER};
-use rhai::serde::to_dynamic;
-use rhai::{Engine, Scope};
+use crate::filter_expr::FilterExpr;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -485,15 +484,9 @@ impl S3TurboConfig {
     }
 }
 
-// ── Filter compilation (Rhai) ──────────────────────────────
+// ── Filter compilation ─────────────────────────────────────
 
-const OBJECT_FILTER_ALLOWED_VARIABLE: [&str; 2] = ["SOURCE", "TARGET"];
-const OBJECT_FILTER_ALLOWED_PROPERTY: [&str; 2] = ["size", "last_modified"];
 const OBJECT_FILTER_MAX_LEN: usize = 512;
-const OBJECT_FILTER_MAX_AST_NODES: usize = 128;
-const OBJECT_FILTER_MAX_OPERATIONS: u64 = 128;
-const OBJECT_FILTER_MAX_EXPR_DEPTH: usize = 24;
-const OBJECT_FILTER_MAX_STRING_SIZE: usize = 128;
 
 fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilter, String> {
     if expr.len() > OBJECT_FILTER_MAX_LEN {
@@ -507,176 +500,19 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
         return Err("Filter expression cannot contain string or character literals".to_string());
     }
 
-    let mut engine = Engine::new();
-    engine
-        .set_fail_on_invalid_map_property(true)
-        .set_max_operations(OBJECT_FILTER_MAX_OPERATIONS)
-        .set_max_call_levels(0)
-        .set_max_expr_depths(OBJECT_FILTER_MAX_EXPR_DEPTH, OBJECT_FILTER_MAX_EXPR_DEPTH)
-        .set_max_string_size(OBJECT_FILTER_MAX_STRING_SIZE)
-        .set_max_array_size(0)
-        .set_max_variables(2)
-        .set_max_map_size(2);
-
-    let ast = engine
-        .compile_expression(expr)
-        .map_err(|e| format!("Failed to compile filter expression: {}", e))?;
-
-    // Walk AST to validate allowed properties/variables and keep the filter
-    // expression to simple property comparisons plus boolean/operator nodes.
-    let mut check_failed = false;
-    let mut check_error = None;
-    let mut node_count = 0usize;
-    ast.walk(&mut |nodes| {
-        node_count = node_count.saturating_add(1);
-        if node_count > OBJECT_FILTER_MAX_AST_NODES {
-            log::error!(
-                "filter expression exceeds AST node limit {}",
-                OBJECT_FILTER_MAX_AST_NODES
-            );
-            check_error = Some("filter expression exceeds AST node limit".to_string());
-            check_failed = true;
-            return false;
-        }
-
-        let Some(node) = nodes.last() else {
-            return true;
-        };
-        if let Some(error) = validate_filter_ast_node(node) {
-            log::error!("{}", error);
-            check_error = Some(error);
-            check_failed = true;
-            return false;
-        }
-        true
-    });
-
-    if check_failed {
-        return Err(format!(
+    let allow_target = mode == Some(&RunMode::BiDir);
+    let compiled = FilterExpr::compile(expr, allow_target).map_err(|e| {
+        format!(
             "Filter expression contains unsupported syntax or identifiers: {}",
-            check_error.unwrap_or_else(|| "unknown validation error".to_string())
-        ));
-    }
-
-    // Test with fake ObjectProps to catch runtime errors.
-    let mut scope = Scope::new();
-    let source = to_dynamic(ObjectProps::default()).unwrap();
-    scope.push_constant_dynamic("SOURCE", source.into_read_only());
-    if mode == Some(&RunMode::BiDir) {
-        let target = to_dynamic(ObjectProps::default()).unwrap();
-        scope.push_constant_dynamic("TARGET", target.into_read_only());
-    }
-    engine
-        .eval_ast_with_scope::<bool>(&mut scope, &ast)
-        .map_err(|e| format!("Filter expression validation failed: {}", e))?;
-
-    let engine = std::sync::Arc::new(engine);
-    let ast = std::sync::Arc::new(ast);
+            e
+        )
+    })?;
 
     Ok(ObjectFilter::new(Box::new(
         move |source: &ObjectProps, target: Option<&ObjectProps>| {
-            let mut scope = Scope::new();
-            let s = to_dynamic(source).ok()?;
-            scope.push_constant_dynamic("SOURCE", s.into_read_only());
-            if let Some(t) = target {
-                let td = to_dynamic(t).ok()?;
-                scope.push_constant_dynamic("TARGET", td.into_read_only());
-            }
-            engine.eval_ast_with_scope::<bool>(&mut scope, &ast).ok()
+            compiled.evaluate(source, target)
         },
     )))
-}
-
-fn validate_filter_ast_node(node: &rhai::ASTNode<'_>) -> Option<String> {
-    match node {
-        rhai::ASTNode::Expr(expr) => validate_filter_expr(expr),
-        rhai::ASTNode::Stmt(stmt) => validate_filter_stmt(stmt),
-        _ => Some("unsupported filter AST node".to_string()),
-    }
-}
-
-fn validate_filter_stmt(stmt: &rhai::Stmt) -> Option<String> {
-    match stmt {
-        rhai::Stmt::Expr(_) | rhai::Stmt::Noop(_) => None,
-        rhai::Stmt::FnCall(call, _) if is_allowed_filter_operator(&call.name) => None,
-        _ => Some("filter expressions cannot contain statements".to_string()),
-    }
-}
-
-fn validate_filter_expr(expr: &rhai::Expr) -> Option<String> {
-    match expr {
-        rhai::Expr::BoolConstant(..)
-        | rhai::Expr::IntegerConstant(..)
-        | rhai::Expr::FloatConstant(..)
-        | rhai::Expr::Dot(..)
-        | rhai::Expr::And(..)
-        | rhai::Expr::Or(..) => None,
-        rhai::Expr::Property(props, _) => {
-            let prop = props.2.as_str();
-            if OBJECT_FILTER_ALLOWED_PROPERTY.contains(&prop) {
-                None
-            } else {
-                Some(format!(
-                    "object property \"{}\" not allowed in filter",
-                    prop
-                ))
-            }
-        }
-        rhai::Expr::Variable(names, _, _) => {
-            let name = names.1.as_str();
-            if OBJECT_FILTER_ALLOWED_VARIABLE.contains(&name) {
-                None
-            } else {
-                Some(format!("variable \"{}\" not allowed in filter", name))
-            }
-        }
-        rhai::Expr::FnCall(call, _) if is_allowed_filter_operator(&call.name) => None,
-        rhai::Expr::FnCall(call, _) => Some(format!(
-            "function call \"{}\" not allowed in filter",
-            call.name
-        )),
-        rhai::Expr::MethodCall(call, _) => Some(format!(
-            "method call \"{}\" not allowed in filter",
-            call.name
-        )),
-        rhai::Expr::StringConstant(..) | rhai::Expr::CharConstant(..) => {
-            Some("string and character literals are not supported in filters".to_string())
-        }
-        rhai::Expr::InterpolatedString(..) => {
-            Some("interpolated strings are not supported in filters".to_string())
-        }
-        rhai::Expr::Array(..)
-        | rhai::Expr::Map(..)
-        | rhai::Expr::Index(..)
-        | rhai::Expr::Coalesce(..) => {
-            Some("arrays, maps, indexing, and coalescing are not supported in filters".to_string())
-        }
-        rhai::Expr::DynamicConstant(..)
-        | rhai::Expr::Unit(..)
-        | rhai::Expr::ThisPtr(..)
-        | rhai::Expr::Stmt(..) => Some("unsupported filter expression syntax".to_string()),
-        rhai::Expr::Custom(..) => Some("custom syntax is not supported in filters".to_string()),
-        _ => Some("unsupported filter expression syntax".to_string()),
-    }
-}
-
-fn is_allowed_filter_operator(name: &str) -> bool {
-    matches!(
-        name,
-        ">" | ">="
-            | "<"
-            | "<="
-            | "=="
-            | "!="
-            | "+"
-            | "-"
-            | "*"
-            | "/"
-            | "%"
-            | "!"
-            | "unary-"
-            | "unary+"
-    )
 }
 
 #[allow(dead_code)] // Phase 5: standalone convenience wrapper
