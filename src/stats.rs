@@ -25,14 +25,14 @@ impl HttpStatusCodeTracker {
         self.map
             .entry(code)
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .fetch_add(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> Vec<(u16, usize)> {
         let mut v: Vec<_> = self
             .map
             .iter()
-            .map(|entry| (*entry.key(), entry.value().load(Ordering::SeqCst)))
+            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
             .collect();
         v.sort_by_key(|(code, _)| *code);
         v

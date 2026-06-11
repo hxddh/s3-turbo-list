@@ -567,35 +567,35 @@ impl GlobalState {
 
     pub fn inc_task_next_stream_timeout(&self) {
         self.task_next_stream_timeout_count
-            .fetch_add(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn read_task_next_stream_timeout(&self) -> usize {
-        self.task_next_stream_timeout_count.load(Ordering::SeqCst)
+        self.task_next_stream_timeout_count.load(Ordering::Relaxed)
     }
     pub fn inc_s3_client_timeout(&self) {
-        self.s3_client_timeout_count.fetch_add(1, Ordering::SeqCst);
+        self.s3_client_timeout_count.fetch_add(1, Ordering::Relaxed);
     }
     pub fn read_s3_client_timeout(&self) -> usize {
-        self.s3_client_timeout_count.load(Ordering::SeqCst)
+        self.s3_client_timeout_count.load(Ordering::Relaxed)
     }
     pub fn inc_s3_client_generic_error(&self) {
         self.s3_client_generic_error_count
-            .fetch_add(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn read_s3_client_generic_error(&self) -> usize {
-        self.s3_client_generic_error_count.load(Ordering::SeqCst)
+        self.s3_client_generic_error_count.load(Ordering::Relaxed)
     }
     pub fn inc_fatal_error(&self) {
-        self.fatal_error_count.fetch_add(1, Ordering::SeqCst);
+        self.fatal_error_count.fetch_add(1, Ordering::Relaxed);
     }
     pub fn read_fatal_error(&self) -> usize {
-        self.fatal_error_count.load(Ordering::SeqCst)
+        self.fatal_error_count.load(Ordering::Relaxed)
     }
     pub fn inc_output_error(&self) {
-        self.output_error_count.fetch_add(1, Ordering::SeqCst);
+        self.output_error_count.fetch_add(1, Ordering::Relaxed);
     }
     pub fn read_output_error(&self) -> usize {
-        self.output_error_count.load(Ordering::SeqCst)
+        self.output_error_count.load(Ordering::Relaxed)
     }
     pub fn record_data_metrics(
         &self,
@@ -610,18 +610,18 @@ impl GlobalState {
         summary_only: bool,
     ) {
         self.data_received_batches
-            .store(received_batches, Ordering::SeqCst);
+            .store(received_batches, Ordering::Relaxed);
         self.data_received_objects
-            .store(received_objects, Ordering::SeqCst);
+            .store(received_objects, Ordering::Relaxed);
         self.data_streamed_rows
-            .store(streamed_rows, Ordering::SeqCst);
+            .store(streamed_rows, Ordering::Relaxed);
         self.data_unique_prefixes
-            .store(unique_prefixes, Ordering::SeqCst);
-        self.data_parquet_rows.store(parquet_rows, Ordering::SeqCst);
-        self.data_ks_entries.store(ks_entries, Ordering::SeqCst);
-        self.data_bytes_total.store(bytes_total, Ordering::SeqCst);
+            .store(unique_prefixes, Ordering::Relaxed);
+        self.data_parquet_rows.store(parquet_rows, Ordering::Relaxed);
+        self.data_ks_entries.store(ks_entries, Ordering::Relaxed);
+        self.data_bytes_total.store(bytes_total, Ordering::Relaxed);
         *self.data_top_prefixes.lock().unwrap() = top_prefixes;
-        self.data_summary_only.store(summary_only, Ordering::SeqCst);
+        self.data_summary_only.store(summary_only, Ordering::Relaxed);
     }
     pub fn metrics_snapshot(&self) -> RunMetricsSnapshot {
         RunMetricsSnapshot {
@@ -630,15 +630,15 @@ impl GlobalState {
             stream_timeouts: self.read_task_next_stream_timeout(),
             s3_client_timeouts: self.read_s3_client_timeout(),
             s3_client_generic_errors: self.read_s3_client_generic_error(),
-            data_received_batches: self.data_received_batches.load(Ordering::SeqCst),
-            data_received_objects: self.data_received_objects.load(Ordering::SeqCst),
-            data_streamed_rows: self.data_streamed_rows.load(Ordering::SeqCst),
-            data_unique_prefixes: self.data_unique_prefixes.load(Ordering::SeqCst),
-            data_parquet_rows: self.data_parquet_rows.load(Ordering::SeqCst),
-            data_ks_entries: self.data_ks_entries.load(Ordering::SeqCst),
-            data_bytes_total: self.data_bytes_total.load(Ordering::SeqCst),
+            data_received_batches: self.data_received_batches.load(Ordering::Relaxed),
+            data_received_objects: self.data_received_objects.load(Ordering::Relaxed),
+            data_streamed_rows: self.data_streamed_rows.load(Ordering::Relaxed),
+            data_unique_prefixes: self.data_unique_prefixes.load(Ordering::Relaxed),
+            data_parquet_rows: self.data_parquet_rows.load(Ordering::Relaxed),
+            data_ks_entries: self.data_ks_entries.load(Ordering::Relaxed),
+            data_bytes_total: self.data_bytes_total.load(Ordering::Relaxed),
             data_top_prefixes: self.data_top_prefixes.lock().unwrap().clone(),
-            data_summary_only: self.data_summary_only.load(Ordering::SeqCst),
+            data_summary_only: self.data_summary_only.load(Ordering::Relaxed),
         }
     }
     pub fn get_tracker(&self) -> Arc<HttpStatusCodeTracker> {
