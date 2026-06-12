@@ -917,6 +917,19 @@ fn main() {
     }
 
     if cli.dry_run {
+        // Validate --filter exactly as a real run would, so a bad expression
+        // fails with exit code 2 at plan time instead of at run time.
+        if let Some(ref filter_expr) = cli.filter {
+            let mode = if matches!(cli.cmd, Commands::Diff { .. }) {
+                RunMode::BiDir
+            } else {
+                RunMode::List
+            };
+            if let Err(e) = config::compile_filter_with_mode(filter_expr, &mode) {
+                eprintln!("Filter error: {}", e);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+        }
         let report = build_plan_report(&cli, &cfg, config_source.clone());
         if let Some(path) = cli.plan_json.as_deref() {
             if let Err(e) = agent::write_json_file(path, &report) {
