@@ -151,7 +151,7 @@ and level explicitly:
 
 ```bash
 s3-turbo-list --compression gzip --compression-level 6 \
-  --delimiter '' list --bucket my-bucket --region us-east-1
+  list --bucket my-bucket --region us-east-1
 ```
 
 ```toml

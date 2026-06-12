@@ -15,7 +15,8 @@ Where boundaries come from, in precedence order:
 2. **Cached hints** at the conventional path
    (`<region>_<bucket>_hints.toml`), written by `auto-hints` or by startup
    discovery on a previous run.
-3. **Startup structural discovery** (flat `--delimiter ''` list runs only) —
+3. **Startup structural discovery** (recursive list runs — the default;
+   hierarchical `--delimiter '/'` runs skip it) —
    a bounded set of delimiter probes (one ListObjectsV2 page each, at most
    3 levels deep) finds real `CommonPrefixes` boundaries at run start and
    caches them at the conventional path.  Costs at most a second or two of
@@ -67,8 +68,8 @@ Generation workflows:
 
 ```bash
 # Object-count-aware hints from a full or sampled sequential scan
-s3-turbo-list --delimiter '' auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
-s3-turbo-list --delimiter '' auto-hints --region us-east-2 --bucket my-bucket \
+s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
+s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
   -o hints.sampled.toml --sample-limit 1000000 --max-pages 1000
 
 # Delimiter-based CommonPrefixes discovery

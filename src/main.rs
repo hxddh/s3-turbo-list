@@ -107,8 +107,10 @@ struct Cli {
     no_auto_hints: bool,
 
     // ── S3-compatible observability flags ─────────────────
-    /// Delimiter for ListObjectsV2; default "/" lists top-level keys, use --delimiter '' for recursive full-bucket listing
-    #[arg(long, default_value = "/", global = true)]
+    /// Delimiter for ListObjectsV2; the default '' is a recursive
+    /// full-bucket listing, use --delimiter '/' for hierarchical
+    /// top-level listing
+    #[arg(long, default_value = "", global = true)]
     delimiter: String,
 
     /// Max keys per ListObjectsV2 page

@@ -19,8 +19,8 @@ s3-turbo-list recipes filter
 s3-turbo-list recipes verify
 s3-turbo-list recipes release-check
 s3-turbo-list recipes diff-safe
-s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
+s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
+s3-turbo-list --dry-run --agent --summary-only list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
 s3-turbo-list manifest-summary run.json --check
 s3-turbo-list trace-summary trace.jsonl --machine-readable
@@ -66,7 +66,6 @@ Use `--plan-json` when stdout should stay quiet:
 ```bash
 s3-turbo-list --dry-run \
   --plan-json plan.json \
-  --delimiter '' \
   --output-parquet-file out/list.parquet \
   --output-ks-file out/list.ks \
   list --bucket my-bucket --region us-east-1
@@ -105,8 +104,8 @@ checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 
 For large buckets, agents should prefer the simple high-throughput path:
-generate hints with `--delimiter '' auto-hints`, validate them locally, then run
-`list` with `--delimiter '' --hints-file hints.toml -c 8 -T 4` as a conservative
+generate hints with `auto-hints`, validate them locally, then run
+`list` with `--hints-file hints.toml -c 8 -T 4` as a conservative
 starting point.  Empty delimiter is omitted from ListObjectsV2 requests, which
 keeps recursive listing compatible with providers that reject `delimiter=`.
 
@@ -127,7 +126,7 @@ partitioning.
 For real listing runs, write a final manifest:
 
 ```bash
-s3-turbo-list --run-manifest run.json --delimiter '' list \
+s3-turbo-list --run-manifest run.json list \
   --bucket my-bucket \
   --region us-east-1 \
   --output-parquet-file out/list.parquet \
@@ -137,7 +136,7 @@ s3-turbo-list --run-manifest run.json --delimiter '' list \
 With `--agent`, the same manifest is also printed to stdout at the end:
 
 ```bash
-s3-turbo-list --agent --run-manifest run.json --delimiter '' list \
+s3-turbo-list --agent --run-manifest run.json list \
   --bucket my-bucket \
   --region us-east-1
 ```
@@ -169,7 +168,7 @@ dry-run: it scans S3 unless combined with `--dry-run`.
 Use `list --output-format ndjson` when an agent needs object rows as a stream:
 
 ```bash
-s3-turbo-list --run-manifest run.json --delimiter '' \
+s3-turbo-list --run-manifest run.json \
   list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
 s3-turbo-list manifest-summary run.json --json
 ```
@@ -206,7 +205,7 @@ numeric predicates such as:
 
 ```bash
 s3-turbo-list --filter 'SOURCE.size > 1073741824' \
-  --run-manifest run.json --delimiter '' \
+  --run-manifest run.json \
   list --bucket my-bucket --region us-east-1
 ```
 

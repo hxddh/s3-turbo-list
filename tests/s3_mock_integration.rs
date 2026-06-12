@@ -402,6 +402,8 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
         "2".into(),
         "--prefix".into(),
         "logs/".into(),
+        "--delimiter".into(),
+        "/".into(),
         "--trace-compat".into(),
         trace.display().to_string(),
         "--output-parquet-file".into(),
@@ -1457,7 +1459,7 @@ last_updated = "2026-05-17T00:00:00Z"
 bucket = "mock-bucket"
 region = "us-east-1"
 prefix = ""
-delimiter = "/"
+delimiter = ""
 addressing_style = "path"
 mode = "list"
 "#,
@@ -1548,7 +1550,7 @@ last_updated = "2026-05-24T00:00:00Z"
 bucket = "mock-bucket"
 region = "us-east-1"
 prefix = ""
-delimiter = "/"
+delimiter = ""
 addressing_style = "path"
 mode = "list"
 "#,

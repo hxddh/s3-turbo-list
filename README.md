@@ -39,23 +39,22 @@ s3-turbo-list doctor --local-only --simple
 
 # Full recursive bucket inventory → Parquet + keyspace CSV in out/
 export AWS_PROFILE=default
-s3-turbo-list --output-dir out --delimiter '' \
+s3-turbo-list --output-dir out \
   list --region us-east-2 --bucket my-bucket
 
 # Count objects and bytes without writing files
-s3-turbo-list --summary-only --delimiter '' \
+s3-turbo-list --summary-only \
   list --region us-east-2 --bucket my-bucket
 
 # Stream rows to shell tools instead of Parquet
-s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
+s3-turbo-list list --region us-east-2 --bucket my-bucket \
   --output-format ndjson > objects.ndjson
 ```
 
-The default delimiter is `/` (hierarchical listing: top-level objects plus
-`CommonPrefixes`). Use `--delimiter ''` for a recursive full-bucket
-inventory — that is the high-performance path: the first run probes the
-bucket's prefix structure, caches the discovered key-space boundaries, and
-lists the segments in parallel.
+Listing is recursive by default — the high-performance path: the first run
+probes the bucket's prefix structure, caches the discovered key-space
+boundaries, and lists the segments in parallel. Use `--delimiter '/'` for a
+hierarchical listing (top-level objects plus `CommonPrefixes` only).
 
 Preview any run without contacting S3 by adding `--dry-run --agent`.
 `init-config`, `quickstart`, `recipes`, and `cheatsheet` provide local help;
@@ -110,14 +109,14 @@ Invalid filters are rejected before any S3 request with exit code `2`.
 
 ```bash
 s3-turbo-list --filter 'SOURCE.size > 1073741824' \
-  --delimiter '' list --region us-east-2 --bucket my-bucket
+  list --region us-east-2 --bucket my-bucket
 s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
   diff --bucket left-bucket --target-bucket right-bucket
 ```
 
 ## Performance and hints
 
-Flat (`--delimiter ''`) list runs parallelise across key-space segments. The
+Recursive list runs (the default) parallelise across key-space segments. The
 boundary sources, in precedence order:
 
 1. `--hints-file` — explicit control for repeated inventories.
@@ -137,8 +136,8 @@ For precise object-count-balanced segments on very large buckets, generate
 hints explicitly:
 
 ```bash
-s3-turbo-list --delimiter '' auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
-s3-turbo-list --delimiter '' --hints-file hints.toml \
+s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
+s3-turbo-list --hints-file hints.toml \
   list --region us-east-2 --bucket my-bucket
 ```
 
@@ -181,7 +180,7 @@ Works against any S3-compatible endpoint via `--endpoint-url` and
 
 ```bash
 s3-turbo-list profiles list
-s3-turbo-list --delimiter '' list --bucket my-bucket \
+s3-turbo-list list --bucket my-bucket \
   --endpoint-url http://localhost:9000 --profile minio
 ```
 
@@ -213,7 +212,7 @@ Full validation reports live in
 Every S3 API call can be recorded as structured JSONL:
 
 ```bash
-s3-turbo-list --delimiter '' list --region us-east-2 --bucket my-bucket \
+s3-turbo-list list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
 s3-turbo-list trace-summary trace.jsonl --output-format json
 ```

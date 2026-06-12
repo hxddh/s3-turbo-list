@@ -1717,7 +1717,7 @@ last_updated = "2026-05-17T00:00:00Z"
 bucket = "test-bucket"
 region = "us-east-1"
 prefix = ""
-delimiter = "/"
+delimiter = ""
 addressing_style = "auto"
 mode = "list"
 "#,

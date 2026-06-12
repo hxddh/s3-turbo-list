@@ -34,7 +34,6 @@ echo "    Output: $OUTDIR/bos-basic.parquet"
 echo "            $OUTDIR/bos-basic.ks"
 
 $S3TL list \
-  --delimiter '' \
   --endpoint-url "$ENDPOINT_URL" \
   --region "$REGION" \
   --profile "$ENDPOINT_PROFILE" \

@@ -18,7 +18,7 @@ cmd=(
   --plan-json "$OUTDIR/plan.json"
   --output-parquet-file "$OUTDIR/list.parquet"
   --output-ks-file "$OUTDIR/list.ks"
-  --delimiter ''
+ 
   list
   --bucket "$BUCKET"
   --region "$REGION"

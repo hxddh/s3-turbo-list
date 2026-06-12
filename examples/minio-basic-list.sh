@@ -26,7 +26,6 @@ echo "    Output: $OUTDIR/minio-basic.parquet"
 echo "            $OUTDIR/minio-basic.ks"
 
 $S3TL list \
-  --delimiter '' \
   --endpoint-url "$ENDPOINT_URL" \
   --region "$REGION" \
   --profile "$ENDPOINT_PROFILE" \

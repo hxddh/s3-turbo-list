@@ -34,7 +34,6 @@ echo "    Output: $OUTDIR/bos-path-style.parquet"
 echo "            $OUTDIR/bos-path-style.ks"
 
 $S3TL list \
-  --delimiter '' \
   --endpoint-url "$ENDPOINT_URL" \
   --region "$REGION" \
   --profile "$ENDPOINT_PROFILE" \

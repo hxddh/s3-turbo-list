@@ -23,7 +23,6 @@ echo "    Output: $OUTDIR/aws-basic.parquet"
 echo "            $OUTDIR/aws-basic.ks"
 
 $S3TL list \
-  --delimiter '' \
   --region "$REGION" \
   --bucket "$BUCKET" \
   --output-parquet-file "$OUTDIR/aws-basic.parquet" \

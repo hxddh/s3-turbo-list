@@ -22,15 +22,15 @@ then dry-run the command before the real listing:
 s3-turbo-list doctor --local-only --simple
 export AWS_PROFILE=default
 
-s3-turbo-list --dry-run --agent --output-dir out --delimiter '' \
+s3-turbo-list --dry-run --agent --output-dir out \
   list --bucket my-bucket --region us-east-1
 
-s3-turbo-list --output-dir out --delimiter '' \
+s3-turbo-list --output-dir out \
   list --bucket my-bucket --region us-east-1
 ```
 
-`--delimiter ''` performs a recursive full-bucket object inventory.  The
-default delimiter is `/`, which is hierarchical and only returns top-level
+Listing is a recursive full-bucket inventory by default.  Use
+`--delimiter '/'` for a hierarchical listing that only returns top-level
 objects plus `CommonPrefixes`.  Other output modes (summary-only, TSV,
 NDJSON, run manifests) are covered in the [README](README.md#output-modes).
 
@@ -161,10 +161,10 @@ s3-turbo-list doctor --local-only --simple
 s3-turbo-list init-config --output s3-turbo-list.toml
 
 s3-turbo-list --dry-run --agent --output-dir out \
-  --delimiter '' list --bucket my-bucket --region us-east-1
+  list --bucket my-bucket --region us-east-1
 
 s3-turbo-list --output-dir out \
-  --delimiter '' list --bucket my-bucket --region us-east-1
+  list --bucket my-bucket --region us-east-1
 ```
 
 The s3-turbo-list `--profile` flag is for endpoint compatibility presets such
@@ -186,7 +186,7 @@ s3-turbo-list recipes verify
 s3-turbo-list recipes release-check
 s3-turbo-list recipes diff-safe
 
-s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list \
+s3-turbo-list --dry-run --agent --output-dir out list \
   --bucket my-bucket \
   --region us-east-1
 ```
@@ -220,7 +220,6 @@ mkdir -p out
 
 # The bos profile preset sets the BOS endpoint and virtual-hosted addressing.
 s3-turbo-list list \
-  --delimiter '' \
   --bucket your-bos-bucket \
   --region bj \
   --profile bos \
@@ -234,7 +233,6 @@ legacy compatibility or diagnostic checks:
 ```bash
 # Path-style (legacy / diagnostic only)
 s3-turbo-list list \
-  --delimiter '' \
   --bucket your-bos-bucket \
   --region bj \
   --profile bos \
@@ -264,7 +262,6 @@ First run:
 mkdir -p out
 
 s3-turbo-list list \
-  --delimiter '' \
   --bucket my-minio-bucket \
   --region us-east-1 \
   --profile minio \
@@ -282,11 +279,11 @@ performance tuning are covered in the [README](README.md) and
 
 ```bash
 # Recursive bucket inventory → Parquet + keyspace CSV
-s3-turbo-list --output-dir out --delimiter '' \
+s3-turbo-list --output-dir out \
   list --bucket my-bucket --region us-east-1
 
 # Resume an interrupted scan (identity-verified)
-s3-turbo-list --resume --delimiter '' \
+s3-turbo-list --resume \
   list --bucket my-bucket --region us-east-1
 
 # Inspect the Parquet output
