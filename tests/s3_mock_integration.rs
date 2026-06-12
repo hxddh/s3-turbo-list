@@ -781,7 +781,9 @@ fn local_mock_list_flat_namespace_runtime_split() {
     // structure, so the run starts single-segment. The flat-cut fallback
     // must derive a cut from the cursor (max_keys=1 probe returning a real
     // key) and fan out a child segment — with every key emitted once.
-    let keys: Vec<String> = (0..80).map(|i| format!("obj-{:04}", i)).collect();
+    // 240 keys at ~80ms/page gives the reactor a wide window (~10s) to
+    // probe and split even on slow, contended CI runners.
+    let keys: Vec<String> = (0..240).map(|i| format!("obj-{:04}", i)).collect();
 
     let all_keys = keys.clone();
     let server = MockS3Server::start(move |request, _sequence| {

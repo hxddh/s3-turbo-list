@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-06-12
+## [0.6.1] - 2026-06-12
+
+Replaces v0.6.0, whose release pipeline was halted by a timing-flaky CI
+test (the tag exists but no assets were ever published). No functional
+difference from the intended 0.6.0; the flat-split integration test now
+uses a wide enough window for slow CI runners.
 
 ### Added
 - Flat-range runtime splitting: ranges without CommonPrefix structure can
