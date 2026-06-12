@@ -11,8 +11,10 @@ prior steps.
 
 **What it solves:**
 
-- **Slow listings** — concurrent segmented listing beats sequential scans by
-  an order of magnitude on large buckets.
+- **Slow listings** — concurrent segmented listing beats sequential scans
+  several-fold to an order of magnitude, depending on bucket structure and
+  provider limits (third-party OSS benchmark: 1M objects, 43s sequential →
+  18s parallel on v0.5.0, before flat-range splitting).
 - **Unreliable long runs** — checkpoint/resume picks an interrupted scan up
   where it left off.
 - **Opaque diffing** — bi-directional diff with per-object `DiffFlag`
@@ -125,12 +127,14 @@ boundary sources, in precedence order:
 3. **Startup structural discovery** (automatic): a handful of delimiter
    probes at run start find real `CommonPrefixes` boundaries and cache them.
    First runs are parallel with zero flags.
-4. Single-segment fallback for flat namespaces with no `/` structure.
+4. Single-segment start for flat namespaces with no `/` structure — runtime
+   splitting (below) then fans these out too.
 
 Segments also **split at runtime**: when one segment turns out to hold most
 of the data, the run probes its remaining range and fans it out across idle
-workers automatically. Skewed buckets no longer serialize behind their
-largest prefix.
+workers automatically — using real `CommonPrefixes` boundaries when the
+range has structure, and cursor-derived single-key probes when it is flat.
+Skewed and flat buckets alike scale out instead of serializing.
 
 For precise object-count-balanced segments on very large buckets, generate
 hints explicitly:
@@ -180,8 +184,13 @@ Works against any S3-compatible endpoint via `--endpoint-url` and
 
 ```bash
 s3-turbo-list profiles list
-s3-turbo-list list --bucket my-bucket \
-  --endpoint-url http://localhost:9000 --profile minio
+
+# Profiles with region-derived endpoints need no --endpoint-url:
+s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket
+
+# Deployment-specific endpoints (minio, r2) stay explicit:
+s3-turbo-list --profile minio --endpoint-url http://localhost:9000 \
+  list --bucket my-bucket
 ```
 
 Built-in profiles: `aws`, `minio`, `bos`, `r2`, `b2`, `oss`. Profiles only
@@ -201,7 +210,7 @@ virtual-hosted addressing guidance):
 Validate any endpoint before full-scale work:
 
 ```bash
-s3-turbo-list compat-probe --endpoint https://endpoint --region r --bucket b
+s3-turbo-list --endpoint-url https://endpoint compat-probe --region r --bucket b
 ```
 
 Full validation reports live in

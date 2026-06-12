@@ -19,14 +19,23 @@ s3-turbo-list list \
 
 ## Built-in Profiles
 
-| Profile | Provider | Default region | Endpoint default | Addressing | Project status |
-|---|---|---:|---|---|---|
-| `aws` | AWS S3 | user/SDK supplied | none | virtual | validated baseline |
-| `minio` | MinIO | user supplied | none | path | validated |
-| `bos` | Baidu BOS S3-compatible API | `bj` | `https://s3.bj.bcebos.com` | virtual | validated with documented caveat |
-| `r2` | Cloudflare R2 | `auto` | account-specific | path | documented preset |
-| `b2` | Backblaze B2 S3-compatible API | provider-specific | account/bucket-specific | path | documented preset |
-| `oss` | Alibaba Cloud OSS S3-compatible API | provider-specific | region-specific | virtual | documented preset |
+| Profile | Provider | Endpoint | Addressing | Project status |
+|---|---|---|---|---|
+| `aws` | AWS S3 | SDK-derived from region | virtual | validated baseline |
+| `minio` | MinIO | deployment-specific, explicit | path | validated |
+| `bos` | Baidu BOS S3-compatible API | `https://s3.{region}.bcebos.com` (default region `bj`) | virtual | validated with documented caveat |
+| `r2` | Cloudflare R2 | account-specific, explicit | path | documented preset |
+| `b2` | Backblaze B2 S3-compatible API | `https://s3.{region}.backblazeb2.com` | path | documented preset |
+| `oss` | Alibaba Cloud OSS S3-compatible API | `https://{region}.aliyuncs.com` | virtual | documented preset |
+
+Profiles with a `{region}` endpoint pattern derive the endpoint from the
+run's `--region`, so everyday commands need no `--endpoint-url`:
+
+```bash
+s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket
+s3-turbo-list --profile bos list --region gz --bucket my-bos-bucket
+s3-turbo-list --profile b2 list --region us-west-004 --bucket my-b2-bucket
+```
 
 `validated` means the project has run its endpoint validation flow for that
 provider or local server.  `documented preset` means the profile encodes known
@@ -45,14 +54,15 @@ For example, `--profile bos` fills the standard BOS endpoint and virtual-hosted
 addressing when they are otherwise unset.  Passing `--endpoint-url` or
 `--addressing-style path` keeps the explicit value.
 
-Profiles with account-, bucket-, or region-specific endpoints, such as `minio`,
-`r2`, `b2`, and `oss`, warn during local `doctor` and dry-run preflight until
-an endpoint URL is configured.  Starter config placeholders such as
-`<account-id>` or `<region>` are also reported locally so agents do not launch a
-real run with an unedited template endpoint.
+Profiles with deployment- or account-specific endpoints (`minio`, `r2`) warn
+during local `doctor` and dry-run preflight until an endpoint URL is
+configured; region-derived profiles (`oss`, `b2`) warn when neither an
+endpoint nor a region is available.  Starter config placeholders such as
+`<account-id>` or `<region>` are also reported locally so agents do not
+launch a real run with an unedited template endpoint.
 
-`compat-probe` takes its endpoint from the command's explicit `--endpoint`
-argument.  It applies the same placeholder guard to that value and exits with
+`compat-probe` takes its endpoint from the global `--endpoint-url` flag (or
+its subcommand-local `--endpoint` override).  It applies the same placeholder guard to that value and exits with
 provider setup code `3` before network setup when the endpoint still contains
 template markers such as `<account-id>`.  Literal but unreachable endpoints are
 left to the probe itself so connectivity failures remain part of the diagnostic

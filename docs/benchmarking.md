@@ -63,12 +63,12 @@ from driving release decisions.
 `--output-format parquet` measures the Parquet plus KeySpace streaming path.
 `--output-format tsv` and `--output-format ndjson` measure the list stdout row
 formatters by writing rows to a temporary local file, not to the terminal.
-`--benchmark diff-map` measures only the local diff data-map construction path:
-it inserts the requested object count for both left and right sides into the
-in-memory prefix/object map and does not write output artifacts.
-`--benchmark diff-output` measures local diff construction plus `PrefixMap`
-dump, Parquet output, and KeySpace output. Its `--diff-shape` option supports
-`mixed` (the default), `all-equal`, and `all-changed` synthetic distributions.
+`--benchmark diff-map` measures the streaming diff merge plus row encoding
+against a null writer (no file IO); it does not write output artifacts.
+`--benchmark diff-output` measures the same merge with real Parquet and
+KeySpace artifacts. Both drive the production merge engine. The
+`--diff-shape` option supports `mixed` (the default), `all-equal`, and
+`all-changed` synthetic distributions.
 
 The JSON report includes:
 

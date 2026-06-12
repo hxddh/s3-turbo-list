@@ -16,7 +16,8 @@ s3-turbo-list compat-probe \
   --output compat-probe.json
 ```
 
-`compat-probe` reads the endpoint from its explicit `--endpoint` argument.
+`compat-probe` reads the endpoint from the global `--endpoint-url` flag
+(or its subcommand-local `--endpoint` override).
 Template placeholders such as `<account-id>` are rejected locally with provider
 setup exit code `3` before network setup.  Literal but unreachable endpoints are
 left to the probe so transport failures remain part of the diagnostic report.

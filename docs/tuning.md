@@ -26,14 +26,21 @@ Where boundaries come from, in precedence order:
    (always single-segment by design).
 
 Boundaries are also adjusted **at runtime**: when a list run has idle
-concurrency and one segment proves to be a long tail, a delimiter probe on
-the segment's remaining range finds a real `CommonPrefixes` boundary and the
-segment splits cooperatively — the right half becomes a new parallel child
-segment, recursively.  Skewed buckets no longer serialize behind their
-largest prefix.  Splitting never applies to `diff`, `--start-after`, or
-`--continuation-token` runs, and ranges without prefix structure simply keep
-running unsplit.  Split segments conservatively do not record checkpoint
-progress, so `--resume` re-lists the original segment.
+concurrency and one segment proves to be a long tail, the segment splits
+cooperatively — the right half becomes a new parallel child segment,
+recursively.  Split points come from a delimiter probe when the remaining
+range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
+candidate cuts are derived from the segment's cursor and validated with
+single-key probes, so the boundary is always a real observed key.  Skewed
+and flat buckets alike fan out until concurrency is used.  Splitting never
+applies to `diff`, `--start-after`, or `--continuation-token` runs.  Split
+segments conservatively do not record checkpoint progress, so `--resume`
+re-lists the original segment.
+
+**Defaults are designed to be the right choice**: `worker_threads` follows
+the machine's CPU count, and `--concurrency` only needs raising when a very
+large bucket on a fast network leaves workers idle.  Hand-tuning `-c`/`-T`
+is rarely worthwhile.
 
 Hints boundaries are lexicographic cut points, not directories.  A boundary
 may also be a real object key; it is treated as part of the preceding segment
