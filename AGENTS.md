@@ -2,186 +2,95 @@
 
 ## Project Context
 
-`s3-turbo-list` is a Rust CLI for high-performance S3-compatible bucket listing, tracing, diffing, checkpoint/resume, and Parquet export.
+`s3-turbo-list` is a Rust CLI for high-performance S3-compatible bucket
+listing, diffing, checkpoint/resume, and Parquet export.  GitHub:
+`https://github.com/hxddh/s3-turbo-list`, main branch `main`; the latest git
+tag / GitHub Release is the release source of truth.
 
-The project prioritizes a clean, high-performance architecture for standards-compatible S3 behavior. Do not compromise the core architecture or performance model to work around non-standard provider behavior.
+The project prioritizes a clean, high-performance architecture for
+standards-compatible S3 behavior.  Do not compromise the core architecture
+or performance model to work around non-standard provider behavior.
 
-Repository:
-
-- Local path: `/home/ubuntu/s3-turbo-list`
-- GitHub: `https://github.com/hxddh/s3-turbo-list`
-- Main branch: `main`
-- Current release source: use the latest git tag / GitHub Release as the
-  release source of truth.
-
-## Required Reading
-
-Before non-trivial code changes, read:
-
-- `README.md`
-- `INSTALL.md`
-- `docs/validation-results/final-validation-summary-20260514.md`
-- `docs/validation-results/bos-listobjects-v2-pagination-compatibility-note-20260514.md`
-
-For architecture or larger changes, also consult:
-
-- `/home/ubuntu/thoughts/shared/designs/2026-05-13_11-59-14_s3-turbo-list.md`
-- `/home/ubuntu/thoughts/shared/plans/2026-05-13_12-52-37_s3-turbo-list.md`
+Before non-trivial code changes, read `README.md`, `docs/tuning.md`, and the
+relevant notes in `docs/validation-results/`.
 
 ## Development Rules
 
-- Prefer existing architecture and module boundaries.
-- Keep changes narrowly scoped to the requested task.
-- Preserve the high-performance S3-compatible design as the primary product identity.
-- Provider-specific compatibility handling must be opt-in and must not alter the standard S3-compatible hot path.
-- Do not add provider-specific workarounds that complicate or slow the standard S3-compatible hot path without explicit approval.
-- Do not implement BOS-specific pagination workarounds by default.
-- Prefer documentation and guardrails for BOS-specific caveats.
-- Do not rewrite unrelated code.
+- **The CLI surface is frozen** (see CONTRIBUTING.md): no new subcommands,
+  global flags, or config knobs without an exceptional, documented case.
+- Prefer existing architecture and module boundaries; keep changes narrowly
+  scoped to the requested task; do not rewrite unrelated code.
+- Provider-specific compatibility handling must be opt-in and must not alter
+  or slow the standard S3-compatible hot path.  Prefer documentation and
+  guardrails over endpoint-specific pagination rewrites.
 - Do not remove or weaken existing tests unless explicitly requested.
-- Do not change public CLI behavior without updating README, INSTALL, and examples where relevant.
-- Treat `docs/validation-results/` as historical evidence. If behavior changes, add a new dated note instead of silently editing old validation conclusions.
-- Do not present BOS as fully unrestricted for hinted multi-segment listing unless BOS fixes its service-side compatibility behavior and this has been revalidated.
+- Do not change public CLI behavior without updating README and docs.
+- Treat `docs/validation-results/` as historical evidence: if behavior
+  changes, add a new dated note instead of editing old conclusions.
 
 ## BOS Compatibility Position
 
-BOS has a documented ListObjectsV2 compatibility issue when both `start_after` and `continuation-token` are present.
+BOS has a documented ListObjectsV2 compatibility issue when both
+`start_after` and `continuation-token` are present.  This is a BOS
+service-side issue, not an architecture problem.  Consequences:
 
-Project position:
-
-- This is considered a BOS service-side S3 compatibility issue, not a general `s3-turbo-list` architecture problem.
 - Single-segment BOS listing is supported and validated.
-- Hinted multi-segment listing is safe on AWS S3 and MinIO.
-- Hinted multi-segment listing is not authoritative on BOS until BOS fixes its ListObjectsV2 continuation-token + start_after compatibility.
-- Do not compromise the tool's architecture, SDK paginator usage, or high-performance listing model to compensate for BOS-specific behavior.
-- If needed, add warnings, documentation, or explicit user guardrails rather than endpoint-specific pagination rewrites.
+- Hinted multi-segment listing is safe on AWS S3 and MinIO but is **not
+  authoritative on BOS** until BOS fixes the service-side behavior; startup
+  discovery and runtime splitting are automatically disabled for the `bos`
+  profile.
+- Do not present BOS as unrestricted for multi-segment listing, and do not
+  implement BOS-specific pagination workarounds by default.
+
+## Other Design Constraints
+
+- Diff is authoritative single-segment by design; `diff --hints-file` and
+  `diff --resume` are intentionally rejected so mismatched segment
+  boundaries cannot hide left-only or right-only objects.
+- `dist/` and `target/` are generated and ignored.
 
 ## Cloud Safety Rules
 
-Do not run real cloud commands unless the user explicitly authorizes that specific action.
+Do not run real cloud commands unless the user explicitly authorizes that
+specific action — including `aws s3 ...`, `bcecmd ...`, `mc ...` against
+non-local endpoints, bucket/object mutations, and endpoint validation
+against real providers.
 
-This includes:
+Allowed without extra confirmation: local source inspection, Rust
+build/test commands, tests that do not contact real cloud endpoints, and
+clearly-local MinIO testing against an already-running local service.
 
-- `aws s3 ...`
-- `aws s3api ...`
-- `bcecmd ...`
-- `mc ...` against non-local endpoints
-- creating, deleting, or modifying buckets
-- uploading or deleting objects
-- running endpoint validation against AWS S3, BOS, OSS, R2, B2, Spaces, or other real providers
+## Secrets
 
-Allowed without extra confirmation:
-
-- local source inspection
-- Rust build/test commands
-- unit/integration tests that do not contact real cloud endpoints
-- MinIO-only local testing if a local MinIO service is already running and the command is clearly local
-
-## Secrets And Sensitive Data
-
-Never print, copy, commit, or expose credentials.
-
-Sensitive local files include:
-
-- `/home/ubuntu/.aws/credentials`
-- `/home/ubuntu/.aws/config`
-- `/home/ubuntu/.bos_env`
-- `/home/ubuntu/.duckdb/setup_s3_secrets.sql`
-- `/tmp/s3tl-validation-20260514-042634/aws/env.sh`
-- `/tmp/s3tl-validation-20260514-042634/bos/env.sh`
-
-Before commits or publication-related work, run a secret scan:
+Never print, copy, commit, or expose credentials.  Before commits or
+publication-related work, run a secret scan:
 
 ```bash
 git grep -nE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_(access_key_id|secret_access_key|session_token)\s*=|AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|ghp_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+' || true
 ```
 
-## Build And Test Commands
+## Build And Test
 
-Run these after code changes:
+After code changes:
 
 ```bash
 cargo fmt --check
 cargo check
+cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build
 ```
 
-For docs-only changes, at minimum run:
+For docs-only changes, `cargo fmt --check` and `cargo check` suffice.  The
+local S3 protocol mock lives in `tests/s3_mock_integration.rs` and never
+contacts real endpoints.
 
-```bash
-cargo fmt --check
-cargo check
-```
-
-Useful targeted tests:
-
-```bash
-cargo test --test checkpoint_integration
-cargo test --test data_map_integration
-cargo test --test diff_integration
-cargo test --test trace_integration
-cargo test --test cli_integration
-```
-
-## Release Build Note
-
-On Ubuntu 20.04 arm64, release builds may hit the `aws-lc-sys` / GCC 9 memcmp issue.
-
-Use the documented workarounds in:
-
-- `BUILD.md`
-- `docs/build-release.md`
-
-Typical workaround:
-
-```bash
-export CC=clang
-cargo build --release
-```
-
-Other documented options include GCC 10+ or disabling ASM.
-
-## Known Technical Constraints
-
-- BOS has a documented ListObjectsV2 compatibility issue when both `start_after` and `continuation-token` are present.
-- Single-segment BOS listing works.
-- Hinted multi-segment listing is safe on AWS S3 and MinIO.
-- Hinted multi-segment listing is not authoritative on BOS until BOS fixes the service-side pagination compatibility issue.
-- Diff is authoritative single-segment by design.
-- `diff --hints-file` and `diff --resume` are intentionally unsupported to avoid incomplete left-only or right-only results from mismatched segment boundaries.
-- Release artifacts in `dist/` are generated and ignored.
-- `target/` is generated and ignored.
-
-## Useful Local Reference Material
-
-Historical design and planning docs:
-
-- `/home/ubuntu/thoughts/shared/designs/2026-05-13_11-59-14_s3-turbo-list.md`
-- `/home/ubuntu/thoughts/shared/plans/2026-05-13_12-52-37_s3-turbo-list.md`
-
-Validation artifacts:
-
-- `/tmp/s3tl-validation-20260514-042634/`
-
-Related compatibility research:
-
-- `/home/ubuntu/s3-compatibility-test`
-- `/home/ubuntu/headobj-compat-test`
-
-Do not assume these external directories are safe to publish. Review for credentials, bucket names, endpoint details, and agent transcript residue before copying anything into the repository.
+Release builds on Ubuntu 20.04 arm64 may hit the `aws-lc-sys` / GCC 9
+memcmp issue; use the workarounds in `BUILD.md` (clang, GCC 10+, or no-ASM).
 
 ## Git Hygiene
 
-Check status before editing:
-
-```bash
-git status --short --branch
-```
-
-Rules:
-
 - Do not revert user changes unless explicitly requested.
-- Do not create tags, releases, or make the repository public unless explicitly requested.
+- Do not create tags, releases, or make the repository public unless
+  explicitly requested.
 - Do not push unless explicitly requested.
-- Keep commits focused and use conventional commit messages when committing.
+- Keep commits focused; use conventional commit messages.

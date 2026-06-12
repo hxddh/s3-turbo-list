@@ -24,6 +24,16 @@ Where boundaries come from, in precedence order:
    `--no-auto-hints`, `--start-after`, or `--continuation-token`, and `diff`
    (always single-segment by design).
 
+Boundaries are also adjusted **at runtime**: when a list run has idle
+concurrency and one segment proves to be a long tail, a delimiter probe on
+the segment's remaining range finds a real `CommonPrefixes` boundary and the
+segment splits cooperatively — the right half becomes a new parallel child
+segment, recursively.  Skewed buckets no longer serialize behind their
+largest prefix.  Splitting never applies to `diff`, `--start-after`, or
+`--continuation-token` runs, and ranges without prefix structure simply keep
+running unsplit.  Split segments conservatively do not record checkpoint
+progress, so `--resume` re-lists the original segment.
+
 Hints boundaries are lexicographic cut points, not directories.  A boundary
 may also be a real object key; it is treated as part of the preceding segment
 so adjacent `start-after` segments do not drop it.  Folder marker objects such
@@ -149,15 +159,14 @@ segments.
 
 ## Trace-Driven Hints Iteration
 
-For large buckets, treat hints as an iterative performance input:
+For repeated inventories, hints can still be curated locally:
 
 ```bash
 s3-turbo-list trace-summary trace.jsonl
 s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
-s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --output next.toml --explain
 ```
 
-These commands read local files only.  They do not contact S3 and do not change
-the listing hot path.  `hints-rebalance` only adds boundaries from observed
-trace key samples (`last_key`) for segments that are clear long-tail outliers;
-otherwise it reports recommendations without guessing cut points.
+These commands read local files only; they do not contact S3.
+`hints-rebalance` is **deprecated**: list runs now split long-tail segments
+at runtime automatically, which covers its use case without a manual
+trace-analysis loop.  It will be removed in a future release.

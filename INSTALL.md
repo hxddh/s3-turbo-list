@@ -31,47 +31,8 @@ s3-turbo-list --output-dir out --delimiter '' \
 
 `--delimiter ''` performs a recursive full-bucket object inventory.  The
 default delimiter is `/`, which is hierarchical and only returns top-level
-objects plus `CommonPrefixes`.
-
-If you only need object count, total bytes, and top-prefix distribution, use
-summary-only mode.  It still scans S3, but it does not write Parquet or
-KeySpace files:
-
-```bash
-s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' \
-  list --bucket my-bucket --region us-east-1
-s3-turbo-list manifest-summary summary.json
-```
-
-If you want rows directly in a shell pipeline or an agent-readable stream, use
-TSV or NDJSON list output.  These modes still scan S3, but they write rows to
-stdout instead of writing Parquet or KeySpace files:
-
-```bash
-s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 \
-  --output-format tsv | wc -l
-
-s3-turbo-list --run-manifest run.json --delimiter '' \
-  list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
-s3-turbo-list manifest-summary run.json --json
-s3-turbo-list manifest-summary run.json --check
-```
-
-Output mode guide:
-
-| Need | Command shape |
-|---|---|
-| Repeatable inventory for DuckDB/pandas/audit | default `list` Parquet output |
-| Object count, bytes, and top prefixes only | `--summary-only --run-manifest run.json` |
-| Shell pipeline rows | `list --output-format tsv` |
-| Agent/JQ-readable rows | `list --output-format ndjson` |
-| Local result validation | `manifest-summary run.json --check` |
-
-`manifest-summary --check` is local-only.  It validates the saved manifest and
-recorded artifact paths on the local filesystem.  When recorded metadata is
-available, it also verifies current artifact size, SHA256, and Parquet
-row/schema metadata.  It does not contact S3 or prove the remote bucket has not
-changed since the run.
+objects plus `CommonPrefixes`.  Other output modes (summary-only, TSV,
+NDJSON, run manifests) are covered in the [README](README.md#output-modes).
 
 ## Choose the correct binary
 
@@ -313,145 +274,24 @@ s3-turbo-list list \
   --output-ks-file out/minio-basic.ks
 ```
 
-## Output files
+## After installation
 
-- **Parquet output** (`--output-parquet-file`): Object listing result with
-  Key, Size, LastModified, ETag, and DiffFlag columns.  Suitable for pandas,
-  duckdb, or any Parquet-compatible tool.  The default compression is
-  `zstd(3)` for faster local writes and smaller files on modern analytics
-  stacks.  Use `--compression gzip --compression-level 6` when a downstream
-  reader requires traditional gzip output.
-- **KS output** (`--output-ks-file`): Keyspace CSV showing per-prefix object
-  counts.
-- **JSONL trace** (`--trace-compat`): Structured compatibility/debug trace
-  with 28 fields per S3 API call.
-
-Current `diff` runs use authoritative single-segment listing.  Conventional
-hints caches are ignored for `diff`, and `diff --hints-file` fails before any
-S3 request until paired-segment diff coordination is implemented in `v0.2.x`.
-
-Example with all output types:
+Output formats and the Parquet schema, checkpoint/resume, hints, and
+performance tuning are covered in the [README](README.md) and
+[`docs/tuning.md`](docs/tuning.md).  Quick pointers:
 
 ```bash
-s3-turbo-list list \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --debug-s3 \
-  --trace-compat out/trace.jsonl \
-  --output-parquet-file out/output.parquet \
-  --output-ks-file out/output.ks \
-  2> out/debug-stderr.log
+# Recursive bucket inventory → Parquet + keyspace CSV
+s3-turbo-list --output-dir out --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+
+# Resume an interrupted scan (identity-verified)
+s3-turbo-list --resume --delimiter '' \
+  list --bucket my-bucket --region us-east-1
+
+# Inspect the Parquet output
+python3 examples/read-parquet.py out/*.parquet
 ```
-
-## Inspect Parquet output
-
-Use the bundled example script:
-
-```bash
-python3 examples/read-parquet.py out/output.parquet
-```
-
-Or with a Python snippet:
-
-```python
-import pandas as pd
-
-df = pd.read_parquet("out/output.parquet")
-print(df.head())
-```
-
-## Checkpoint / resume
-
-s3-turbo-list saves progress every 30 seconds and on graceful shutdown.
-Resume picks up where an interrupted scan left off:
-
-```bash
-s3-turbo-list list \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --resume \
-  --output-parquet-file out/resume.parquet \
-  --output-ks-file out/resume.ks
-```
-
-Resume uses checkpoint identity validation.  If bucket, region, prefix,
-delimiter, max_keys, profile, addressing_style, or mode change, the
-checkpoint is rejected to prevent mismatched data.
-
-## Hints file
-
-Hints files split a bucket into segments for parallel listing.  TOML format:
-
-```toml
-boundaries = [
-  "alpha/",
-  "beta/",
-  "logs/file with spaces.log",
-  "logs/file+plus.log",
-  "中文/"
-]
-```
-
-Run with a hints file:
-
-```bash
-s3-turbo-list list \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --hints-file ./hints.toml \
-  --output-parquet-file out/hints.parquet \
-  --output-ks-file out/hints.ks
-```
-
-TOML hints are parsed as TOML.  Plain line-by-line hints are also
-supported.  Malformed TOML-like hints fail before any S3 requests are
-sent — no partial work or wasted API calls.
-
-Validate a hints file locally:
-
-```bash
-s3-turbo-list hints-validate --hints-file ./hints.toml
-```
-
-For very large buckets, `auto-hints` can produce an estimated hints cache
-from a bounded sample:
-
-```bash
-s3-turbo-list auto-hints \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --sample-limit 1000000 \
-  --max-pages 1000 \
-  --output ./hints.sampled.toml
-```
-
-`auto-hints` can also be scoped to a subtree:
-
-```bash
-s3-turbo-list --prefix logs/2026/ auto-hints \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --output ./logs-2026-hints.toml
-```
-
-Use `discover-prefixes` when you want delimiter-based `CommonPrefixes` as a
-starting point for manual hints:
-
-```bash
-s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
-  --bucket my-bucket \
-  --region us-east-1 \
-  --output ./logs-prefixes.txt
-```
-
-In sampled mode, `total_objects` means sampled objects, not the full bucket
-total.  Prefix-scoped hints describe only the selected subtree.  Segment
-estimates in the hints cache are sampled/estimated, not authoritative
-bucket-wide statistics.  Use full-scan `auto-hints` when you need observed
-bucket-wide prefix statistics.
-
-For runtime defaults and advanced TOML-only settings, see
-[`docs/tuning.md`](docs/tuning.md).
 
 ## Troubleshooting
 

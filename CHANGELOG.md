@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-12
+
+### Added
+- Runtime long-tail segment splitting: when a list run has idle concurrency
+  and one segment proves to be a long tail, a delimiter probe over the
+  cursor's ancestor directories finds a real CommonPrefix boundary and the
+  segment splits cooperatively — the right half becomes a new parallel
+  child segment, recursively.  Skewed buckets no longer serialize behind
+  their largest prefix.  Splitting never applies to diff,
+  `--start-after`, `--continuation-token`, or `bos`-profile runs, and
+  ranges without prefix structure keep running unsplit.  Split segments
+  conservatively do not record checkpoint progress.
+
+### Changed
+- Removed the last per-object allocation from the list ingest hot path by
+  moving SDK-owned key Strings into batches instead of copying them.
+- Deprecated `hints-rebalance`: runtime splitting covers its use case
+  without a manual trace-analysis loop.  The command still works but warns,
+  and will be removed in a future release.
+- Slimmed INSTALL.md to installation, credentials, and provider setup;
+  output/hints/checkpoint details now live in the README and
+  `docs/tuning.md` (also fixes stale compression and diff notes).
+  Tightened AGENTS.md and removed machine-specific paths.
+- Removed the ineffective `release-dispatch.yml` workflow.
+
+### Fixed
+- `--dry-run` now validates `--filter` expressions, failing with exit
+  code 2 at plan time instead of only at run time.
+
 ## [0.3.0] - 2026-06-11
 
 ### Added

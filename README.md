@@ -128,6 +128,11 @@ boundary sources, in precedence order:
    First runs are parallel with zero flags.
 4. Single-segment fallback for flat namespaces with no `/` structure.
 
+Segments also **split at runtime**: when one segment turns out to hold most
+of the data, the run probes its remaining range and fans it out across idle
+workers automatically. Skewed buckets no longer serialize behind their
+largest prefix.
+
 For precise object-count-balanced segments on very large buckets, generate
 hints explicitly:
 
@@ -138,9 +143,8 @@ s3-turbo-list --delimiter '' --hints-file hints.toml \
 ```
 
 Hints file formats, boundary semantics, advanced generation workflows
-(`discover-prefixes`, `hints-validate`, `hints-merge`, `hints-rebalance`),
-and all runtime tuning knobs are documented in
-[`docs/tuning.md`](docs/tuning.md).
+(`discover-prefixes`, `hints-validate`, `hints-merge`), and all runtime
+tuning knobs are documented in [`docs/tuning.md`](docs/tuning.md).
 
 ## Diff mode
 

@@ -343,7 +343,8 @@ enum Commands {
         check: bool,
     },
 
-    /// Generate conservative next-run hints from a local trace and hints file
+    /// DEPRECATED: list runs now split long-tail segments at runtime
+    /// automatically; this command will be removed in a future release
     HintsRebalance {
         /// Trace JSONL file
         #[arg(long)]
@@ -705,6 +706,11 @@ fn main() {
             emit_manifest,
             overwrite,
         } => {
+            eprintln!(
+                "warning: hints-rebalance is deprecated — list runs now split \
+                 long-tail segments at runtime automatically; this command \
+                 will be removed in a future release"
+            );
             run_hints_rebalance(
                 trace,
                 hints_file,
