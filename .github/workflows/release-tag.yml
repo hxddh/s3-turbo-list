@@ -5,12 +5,12 @@ name: Release Tag
 # Two triggers:
 #  - workflow_dispatch: one manual dispatch releases the version prepared
 #    on main (tag defaults to the Cargo.toml version).
-#  - schedule: release-on-version-bump, explicitly authorized by the
-#    maintainer. Managed environments can push branches but cannot create
-#    tags or fire push workflows, so a timer checks main: when Cargo.toml's
-#    version has a matching CHANGELOG section but no tag yet, the tag is
-#    created and the asset build is dispatched. Idempotent — existing tags
-#    are a no-op, so the timer normally does nothing.
+#  - push to main touching Cargo.toml, and a schedule backstop:
+#    release-on-version-bump, explicitly authorized by the maintainer.
+#    When Cargo.toml's version has a matching CHANGELOG section but no tag
+#    yet, the tag is created and the asset build is dispatched.
+#    Idempotent — existing tags are a no-op, so both triggers are normally
+#    no-ops.
 
 on:
   workflow_dispatch:
@@ -21,6 +21,9 @@ on:
       sha:
         description: 'Commit SHA to tag (defaults to main HEAD)'
         required: false
+  push:
+    branches: [main]
+    paths: ['Cargo.toml']
   schedule:
     - cron: '*/15 * * * *'
 
