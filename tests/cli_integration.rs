@@ -199,10 +199,6 @@ fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["hints-merge", "--help"]);
     assert_eq!(code, 0, "hints-merge --help should exit 0");
     assert!(stdout.contains("--emit-manifest"));
-
-    let (code, stdout, _stderr) = run_cli(&["hints-rebalance", "--help"]);
-    assert_eq!(code, 0, "hints-rebalance --help should exit 0");
-    assert!(stdout.contains("--long-tail-ratio"));
 }
 
 #[test]
@@ -2077,48 +2073,4 @@ fn test_cli_trace_summary_json() {
     assert_eq!(json["total_pages"], 3);
     assert_eq!(json["total_objects"], 30);
     assert_eq!(json["list_events"], 1);
-}
-
-#[test]
-fn test_cli_hints_rebalance_adds_trace_sample_boundary() {
-    let dir = tempfile::tempdir().unwrap();
-    let hints = dir.path().join("hints.txt");
-    let trace = dir.path().join("trace.jsonl");
-    let out = dir.path().join("new.toml");
-    std::fs::write(&hints, "m/\n").unwrap();
-    std::fs::write(
-        &trace,
-        r#"{"timestamp":"2026-05-19T00:00:00Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"a/1","last_key":"a/2"}
-{"timestamp":"2026-05-19T00:00:01Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"c/1","last_key":"c/2"}
-{"timestamp":"2026-05-19T00:00:02Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"e/1","last_key":"e/2"}
-{"timestamp":"2026-05-19T00:00:03Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"g/1","last_key":"g/2"}
-{"timestamp":"2026-05-19T00:00:04Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"contents_count":2,"first_key":"i/1","last_key":"i/2"}
-{"timestamp":"2026-05-19T00:00:05Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":500,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":0,"segment_pages":5,"segment_objects":50,"segment_common_prefixes":0,"ended_by":"boundary","end_before":"m/"}
-{"timestamp":"2026-05-19T00:00:06Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":1,"segment_pages":1,"segment_objects":10,"segment_common_prefixes":0,"ended_by":"pagination","start_after":"m/"}
-"#,
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run_cli(&[
-        "hints-rebalance",
-        "--trace",
-        trace.to_str().unwrap(),
-        "--hints-file",
-        hints.to_str().unwrap(),
-        "--output",
-        out.to_str().unwrap(),
-        "--long-tail-ratio",
-        "2",
-        "--min-pages",
-        "2",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["added_boundaries"].as_array().unwrap().len(), 1);
-    assert_eq!(json["output_written"], true);
-
-    let rendered = std::fs::read_to_string(out).unwrap();
-    assert!(rendered.contains("e/2"));
-    assert!(rendered.contains("m/"));
 }

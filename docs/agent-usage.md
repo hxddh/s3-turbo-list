@@ -25,7 +25,6 @@ s3-turbo-list manifest-summary run.json --json
 s3-turbo-list manifest-summary run.json --check
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
-s3-turbo-list hints-rebalance --trace trace.jsonl --hints-file merged.toml --dry-run --machine-readable
 ```
 
 `config-inspect --json` prints the resolved local configuration after TOML,
@@ -55,7 +54,7 @@ without editing TOML.  The default is `zstd(1)`; use
 traditional gzip output.
 
 `init-config`, `recipes`, `quickstart`, `cheatsheet`, `trace-summary`,
-`hints-merge`, and `hints-rebalance` are local tooling commands.  They are
+and `hints-merge` are local tooling commands.  They are
 handled before S3 config loading, do not require cloud credentials, and do not
 change list/diff hot-path behavior.
 
@@ -268,29 +267,19 @@ s3-turbo-list hints-merge \
   --output merged.toml \
   --emit-manifest merge.manifest.json \
   --machine-readable
-
-s3-turbo-list hints-rebalance \
-  --trace trace.jsonl \
-  --hints-file merged.toml \
-  --output rebalanced.toml \
-  --emit-manifest rebalance.manifest.json \
-  --machine-readable
 ```
 
 `--machine-readable` is an alias for JSON report output on these commands.
 Warnings and recommendations are JSON fields, so agents should not scrape human
 text.  `--emit-manifest` records input/output file hashes for reproducibility.
 
-`hints-rebalance` is conservative.  It only adds boundaries from observed
-per-page trace key samples and only for segments that exceed the configured
-long-tail threshold.  If a trace was produced by an older binary and lacks
-`last_key` samples, the command reports the long-tail segments but does not
-guess synthetic boundaries.
+Long-tail segments no longer need offline rebalancing: list runs split them
+at runtime automatically.
 
 ## Safety expectations
 
 - `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
-- `trace-summary`, `hints-merge`, and `hints-rebalance` are local-only.
+- `trace-summary` and `hints-merge` are local-only.
 - `list`, `diff`, `auto-hints`, `discover-prefixes`, and `compat-probe` can contact S3 unless
   combined with `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS

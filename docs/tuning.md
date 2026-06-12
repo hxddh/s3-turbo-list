@@ -103,7 +103,6 @@ it.
 | `output.compression_level` | `1` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
 | `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
 | `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
-| `auto_hints.min_segment_size` | `1000` | Reserved segment-size tuning value. |
 | `auto_hints.max_prefix_entries` | `1000000` | Maximum unique parent prefixes retained during auto-hints counting before bounded mode. |
 
 For high-latency or cross-region endpoints, consider raising
@@ -133,7 +132,6 @@ compression_level = 1
 [auto_hints]
 sample_threshold = 10000
 max_prefix_depth = 5
-min_segment_size = 1000
 max_prefix_entries = 1000000
 
 [channel]
@@ -144,8 +142,8 @@ CLI flags exist for common runtime controls such as `--threads`,
 `--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
 `--max-keys`, `--start-after`, output file paths, `--sample-limit`, and
 `--max-pages`.  The `auto_hints.sample_threshold`,
-`auto_hints.max_prefix_depth`, `auto_hints.min_segment_size`, and
-`auto_hints.max_prefix_entries` values are TOML-only.
+`auto_hints.max_prefix_depth`, and `auto_hints.max_prefix_entries` values
+are TOML-only.
 
 ## Auto-Hints Scope
 
@@ -167,7 +165,6 @@ s3-turbo-list trace-summary trace.jsonl
 s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
 ```
 
-These commands read local files only; they do not contact S3.
-`hints-rebalance` is **deprecated**: list runs now split long-tail segments
-at runtime automatically, which covers its use case without a manual
-trace-analysis loop.  It will be removed in a future release.
+These commands read local files only; they do not contact S3.  Long-tail
+segments are split at runtime automatically, so no offline rebalancing
+workflow is needed.

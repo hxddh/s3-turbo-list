@@ -120,7 +120,6 @@ pub struct OutputSummary {
 pub struct AutoHintsSummary {
     pub sample_threshold: usize,
     pub max_prefix_depth: usize,
-    pub min_segment_size: usize,
     pub max_prefix_entries: usize,
 }
 
@@ -179,7 +178,6 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
             auto_hints: AutoHintsSummary {
                 sample_threshold: cfg.auto_hints.sample_threshold,
                 max_prefix_depth: cfg.auto_hints.max_prefix_depth,
-                min_segment_size: cfg.auto_hints.min_segment_size,
                 max_prefix_entries: cfg.auto_hints.max_prefix_entries,
             },
             channel: ChannelSummary {

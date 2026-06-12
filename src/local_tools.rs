@@ -5,7 +5,6 @@ use crate::trace::S3CompatEvent;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -95,33 +94,6 @@ pub struct ImbalanceSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HintsRebalanceReport {
-    pub status: String,
-    pub trace_file: String,
-    pub hints_file: String,
-    pub output: Option<String>,
-    pub output_written: bool,
-    pub dry_run: bool,
-    pub original_boundary_count: usize,
-    pub new_boundary_count: usize,
-    pub added_boundaries: Vec<String>,
-    pub long_tail_segments: Vec<LongTailSegment>,
-    pub warnings: Vec<String>,
-    pub recommendations: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LongTailSegment {
-    pub segment_index: usize,
-    pub start_after: Option<String>,
-    pub end_before: Option<String>,
-    pub pages: u32,
-    pub median_pages: u32,
-    pub selected_boundary: Option<String>,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct ManifestSummaryReport {
     pub status: String,
     pub manifest_file: String,
@@ -198,8 +170,6 @@ pub struct ManifestCheckSummary {
 #[derive(Debug, Clone)]
 struct TraceAnalysis {
     report: TraceSummaryReport,
-    segments: Vec<SegmentSummary>,
-    page_samples_by_start: BTreeMap<String, Vec<String>>,
 }
 
 pub fn merge_hints_files(
@@ -254,127 +224,6 @@ pub fn merge_hints_files(
 
 pub fn trace_summary(path: &str) -> Result<TraceSummaryReport, String> {
     Ok(analyze_trace(path)?.report)
-}
-
-pub fn rebalance_hints(
-    trace_path: &str,
-    hints_path: &str,
-    output: Option<&str>,
-    dry_run: bool,
-    max_new_boundaries: usize,
-    long_tail_ratio: f64,
-    min_pages: u32,
-    overwrite: bool,
-) -> Result<HintsRebalanceReport, String> {
-    let analysis = analyze_trace(trace_path)?;
-    let original = hints::parse_hints_file(hints_path)?;
-    let original_set: BTreeSet<String> = original.iter().cloned().collect();
-    let median_pages = analysis
-        .report
-        .imbalance
-        .as_ref()
-        .map(|i| i.median_pages.max(1))
-        .unwrap_or(1);
-
-    let mut added = Vec::new();
-    let mut long_tails = Vec::new();
-    let mut warnings = Vec::new();
-    for segment in &analysis.segments {
-        if added.len() >= max_new_boundaries {
-            break;
-        }
-        let threshold = (median_pages as f64 * long_tail_ratio).ceil() as u32;
-        if segment.pages < min_pages || segment.pages < threshold.max(1) {
-            continue;
-        }
-
-        let start = segment.start_after.clone().unwrap_or_default();
-        let candidate = analysis
-            .page_samples_by_start
-            .get(&start)
-            .and_then(|samples| pick_candidate(samples, &start, segment.end_before.as_deref()));
-
-        let reason = if candidate.is_some() {
-            "selected midpoint page last_key from trace".to_string()
-        } else {
-            "trace lacks usable per-page key samples for this segment".to_string()
-        };
-
-        if let Some(boundary) = candidate.clone() {
-            if original_set.contains(&boundary) || added.contains(&boundary) {
-                warnings.push(format!(
-                    "candidate boundary '{}' for segment {} already exists",
-                    boundary, segment.segment_index
-                ));
-            } else {
-                added.push(boundary);
-            }
-        }
-
-        long_tails.push(LongTailSegment {
-            segment_index: segment.segment_index,
-            start_after: segment.start_after.clone(),
-            end_before: segment.end_before.clone(),
-            pages: segment.pages,
-            median_pages,
-            selected_boundary: candidate,
-            reason,
-        });
-    }
-
-    let mut new_boundaries = original.clone();
-    new_boundaries.extend(added.iter().cloned());
-    new_boundaries.sort();
-    new_boundaries.dedup();
-
-    let output_written = if let Some(path) = output {
-        if dry_run {
-            false
-        } else {
-            write_hints_cache(
-                path,
-                "rebalanced",
-                None,
-                new_boundaries.clone(),
-                Some(&[hints_path.to_string(), trace_path.to_string()]),
-                overwrite,
-            )?;
-            true
-        }
-    } else {
-        false
-    };
-
-    let mut recommendations = Vec::new();
-    if added.is_empty() {
-        recommendations.push(
-            "no new boundaries were generated; collect trace with first_key/last_key metadata or use auto-hints/discover-prefixes for more evidence"
-                .to_string(),
-        );
-    } else {
-        recommendations.push(format!(
-            "rerun listing with the rebalanced hints file; {} boundary/boundaries were added",
-            added.len()
-        ));
-    }
-    if max_new_boundaries == 0 {
-        recommendations.push("--max-new-boundaries=0 makes this an analysis-only run".to_string());
-    }
-
-    Ok(HintsRebalanceReport {
-        status: "success".to_string(),
-        trace_file: trace_path.to_string(),
-        hints_file: hints_path.to_string(),
-        output: output.map(str::to_string),
-        output_written,
-        dry_run,
-        original_boundary_count: original.len(),
-        new_boundary_count: new_boundaries.len(),
-        added_boundaries: added,
-        long_tail_segments: long_tails,
-        warnings,
-        recommendations,
-    })
 }
 
 pub fn init_config(
@@ -1265,41 +1114,6 @@ pub fn render_merge_text(report: &HintsMergeReport) -> String {
     out
 }
 
-pub fn render_rebalance_text(report: &HintsRebalanceReport, explain: bool) -> String {
-    let mut out = String::new();
-    out.push_str("Hints rebalance:\n");
-    out.push_str(&format!("  Trace:           {}\n", report.trace_file));
-    out.push_str(&format!("  Hints:           {}\n", report.hints_file));
-    out.push_str(&format!(
-        "  Boundaries:      {} -> {}\n",
-        report.original_boundary_count, report.new_boundary_count
-    ));
-    out.push_str(&format!(
-        "  Added:           {}\n",
-        report.added_boundaries.len()
-    ));
-    out.push_str(&format!(
-        "  Output:          {}\n",
-        report.output.as_deref().unwrap_or("-")
-    ));
-    out.push_str(&format!("  Output written:  {}\n", report.output_written));
-    if explain && !report.long_tail_segments.is_empty() {
-        out.push_str("  Long-tail segments:\n");
-        for s in &report.long_tail_segments {
-            out.push_str(&format!(
-                "    - #{} pages={} median={} selected='{}' reason={}\n",
-                s.segment_index,
-                s.pages,
-                s.median_pages,
-                s.selected_boundary.as_deref().unwrap_or(""),
-                s.reason
-            ));
-        }
-    }
-    append_warnings_and_recommendations(&mut out, &report.warnings, &report.recommendations);
-    out
-}
-
 pub fn write_local_manifest<T: Serialize>(
     path: &str,
     command: &str,
@@ -1332,7 +1146,7 @@ fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
     let mut retry_events = 0usize;
     let mut error_events = 0usize;
     let mut segments = Vec::new();
-    let mut page_samples_by_start: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut has_page_samples = false;
 
     for (line_no, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -1356,11 +1170,8 @@ fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
             if event.http_status >= 400 || event.fatal || event.s3_error_code.is_some() {
                 error_events += 1;
             }
-            if let Some(last_key) = event.last_key.clone() {
-                page_samples_by_start
-                    .entry(event.start_after.clone().unwrap_or_default())
-                    .or_default()
-                    .push(last_key);
+            if event.last_key.is_some() {
+                has_page_samples = true;
             }
         } else if event.operation == "ListObjectsV2SegmentSummary" {
             segments.push(SegmentSummary {
@@ -1393,17 +1204,15 @@ fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
         recommendations
             .push("collect a new trace with a v0.1.10+ binary and --trace-compat".to_string());
     }
-    if !segments.is_empty() && page_samples_by_start.is_empty() {
+    if !segments.is_empty() && !has_page_samples {
         warnings.push("trace contains no per-page last_key samples".to_string());
-        recommendations.push(
-            "collect a new trace with v0.1.11+ if hints-rebalance should generate new boundaries"
-                .to_string(),
-        );
     }
     if let Some(i) = &imbalance {
         if i.max_to_median_ratio >= 5.0 {
             recommendations.push(
-                "long-tail segment detected; consider hints-rebalance with this trace".to_string(),
+                "long-tail segment detected; recent releases split long tails at runtime — \
+                 rerun with the current version"
+                    .to_string(),
             );
         }
     }
@@ -1425,11 +1234,7 @@ fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
         recommendations,
     };
 
-    Ok(TraceAnalysis {
-        report,
-        segments,
-        page_samples_by_start,
-    })
+    Ok(TraceAnalysis { report })
 }
 
 fn summarize_imbalance(segments: &[SegmentSummary]) -> Option<ImbalanceSummary> {
@@ -1450,27 +1255,6 @@ fn summarize_imbalance(segments: &[SegmentSummary]) -> Option<ImbalanceSummary> 
         max_to_median_ratio: max_pages as f64 / median_for_ratio,
         max_to_min_ratio: min_for_ratio,
     })
-}
-
-fn pick_candidate(
-    samples: &[String],
-    start_after: &str,
-    end_before: Option<&str>,
-) -> Option<String> {
-    if samples.is_empty() {
-        return None;
-    }
-    let mut candidates: Vec<&String> = samples
-        .iter()
-        .filter(|key| key.as_str() > start_after)
-        .filter(|key| end_before.map(|end| key.as_str() < end).unwrap_or(true))
-        .collect();
-    candidates.dedup();
-    if candidates.is_empty() {
-        return None;
-    }
-    let idx = candidates.len() / 2;
-    Some(candidates[idx].clone())
 }
 
 fn write_hints_cache(
@@ -1599,7 +1383,6 @@ compression_level = 1
 [auto_hints]
 sample_threshold = 10000
 max_prefix_depth = 5
-min_segment_size = 1000
 max_prefix_entries = 1000000
 
 [channel]

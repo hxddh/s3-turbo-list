@@ -116,7 +116,6 @@ on BOS should wait for a BOS-side fix or use single-segment fallback.
 | `hints-file-toml.sh` | List with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
 | `hints-validate.sh` | Validate TOML or plain-text hints locally | stdout |
 | `auto-hints-sampled.sh` | Generate sampled hints with segment estimates | `hints.sampled.toml` |
-| `hints-tooling-local.sh` | Summarize, merge, and rebalance local trace/hints files | `.toml`, `.json` manifests |
 | `agent-dry-run.sh` | Produce local-only agent plan JSON | `plan.json` |
 | `agent-run-with-manifest.sh` | Run list with manifest and trace outputs; requires `RUN_REAL_S3=1` | `.parquet`, `.ks`, `run.json`, `trace.jsonl` |
 | `read-parquet.py` | Read a Parquet file with pandas | stdout |

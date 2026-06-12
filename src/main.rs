@@ -345,58 +345,6 @@ enum Commands {
         check: bool,
     },
 
-    /// DEPRECATED: list runs now split long-tail segments at runtime
-    /// automatically; this command will be removed in a future release
-    HintsRebalance {
-        /// Trace JSONL file
-        #[arg(long)]
-        trace: String,
-
-        /// Existing hints file
-        #[arg(short = 'H', long)]
-        hints_file: String,
-
-        /// Output hints file path; content is always TOML regardless of extension
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Maximum number of new boundaries to add
-        #[arg(long, default_value_t = 8)]
-        max_new_boundaries: usize,
-
-        /// Segment page ratio over median required before adding a boundary
-        #[arg(long, default_value_t = 5.0)]
-        long_tail_ratio: f64,
-
-        /// Minimum segment page count before considering a split
-        #[arg(long, default_value_t = 5)]
-        min_pages: u32,
-
-        /// Explain long-tail decisions in human output
-        #[arg(long)]
-        explain: bool,
-
-        /// Output format for the command report
-        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-        output_format: ReportFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit JSON report with stdout reserved for machine-readable output
-        #[arg(long)]
-        machine_readable: bool,
-
-        /// Write local tooling manifest JSON to this path
-        #[arg(long)]
-        emit_manifest: Option<String>,
-
-        /// Allow replacing an existing output hints file
-        #[arg(long)]
-        overwrite: bool,
-    },
-
     /// Write a starter local TOML config without contacting S3
     InitConfig {
         /// Endpoint compatibility profile template: aws, minio, r2, b2, oss, or bos
@@ -692,41 +640,6 @@ fn main() {
             check,
         } => {
             run_manifest_summary(manifest_file, *json || cli.agent, *check);
-            return;
-        }
-        Commands::HintsRebalance {
-            trace,
-            hints_file,
-            output,
-            max_new_boundaries,
-            long_tail_ratio,
-            min_pages,
-            explain,
-            output_format,
-            json,
-            machine_readable,
-            emit_manifest,
-            overwrite,
-        } => {
-            eprintln!(
-                "warning: hints-rebalance is deprecated — list runs now split \
-                 long-tail segments at runtime automatically; this command \
-                 will be removed in a future release"
-            );
-            run_hints_rebalance(
-                trace,
-                hints_file,
-                output.as_deref(),
-                cli.dry_run,
-                *overwrite,
-                *max_new_boundaries,
-                *long_tail_ratio,
-                *min_pages,
-                *explain,
-                *output_format,
-                *json || *machine_readable || cli.agent,
-                emit_manifest.as_deref(),
-            );
             return;
         }
         Commands::InitConfig {
@@ -1073,7 +986,6 @@ fn main() {
         Commands::HintsMerge { .. }
         | Commands::TraceSummary { .. }
         | Commands::ManifestSummary { .. }
-        | Commands::HintsRebalance { .. }
         | Commands::InitConfig { .. }
         | Commands::Recipes { .. }
         | Commands::Cheatsheet
@@ -1746,65 +1658,6 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
         }
         Err(e) => {
             eprintln!("Manifest summary failed: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_hints_rebalance(
-    trace: &str,
-    hints_file: &str,
-    output: Option<&str>,
-    dry_run: bool,
-    overwrite: bool,
-    max_new_boundaries: usize,
-    long_tail_ratio: f64,
-    min_pages: u32,
-    explain: bool,
-    output_format: ReportFormat,
-    json: bool,
-    emit_manifest: Option<&str>,
-) {
-    if !(long_tail_ratio.is_finite() && long_tail_ratio >= 1.0) {
-        eprintln!("Hints rebalance failed: --long-tail-ratio must be >= 1.0");
-        std::process::exit(agent::ExitCode::CliConfig.code());
-    }
-
-    match local_tools::rebalance_hints(
-        trace,
-        hints_file,
-        output,
-        dry_run,
-        max_new_boundaries,
-        long_tail_ratio,
-        min_pages,
-        overwrite,
-    ) {
-        Ok(report) => {
-            if let Some(manifest_path) = emit_manifest {
-                let inputs = vec![trace.to_string(), hints_file.to_string()];
-                let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
-                if let Err(e) = local_tools::write_local_manifest(
-                    manifest_path,
-                    "hints-rebalance",
-                    &inputs,
-                    &outputs,
-                    &report,
-                    &report.warnings,
-                ) {
-                    eprintln!("Manifest write error: {}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
-                }
-            }
-            if json || output_format == ReportFormat::Json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                print!("{}", local_tools::render_rebalance_text(&report, explain));
-            }
-        }
-        Err(e) => {
-            eprintln!("Hints rebalance failed: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -3125,9 +2978,6 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         }
         Commands::ManifestSummary { .. } => {
             ("manifest-summary".to_string(), None, None, None, None, None)
-        }
-        Commands::HintsRebalance { .. } => {
-            ("hints-rebalance".to_string(), None, None, None, None, None)
         }
         Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
         Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None, None),
