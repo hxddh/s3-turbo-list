@@ -628,6 +628,152 @@ fn local_mock_list_startup_discovery_splits_segments() {
 }
 
 #[test]
+fn local_mock_list_runtime_split_covers_long_tail() {
+    // A deliberately coarse hints file leaves one huge segment holding all
+    // of big/*. With idle concurrency, the reactor must probe the long
+    // tail, split it at a real CommonPrefix (big/b/), and a child segment
+    // must list the right half — with every key emitted exactly once.
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..40 {
+        keys.push(format!("big/a/{:02}", i));
+    }
+    for i in 0..20 {
+        keys.push(format!("big/b/{:02}", i));
+    }
+    for i in 0..20 {
+        keys.push(format!("big/c/{:02}", i));
+    }
+    keys.push("small/x".to_string());
+
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        assert_eq!(request.method, "GET");
+        let prefix = request.query.get("prefix").cloned().unwrap_or_default();
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Split probe: next-level dirs under `prefix` for keys after
+            // `start_after`.
+            let mut cps: Vec<String> = all_keys
+                .iter()
+                .filter(|k| k.starts_with(&prefix) && k.as_str() > start_after.as_str())
+                .filter_map(|k| {
+                    k[prefix.len()..]
+                        .split_once('/')
+                        .map(|(d, _)| format!("{}{}/", prefix, d))
+                })
+                .collect();
+            cps.sort();
+            cps.dedup();
+            let cps_ref: Vec<&str> = cps.iter().map(String::as_str).collect();
+            return MockResponse::ok_xml(list_bucket_xml(
+                &prefix,
+                1000,
+                &[],
+                &cps_ref,
+                false,
+                None,
+            ));
+        }
+
+        // Flat listing with offset-encoded continuation tokens, 2 keys per
+        // page, slowed down so the long-tail segment is still running when
+        // the reactor's split check fires.
+        std::thread::sleep(Duration::from_millis(80));
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => all_keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = all_keys[start_idx..]
+            .iter()
+            .take(2)
+            .map(String::as_str)
+            .collect();
+        let truncated = start_idx + page.len() < all_keys.len();
+        let token = truncated.then(|| format!("off-{}", start_idx + page.len()));
+        MockResponse::ok_xml(list_bucket_xml(
+            &prefix,
+            2,
+            &page,
+            &[],
+            truncated,
+            token.as_deref(),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.txt");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    std::fs::write(&hints, "small/\n").unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--delimiter".into(),
+        "".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Every key exactly once, regardless of which segment emitted it.
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    let requests = server.requests();
+    let probes: Vec<_> = requests
+        .iter()
+        .filter(|r| r.query.contains_key("delimiter"))
+        .collect();
+    assert!(
+        probes
+            .iter()
+            .any(|r| r.query.get("prefix").map(String::as_str) == Some("big/")),
+        "expected a split probe under big/: {:#?}",
+        probes
+    );
+    // A child segment starts listing from the accepted cut (which of the
+    // candidate prefixes wins depends on probe timing).
+    assert!(
+        requests.iter().any(|r| {
+            !r.query.contains_key("delimiter")
+                && matches!(
+                    r.query.get("start-after").map(String::as_str),
+                    Some("big/b/") | Some("big/c/")
+                )
+        }),
+        "expected a child segment starting at big/b/ or big/c/"
+    );
+}
+
+#[test]
 fn local_mock_summary_only_reports_metrics_without_outputs() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");

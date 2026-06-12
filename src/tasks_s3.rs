@@ -4,6 +4,9 @@ use crate::error::*;
 use crate::trace::S3CompatEvent;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use log::{debug, error, info};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout_at, Instant};
 
@@ -11,6 +14,177 @@ use tokio::time::{timeout_at, Instant};
 struct SegmentOutcome {
     index: usize,
     completed: bool,
+    /// Original hint segments record checkpoint progress; runtime-split
+    /// children (and split parents) conservatively do not.
+    checkpointable: bool,
+}
+
+// ── Adaptive long-tail splitting ───────────────────────────
+//
+// When the reactor has idle concurrency and a running segment has paged
+// long enough to prove it is a long tail, a single delimiter probe on the
+// segment's remaining range finds a real CommonPrefix boundary.  The
+// segment task itself accepts the split at a page boundary (comparing the
+// proposed cut against its authoritative cursor), shrinks its own
+// end_before, and hands the right half back to the reactor as a child
+// segment.  Anything uncertain — no structure, stale cut, probe error —
+// results in no split.
+
+/// Pages a segment must have processed before it is a split candidate.
+const SPLIT_MIN_PAGES: u32 = 5;
+/// Reactor split/heartbeat tick.
+const SPLIT_CHECK_INTERVAL_SECS: u64 = 1;
+/// Maximum ancestor-directory probe rungs per split attempt.
+const SPLIT_PROBE_MAX_RUNGS: usize = 4;
+
+/// Right half of a split, sent from the segment task to the reactor.
+#[derive(Debug, Clone)]
+struct SplitRange {
+    start: String,
+    end: Option<String>,
+}
+
+type SplitSender = tokio::sync::mpsc::UnboundedSender<SplitRange>;
+
+/// Shared state between the reactor and one running segment.
+pub(crate) struct SegmentControl {
+    /// Last fully processed key; written by the segment task once per page.
+    cursor: Mutex<String>,
+    /// Upper boundary (exclusive start of the next segment); shrunk on split.
+    end_before: Mutex<Option<String>>,
+    /// Cut proposed by the reactor's probe, awaiting the segment's decision.
+    pending_split: Mutex<Option<String>>,
+    pages: AtomicU32,
+    /// A probe or pending decision is in flight.
+    splitting: AtomicBool,
+    /// No structural boundary exists in the remaining range; do not re-probe.
+    unsplittable: AtomicBool,
+    /// Segment gave part of its range away; checkpoint must not record it.
+    was_split: AtomicBool,
+}
+
+impl SegmentControl {
+    fn new(end: Option<String>) -> Self {
+        Self {
+            cursor: Mutex::new(String::new()),
+            end_before: Mutex::new(end),
+            pending_split: Mutex::new(None),
+            pages: AtomicU32::new(0),
+            splitting: AtomicBool::new(false),
+            unsplittable: AtomicBool::new(false),
+            was_split: AtomicBool::new(false),
+        }
+    }
+
+    fn current_end(&self) -> Option<String> {
+        self.end_before.lock().unwrap().clone()
+    }
+
+    fn record_page(&self, cursor: &str) {
+        let mut guard = self.cursor.lock().unwrap();
+        guard.clear();
+        guard.push_str(cursor);
+        drop(guard);
+        self.pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (String, Option<String>) {
+        (self.cursor.lock().unwrap().clone(), self.current_end())
+    }
+
+    fn was_split(&self) -> bool {
+        self.was_split.load(Ordering::Relaxed)
+    }
+
+    fn is_split_candidate(&self) -> bool {
+        self.pages.load(Ordering::Relaxed) >= SPLIT_MIN_PAGES
+            && !self.splitting.load(Ordering::Relaxed)
+            && !self.unsplittable.load(Ordering::Relaxed)
+    }
+
+    /// Called at a page boundary by the segment task.  Accepts the pending
+    /// cut only if it is still strictly ahead of the cursor and inside the
+    /// current range; otherwise the proposal is discarded.
+    fn try_accept_split(&self) -> Option<SplitRange> {
+        let proposed = self.pending_split.lock().unwrap().take()?;
+        let cursor = self.cursor.lock().unwrap();
+        let mut end = self.end_before.lock().unwrap();
+        let in_range = proposed.as_str() > cursor.as_str()
+            && end.as_deref().map_or(true, |e| proposed.as_str() < e);
+        if !in_range {
+            self.splitting.store(false, Ordering::Relaxed);
+            return None;
+        }
+        let old_end = end.replace(proposed.clone());
+        self.was_split.store(true, Ordering::Relaxed);
+        self.splitting.store(false, Ordering::Relaxed);
+        Some(SplitRange {
+            start: proposed,
+            end: old_end,
+        })
+    }
+}
+
+/// Ancestor directories of `cursor`, deepest first, ending at the listing
+/// prefix: `big/a/0005` → `["big/a/", "big/", <listing_prefix>]`.
+fn ancestor_dirs(cursor: &str, listing_prefix: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut idx = cursor.len();
+    while let Some(pos) = cursor[..idx].rfind('/') {
+        let dir = &cursor[..pos + 1];
+        if dir.len() <= listing_prefix.len() {
+            break;
+        }
+        dirs.push(dir.to_string());
+        idx = pos;
+    }
+    if dirs.last().map(String::as_str) != Some(listing_prefix) {
+        dirs.push(listing_prefix.to_string());
+    }
+    dirs
+}
+
+/// One delimiter probe per ancestor rung; returns the middle CommonPrefix
+/// strictly inside `(cursor, end)`, or None when the range has no structure.
+async fn probe_split_candidate(
+    ctx: &S3TaskContext,
+    listing_prefix: &str,
+    cursor: &str,
+    end: Option<&str>,
+) -> Option<String> {
+    for dir in ancestor_dirs(cursor, listing_prefix)
+        .into_iter()
+        .take(SPLIT_PROBE_MAX_RUNGS)
+    {
+        let response = ctx
+            .s3_client
+            .list_objects_v2()
+            .bucket(&ctx.s3_bucket_name)
+            .prefix(&dir)
+            .start_after(cursor)
+            .delimiter("/")
+            .send()
+            .await;
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Split probe failed for prefix '{}': {:?}", dir, e);
+                return None;
+            }
+        };
+        let mut candidates: Vec<String> = response
+            .common_prefixes()
+            .iter()
+            .filter_map(|cp| cp.prefix())
+            .filter(|c| *c > cursor && end.map_or(true, |e| *c < e))
+            .map(str::to_string)
+            .collect();
+        if !candidates.is_empty() {
+            candidates.sort();
+            return Some(candidates.swap_remove(candidates.len() / 2));
+        }
+    }
+    None
 }
 
 // ── Public entry point ─────────────────────────────────────
@@ -38,29 +212,60 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — started", ctx.s3_bucket_name);
     tokio::task::yield_now().await;
 
+    // Adaptive splitting only applies to plain list runs: diff is
+    // authoritative single-segment by design, and --start-after /
+    // --continuation-token are single-chain modes.
+    let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
+        && ctx.start_after.is_none()
+        && ctx.continuation_token.is_none();
+
+    let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
     let mut set = tokio::task::JoinSet::new();
+    let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+    let mut pending_children: Vec<SplitRange> = Vec::new();
+    let mut next_child_index = hints.total_count();
+    let mut split_count = 0usize;
     let mut last_ts = epoch_secs();
+    // A persistent interval — unlike a fresh sleep per loop iteration, it
+    // still fires when join/split events keep the select! busy.
+    let mut split_check = tokio::time::interval(Duration::from_secs(SPLIT_CHECK_INTERVAL_SECS));
+    split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        // Fill up to concurrency limit.
+        // Fill up to the concurrency limit: split children first, then hints.
         while set.len() < flat_concurrency {
-            if let Some(pair) = hints.next() {
-                let task_ctx = ctx.clone();
-                let start_prefix = start_prefix.to_string();
-                let index = pair.index;
-                let start = pair.start;
-                let end = pair.end;
-
-                set.spawn(async move {
-                    let end_ref: Option<&str> = end.as_deref();
-                    let completed =
-                        flat_list_run_to_complete(&task_ctx, index, &start_prefix, &start, end_ref)
-                            .await;
-                    SegmentOutcome { index, completed }
-                });
+            let (index, start, end, checkpointable) = if let Some(child) = pending_children.pop() {
+                let index = next_child_index;
+                next_child_index += 1;
+                (index, child.start, child.end, false)
+            } else if let Some(pair) = hints.next() {
+                (pair.index, pair.start, pair.end, true)
             } else {
                 break;
-            }
+            };
+
+            let control = Arc::new(SegmentControl::new(end));
+            controls.insert(index, Arc::clone(&control));
+            let task_ctx = ctx.clone();
+            let start_prefix = start_prefix.to_string();
+            let task_split_tx = allow_split.then(|| split_tx.clone());
+
+            set.spawn(async move {
+                let completed = flat_list_run_to_complete(
+                    &task_ctx,
+                    index,
+                    &start_prefix,
+                    &start,
+                    &control,
+                    task_split_tx.as_ref(),
+                )
+                .await;
+                SegmentOutcome {
+                    index,
+                    completed,
+                    checkpointable,
+                }
+            });
         }
 
         if set.is_empty() {
@@ -73,42 +278,70 @@ async fn flat_reactor_task(
             break;
         }
 
-        // Await-driven polling: wait for the next segment to complete,
-        // with a heartbeat timeout so logs stay fresh.
-        let heartbeat_dur = Duration::from_secs(core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS);
-        match tokio::time::timeout(heartbeat_dur, set.join_next()).await {
-            Ok(Some(Ok(outcome))) => {
-                if outcome.completed {
-                    hints.finish(outcome.index);
-                    ctx.checkpoint_completed.lock().unwrap().push(outcome.index);
-                } else {
-                    debug!(
-                        "Segment {} did not complete successfully; not marking checkpoint progress",
-                        outcome.index
-                    );
+        tokio::select! {
+            joined = set.join_next() => match joined {
+                Some(Ok(outcome)) => {
+                    let control = controls.remove(&outcome.index);
+                    if outcome.completed {
+                        if outcome.checkpointable {
+                            hints.finish(outcome.index);
+                            let split = control.is_some_and(|c| c.was_split());
+                            if split {
+                                debug!(
+                                    "Segment {} was split at runtime; not marking checkpoint progress",
+                                    outcome.index
+                                );
+                            } else {
+                                ctx.checkpoint_completed.lock().unwrap().push(outcome.index);
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "Segment {} did not complete successfully; not marking checkpoint progress",
+                            outcome.index
+                        );
+                    }
                 }
-            }
-            Ok(Some(Err(e))) => {
-                error!("Task join error: {:?}", e);
-            }
-            Ok(None) => {
-                // All tasks drained — should not happen while !set.is_empty().
-                break;
-            }
-            Err(_elapsed) => {
-                // Timeout — emit heartbeat.
+                Some(Err(e)) => {
+                    error!("Task join error: {:?}", e);
+                }
+                None => {}
+            },
+            child = split_rx.recv() => {
+                if let Some(range) = child {
+                    split_count += 1;
+                    info!(
+                        "Segment split: new child segment from '{}' to '{}'",
+                        range.start,
+                        range.end.as_deref().unwrap_or("<end>"),
+                    );
+                    pending_children.push(range);
+                }
+            },
+            _ = split_check.tick() => {
                 let now = epoch_secs();
                 if now - last_ts >= core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
                     info!(
-                        "Flat List S3 Task — {} — heartbeat, {} segments in-flight, {} done, {} remaining",
+                        "Flat List S3 Task — {} — heartbeat, {} segments in-flight, {} done, {} remaining, {} runtime splits",
                         ctx.s3_bucket_name,
                         set.len(),
                         hints.done_count(),
                         hints.len(),
+                        split_count,
                     );
                     last_ts = now;
                 }
-            }
+
+                // Idle capacity and nothing queued: probe the longest-running
+                // candidate for a structural split point.
+                if allow_split
+                    && set.len() < flat_concurrency
+                    && pending_children.is_empty()
+                    && hints.is_empty()
+                {
+                    maybe_start_split_probe(ctx, start_prefix, &controls);
+                }
+            },
         }
 
         // Handle global quit.
@@ -122,6 +355,50 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
 }
 
+/// Pick the busiest splittable in-flight segment and probe it in the
+/// background.  The probe only proposes a cut; the segment task decides.
+fn maybe_start_split_probe(
+    ctx: &S3TaskContext,
+    start_prefix: &str,
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+) {
+    let candidate = controls
+        .iter()
+        .filter(|(_, c)| c.is_split_candidate())
+        .max_by_key(|(_, c)| c.pages.load(Ordering::Relaxed));
+    let Some((&index, control)) = candidate else {
+        return;
+    };
+
+    control.splitting.store(true, Ordering::Relaxed);
+    let control = Arc::clone(control);
+    let probe_ctx = ctx.clone();
+    let listing_prefix = start_prefix.to_string();
+    tokio::spawn(async move {
+        let (cursor, end) = control.snapshot();
+        if cursor.is_empty() {
+            control.splitting.store(false, Ordering::Relaxed);
+            return;
+        }
+        match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await {
+            Some(mid) => {
+                debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
+                *control.pending_split.lock().unwrap() = Some(mid);
+                // The segment task clears `splitting` when it accepts or
+                // rejects the proposal at its next page boundary.
+            }
+            None => {
+                debug!(
+                    "Split probe for segment {}: no structural boundary in remaining range",
+                    index
+                );
+                control.unsplittable.store(true, Ordering::Relaxed);
+                control.splitting.store(false, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 // ── Run one segment to completion (with retry) ─────────────
 
 async fn flat_list_run_to_complete(
@@ -129,7 +406,8 @@ async fn flat_list_run_to_complete(
     segment_index: usize,
     prefix: &str,
     start: &str,
-    until: Option<&str>,
+    control: &SegmentControl,
+    split_tx: Option<&SplitSender>,
 ) -> bool {
     let mut continuation_token = ctx.continuation_token.clone();
     // If the CLI provided --start-after, it overrides the segment's start.
@@ -147,7 +425,8 @@ async fn flat_list_run_to_complete(
             segment_index,
             prefix,
             &start_after,
-            until,
+            control,
+            split_tx,
             continuation_token.as_deref(),
             retry_attempt,
         )
@@ -190,7 +469,8 @@ async fn flat_list(
     segment_index: usize,
     prefix: &str,
     start_after: &str,
-    until: Option<&str>,
+    control: &SegmentControl,
+    split_tx: Option<&SplitSender>,
     continuation_token: Option<&str>,
     retry_attempt: u32,
 ) -> Result<(), FlatRuntimeError> {
@@ -351,12 +631,15 @@ async fn flat_list(
                     None,
                 );
 
+                // The segment boundary is re-read each page so a runtime
+                // split (which shrinks end_before) takes effect immediately.
+                let until = control.current_end();
+
                 // Consume the page contents so each key's String moves into
                 // the batch instead of being copied — zero per-object key
                 // allocation on the ingest hot path.
                 let contents = objects.contents.unwrap_or_default();
-                let mut batch: Vec<(ObjectKey, ObjectProps)> =
-                    Vec::with_capacity(contents.len());
+                let mut batch: Vec<(ObjectKey, ObjectProps)> = Vec::with_capacity(contents.len());
 
                 for mut obj in contents {
                     let Some(obj_key) = obj.key.take() else {
@@ -367,7 +650,7 @@ async fn flat_list(
                     // segment starts with start_after=end_before, so excluding
                     // equality here would drop a real object whose key equals
                     // the boundary.
-                    if let Some(end) = until {
+                    if let Some(end) = until.as_deref() {
                         if end < obj_key.as_str() {
                             debug!("Segment boundary reached at key: {}", obj_key);
                             is_ended = true;
@@ -387,6 +670,19 @@ async fn flat_list(
                 if let Some((key, _)) = batch.last() {
                     next_start.clear();
                     next_start.push_str(key.as_str());
+                }
+                control.record_page(&next_start);
+
+                // A split proposal is decided here, at a page boundary,
+                // against the authoritative cursor.
+                if let Some(tx) = split_tx {
+                    if let Some(child) = control.try_accept_split() {
+                        info!(
+                            "Segment {} accepted runtime split at '{}'",
+                            segment_index, child.start
+                        );
+                        let _ = tx.send(child);
+                    }
                 }
 
                 // Send batch to data_map via bounded channel.
@@ -413,12 +709,13 @@ async fn flat_list(
     }
 
     let ended_by = if is_ended { "boundary" } else { "pagination" };
+    let final_end = control.current_end();
     emit_segment_summary(
         ctx,
         segment_index,
         prefix,
         start_after,
-        until,
+        final_end.as_deref(),
         retry_attempt,
         page_count,
         object_count,
@@ -429,7 +726,7 @@ async fn flat_list(
 
     debug!(
         "Segment complete: start={}, end={:?}, pages={}",
-        start_after, until, page_count
+        start_after, final_end, page_count
     );
     Ok(())
 }
@@ -722,4 +1019,75 @@ fn epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ancestor_dirs_ladder() {
+        assert_eq!(ancestor_dirs("big/a/0005", ""), vec!["big/a/", "big/", ""]);
+        assert_eq!(ancestor_dirs("logs/a/b", "logs/"), vec!["logs/a/", "logs/"]);
+        assert_eq!(ancestor_dirs("toplevel", ""), vec![""]);
+        assert_eq!(ancestor_dirs("a/b", "a/"), vec!["a/"]);
+    }
+
+    #[test]
+    fn test_segment_control_accepts_valid_split() {
+        let control = SegmentControl::new(Some("small/".to_string()));
+        control.record_page("big/a/05");
+        *control.pending_split.lock().unwrap() = Some("big/b/".to_string());
+        control.splitting.store(true, Ordering::Relaxed);
+
+        let child = control.try_accept_split().expect("split accepted");
+        assert_eq!(child.start, "big/b/");
+        assert_eq!(child.end.as_deref(), Some("small/"));
+        assert_eq!(control.current_end().as_deref(), Some("big/b/"));
+        assert!(control.was_split());
+        assert!(!control.splitting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_segment_control_rejects_stale_split() {
+        // The cursor has already passed the proposed cut.
+        let control = SegmentControl::new(None);
+        control.record_page("big/c/99");
+        *control.pending_split.lock().unwrap() = Some("big/b/".to_string());
+        control.splitting.store(true, Ordering::Relaxed);
+
+        assert!(control.try_accept_split().is_none());
+        assert_eq!(control.current_end(), None);
+        assert!(!control.was_split());
+        assert!(!control.splitting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_segment_control_rejects_out_of_range_split() {
+        // The proposed cut is at or beyond the current end boundary.
+        let control = SegmentControl::new(Some("d/".to_string()));
+        control.record_page("a/1");
+        *control.pending_split.lock().unwrap() = Some("d/".to_string());
+        assert!(control.try_accept_split().is_none());
+
+        // Unbounded segment accepts any cut ahead of the cursor.
+        let control = SegmentControl::new(None);
+        control.record_page("a/1");
+        *control.pending_split.lock().unwrap() = Some("z/".to_string());
+        assert!(control.try_accept_split().is_some());
+    }
+
+    #[test]
+    fn test_segment_control_split_candidate_gating() {
+        let control = SegmentControl::new(None);
+        assert!(!control.is_split_candidate(), "needs pages");
+        for i in 0..SPLIT_MIN_PAGES {
+            control.record_page(&format!("k/{}", i));
+        }
+        assert!(control.is_split_candidate());
+        control.unsplittable.store(true, Ordering::Relaxed);
+        assert!(!control.is_split_candidate(), "unsplittable is sticky");
+    }
 }
