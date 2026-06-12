@@ -157,9 +157,9 @@ Diff lists both buckets and writes one Parquet with `DiffFlag` per object
 (equal rows included; filter `DiffFlag != 0` downstream). Diff is
 authoritative single-segment by design — hints are ignored and
 `--hints-file`/`--resume` are rejected — so left-only and right-only objects
-cannot be hidden by mismatched segment boundaries. The comparison map is held
-in memory until both sides finish; plan capacity around the combined key
-count for very large comparisons.
+cannot be hidden by mismatched segment boundaries. The two ordered streams
+are merged on the fly and rows stream straight to Parquet, so memory stays
+bounded regardless of bucket size.
 
 ## Checkpoint / resume
 
@@ -227,9 +227,8 @@ run locally. Exit-code classes are stable. Full reference:
 
 ## Known limitations
 
-1. **Diff is single-segment and in-memory by design** (see Diff mode above).
-   List-mode streaming output remains the bounded-memory path for very large
-   single-bucket inventories.
+1. **Diff is authoritative single-segment by design** (see Diff mode
+   above); each side follows one ListObjectsV2 chain.
 2. **Release builds on Ubuntu 20.04 arm64** may need the `aws-lc-sys`
    workaround documented in [BUILD.md](BUILD.md).
 

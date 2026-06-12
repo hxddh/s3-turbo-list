@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-12
+
+### Changed
+- **Recursive listing is now the default** (`--delimiter ''`). The S3
+  ListObjectsV2 API itself defaults to no delimiter, the performance path
+  (startup discovery, runtime splitting, parallel segments) only engages on
+  recursive runs, and every documented example carried the boilerplate
+  override. Hierarchical listing remains available via `--delimiter '/'`.
+  Checkpoints recorded with the old default no longer match the new
+  identity and are discarded with a warning, never mis-resumed.
+- **Diff streams as an ordered merge-join.** Each side is an authoritative
+  single segment, so its keys arrive in S3 lexicographic order; merging the
+  two ordered streams classifies every key on the fly and streams rows
+  straight to Parquet. Memory is bounded by channel buffers instead of the
+  combined object count (2M-object diff: 375 MB → 63 MB peak RSS, flat as
+  buckets grow), and local diff benchmarks run +65% (diff-map) to +148%
+  (diff-output) faster. Classification semantics, DiffFlag values, equal-row
+  output, and KS counts are unchanged. A side returning keys out of
+  lexicographic order now fails the run loudly instead of producing a wrong
+  diff. `benchmark-local --benchmark diff-map` now measures the merge plus
+  row encoding against a null writer (its `parquet_rows` metric is no
+  longer zero).
+
+### Removed
+- `hints-rebalance` (deprecated in 0.4.0): runtime long-tail splitting
+  covers its use case. Also removes its five tuning flags, the example
+  script, and docs references.
+- The dead `auto_hints.min_segment_size` TOML knob (never read by any
+  algorithm) and its config-inspect/plan JSON field.
+- The legacy in-memory diff machinery (PrefixMap/ObjectMap and the match
+  state machine), ~500 lines net.
+- `docs/endpoint-validation-plan.md` moved into `docs/validation-results/`
+  as a dated historical document.
+
 ## [0.4.0] - 2026-06-12
 
 ### Added
