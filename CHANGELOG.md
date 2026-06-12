@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-12
+
+### Added
+- Flat-range runtime splitting: ranges without CommonPrefix structure can
+  now split too. Candidate cuts are derived from the segment's cursor — a
+  real key inside the live region — by bumping one character at several
+  tail depths; each candidate costs one max_keys=1 request and the first
+  real key returned inside the range becomes the cut. Third-party OSS
+  benchmarks showed structureless prefixes capping real parallelism at the
+  bucket's top-level prefix count (2.3x with 80% of concurrency idle);
+  flat and skewed buckets alike now fan out until concurrency is used.
+- Region-derived profile endpoints: `--profile oss/bos/b2` now template
+  the endpoint from `--region` (`{region}.aliyuncs.com`,
+  `s3.{region}.bcebos.com`, `s3.{region}.backblazeb2.com`), removing
+  `--endpoint-url` from everyday commands for these providers. This also
+  fixes `bos` previously hard-coding the `bj` endpoint for every region.
+  Explicit endpoint values always win; the generic no-profile path is
+  unchanged.
+
+### Changed
+- `runtime.worker_threads` defaults to the machine's CPU count instead of
+  a hard-coded 10; benchmarks showed oversubscribing a 2-vCPU host
+  degrades throughput.
+- `compat-probe` reads the global `--endpoint-url` flag, fixing the flag
+  inconsistency third-party testers reported; the subcommand-local
+  `--endpoint` remains as an override and is now optional.
+- Documentation refreshed: defaults-first tuning guidance, region-derived
+  profile examples, benchmark scenario descriptions aligned with the
+  streaming merge engine.
+
 ## [0.5.0] - 2026-06-12
 
 ### Changed
