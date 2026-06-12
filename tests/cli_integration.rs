@@ -531,7 +531,8 @@ fn test_cli_benchmark_local_diff_map_no_cloud() {
     assert_eq!(json["metrics"]["received_objects"], 64);
     assert_eq!(json["metrics"]["streamed_rows"], 32);
     assert_eq!(json["metrics"]["unique_prefixes"], 4);
-    assert_eq!(json["metrics"]["parquet_rows"], 0);
+    // diff-map measures the merge plus row encoding against a null writer.
+    assert_eq!(json["metrics"]["parquet_rows"], 32);
     assert_eq!(json["parquet_file"], serde_json::Value::Null);
     assert_eq!(json["text_file"], serde_json::Value::Null);
     assert!(json["objects_per_sec"].as_f64().unwrap() > 0.0);

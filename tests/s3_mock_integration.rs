@@ -1977,9 +1977,9 @@ fn local_mock_diff_ignores_conventional_hints_cache() {
             );
         }
         let contents = if request.path.contains("/left") {
-            vec!["same.txt", "left-only.txt"]
+            vec!["left-only.txt", "same.txt"]
         } else if request.path.contains("/right") {
-            vec!["same.txt", "right-only.txt"]
+            vec!["right-only.txt", "same.txt"]
         } else {
             return MockResponse::error(500, "UnexpectedBucket", &request.path);
         };

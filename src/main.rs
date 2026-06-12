@@ -1101,6 +1101,16 @@ fn main() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
             channel_capacity,
         );
+        // Diff streams each side over its own channel so the data-map task
+        // can merge-join the two ordered streams.
+        let (right_tx, right_rx) = if mode == RunMode::BiDir {
+            let (rtx, rrx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
+                channel_capacity,
+            );
+            (Some(rtx), Some(rrx))
+        } else {
+            (None, None)
+        };
 
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
@@ -1241,7 +1251,7 @@ fn main() {
             cfg.s3.force_path_style,
             &sdk_config,
             &s3_cfg,
-            tx.clone(),
+            tx,
             dir,
             g_state.clone(),
             trace_writer.clone(),
@@ -1278,7 +1288,7 @@ fn main() {
                 cfg.s3.force_path_style,
                 &sdk_config,
                 &cfg.s3,
-                tx.clone(),
+                right_tx.expect("diff mode allocates the right channel"),
                 core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
                 g_state.clone(),
                 trace_writer.clone(),
@@ -1299,30 +1309,37 @@ fn main() {
         };
 
         // ── Spawn data map task ─────────────────────────────
-        let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
         let is_diff = mode == RunMode::BiDir;
         let output_config = cfg.output.clone();
         let filename_ks_for_task = filename_ks.clone();
         let filename_output_for_task = filename_output.clone();
         if is_diff {
+            let sides = data_map::DiffStreamSides {
+                left: rx,
+                right: right_rx.expect("diff mode allocates the right channel"),
+            };
+            let diff_g_state = g_state.clone();
             set.spawn(async move {
-                data_map::data_map_task(
-                    data_map_ctx,
+                data_map::data_map_task_diff_streaming(
+                    diff_g_state,
+                    sides,
                     &filename_ks_for_task,
                     &filename_output_for_task,
-                    true,
                     output_config,
                 )
                 .await
             });
         } else if cli.summary_only {
+            let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             set.spawn(async move { data_map::data_map_task_list_summary_only(data_map_ctx).await });
         } else if list_output_format.writes_stdout_rows() {
+            let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             let text_format = data_map::ListTextOutputFormat::from(list_output_format);
             set.spawn(async move {
                 data_map::data_map_task_list_stdout(data_map_ctx, text_format).await
             });
         } else {
+            let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(
                     data_map_ctx,
@@ -1343,9 +1360,8 @@ fn main() {
             info!("Diff mode initialized — objects from both sides will be compared by data_map");
         }
 
-        // Drop the original sender so the channel closes when all list tasks
-        // finish (each list task clones tx; this drops the last reference).
-        drop(tx);
+        // The channel senders are moved into the list-task contexts, so each
+        // channel closes when its side's task finishes.
 
         // Wait for all tasks — save checkpoints on segment completion.
         let mut last_checkpoint_save = std::time::Instant::now();
@@ -2365,97 +2381,123 @@ fn run_benchmark_local_diff(
     let batch_size = batch_size.max(1);
     let prefixes = prefixes.max(1);
     let started = Instant::now();
-    let map = data_map::PrefixMap::new();
-    let mut received_batches = 0usize;
-    let mut received_objects = 0usize;
 
-    let mut sent = 0usize;
-    while sent < objects {
-        let take = (objects - sent).min(batch_size);
-        let (left, right) = synthetic_diff_batches(sent, take, prefixes, benchmark, diff_shape);
-        if !left.is_empty() {
-            received_objects += left.len();
-            received_batches += 1;
-            data_map::insert_batch_grouped(&map, left);
-        }
-        if !right.is_empty() {
-            received_objects += right.len();
-            received_batches += 1;
-            data_map::insert_batch_grouped(&map, right);
-        }
-        sent += take;
-    }
-
-    let (unique_prefixes, unique_objects) = map.get_stats();
-    let mut parquet_file = None;
-    let mut ks_file = None;
-    let mut parquet_bytes = 0u64;
-    let mut ks_bytes = 0u64;
-    let mut parquet_rows = 0usize;
-    let mut ks_entries = 0usize;
+    // DiffOutput writes real Parquet/KS artifacts; DiffMap measures the
+    // merge + row encoding against a null writer (no file IO).
     let mut artifact_dir_summary = None;
-
-    if benchmark == LocalBenchmarkKind::DiffOutput {
+    let (artifact_dir, parquet_path, ks_path) = if benchmark == LocalBenchmarkKind::DiffOutput {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let artifact_dir =
-            std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
-        std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
+        let dir = std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
             eprintln!(
                 "Benchmark setup error: failed to create {}: {}",
-                artifact_dir.display(),
+                dir.display(),
                 e
             );
             std::process::exit(agent::ExitCode::OutputWrite.code());
         });
-        let parquet_path = artifact_dir.join("diff.parquet");
-        let ks_path = artifact_dir.join("diff.ks");
-        let output_config = cfg.output.clone();
-        let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
-        rt.block_on(async {
-            let output = tokio::fs::File::create(&parquet_path)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!(
-                        "Benchmark setup error: failed to create {}: {}",
-                        parquet_path.display(),
-                        e
-                    );
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
-                });
-            let writer = tokio::io::BufWriter::with_capacity(100 * 1_048_576, output);
-            let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
-                writer,
-                &ks_path.display().to_string(),
-                output_config.row_group_size,
-                &output_config.compression,
-                output_config.compression_level,
-            );
-            let stats = map.dump(&mut parquet, true).await.unwrap_or_else(|e| {
-                eprintln!("Benchmark output error: {}", e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
-            });
-            parquet_rows = stats.parquet_rows;
-            ks_entries = stats.ks_entries;
-            parquet.close().await.unwrap_or_else(|e| {
-                eprintln!("Benchmark output error: {}", e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
-            });
+        let parquet = dir.join("diff.parquet");
+        let ks = dir.join("diff.ks");
+        (Some(dir), Some(parquet), Some(ks))
+    } else {
+        (None, None, None)
+    };
+
+    let output_config = cfg.output.clone();
+    let channel_capacity = cfg.channel.capacity;
+    let mut parquet_rows = 0usize;
+    let mut ks_entries = 0usize;
+
+    let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
+    let outcome = rt.block_on(async {
+        let (left_tx, left_rx) = tokio::sync::mpsc::channel::<
+            Vec<(core::ObjectKey, core::ObjectProps)>,
+        >(channel_capacity);
+        let (right_tx, right_rx) = tokio::sync::mpsc::channel::<
+            Vec<(core::ObjectKey, core::ObjectProps)>,
+        >(channel_capacity);
+
+        let producer = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent < objects {
+                let take = (objects - sent).min(batch_size);
+                let (left, right) =
+                    synthetic_diff_batches(sent, take, prefixes, objects, benchmark, diff_shape);
+                if !left.is_empty() && left_tx.send(left).await.is_err() {
+                    return;
+                }
+                if !right.is_empty() && right_tx.send(right).await.is_err() {
+                    return;
+                }
+                sent += take;
+            }
         });
-        rt.shutdown_background();
-        parquet_bytes = std::fs::metadata(&parquet_path)
+
+        let sides = data_map::DiffStreamSides {
+            left: left_rx,
+            right: right_rx,
+        };
+        let merged: Result<data_map::DiffMergeOutcome, String> =
+            if let (Some(parquet_path), Some(ks_path)) = (&parquet_path, &ks_path) {
+                let output = tokio::fs::File::create(parquet_path)
+                    .await
+                    .map_err(|e| format!("failed to create {}: {}", parquet_path.display(), e))?;
+                let writer = tokio::io::BufWriter::with_capacity(100 * 1_048_576, output);
+                let ks = ks_path.display().to_string();
+                let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
+                    writer,
+                    &ks,
+                    output_config.row_group_size,
+                    &output_config.compression,
+                    output_config.compression_level,
+                );
+                let outcome = data_map::run_diff_merge(sides, &mut parquet).await?;
+                parquet_rows = parquet.total_rows();
+                ks_entries = outcome.write_ks(&ks).await?;
+                parquet.close().await?;
+                Ok(outcome)
+            } else {
+                let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
+                    tokio::io::sink(),
+                    "",
+                    output_config.row_group_size,
+                    &output_config.compression,
+                    output_config.compression_level,
+                );
+                let outcome = data_map::run_diff_merge(sides, &mut parquet).await?;
+                parquet_rows = parquet.total_rows();
+                Ok(outcome)
+            };
+        let _ = producer.await;
+        merged
+    });
+    rt.shutdown_background();
+
+    let outcome = outcome.unwrap_or_else(|e| {
+        eprintln!("Benchmark output error: {}", e);
+        std::process::exit(agent::ExitCode::OutputWrite.code());
+    });
+
+    let mut parquet_bytes = 0u64;
+    let mut ks_bytes = 0u64;
+    let mut parquet_file = None;
+    let mut ks_file = None;
+    if let (Some(dir), Some(parquet_path), Some(ks_path)) = (&artifact_dir, &parquet_path, &ks_path)
+    {
+        parquet_bytes = std::fs::metadata(parquet_path)
             .map(|m| m.len())
             .unwrap_or(0);
-        ks_bytes = std::fs::metadata(&ks_path).map(|m| m.len()).unwrap_or(0);
+        ks_bytes = std::fs::metadata(ks_path).map(|m| m.len()).unwrap_or(0);
         parquet_file = Some(parquet_path.display().to_string());
         ks_file = Some(ks_path.display().to_string());
         if keep_artifacts {
-            artifact_dir_summary = Some(artifact_dir.display().to_string());
+            artifact_dir_summary = Some(dir.display().to_string());
         } else {
-            let _ = std::fs::remove_dir_all(&artifact_dir);
+            let _ = std::fs::remove_dir_all(dir);
             parquet_file = None;
             ks_file = None;
         }
@@ -2469,13 +2511,13 @@ fn run_benchmark_local_diff(
         stream_timeouts: 0,
         s3_client_timeouts: 0,
         s3_client_generic_errors: 0,
-        received_batches,
-        received_objects,
-        streamed_rows: unique_objects,
-        unique_prefixes,
+        received_batches: outcome.received_batches,
+        received_objects: outcome.received_objects,
+        streamed_rows: outcome.rows,
+        unique_prefixes: outcome.unique_prefixes(),
         parquet_rows,
         ks_entries,
-        bytes_total: 0,
+        bytes_total: outcome.bytes_total,
         top_prefixes: Vec::new(),
         summary_only: false,
     };
@@ -2496,8 +2538,8 @@ fn run_benchmark_local_diff(
         channel_capacity: cfg.channel.capacity,
         producer_send_wait_secs: 0.0,
         elapsed_secs,
-        objects_per_sec: received_objects as f64 / elapsed_secs,
-        rows_per_sec: unique_objects as f64 / elapsed_secs,
+        objects_per_sec: outcome.received_objects as f64 / elapsed_secs,
+        rows_per_sec: outcome.rows as f64 / elapsed_secs,
         parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
         ks_bytes_per_object: ks_bytes as f64 / objects as f64,
         text_bytes_per_object: 0.0,
@@ -2524,6 +2566,7 @@ fn synthetic_diff_batches(
     start: usize,
     take: usize,
     prefixes: usize,
+    total_objects: usize,
     benchmark: LocalBenchmarkKind,
     diff_shape: LocalDiffShape,
 ) -> SyntheticDiffBatches {
@@ -2531,8 +2574,10 @@ fn synthetic_diff_batches(
     let mut right = Vec::with_capacity(take);
     for offset in 0..take {
         let index = start + offset;
-        let prefix_index = index % prefixes;
-        let key_text = format!("prefix-{}/object-{:012}.dat", prefix_index, index);
+        // Block-partitioned, zero-padded prefixes keep the synthetic key
+        // stream in S3 lexicographic order, as the diff merge requires.
+        let prefix_index = (index * prefixes) / total_objects.max(1);
+        let key_text = format!("prefix-{:06}/object-{:012}.dat", prefix_index, index);
         let key = core::ObjectKey::from(key_text.as_str());
         let mut etag = [0u8; 16];
         etag[..8].copy_from_slice(&(index as u64).to_le_bytes());

@@ -32,10 +32,7 @@ const OBJECT_PROPS_FLAG_DIR_BOTH: u8 = 0b1100_0000;
 pub(crate) const OBJECT_PROPS_FLAG_DIFF_MODE: u8 = 0b0010_0000;
 
 const OBJECT_PROPS_STATUS_OPEN: u8 = 0xFF;
-const OBJECT_PROPS_STATUS_MATCH: u8 = 0x0;
-const OBJECT_PROPS_STATUS_SIZE_NOT_MATCH: u8 = 1;
-const OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL: u8 = 2;
-const OBJECT_PROPS_STATUS_ETAG_NOT_MATCH: u8 = 3;
+#[cfg(test)]
 const OBJECT_PROPS_STATUS_FILTER_OUT: u8 = 4;
 
 pub const S3_TASK_CONTEXT_DIR_LEFT: u8 = OBJECT_PROPS_FLAG_DIR_LEFT;
@@ -280,130 +277,25 @@ impl ObjectProps {
         dir == OBJECT_PROPS_FLAG_DIR_LEFT || dir == OBJECT_PROPS_FLAG_DIR_RIGHT
     }
 
-    /// Final status check — used at dump time.
-    pub fn final_status_check(&self) -> MatchResult {
-        // In list mode, apply optional filter here.
-        if !self.is_diff_mode() {
-            if let Some(filter) = OBJECT_FILTER.get() {
-                if filter.evaluate(self, None) == Some(false) {
-                    return MatchResult::Ignore;
-                }
-            }
-        }
-
-        if self.status == OBJECT_PROPS_STATUS_FILTER_OUT {
-            return MatchResult::Ignore;
-        }
-        if matches!(
-            self.status,
-            OBJECT_PROPS_STATUS_SIZE_NOT_MATCH
-                | OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL
-                | OBJECT_PROPS_STATUS_ETAG_NOT_MATCH
-        ) {
-            return self.both_sides_or_ignore(MatchResult::Astrisk);
-        }
-        if self.status == OBJECT_PROPS_STATUS_MATCH {
-            return self.both_sides_or_ignore(MatchResult::Equal);
-        }
-        if self.status == OBJECT_PROPS_STATUS_OPEN {
-            if (self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) == OBJECT_PROPS_FLAG_DIR_BOTH {
-                log::warn!(
-                    "ObjectProps: flags {} status OPEN but both direction bits are set; ignoring row",
-                    self.flags
-                );
-                return MatchResult::Ignore;
-            }
-            return if self.is_left() {
-                MatchResult::Plus
-            } else if self.is_right() {
-                MatchResult::Minus
-            } else {
-                log::warn!(
-                    "ObjectProps: flags {} status OPEN but no direction bit is set; ignoring row",
-                    self.flags
-                );
-                MatchResult::Ignore
-            };
-        }
-        log::warn!(
-            "ObjectProps: unhandled flags {} status {}; ignoring row",
-            self.flags,
-            self.status
-        );
-        MatchResult::Ignore
-    }
-
-    fn both_sides_or_ignore(&self, result: MatchResult) -> MatchResult {
-        if (self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) == OBJECT_PROPS_FLAG_DIR_BOTH {
-            result
-        } else {
-            log::warn!(
-                "ObjectProps: flags {} status {} requires both direction bits; ignoring row",
-                self.flags,
-                self.status
-            );
-            MatchResult::Ignore
-        }
-    }
-
-    /// Match two ObjectProps (from left and right sides).  Self is the accumulator.
-    pub fn r#match(&mut self, other: &ObjectProps) -> MatchResult {
-        // Already matched both sides → duplicate.
-        if (self.flags & OBJECT_PROPS_FLAG_DIR_BOTH) == OBJECT_PROPS_FLAG_DIR_BOTH {
-            return MatchResult::Dup;
-        }
-
-        // Same-side duplicate — overwrite with latest.
-        if (self.is_right() && other.is_right()) || (self.is_left() && other.is_left()) {
-            *self = other.clone();
-            return MatchResult::Dup;
-        }
-
-        let (left, right): (&ObjectProps, &ObjectProps) = if self.is_left() {
-            (self, other)
-        } else if self.is_right() {
-            (other, self)
-        } else {
-            log::warn!(
-                "ObjectProps: cannot match accumulator with no direction bit set; marking row ignored"
-            );
-            self.status = OBJECT_PROPS_STATUS_FILTER_OUT;
-            return MatchResult::Ignore;
-        };
-
-        // Apply optional filter in diff mode.
+    /// Streaming-diff classification of a key present on both sides.
+    /// Returns `None` when the optional diff filter excludes the pair.
+    /// Semantics mirror the legacy match state machine: size mismatch,
+    /// an unavailable ETag on either side, or an ETag mismatch are all
+    /// reported as `Astrisk`; everything else is `Equal`.
+    pub fn classify_pair(left: &ObjectProps, right: &ObjectProps) -> Option<MatchResult> {
         if let Some(filter) = OBJECT_FILTER.get() {
             if filter.evaluate(left, Some(right)) == Some(false) {
-                *self = left.clone();
-                self.flags |= OBJECT_PROPS_FLAG_DIR_BOTH;
-                self.status = OBJECT_PROPS_STATUS_FILTER_OUT;
-                return MatchResult::Ignore;
+                return None;
             }
         }
-
-        if left.size != right.size {
-            *self = left.clone();
-            self.flags |= OBJECT_PROPS_FLAG_DIR_BOTH;
-            self.status = OBJECT_PROPS_STATUS_SIZE_NOT_MATCH;
-            return MatchResult::Astrisk;
+        if left.size != right.size
+            || left.is_etag_not_avail()
+            || right.is_etag_not_avail()
+            || left.etag() != right.etag()
+        {
+            return Some(MatchResult::Astrisk);
         }
-        if left.is_etag_not_avail() || right.is_etag_not_avail() {
-            *self = left.clone();
-            self.flags |= OBJECT_PROPS_FLAG_DIR_BOTH;
-            self.status = OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL;
-            return MatchResult::Astrisk;
-        }
-        if left.etag() != right.etag() {
-            *self = left.clone();
-            self.flags |= OBJECT_PROPS_FLAG_DIR_BOTH;
-            self.status = OBJECT_PROPS_STATUS_ETAG_NOT_MATCH;
-            return MatchResult::Astrisk;
-        }
-
-        *self = left.clone();
-        self.flags |= OBJECT_PROPS_FLAG_DIR_BOTH;
-        self.status = OBJECT_PROPS_STATUS_MATCH;
-        MatchResult::Equal
+        Some(MatchResult::Equal)
     }
 }
 
@@ -1237,26 +1129,49 @@ mod tests {
     }
 
     #[test]
-    fn test_object_props_match_both_sides() {
-        let mut left = ObjectProps::default();
-        left.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        left.size = 100;
-        left.etag_md5 = [0xabu8; 16];
-
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.size = 100;
-        right.etag_md5 = [0xabu8; 16];
-
-        let result = left.r#match(&right);
-        assert_eq!(result, MatchResult::Equal);
+    fn test_classify_pair_equal() {
+        let left = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
+        let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 100, [0xab; 16]);
+        assert_eq!(
+            ObjectProps::classify_pair(&left, &right),
+            Some(MatchResult::Equal)
+        );
     }
 
     #[test]
-    fn test_object_props_final_status_open_without_direction_is_ignored() {
-        let mut props = ObjectProps::default();
-        props.status = OBJECT_PROPS_STATUS_OPEN;
-        assert_eq!(props.final_status_check(), MatchResult::Ignore);
+    fn test_classify_pair_size_diff_is_astrisk() {
+        let left = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
+        let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 200, [0xab; 16]);
+        assert_eq!(
+            ObjectProps::classify_pair(&left, &right),
+            Some(MatchResult::Astrisk)
+        );
+    }
+
+    #[test]
+    fn test_classify_pair_etag_not_avail_is_astrisk() {
+        // Unavailable (all-zero) ETag on either side cannot verify equality.
+        let avail = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
+        let missing = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 100, [0; 16]);
+        assert!(missing.is_etag_not_avail());
+        assert_eq!(
+            ObjectProps::classify_pair(&avail, &missing),
+            Some(MatchResult::Astrisk)
+        );
+        assert_eq!(
+            ObjectProps::classify_pair(&missing, &missing),
+            Some(MatchResult::Astrisk)
+        );
+    }
+
+    #[test]
+    fn test_classify_pair_etag_mismatch_is_astrisk() {
+        let left = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
+        let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 100, [0x42; 16]);
+        assert_eq!(
+            ObjectProps::classify_pair(&left, &right),
+            Some(MatchResult::Astrisk)
+        );
     }
 
     #[test]
@@ -1325,122 +1240,5 @@ mod tests {
         let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 100, [0u8; 16]);
         let mut buf = [0u8; 43];
         assert_eq!(props.write_etag_to_buffer(&mut buf), props.etag_string());
-    }
-
-    #[test]
-    fn test_object_props_final_status_unknown_status_is_ignored() {
-        let mut props = ObjectProps::default();
-        props.set_dir(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
-        props.status = 99;
-        assert_eq!(props.final_status_check(), MatchResult::Ignore);
-    }
-
-    #[test]
-    fn test_object_props_final_status_match_without_both_sides_is_ignored() {
-        let props = ObjectProps::default();
-        assert_eq!(props.final_status_check(), MatchResult::Ignore);
-    }
-
-    #[test]
-    fn test_object_props_match_without_accumulator_direction_is_ignored() {
-        let mut accumulator = ObjectProps::default();
-        accumulator.status = OBJECT_PROPS_STATUS_OPEN;
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.status = OBJECT_PROPS_STATUS_OPEN;
-
-        let result = accumulator.r#match(&right);
-        assert_eq!(result, MatchResult::Ignore);
-        assert_eq!(accumulator.final_status_check(), MatchResult::Ignore);
-    }
-
-    #[test]
-    fn test_object_props_match_size_diff() {
-        let mut left = ObjectProps::default();
-        left.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        left.size = 100;
-
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.size = 200;
-
-        let result = left.r#match(&right);
-        assert_eq!(result, MatchResult::Astrisk);
-    }
-
-    #[test]
-    fn test_object_props_duplicate_same_side() {
-        let mut first = ObjectProps::default();
-        first.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        first.size = 100;
-
-        let mut second = ObjectProps::default();
-        second.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        second.size = 200;
-
-        let result = first.r#match(&second);
-        assert_eq!(result, MatchResult::Dup);
-        assert_eq!(first.size, 200); // overwritten
-    }
-
-    #[test]
-    fn test_object_props_match_etag_not_avail_both_default() {
-        // Both sides have default (all-zero) etag → is_etag_not_avail() true.
-        let mut left = ObjectProps::default();
-        left.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        left.size = 100;
-
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.size = 100;
-
-        assert!(left.is_etag_not_avail());
-        assert!(right.is_etag_not_avail());
-
-        let result = left.r#match(&right);
-        assert_eq!(result, MatchResult::Astrisk);
-        assert_eq!(left.status, OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL);
-    }
-
-    #[test]
-    fn test_object_props_match_etag_not_avail_one_side_default() {
-        // Left has a real etag, right has default (all-zero) → one side etag not available.
-        let mut left = ObjectProps::default();
-        left.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        left.size = 100;
-        left.etag_md5 = [0xabu8; 16];
-
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.size = 100;
-        // right.etag_md5 remains all-zero
-
-        assert!(!left.is_etag_not_avail());
-        assert!(right.is_etag_not_avail());
-
-        let result = left.r#match(&right);
-        assert_eq!(result, MatchResult::Astrisk);
-        assert_eq!(left.status, OBJECT_PROPS_STATUS_ETAG_NOT_AVAIL);
-    }
-
-    #[test]
-    fn test_object_props_match_etag_not_match() {
-        // Same size, different etags → ETAG_NOT_MATCH.
-        let mut left = ObjectProps::default();
-        left.set_dir(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE);
-        left.size = 100;
-        left.etag_md5 = [0xabu8; 16];
-
-        let mut right = ObjectProps::default();
-        right.set_dir(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE);
-        right.size = 100;
-        right.etag_md5 = [0x42u8; 16];
-
-        assert!(!left.is_etag_not_avail());
-        assert!(!right.is_etag_not_avail());
-
-        let result = left.r#match(&right);
-        assert_eq!(result, MatchResult::Astrisk);
-        assert_eq!(left.status, OBJECT_PROPS_STATUS_ETAG_NOT_MATCH);
     }
 }

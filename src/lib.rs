@@ -21,7 +21,7 @@ pub mod checkpoint; // CheckpointIdentity, CheckpointJournal, checkpoint_path
 pub mod compat_probe;
 pub mod config;
 pub mod core; // ObjectKey, ObjectProps, MatchResult, KeySpaceHints, GlobalState, DataMapContext, MonContext, S3TaskContext
-pub mod data_map; // PrefixMap, ObjectMap, data_map_task
+pub mod data_map; // streaming list output + diff merge-join
 pub mod error; // FlatRuntimeError, error code constants
 pub mod filter_expr; // FilterExpr — compiled --filter expressions
 pub mod hints;
