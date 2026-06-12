@@ -776,6 +776,116 @@ fn local_mock_list_runtime_split_covers_long_tail() {
 }
 
 #[test]
+fn local_mock_list_flat_namespace_runtime_split() {
+    // A flat namespace (no '/' anywhere): startup discovery finds no
+    // structure, so the run starts single-segment. The flat-cut fallback
+    // must derive a cut from the cursor (max_keys=1 probe returning a real
+    // key) and fan out a child segment — with every key emitted once.
+    let keys: Vec<String> = (0..80).map(|i| format!("obj-{:04}", i)).collect();
+
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        assert_eq!(request.method, "GET");
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Discovery / ladder probes: flat namespace, no CommonPrefixes.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        if request.query.get("max-keys").map(String::as_str) == Some("1") {
+            // Flat-cut probe: first real key after the candidate, no delay.
+            let first: Vec<&str> = all_keys
+                .iter()
+                .find(|k| k.as_str() > start_after.as_str())
+                .map(|k| vec![k.as_str()])
+                .unwrap_or_default();
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
+        }
+
+        // Flat listing, 2 keys per page, slowed so the segment is still
+        // running when the reactor's split check fires.
+        std::thread::sleep(Duration::from_millis(80));
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => all_keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = all_keys[start_idx..]
+            .iter()
+            .take(2)
+            .map(String::as_str)
+            .collect();
+        let truncated = start_idx + page.len() < all_keys.len();
+        let token = truncated.then(|| format!("off-{}", start_idx + page.len()));
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            2,
+            &page,
+            &[],
+            truncated,
+            token.as_deref(),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.query.get("max-keys").map(String::as_str) == Some("1")),
+        "expected at least one flat-cut probe (max-keys=1)"
+    );
+    // A child segment starts listing from a real-key cut.
+    assert!(
+        requests.iter().any(|r| {
+            !r.query.contains_key("delimiter")
+                && r.query.get("max-keys").map(String::as_str) != Some("1")
+                && r.query
+                    .get("start-after")
+                    .is_some_and(|sa| sa.starts_with("obj-"))
+        }),
+        "expected a child segment starting at a flat cut"
+    );
+}
+
+#[test]
 fn local_mock_summary_only_reports_metrics_without_outputs() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");

@@ -3205,8 +3205,8 @@ fn planned_output_paths(
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
 /// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
 /// 3. Single-segment fallback (empty vec).
-/// The region supplied by the active subcommand, used for profile endpoint
-/// templating before the full command dispatch.
+// The region supplied by the active subcommand, used for profile endpoint
+// templating before the full command dispatch.
 fn command_region(cmd: &Commands) -> Option<&str> {
     match cmd {
         Commands::List { region, .. }
