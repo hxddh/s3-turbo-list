@@ -1,21 +1,24 @@
 name: Release Tag
 
-# Creates an annotated release tag via workflow dispatch. Exists because
-# managed development environments can push branches but not tags; the
-# release checklist triggers this before release-assets.yml.
+# Creates the annotated release tag and kicks off the release-assets build.
+# One dispatch releases the version prepared on main: the tag defaults to
+# the Cargo.toml version, requires a matching CHANGELOG section, is
+# idempotent (existing tags are a no-op), and the asset build is dispatched
+# automatically after tagging.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to create (e.g. v0.3.0)'
-        required: true
+        description: 'Tag to create (e.g. v0.4.0); defaults to Cargo.toml version'
+        required: false
       sha:
         description: 'Commit SHA to tag (defaults to main HEAD)'
         required: false
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -25,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve target commit
+      - name: Resolve target commit and tag
         run: |
           TARGET="${{ inputs.sha }}"
           if [ -z "$TARGET" ]; then
@@ -35,27 +38,50 @@ jobs:
             echo "::error::Target commit ${TARGET} not found"
             exit 1
           }
-          echo "TARGET=${TARGET}" >> "$GITHUB_ENV"
-
-      - name: Validate tag matches Cargo.toml version at target commit
-        run: |
           VERSION="$(git show "${TARGET}:Cargo.toml" | grep '^version' | head -1 | cut -d'"' -f2)"
-          EXPECTED_TAG="v${VERSION}"
-          if [ "${{ inputs.tag }}" != "$EXPECTED_TAG" ]; then
-            echo "::error::tag input '${{ inputs.tag }}' does not match Cargo.toml version '${VERSION}' (${EXPECTED_TAG}) at ${TARGET}"
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${VERSION}"
+          fi
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "::error::tag '${TAG}' does not match Cargo.toml version '${VERSION}' at ${TARGET}"
             exit 1
           fi
+          {
+            echo "TARGET=${TARGET}"
+            echo "TAG=${TAG}"
+            echo "VERSION=${VERSION}"
+          } >> "$GITHUB_ENV"
 
-      - name: Refuse to move an existing tag
+      - name: Skip when the tag already exists
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${{ inputs.tag }}" >/dev/null 2>&1; then
-            echo "::error::tag ${{ inputs.tag }} already exists on origin"
-            exit 1
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — nothing to do"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Require a CHANGELOG section for the version
+        if: env.SKIP != '1'
+        run: |
+          if ! git show "${TARGET}:CHANGELOG.md" | grep -q "^## \[${VERSION}\]"; then
+            echo "CHANGELOG has no section for ${VERSION} — not releasing"
+            echo "SKIP=1" >> "$GITHUB_ENV"
           fi
 
       - name: Create and push annotated tag
+        if: env.SKIP != '1'
         run: |
           git -c user.name=github-actions -c user.email=github-actions@github.com \
-            tag -a "${{ inputs.tag }}" -m "Release ${{ inputs.tag }}" "$TARGET"
-          git push origin "refs/tags/${{ inputs.tag }}"
-          echo "Created ${{ inputs.tag }} -> ${TARGET}"
+            tag -a "$TAG" -m "Release $TAG" "$TARGET"
+          git push origin "refs/tags/$TAG"
+          echo "Created $TAG -> $TARGET"
+
+      - name: Dispatch release-assets build
+        if: env.SKIP != '1'
+        run: |
+          gh workflow run release-assets.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f tag="$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}

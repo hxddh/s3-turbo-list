@@ -118,6 +118,11 @@ pushes only), trigger the `release-tag.yml` workflow instead:
 gh workflow run release-tag.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
 ```
 
+The `tag` input is optional and defaults to the Cargo.toml version on main.
+The workflow requires a matching CHANGELOG section, is idempotent (existing
+tags are a no-op), and dispatches the release-assets build automatically
+after tagging — one dispatch releases the version prepared on main.
+
 ## 8. Build Release Assets
 
 Trigger the release asset workflow:
