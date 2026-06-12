@@ -123,6 +123,14 @@ The workflow requires a matching CHANGELOG section, is idempotent (existing
 tags are a no-op), and dispatches the release-assets build automatically
 after tagging — one dispatch releases the version prepared on main.
 
+`release-tag.yml` also runs on a schedule as release-on-version-bump
+(maintainer-authorized): once main carries a Cargo.toml version with a
+matching CHANGELOG section and no tag, the next scheduled run creates the
+tag and dispatches the asset build automatically.  Pushing a prepared
+release to main is therefore sufficient to release.  **Note:** a version
+bump on main is treated as a release instruction — keep unreleased version
+bumps off main.
+
 ## 8. Build Release Assets
 
 Trigger the release asset workflow:

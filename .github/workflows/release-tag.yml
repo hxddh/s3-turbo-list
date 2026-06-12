@@ -1,10 +1,16 @@
 name: Release Tag
 
 # Creates the annotated release tag and kicks off the release-assets build.
-# One dispatch releases the version prepared on main: the tag defaults to
-# the Cargo.toml version, requires a matching CHANGELOG section, is
-# idempotent (existing tags are a no-op), and the asset build is dispatched
-# automatically after tagging.
+#
+# Two triggers:
+#  - workflow_dispatch: one manual dispatch releases the version prepared
+#    on main (tag defaults to the Cargo.toml version).
+#  - schedule: release-on-version-bump, explicitly authorized by the
+#    maintainer. Managed environments can push branches but cannot create
+#    tags or fire push workflows, so a timer checks main: when Cargo.toml's
+#    version has a matching CHANGELOG section but no tag yet, the tag is
+#    created and the asset build is dispatched. Idempotent — existing tags
+#    are a no-op, so the timer normally does nothing.
 
 on:
   workflow_dispatch:
@@ -15,6 +21,8 @@ on:
       sha:
         description: 'Commit SHA to tag (defaults to main HEAD)'
         required: false
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: write
