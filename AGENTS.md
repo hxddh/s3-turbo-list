@@ -4,8 +4,8 @@
 
 `s3-turbo-list` is a Rust CLI for high-performance S3-compatible bucket
 listing, diffing, checkpoint/resume, and Parquet export.  GitHub:
-`https://github.com/hxddh/s3-turbo-list`, main branch `main`; the latest git
-tag / GitHub Release is the release source of truth.
+`https://github.com/hxddh/s3-turbo-list`, main branch `main`.
+The release source of truth is the latest git tag / GitHub Release.
 
 The project prioritizes a clean, high-performance architecture for
 standards-compatible S3 behavior.  Do not compromise the core architecture
