@@ -351,13 +351,16 @@ async fn flat_list(
                     None,
                 );
 
+                // Consume the page contents so each key's String moves into
+                // the batch instead of being copied — zero per-object key
+                // allocation on the ingest hot path.
+                let contents = objects.contents.unwrap_or_default();
                 let mut batch: Vec<(ObjectKey, ObjectProps)> =
-                    Vec::with_capacity(objects.contents().len());
+                    Vec::with_capacity(contents.len());
 
-                for obj in objects.contents() {
-                    let obj_key = match obj.key() {
-                        Some(k) => k,
-                        None => continue,
+                for mut obj in contents {
+                    let Some(obj_key) = obj.key.take() else {
+                        continue;
                     };
 
                     // Segment ranges are (start_after, end_before].  The next
@@ -365,17 +368,16 @@ async fn flat_list(
                     // equality here would drop a real object whose key equals
                     // the boundary.
                     if let Some(end) = until {
-                        if end < obj_key {
+                        if end < obj_key.as_str() {
                             debug!("Segment boundary reached at key: {}", obj_key);
                             is_ended = true;
                             break;
                         }
                     }
 
-                    let key: ObjectKey = obj_key.into();
-                    let mut props: ObjectProps = obj.into();
+                    let mut props: ObjectProps = (&obj).into();
                     props.set_dir(ctx.dir);
-                    batch.push((key, props));
+                    batch.push((obj_key.into(), props));
                     object_count = object_count.saturating_add(1);
                 }
 

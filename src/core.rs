@@ -129,6 +129,12 @@ impl From<&str> for ObjectKey {
     }
 }
 
+impl From<String> for ObjectKey {
+    fn from(item: String) -> Self {
+        Self(item)
+    }
+}
+
 impl std::fmt::Display for ObjectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
