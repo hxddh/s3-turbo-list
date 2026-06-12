@@ -1362,7 +1362,6 @@ fn init_config_template(profile: &str) -> String {
 # The s3-turbo-list `profile` below is an endpoint compatibility profile.
 
 [runtime]
-worker_threads = 10
 max_concurrency = 100
 
 [s3]

@@ -200,9 +200,9 @@ enum Commands {
 
     /// Validate S3-compatible provider compatibility before listing
     CompatProbe {
-        /// Endpoint URL (required for compat-probe)
+        /// Endpoint URL (defaults to the global --endpoint-url)
         #[arg(long = "endpoint")]
-        endpoint_url: String,
+        endpoint_url: Option<String>,
 
         /// AWS region or vendor region
         #[arg(long)]
@@ -701,7 +701,7 @@ fn main() {
         cli.compression.as_deref(),
         cli.compression_level,
     );
-    cfg.apply_profile_preset();
+    cfg.apply_profile_preset(command_region(&cli.cmd));
     cfg.normalize_addressing_style();
     apply_output_dir_defaults(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
@@ -923,6 +923,15 @@ fn main() {
             addressing_style,
             output,
         } => {
+            let endpoint_url = endpoint_url
+                .as_deref()
+                .or(cli.endpoint.as_deref())
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint"
+                    );
+                    std::process::exit(agent::ExitCode::CliConfig.code());
+                });
             run_compat_probe(
                 endpoint_url,
                 region,
@@ -1885,13 +1894,16 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
         | Commands::DiscoverPrefixes { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
         }
-        Commands::CompatProbe { endpoint_url, .. }
-            if profiles::endpoint_url_has_template_placeholder(endpoint_url) =>
-        {
-            warnings.push(format!(
-                "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
-                endpoint_url
-            ));
+        Commands::CompatProbe { endpoint_url, .. } => {
+            let effective = endpoint_url.as_deref().or(cli.endpoint.as_deref());
+            if let Some(endpoint) = effective {
+                if profiles::endpoint_url_has_template_placeholder(endpoint) {
+                    warnings.push(format!(
+                        "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
+                        endpoint
+                    ));
+                }
+            }
         }
         _ => {}
     }
@@ -3193,6 +3205,19 @@ fn planned_output_paths(
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
 /// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
 /// 3. Single-segment fallback (empty vec).
+/// The region supplied by the active subcommand, used for profile endpoint
+/// templating before the full command dispatch.
+fn command_region(cmd: &Commands) -> Option<&str> {
+    match cmd {
+        Commands::List { region, .. }
+        | Commands::AutoHints { region, .. }
+        | Commands::DiscoverPrefixes { region, .. }
+        | Commands::Diff { region, .. } => region.as_deref(),
+        Commands::CompatProbe { region, .. } => Some(region.as_str()),
+        _ => None,
+    }
+}
+
 fn load_hints(
     hints_file: Option<&str>,
     bucket: &str,

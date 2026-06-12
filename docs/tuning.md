@@ -95,7 +95,7 @@ it.
 | `s3.initial_backoff_secs` | `30` | Initial SDK retry backoff. |
 | `s3.connect_timeout_secs` | `60` | Connection timeout. |
 | `s3.operation_timeout_secs` | `5` | Per-page ListObjectsV2 watchdog and SDK operation/read/attempt timeout. |
-| `runtime.worker_threads` | `10` | Tokio worker threads; CLI override: `-T`, `--threads`. |
+| `runtime.worker_threads` | CPU cores | Tokio worker threads; CLI override: `-T`, `--threads`. |
 | `runtime.max_concurrency` | `100` | Max concurrent list operations; CLI override: `-c`, `--concurrency`. |
 | `channel.capacity` | `64` | Bounded channel capacity between list tasks and data-map output. |
 | `output.row_group_size` | `100000` | Parquet max row group size. |

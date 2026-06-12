@@ -233,7 +233,11 @@ fn default_operation_timeout_secs() -> u64 {
     5
 }
 fn default_worker_threads() -> usize {
-    10
+    // Match the machine instead of a fixed count: oversubscribing small
+    // hosts (e.g. 10 workers on 2 vCPUs) measurably degrades throughput.
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
 }
 fn default_max_concurrency() -> usize {
     100
@@ -446,8 +450,8 @@ impl S3TurboConfig {
         }
     }
 
-    pub fn apply_profile_preset(&mut self) {
-        if let Some(application) = crate::profiles::apply_profile_preset(self) {
+    pub fn apply_profile_preset(&mut self, region: Option<&str>) {
+        if let Some(application) = crate::profiles::apply_profile_preset(self, region) {
             if application.known {
                 log::info!(
                     "Applied endpoint profile '{}': endpoint applied {}, addressing applied {}",
@@ -534,7 +538,12 @@ mod tests {
         let config = S3TurboConfig::default();
         assert_eq!(config.s3.max_attempts, 10);
         assert_eq!(config.s3.initial_backoff_secs, 30);
-        assert_eq!(config.runtime.worker_threads, 10);
+        assert_eq!(
+            config.runtime.worker_threads,
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4)
+        );
         assert_eq!(config.runtime.max_concurrency, 100);
         assert_eq!(config.output.row_group_size, 100000);
         assert_eq!(config.output.compression, "zstd");
@@ -645,10 +654,57 @@ profile = "bos"
     }
 
     #[test]
+    fn test_profile_endpoint_templates_derive_from_region() {
+        for (profile, region, expected) in [
+            (
+                "oss",
+                "oss-cn-beijing",
+                "https://oss-cn-beijing.aliyuncs.com",
+            ),
+            ("bos", "gz", "https://s3.gz.bcebos.com"),
+            (
+                "b2",
+                "us-west-004",
+                "https://s3.us-west-004.backblazeb2.com",
+            ),
+        ] {
+            let mut config = S3TurboConfig::default();
+            config.s3.profile = Some(profile.to_string());
+            config.apply_profile_preset(Some(region));
+            assert_eq!(
+                config.s3.endpoint_url.as_deref(),
+                Some(expected),
+                "profile {}",
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn test_profile_template_never_overrides_explicit_endpoint() {
+        let mut config = S3TurboConfig::default();
+        config.s3.profile = Some("oss".to_string());
+        config.s3.endpoint_url = Some("https://oss-cn-beijing-internal.aliyuncs.com".to_string());
+        config.apply_profile_preset(Some("oss-cn-beijing"));
+        assert_eq!(
+            config.s3.endpoint_url.as_deref(),
+            Some("https://oss-cn-beijing-internal.aliyuncs.com")
+        );
+    }
+
+    #[test]
+    fn test_profile_template_without_region_leaves_endpoint_unset() {
+        let mut config = S3TurboConfig::default();
+        config.s3.profile = Some("oss".to_string());
+        config.apply_profile_preset(None);
+        assert_eq!(config.s3.endpoint_url, None);
+    }
+
+    #[test]
     fn test_apply_bos_profile_preset() {
         let mut config = S3TurboConfig::default();
         config.s3.profile = Some("bos".to_string());
-        config.apply_profile_preset();
+        config.apply_profile_preset(None);
         assert_eq!(
             config.s3.endpoint_url.as_deref(),
             Some("https://s3.bj.bcebos.com")
@@ -662,7 +718,7 @@ profile = "bos"
         let mut config = S3TurboConfig::default();
         config.s3.profile = Some("bos".to_string());
         config.s3.addressing_style = AddressingStyle::Path;
-        config.apply_profile_preset();
+        config.apply_profile_preset(None);
         config.normalize_addressing_style();
         assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
         assert!(config.s3.force_path_style);

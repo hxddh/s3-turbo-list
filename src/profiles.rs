@@ -8,6 +8,9 @@ pub struct EndpointProfile {
     pub status: &'static str,
     pub default_region: Option<&'static str>,
     pub default_endpoint_url: Option<&'static str>,
+    /// Region-derived endpoint pattern; `{region}` is substituted with the
+    /// run's region (or `default_region`) when no explicit endpoint is set.
+    pub endpoint_template: Option<&'static str>,
     pub recommended_addressing_style: AddressingStyle,
     pub requires_explicit_endpoint: bool,
     pub tested_by_project: bool,
@@ -31,6 +34,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "AWS S3",
             status: "stable",
             default_region: None,
+            endpoint_template: None,
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Virtual,
             requires_explicit_endpoint: false,
@@ -43,6 +47,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "MinIO",
             status: "stable",
             default_region: None,
+            endpoint_template: None,
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Path,
             requires_explicit_endpoint: true,
@@ -55,7 +60,8 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "Baidu BOS S3-compatible API",
             status: "documented",
             default_region: Some("bj"),
-            default_endpoint_url: Some("https://s3.bj.bcebos.com"),
+            endpoint_template: Some("https://s3.{region}.bcebos.com"),
+            default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Virtual,
             requires_explicit_endpoint: false,
             tested_by_project: true,
@@ -70,6 +76,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "Cloudflare R2",
             status: "documented",
             default_region: Some("auto"),
+            endpoint_template: None,
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Path,
             requires_explicit_endpoint: true,
@@ -82,11 +89,12 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "Backblaze B2 S3-compatible API",
             status: "documented",
             default_region: None,
+            endpoint_template: Some("https://s3.{region}.backblazeb2.com"),
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Path,
-            requires_explicit_endpoint: true,
+            requires_explicit_endpoint: false,
             tested_by_project: false,
-            notes: &["B2 endpoints and regions are bucket/account specific"],
+            notes: &["the endpoint derives from the bucket's region (e.g. us-west-004)"],
             limitations: &["not claimed as project-validated until compat-probe or endpoint validation is run"],
         },
         EndpointProfile {
@@ -94,11 +102,12 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             provider: "Alibaba Cloud OSS S3-compatible API",
             status: "documented",
             default_region: None,
+            endpoint_template: Some("https://{region}.aliyuncs.com"),
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Virtual,
-            requires_explicit_endpoint: true,
+            requires_explicit_endpoint: false,
             tested_by_project: false,
-            notes: &["OSS endpoint and region are deployment specific"],
+            notes: &["the endpoint derives from the region (e.g. oss-cn-beijing)"],
             limitations: &["not claimed as project-validated until compat-probe or endpoint validation is run"],
         },
     ]
@@ -123,13 +132,18 @@ pub fn endpoint_profile_guardrail_warnings(cfg: &S3TurboConfig) -> Vec<String> {
     if let Some(profile_name) = cfg.s3.profile.as_deref() {
         if let Some(profile) = get_profile(profile_name) {
             let endpoint = cfg.s3.endpoint_url.as_deref().map(str::trim);
-            if profile.requires_explicit_endpoint
-                && endpoint.filter(|value| !value.is_empty()).is_none()
-            {
-                warnings.push(format!(
-                    "endpoint compatibility profile '{}' requires an explicit endpoint URL; pass --endpoint-url or set s3.endpoint_url in config",
-                    profile.name
-                ));
+            if endpoint.filter(|value| !value.is_empty()).is_none() {
+                if profile.requires_explicit_endpoint {
+                    warnings.push(format!(
+                        "endpoint compatibility profile '{}' requires an explicit endpoint URL; pass --endpoint-url or set s3.endpoint_url in config",
+                        profile.name
+                    ));
+                } else if profile.endpoint_template.is_some() && profile.default_region.is_none() {
+                    warnings.push(format!(
+                        "endpoint compatibility profile '{}' derives its endpoint from the region; pass --region or --endpoint-url",
+                        profile.name
+                    ));
+                }
             }
         }
     }
@@ -150,7 +164,10 @@ pub fn endpoint_url_has_template_placeholder(endpoint: &str) -> bool {
     endpoint.contains('<') || endpoint.contains('>')
 }
 
-pub fn apply_profile_preset(cfg: &mut S3TurboConfig) -> Option<ProfileApplication> {
+pub fn apply_profile_preset(
+    cfg: &mut S3TurboConfig,
+    region: Option<&str>,
+) -> Option<ProfileApplication> {
     let name = cfg.s3.profile.clone()?;
     let Some(profile) = get_profile(&name) else {
         return Some(ProfileApplication {
@@ -166,6 +183,12 @@ pub fn apply_profile_preset(cfg: &mut S3TurboConfig) -> Option<ProfileApplicatio
     if cfg.s3.endpoint_url.is_none() {
         if let Some(endpoint) = profile.default_endpoint_url {
             cfg.s3.endpoint_url = Some(endpoint.to_string());
+            endpoint_url_applied = true;
+        } else if let (Some(template), Some(region)) = (
+            profile.endpoint_template,
+            region.filter(|r| !r.is_empty()).or(profile.default_region),
+        ) {
+            cfg.s3.endpoint_url = Some(template.replace("{region}", region));
             endpoint_url_applied = true;
         }
     }
