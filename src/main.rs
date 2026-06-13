@@ -70,8 +70,9 @@ struct Cli {
     #[arg(long = "endpoint-url", global = true)]
     endpoint: Option<String>,
 
-    /// Force path-style addressing
-    #[arg(long, global = true)]
+    /// Deprecated alias for `--addressing-style path`; hidden but still
+    /// honored. Prefer `--addressing-style path`.
+    #[arg(long, global = true, hide = true)]
     force_path_style: bool,
 
     /// Log file path (implies --log)

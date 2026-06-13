@@ -853,7 +853,7 @@ These commands do not contact S3-compatible cloud endpoints.
             r#"Local MinIO:
   export AWS_ACCESS_KEY_ID=minioadmin
   export AWS_SECRET_ACCESS_KEY=minioadmin
-  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --addressing-style path --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
@@ -920,7 +920,7 @@ fn render_quickstart(provider: &str) -> Result<String, String> {
    export AWS_ACCESS_KEY_ID=minioadmin
    export AWS_SECRET_ACCESS_KEY=minioadmin
 2. First list:
-   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --force-path-style --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --addressing-style path --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),
