@@ -35,12 +35,15 @@ cooperatively — the right half becomes a new parallel child segment,
 recursively.  Split points come from a delimiter probe when the remaining
 range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
 candidate cuts are derived from the segment's cursor and validated with
-single-key probes, so the boundary is always a real observed key.  Skewed
-and flat buckets alike fan out until concurrency is used.  Splitting never
-applies to `diff` (static segments by design), `--start-after`, or
-`--continuation-token` runs.  Split
-segments conservatively do not record checkpoint progress, so `--resume`
-re-lists the original segment.
+single-key probes, so the boundary is always a real observed key.  The reactor
+probes the busiest long-tail segments as soon as slots are idle (not on a fixed
+once-per-second tick) and fans out several at once up to the idle-slot budget,
+so a flat namespace — where this is the only fan-out mechanism — reaches full
+concurrency in a few page round-trips rather than one segment per second.
+Skewed and flat buckets alike fan out until concurrency is used.  Splitting
+never applies to `diff` (static segments by design), `--start-after`, or
+`--continuation-token` runs.  Split segments conservatively do not record
+checkpoint progress, so `--resume` re-lists the original segment.
 
 **Defaults are designed to be the right choice**: `worker_threads` follows
 the machine's CPU count, and `--concurrency` only needs raising when a very

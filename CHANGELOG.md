@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-13
+
+### Performance
+- **Runtime split fan-out is now event-driven and multi-candidate.** The
+  reactor previously probed at most one segment per one-second tick, so
+  cold-start parallelism on flat/unstructured namespaces — where startup
+  discovery finds no `CommonPrefixes` and runtime splitting is the only fan-out
+  mechanism — ramped at roughly one segment per second, leaving the run far
+  under the provider's request-rate ceiling. It now probes the busiest
+  candidates at a 200ms cadence up to the idle-slot budget (counting in-flight
+  probes so total outstanding probes never exceed idle capacity), reaching full
+  concurrency in a few page round-trips instead. Structured buckets are
+  unchanged (startup discovery still seeds them).
+
+### Removed
+- **Removed the `hints-merge` subcommand.** With auto-hints and
+  discover-prefixes gone, nothing produces multiple hints files to merge.
+  `hints-validate` and `--hints-file` are unchanged.
+- **Removed `config-inspect`, folding it into `doctor`.** `doctor` already
+  covered the environment view; its report now also carries `resolved_config`
+  and `config_source` in both JSON and human output. Use
+  `doctor --local-only --json` for local inspection.
+
+### Changed
+- **Consolidated `recipes`, `cheatsheet`, and `quickstart` into one `guide`
+  command.** A bare `guide` prints the overview, a provider name
+  (aws/minio/r2/bos) prints that quickstart, and any other topic is a recipe
+  name (`index` lists them).
+- **Hid `--force-path-style` in favor of `--addressing-style path`.** The flag
+  remains honored for compatibility but no longer appears in `--help`; the
+  documented canonical form is `--addressing-style path`.
+
 ## [0.8.0] - 2026-06-13
 
 ### Removed
