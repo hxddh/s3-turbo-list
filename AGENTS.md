@@ -44,9 +44,9 @@ service-side issue, not an architecture problem.  Consequences:
 
 ## Other Design Constraints
 
-- Diff is authoritative single-segment by design; `diff --hints-file` and
-  `diff --resume` are intentionally rejected so mismatched segment
-  boundaries cannot hide left-only or right-only objects.
+- Diff partitions each side automatically and merges the ordered segment
+  streams; `diff --hints-file` and `diff --resume` are intentionally
+  rejected, and any segment failure or ordering violation fails the run.
 - `dist/` and `target/` are generated and ignored.
 
 ## Cloud Safety Rules

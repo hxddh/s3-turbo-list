@@ -21,9 +21,13 @@ Where boundaries come from, in precedence order:
    3 levels deep) finds real `CommonPrefixes` boundaries at run start and
    caches them at the conventional path.  Costs at most a second or two of
    startup; first runs list in parallel with no prior steps.
-4. **Single segment** — flat namespaces with no `/` structure, runs with
-   `--no-auto-hints`, `--start-after`, or `--continuation-token`, and `diff`
-   (always single-segment by design).
+4. **Single segment** — flat namespaces with no `/` structure, and runs
+   with `--no-auto-hints`, `--start-after`, or `--continuation-token`.
+
+`diff` uses the same automatic sources per side (cached hints or startup
+discovery) and lists each side's segments in parallel; its segment set
+stays static (no runtime splitting) so the merge can consume segments in
+key order.
 
 Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits
@@ -33,7 +37,8 @@ range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
 candidate cuts are derived from the segment's cursor and validated with
 single-key probes, so the boundary is always a real observed key.  Skewed
 and flat buckets alike fan out until concurrency is used.  Splitting never
-applies to `diff`, `--start-after`, or `--continuation-token` runs.  Split
+applies to `diff` (static segments by design), `--start-after`, or
+`--continuation-token` runs.  Split
 segments conservatively do not record checkpoint progress, so `--resume`
 re-lists the original segment.
 

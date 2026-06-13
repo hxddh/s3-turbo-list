@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-13
+
+### Changed
+- **Diff lists both sides in parallel.** Each side partitions
+  automatically (cached hints or startup discovery, the same sources as
+  list mode) and lists its segments concurrently; the merge consumes each
+  side's segment outputs in key order, so the ordered merge-join engine —
+  including its loud-failure ordering guard — is unchanged. Memory stays
+  bounded by the per-segment prefetch windows (4 batches each, at most 32
+  segments in flight per side). Diff on a 1M-object bucket previously paid
+  full sequential listing time per side. `--hints-file`/`--resume` remain
+  rejected for diff; the dry-run hints plan `source` for diff is now
+  `diff_per_side_automatic`.
+- Deprecated `auto-hints` and `discover-prefixes`: startup discovery and
+  runtime splitting cover both commands' use cases, and auto-hints' full
+  sequential scan is often slower than simply running the listing. Both
+  warn on invocation and will be removed in a future release;
+  `--hints-file`, `hints-validate`, and `hints-merge` stay.
+
+
 ## [0.6.1] - 2026-06-12
 
 Replaces v0.6.0, whose release pipeline was halted by a timing-flaky CI

@@ -152,12 +152,13 @@ s3-turbo-list diff \
 ```
 
 Diff lists both buckets and writes one Parquet with `DiffFlag` per object
-(equal rows included; filter `DiffFlag != 0` downstream). Diff is
-authoritative single-segment by design — hints are ignored and
-`--hints-file`/`--resume` are rejected — so left-only and right-only objects
-cannot be hidden by mismatched segment boundaries. The two ordered streams
-are merged on the fly and rows stream straight to Parquet, so memory stays
-bounded regardless of bucket size.
+(equal rows included; filter `DiffFlag != 0` downstream). Each side
+partitions automatically and lists its segments **in parallel**; the
+segment outputs are consumed in key order, merged on the fly, and streamed
+straight to Parquet — memory stays bounded regardless of bucket size, and
+any ordering violation or segment failure fails the run loudly instead of
+producing a wrong diff. `--hints-file` and `--resume` are rejected for
+diff.
 
 ## Checkpoint / resume
 
@@ -230,8 +231,9 @@ run locally. Exit-code classes are stable. Full reference:
 
 ## Known limitations
 
-1. **Diff is authoritative single-segment by design** (see Diff mode
-   above); each side follows one ListObjectsV2 chain.
+1. **Diff segments are static** (no runtime splitting), so a diff side
+   with a single flat namespace lists serially; list mode remains the
+   fastest path for one-bucket inventories.
 2. **Release builds on Ubuntu 20.04 arm64** may need the `aws-lc-sys`
    workaround documented in [BUILD.md](BUILD.md).
 
