@@ -59,7 +59,7 @@ boundaries, and lists the segments in parallel. Use `--delimiter '/'` for a
 hierarchical listing (top-level objects plus `CommonPrefixes` only).
 
 Preview any run without contacting S3 by adding `--dry-run --agent`.
-`init-config`, `quickstart`, `recipes`, and `cheatsheet` provide local help;
+`init-config` and `guide` provide local setup help and command examples;
 `completions` and `man` generate shell completions and a man page.
 
 Output files (auto-named):

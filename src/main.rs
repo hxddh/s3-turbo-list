@@ -287,19 +287,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Print concise command recipes without contacting S3
-    Recipes {
-        /// Recipe name, for example aws-basic, large-bucket, local-minio, or agent-safe
-        name: Option<String>,
-    },
-
-    /// Print a compact command cheatsheet without contacting S3
-    Cheatsheet,
-
-    /// Print provider-specific first-run steps without contacting S3
-    Quickstart {
-        /// Provider name: aws, minio, r2, or bos
-        provider: String,
+    /// Print guidance without contacting S3: an overview when no topic is
+    /// given, a provider quickstart (aws/minio/r2/bos), or a named recipe
+    Guide {
+        /// Topic: a provider (aws/minio/r2/bos), a recipe name (e.g.
+        /// large-bucket, filter, release-check), or `index` to list recipes
+        topic: Option<String>,
     },
 
     /// Inspect resolved local config without contacting S3
@@ -554,16 +547,8 @@ fn main() {
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
         }
-        Commands::Recipes { name } => {
-            run_recipes(name.as_deref());
-            return;
-        }
-        Commands::Cheatsheet => {
-            print!("{}", local_tools::render_cheatsheet());
-            return;
-        }
-        Commands::Quickstart { provider } => {
-            run_quickstart(provider);
+        Commands::Guide { topic } => {
+            run_guide(topic.as_deref());
             return;
         }
         _ => {}
@@ -862,9 +847,7 @@ fn main() {
         Commands::TraceSummary { .. }
         | Commands::ManifestSummary { .. }
         | Commands::InitConfig { .. }
-        | Commands::Recipes { .. }
-        | Commands::Cheatsheet
-        | Commands::Quickstart { .. } => {
+        | Commands::Guide { .. } => {
             unreachable!("local tooling commands are handled before config load")
         }
         Commands::BenchmarkLocal { .. } => {
@@ -1517,21 +1500,11 @@ fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: b
     }
 }
 
-fn run_recipes(name: Option<&str>) {
-    match local_tools::render_recipe(name) {
+fn run_guide(topic: Option<&str>) {
+    match local_tools::render_guide(topic) {
         Ok(rendered) => print!("{}", rendered),
         Err(e) => {
-            eprintln!("Recipe error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-fn run_quickstart(provider: &str) {
-    match local_tools::render_quickstart(provider) {
-        Ok(rendered) => print!("{}", rendered),
-        Err(e) => {
-            eprintln!("Quickstart error: {}", e);
+            eprintln!("Guide error: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -2870,9 +2843,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             ("manifest-summary".to_string(), None, None, None, None, None)
         }
         Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
-        Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None, None),
-        Commands::Cheatsheet => ("cheatsheet".to_string(), None, None, None, None, None),
-        Commands::Quickstart { .. } => ("quickstart".to_string(), None, None, None, None, None),
+        Commands::Guide { .. } => ("guide".to_string(), None, None, None, None, None),
         Commands::ConfigInspect { .. } => {
             ("config-inspect".to_string(), None, None, None, None, None)
         }

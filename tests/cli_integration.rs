@@ -155,13 +155,9 @@ fn test_cli_help_agent_local_commands() {
     assert_eq!(code, 0, "init-config --help should exit 0");
     assert!(stdout.contains("--overwrite"));
 
-    let (code, stdout, _stderr) = run_cli(&["recipes", "--help"]);
-    assert_eq!(code, 0, "recipes --help should exit 0");
-    assert!(stdout.contains("Recipe name"));
-
-    let (code, stdout, _stderr) = run_cli(&["quickstart", "--help"]);
-    assert_eq!(code, 0, "quickstart --help should exit 0");
-    assert!(stdout.contains("Provider name"));
+    let (code, stdout, _stderr) = run_cli(&["guide", "--help"]);
+    assert_eq!(code, 0, "guide --help should exit 0");
+    assert!(stdout.contains("provider quickstart") || stdout.contains("recipe"));
 
     let (code, stdout, _stderr) = run_cli(&["trace-summary", "--help"]);
     assert_eq!(code, 0, "trace-summary --help should exit 0");
@@ -233,31 +229,32 @@ fn test_cli_init_config_writes_and_requires_overwrite() {
 }
 
 #[test]
-fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
-    let (code, stdout, stderr) = run_cli(&["recipes", "aws-basic"]);
+fn test_cli_guide_local_only() {
+    // Named recipes.
+    let (code, stdout, stderr) = run_cli(&["guide", "aws-basic"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--output-dir"));
     assert!(stdout.contains("--delimiter ''"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "summary"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "summary"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--summary-only"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "pipe"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "pipe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--output-format tsv"));
     assert!(stdout.contains("--output-format ndjson"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "filter"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "filter"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("SOURCE.size > 1073741824"));
     assert!(stdout.contains("SOURCE.last_modified"));
     assert!(stdout.contains("Rejected before network"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "release-check"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "release-check"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("./scripts/check-release-env.sh"));
     assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
@@ -269,24 +266,32 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("./scripts/verify-release-assets.sh"));
     assert!(stdout.contains("do not contact S3-compatible cloud endpoints"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "diff-safe"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "diff-safe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Safe diff"));
     assert!(stdout.contains("diff --bucket"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
+    // Provider topics dispatch to quickstarts.
+    let (code, stdout, stderr) = run_cli(&["guide", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("AWS_PROFILE"));
     assert!(stdout.contains("--profile r2"));
     assert!(stdout.contains("--delimiter ''"));
 
-    let (code, stdout, stderr) = run_cli(&["cheatsheet"]);
+    // No topic prints the overview, which points back at guide topics.
+    let (code, stdout, stderr) = run_cli(&["guide"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("First run"));
     assert!(stdout.contains("--delimiter ''"));
-    assert!(stdout.contains("recipes filter"));
-    assert!(stdout.contains("recipes release-check"));
+    assert!(stdout.contains("guide filter"));
+    assert!(stdout.contains("release-check"));
+
+    // index lists the recipe names.
+    let (code, stdout, stderr) = run_cli(&["guide", "index"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Available recipes"));
+    assert!(stdout.contains("guide <name>"));
 }
 
 #[test]

@@ -12,13 +12,13 @@ s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
-s3-turbo-list recipes agent-safe
-s3-turbo-list recipes summary
-s3-turbo-list recipes pipe
-s3-turbo-list recipes filter
-s3-turbo-list recipes verify
-s3-turbo-list recipes release-check
-s3-turbo-list recipes diff-safe
+s3-turbo-list guide agent-safe
+s3-turbo-list guide summary
+s3-turbo-list guide pipe
+s3-turbo-list guide filter
+s3-turbo-list guide verify
+s3-turbo-list guide release-check
+s3-turbo-list guide diff-safe
 s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
@@ -52,7 +52,7 @@ without editing TOML.  The default is `zstd(1)`; use
 `--compression gzip --compression-level 6` when a downstream reader requires
 traditional gzip output.
 
-`init-config`, `recipes`, `quickstart`, `cheatsheet`, and `trace-summary`
+`init-config`, `guide`, and `trace-summary`
 are local tooling commands.  They are handled before S3 config loading, do not
 require cloud credentials, and do not change list/diff hot-path behavior.
 

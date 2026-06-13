@@ -702,7 +702,24 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
+/// Quickstart provider topics, dispatched ahead of named recipes so that a
+/// bare provider name (e.g. `guide r2`) prints its quickstart.
+fn is_quickstart_provider(topic: &str) -> bool {
+    matches!(topic, "aws" | "minio" | "r2" | "bos")
+}
+
+/// Single guidance surface: bare `guide` prints the overview; a provider name
+/// prints that provider's quickstart; anything else is treated as a recipe
+/// name (including `index`/`list`).
+pub fn render_guide(topic: Option<&str>) -> Result<String, String> {
+    match topic {
+        None => Ok(render_overview()),
+        Some(provider) if is_quickstart_provider(provider) => render_quickstart(provider),
+        Some(name) => render_recipe(Some(name)),
+    }
+}
+
+fn render_recipe(name: Option<&str>) -> Result<String, String> {
     let name = name.unwrap_or("index");
     match name {
         "index" | "list" => Ok(
@@ -718,7 +735,7 @@ pub fn render_recipe(name: Option<&str>) -> Result<String, String> {
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands
 
-Run: s3-turbo-list recipes <name>
+Run: s3-turbo-list guide <name>
 "#
             .to_string(),
         ),
@@ -856,8 +873,8 @@ These commands do not contact S3-compatible cloud endpoints.
     }
 }
 
-pub fn render_cheatsheet() -> String {
-    r#"s3-turbo-list cheatsheet
+fn render_overview() -> String {
+    r#"s3-turbo-list guide
 
 First run:
   s3-turbo-list doctor --local-only --simple
@@ -869,19 +886,21 @@ Credentials vs endpoint profiles:
   export AWS_PROFILE=my-credentials-profile
   s3-turbo-list --profile r2 ...
 
+More guidance (s3-turbo-list guide <topic>):
+  guide aws | minio | r2 | bos   provider quickstarts
+  guide index                    list all recipes
+  guide filter | release-check | large-bucket
+
 Useful local commands:
   s3-turbo-list profiles list
   s3-turbo-list hints-validate --hints-file hints.toml --json
   s3-turbo-list trace-summary trace.jsonl --machine-readable
   s3-turbo-list manifest-summary run.json --check
-  s3-turbo-list recipes filter
-  s3-turbo-list recipes release-check
-  s3-turbo-list recipes large-bucket
 "#
     .to_string()
 }
 
-pub fn render_quickstart(provider: &str) -> Result<String, String> {
+fn render_quickstart(provider: &str) -> Result<String, String> {
     match provider {
         "aws" => Ok(
             r#"AWS quickstart:
