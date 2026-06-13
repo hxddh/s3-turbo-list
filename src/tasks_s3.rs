@@ -32,8 +32,11 @@ struct SegmentOutcome {
 
 /// Pages a segment must have processed before it is a split candidate.
 const SPLIT_MIN_PAGES: u32 = 5;
-/// Reactor split/heartbeat tick.
-const SPLIT_CHECK_INTERVAL_SECS: u64 = 1;
+/// Reactor split-probe cadence. Sub-second so cold-start fan-out on flat
+/// namespaces — where startup discovery finds no structure and runtime
+/// splitting is the only mechanism that fans out — ramps toward full
+/// concurrency in a few page-latencies instead of one segment per second.
+const SPLIT_CHECK_INTERVAL_MS: u64 = 200;
 /// Maximum ancestor-directory probe rungs per split attempt.
 const SPLIT_PROBE_MAX_RUNGS: usize = 4;
 
@@ -303,7 +306,7 @@ async fn flat_reactor_task(
     let mut last_ts = epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
-    let mut split_check = tokio::time::interval(Duration::from_secs(SPLIT_CHECK_INTERVAL_SECS));
+    let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -408,13 +411,15 @@ async fn flat_reactor_task(
                 }
 
                 // Idle capacity and nothing queued: probe the longest-running
-                // candidate for a structural split point.
+                // candidates for structural split points, enough to fill the
+                // idle slots in one pass instead of one segment per tick.
                 if allow_split
                     && set.len() < flat_concurrency
                     && pending_children.is_empty()
                     && hints.is_empty()
                 {
-                    maybe_start_split_probe(ctx, start_prefix, &controls);
+                    let idle = flat_concurrency - set.len();
+                    maybe_start_split_probes(ctx, start_prefix, &controls, idle);
                 }
             },
         }
@@ -430,48 +435,79 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
 }
 
-/// Pick the busiest splittable in-flight segment and probe it in the
-/// background.  The probe only proposes a cut; the segment task decides.
-fn maybe_start_split_probe(
+/// Choose which in-flight segments to probe for a split this tick.  Returns
+/// segment indices busiest-first (most pages = most remaining range), bounded
+/// so that total outstanding probes never exceed the idle slots: probes
+/// already in flight (segments marked `splitting`, including ones with a
+/// proposal pending acceptance) count against the budget.  This fills all
+/// idle slots in a single pass while keeping probe-request cost bounded on
+/// rate-limited providers.
+fn select_split_targets(
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+    idle_capacity: usize,
+) -> Vec<usize> {
+    let in_flight = controls
+        .values()
+        .filter(|c| c.splitting.load(Ordering::Relaxed))
+        .count();
+    let budget = idle_capacity.saturating_sub(in_flight);
+    if budget == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(usize, u32)> = controls
+        .iter()
+        .filter(|(_, c)| c.is_split_candidate())
+        .map(|(index, c)| (*index, c.pages.load(Ordering::Relaxed)))
+        .collect();
+    // Busiest first; index breaks ties for deterministic selection.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    candidates
+        .into_iter()
+        .take(budget)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Probe the busiest splittable in-flight segments in the background, up to
+/// the idle-slot budget.  Each probe only proposes a cut; the segment task
+/// decides at its next page boundary.
+fn maybe_start_split_probes(
     ctx: &S3TaskContext,
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
+    idle_capacity: usize,
 ) {
-    let candidate = controls
-        .iter()
-        .filter(|(_, c)| c.is_split_candidate())
-        .max_by_key(|(_, c)| c.pages.load(Ordering::Relaxed));
-    let Some((&index, control)) = candidate else {
-        return;
-    };
-
-    control.splitting.store(true, Ordering::Relaxed);
-    let control = Arc::clone(control);
-    let probe_ctx = ctx.clone();
-    let listing_prefix = start_prefix.to_string();
-    tokio::spawn(async move {
-        let (cursor, end) = control.snapshot();
-        if cursor.is_empty() {
-            control.splitting.store(false, Ordering::Relaxed);
-            return;
-        }
-        match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await {
-            Some(mid) => {
-                debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
-                *control.pending_split.lock().unwrap() = Some(mid);
-                // The segment task clears `splitting` when it accepts or
-                // rejects the proposal at its next page boundary.
-            }
-            None => {
-                debug!(
-                    "Split probe for segment {}: no structural boundary in remaining range",
-                    index
-                );
-                control.unsplittable.store(true, Ordering::Relaxed);
+    for index in select_split_targets(controls, idle_capacity) {
+        let control = Arc::clone(&controls[&index]);
+        control.splitting.store(true, Ordering::Relaxed);
+        let probe_ctx = ctx.clone();
+        let listing_prefix = start_prefix.to_string();
+        tokio::spawn(async move {
+            let (cursor, end) = control.snapshot();
+            if cursor.is_empty() {
                 control.splitting.store(false, Ordering::Relaxed);
+                return;
             }
-        }
-    });
+            match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await
+            {
+                Some(mid) => {
+                    debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
+                    *control.pending_split.lock().unwrap() = Some(mid);
+                    // The segment task clears `splitting` when it accepts or
+                    // rejects the proposal at its next page boundary.
+                }
+                None => {
+                    debug!(
+                        "Split probe for segment {}: no structural boundary in remaining range",
+                        index
+                    );
+                    control.unsplittable.store(true, Ordering::Relaxed);
+                    control.splitting.store(false, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 }
 
 // ── Run one segment to completion (with retry) ─────────────
@@ -1164,6 +1200,44 @@ mod tests {
         assert!(control.is_split_candidate());
         control.unsplittable.store(true, Ordering::Relaxed);
         assert!(!control.is_split_candidate(), "unsplittable is sticky");
+    }
+
+    fn control_with_pages(pages: u32) -> Arc<SegmentControl> {
+        let control = SegmentControl::new(None);
+        for i in 0..pages {
+            control.record_page(&format!("k{}", i));
+        }
+        Arc::new(control)
+    }
+
+    #[test]
+    fn test_select_split_targets_busiest_first_and_budget_bounded() {
+        let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+        controls.insert(0, control_with_pages(10)); // busiest
+        controls.insert(1, control_with_pages(6));
+        controls.insert(2, control_with_pages(SPLIT_MIN_PAGES));
+        controls.insert(3, control_with_pages(SPLIT_MIN_PAGES - 1)); // below threshold
+
+        // Two idle slots, nothing in flight: the two busiest candidates,
+        // busiest first. The sub-threshold segment is never selected.
+        assert_eq!(select_split_targets(&controls, 2), vec![0, 1]);
+        // Ample idle capacity: every eligible candidate, still ordered.
+        assert_eq!(select_split_targets(&controls, 10), vec![0, 1, 2]);
+        // No idle capacity: no probes.
+        assert!(select_split_targets(&controls, 0).is_empty());
+    }
+
+    #[test]
+    fn test_select_split_targets_counts_in_flight_against_budget() {
+        let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+        controls.insert(0, control_with_pages(10));
+        controls.insert(1, control_with_pages(8));
+        // Segment 0 is already probing: excluded as a candidate and it spends
+        // one unit of the idle budget so total outstanding probes stay bounded.
+        controls[&0].splitting.store(true, Ordering::Relaxed);
+
+        assert_eq!(select_split_targets(&controls, 2), vec![1]);
+        assert!(select_split_targets(&controls, 1).is_empty());
     }
 }
 
