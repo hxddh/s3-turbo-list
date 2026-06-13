@@ -212,9 +212,7 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
                         right_obj(&key, 100, [7; 16])
                     };
                     batch.push(obj);
-                    if batch.len() == BATCH
-                        && tx.send(std::mem::take(&mut batch)).await.is_err()
-                    {
+                    if batch.len() == BATCH && tx.send(std::mem::take(&mut batch)).await.is_err() {
                         return;
                     }
                 }

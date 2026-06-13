@@ -852,8 +852,7 @@ fn test_cli_removed_subcommands_are_gone() {
         let (code, _stdout, stderr) = run_cli(&[cmd, "--help"]);
         assert_ne!(code, 0, "{} should no longer be a valid subcommand", cmd);
         assert!(
-            stderr.contains("unrecognized subcommand")
-                || stderr.contains("unexpected argument"),
+            stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
             "{} removal should produce a clap error, got: {}",
             cmd,
             stderr
