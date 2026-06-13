@@ -236,37 +236,6 @@ enum Commands {
         json: bool,
     },
 
-    /// Merge local TOML/plain hints files without contacting S3
-    HintsMerge {
-        /// Input hints files
-        #[arg(required = true)]
-        inputs: Vec<String>,
-
-        /// Output hints file path; content is always TOML regardless of extension
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Output format for the command report
-        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-        output_format: ReportFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit JSON report with stdout reserved for machine-readable output
-        #[arg(long)]
-        machine_readable: bool,
-
-        /// Write local tooling manifest JSON to this path
-        #[arg(long)]
-        emit_manifest: Option<String>,
-
-        /// Allow replacing an existing output hints file
-        #[arg(long)]
-        overwrite: bool,
-    },
-
     /// Summarize a local --trace-compat JSONL file without contacting S3
     TraceSummary {
         /// Trace JSONL file
@@ -553,26 +522,6 @@ fn main() {
         }
         Commands::Profiles { cmd } => {
             run_profiles(cmd);
-            return;
-        }
-        Commands::HintsMerge {
-            inputs,
-            output,
-            output_format,
-            json,
-            machine_readable,
-            emit_manifest,
-            overwrite,
-        } => {
-            run_hints_merge(
-                inputs,
-                output.as_deref(),
-                cli.dry_run,
-                *overwrite,
-                *output_format,
-                *json || *machine_readable || cli.agent,
-                emit_manifest.as_deref(),
-            );
             return;
         }
         Commands::TraceSummary {
@@ -910,8 +859,7 @@ fn main() {
         Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
             unreachable!("local-only commands are handled before config load")
         }
-        Commands::HintsMerge { .. }
-        | Commands::TraceSummary { .. }
+        Commands::TraceSummary { .. }
         | Commands::ManifestSummary { .. }
         | Commands::InitConfig { .. }
         | Commands::Recipes { .. }
@@ -1584,44 +1532,6 @@ fn run_quickstart(provider: &str) {
         Ok(rendered) => print!("{}", rendered),
         Err(e) => {
             eprintln!("Quickstart error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-fn run_hints_merge(
-    inputs: &[String],
-    output: Option<&str>,
-    dry_run: bool,
-    overwrite: bool,
-    output_format: ReportFormat,
-    json: bool,
-    emit_manifest: Option<&str>,
-) {
-    match local_tools::merge_hints_files(inputs, output, dry_run, overwrite) {
-        Ok(report) => {
-            if let Some(manifest_path) = emit_manifest {
-                let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
-                if let Err(e) = local_tools::write_local_manifest(
-                    manifest_path,
-                    "hints-merge",
-                    inputs,
-                    &outputs,
-                    &report,
-                    &report.warnings,
-                ) {
-                    eprintln!("Manifest write error: {}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
-                }
-            }
-            if json || output_format == ReportFormat::Json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                print!("{}", local_tools::render_merge_text(&report));
-            }
-        }
-        Err(e) => {
-            eprintln!("Hints merge failed: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -2953,7 +2863,6 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         Commands::HintsValidate { .. } => {
             ("hints-validate".to_string(), None, None, None, None, None)
         }
-        Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None, None),
         Commands::TraceSummary { .. } => {
             ("trace-summary".to_string(), None, None, None, None, None)
         }

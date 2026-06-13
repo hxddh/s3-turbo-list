@@ -24,7 +24,6 @@ s3-turbo-list --dry-run --agent --summary-only list --bucket my-bucket --region 
 s3-turbo-list manifest-summary run.json --json
 s3-turbo-list manifest-summary run.json --check
 s3-turbo-list trace-summary trace.jsonl --machine-readable
-s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
 ```
 
 `config-inspect --json` prints the resolved local configuration after TOML,
@@ -53,10 +52,9 @@ without editing TOML.  The default is `zstd(1)`; use
 `--compression gzip --compression-level 6` when a downstream reader requires
 traditional gzip output.
 
-`init-config`, `recipes`, `quickstart`, `cheatsheet`, `trace-summary`,
-and `hints-merge` are local tooling commands.  They are
-handled before S3 config loading, do not require cloud credentials, and do not
-change list/diff hot-path behavior.
+`init-config`, `recipes`, `quickstart`, `cheatsheet`, and `trace-summary`
+are local tooling commands.  They are handled before S3 config loading, do not
+require cloud credentials, and do not change list/diff hot-path behavior.
 
 ## Dry-run plan files
 
@@ -257,23 +255,17 @@ Use the manifest for final run status and aggregate metrics.  Use trace JSONL
 for endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
 metadata, and retry details.
 
-## Trace-driven hints tooling
+## Trace-driven inspection
 
-The local hints tooling commands support machine-readable output for agents:
+The local trace tooling supports machine-readable output for agents:
 
 ```bash
 s3-turbo-list trace-summary trace.jsonl --output-format json
-
-s3-turbo-list hints-merge \
-  base.toml prefixes.txt \
-  --output merged.toml \
-  --emit-manifest merge.manifest.json \
-  --machine-readable
 ```
 
-`--machine-readable` is an alias for JSON report output on these commands.
+`--machine-readable` is an alias for JSON report output on this command.
 Warnings and recommendations are JSON fields, so agents should not scrape human
-text.  `--emit-manifest` records input/output file hashes for reproducibility.
+text.
 
 Long-tail segments no longer need offline rebalancing: list runs split them
 at runtime automatically.
@@ -281,7 +273,7 @@ at runtime automatically.
 ## Safety expectations
 
 - `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
-- `trace-summary` and `hints-merge` are local-only.
+- `trace-summary` is local-only.
 - `list`, `diff`, and `compat-probe` can contact S3 unless combined with
   `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS

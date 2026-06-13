@@ -1,5 +1,3 @@
-use crate::auto_hints::{HintsCache, SegmentEstimate};
-use crate::hints;
 use crate::profiles;
 use crate::trace::S3CompatEvent;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -7,41 +5,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ArtifactSummary {
-    pub path: String,
-    pub exists: bool,
-    pub size_bytes: Option<u64>,
-    pub sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LocalToolManifest {
-    pub schema_version: u32,
-    pub tool_version: String,
-    pub command: String,
-    pub generated_at: String,
-    pub status: String,
-    pub inputs: Vec<ArtifactSummary>,
-    pub outputs: Vec<ArtifactSummary>,
-    pub warnings: Vec<String>,
-    pub summary: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HintsMergeReport {
-    pub status: String,
-    pub input_files: Vec<String>,
-    pub input_count: usize,
-    pub boundary_count_before_dedup: usize,
-    pub boundary_count: usize,
-    pub duplicate_count: usize,
-    pub output: Option<String>,
-    pub output_written: bool,
-    pub dry_run: bool,
-    pub warnings: Vec<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitConfigReport {
@@ -170,56 +133,6 @@ pub struct ManifestCheckSummary {
 #[derive(Debug, Clone)]
 struct TraceAnalysis {
     report: TraceSummaryReport,
-}
-
-pub fn merge_hints_files(
-    inputs: &[String],
-    output: Option<&str>,
-    dry_run: bool,
-    overwrite: bool,
-) -> Result<HintsMergeReport, String> {
-    if inputs.is_empty() {
-        return Err("hints-merge requires at least one input file".to_string());
-    }
-
-    let mut all = Vec::new();
-    let mut warnings = Vec::new();
-    for path in inputs {
-        let boundaries = hints::parse_hints_file(path)?;
-        if boundaries.is_empty() {
-            warnings.push(format!("input '{}' contains no boundaries", path));
-        }
-        all.extend(boundaries);
-    }
-
-    let before = all.len();
-    all.sort();
-    all.dedup();
-    let duplicate_count = before.saturating_sub(all.len());
-
-    let output_written = if let Some(path) = output {
-        if dry_run {
-            false
-        } else {
-            write_hints_cache(path, "merged", None, all.clone(), Some(inputs), overwrite)?;
-            true
-        }
-    } else {
-        false
-    };
-
-    Ok(HintsMergeReport {
-        status: "success".to_string(),
-        input_files: inputs.to_vec(),
-        input_count: inputs.len(),
-        boundary_count_before_dedup: before,
-        boundary_count: all.len(),
-        duplicate_count,
-        output: output.map(str::to_string),
-        output_written,
-        dry_run,
-        warnings,
-    })
 }
 
 pub fn trace_summary(path: &str) -> Result<TraceSummaryReport, String> {
@@ -1096,48 +1009,6 @@ pub fn render_trace_summary_markdown(report: &TraceSummaryReport) -> String {
     out
 }
 
-pub fn render_merge_text(report: &HintsMergeReport) -> String {
-    let mut out = String::new();
-    out.push_str("Hints merge:\n");
-    out.push_str(&format!("  Inputs:          {}\n", report.input_count));
-    out.push_str(&format!(
-        "  Boundaries:      {} -> {}\n",
-        report.boundary_count_before_dedup, report.boundary_count
-    ));
-    out.push_str(&format!("  Duplicates:      {}\n", report.duplicate_count));
-    out.push_str(&format!(
-        "  Output:          {}\n",
-        report.output.as_deref().unwrap_or("-")
-    ));
-    out.push_str(&format!("  Output written:  {}\n", report.output_written));
-    append_warnings_and_recommendations(&mut out, &report.warnings, &[]);
-    out
-}
-
-pub fn write_local_manifest<T: Serialize>(
-    path: &str,
-    command: &str,
-    input_paths: &[String],
-    output_paths: &[String],
-    report: &T,
-    warnings: &[String],
-) -> Result<(), String> {
-    let manifest = LocalToolManifest {
-        schema_version: 1,
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        command: command.to_string(),
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        status: "success".to_string(),
-        inputs: input_paths.iter().map(|p| summarize_artifact(p)).collect(),
-        outputs: output_paths.iter().map(|p| summarize_artifact(p)).collect(),
-        warnings: warnings.to_vec(),
-        summary: serde_json::to_value(report).map_err(|e| e.to_string())?,
-    };
-    let rendered = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    std::fs::write(path, rendered)
-        .map_err(|e| format!("failed to write manifest '{}': {}", path, e))
-}
-
 fn analyze_trace(path: &str) -> Result<TraceAnalysis, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read trace '{}': {}", path, e))?;
@@ -1257,52 +1128,6 @@ fn summarize_imbalance(segments: &[SegmentSummary]) -> Option<ImbalanceSummary> 
     })
 }
 
-fn write_hints_cache(
-    path: &str,
-    bucket: &str,
-    region: Option<String>,
-    boundaries: Vec<String>,
-    sources: Option<&[String]>,
-    overwrite: bool,
-) -> Result<(), String> {
-    ensure_can_write(path, overwrite)?;
-    let cache = HintsCache {
-        bucket: bucket.to_string(),
-        region,
-        prefix: None,
-        total_objects: 0,
-        boundaries,
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        source_count: sources.map(|s| s.len()),
-        source_files: sources.map(|s| s.to_vec()).unwrap_or_default(),
-        max_keys: None,
-        max_prefix_entries: None,
-        prefix_counts_truncated: false,
-        scan_mode: None,
-        sampled_objects: None,
-        sampled_pages: None,
-        sample_limit: None,
-        max_pages: None,
-        estimate_mode: Some("local-tooling".to_string()),
-        segment_estimates: Vec::<SegmentEstimate>::new(),
-    };
-    let rendered = toml::to_string_pretty(&cache)
-        .map_err(|e| format!("failed to serialize hints TOML: {}", e))?;
-    if let Some(parent) = Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "failed to create output directory '{}': {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-    std::fs::write(path, rendered).map_err(|e| format!("failed to write '{}': {}", path, e))
-}
-
 fn ensure_can_write(path: &str, overwrite: bool) -> Result<(), String> {
     if !overwrite && Path::new(path).exists() {
         return Err(format!(
@@ -1397,19 +1222,6 @@ fn append_warnings_and_recommendations(out: &mut String, warnings: &[String], re
         for rec in recs {
             out.push_str(&format!("    - {}\n", rec));
         }
-    }
-}
-
-fn summarize_artifact(path: &str) -> ArtifactSummary {
-    let meta = std::fs::metadata(path);
-    let exists = meta.is_ok();
-    let size_bytes = meta.ok().map(|m| m.len());
-    let sha256 = exists.then(|| sha256_file(path).ok()).flatten();
-    ArtifactSummary {
-        path: path.to_string(),
-        exists,
-        size_bytes,
-        sha256,
     }
 }
 

@@ -64,7 +64,7 @@ beta/
 logs/
 ```
 
-**TOML** (written by startup discovery and `hints-merge`):
+**TOML** (written by startup discovery):
 
 ```toml
 bucket = "my-bucket"
@@ -79,7 +79,6 @@ Local tooling (no S3 access):
 
 ```bash
 s3-turbo-list hints-validate --hints-file hints.toml
-s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
 ```
 
 The `auto-hints` and `discover-prefixes` scan commands were **removed in
@@ -162,15 +161,13 @@ CLI flags exist for common runtime controls such as `--threads`,
 `--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
 `--max-keys`, `--start-after`, and output file paths.
 
-## Trace-Driven Hints Iteration
+## Trace-Driven Inspection
 
-For repeated inventories, hints can still be curated locally:
+After a run, inspect segment balance from the `--trace-compat` JSONL locally:
 
 ```bash
 s3-turbo-list trace-summary trace.jsonl
-s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
 ```
 
-These commands read local files only; they do not contact S3.  Long-tail
-segments are split at runtime automatically, so no offline rebalancing
-workflow is needed.
+This reads local files only and does not contact S3.  Long-tail segments are
+split at runtime automatically, so no offline rebalancing workflow is needed.

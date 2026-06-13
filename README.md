@@ -137,8 +137,8 @@ range has structure, and cursor-derived single-key probes when it is flat.
 Skewed and flat buckets alike scale out instead of serializing.
 
 Explicit `--hints-file` control remains available for repeated inventories;
-hints file formats, boundary semantics, local tooling (`hints-validate`,
-`hints-merge`), and all runtime tuning knobs are documented in
+hints file formats, boundary semantics, local tooling (`hints-validate`), and
+all runtime tuning knobs are documented in
 [`docs/tuning.md`](docs/tuning.md). Automatic startup discovery and runtime
 splitting partition buckets with zero flags, so no separate scan command is
 needed.

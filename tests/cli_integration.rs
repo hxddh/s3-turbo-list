@@ -170,10 +170,6 @@ fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["manifest-summary", "--help"]);
     assert_eq!(code, 0, "manifest-summary --help should exit 0");
     assert!(stdout.contains("--json"));
-
-    let (code, stdout, _stderr) = run_cli(&["hints-merge", "--help"]);
-    assert_eq!(code, 0, "hints-merge --help should exit 0");
-    assert!(stdout.contains("--emit-manifest"));
 }
 
 #[test]
@@ -1940,60 +1936,6 @@ fn test_cli_hints_validate_malformed_failure() {
         run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
     assert_ne!(code, 0, "malformed hints should fail");
     assert!(stderr.contains("Hints validation failed"));
-}
-
-#[test]
-fn test_cli_hints_merge_json_writes_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.txt");
-    let b = dir.path().join("b.toml");
-    let out = dir.path().join("merged.toml");
-    let manifest = dir.path().join("merge.manifest.json");
-    std::fs::write(&a, "logs/a/\nlogs/c/\n").unwrap();
-    std::fs::write(
-        &b,
-        r#"bucket = "b"
-total_objects = 0
-boundaries = ["logs/b/", "logs/c/"]
-generated_at = "2026-05-19T00:00:00Z"
-"#,
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run_cli(&[
-        "hints-merge",
-        a.to_str().unwrap(),
-        b.to_str().unwrap(),
-        "--output",
-        out.to_str().unwrap(),
-        "--emit-manifest",
-        manifest.to_str().unwrap(),
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["boundary_count"], 3);
-    assert_eq!(json["duplicate_count"], 1);
-    assert_eq!(json["output_written"], true);
-
-    let merged = std::fs::read_to_string(&out).unwrap();
-    assert!(merged.contains("logs/a/"));
-    assert!(merged.contains("logs/b/"));
-    assert!(merged.contains("logs/c/"));
-
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["command"], "hints-merge");
-    assert_eq!(manifest_json["outputs"].as_array().unwrap().len(), 1);
-
-    let (code, _stdout, stderr) = run_cli(&[
-        "hints-merge",
-        a.to_str().unwrap(),
-        "--output",
-        out.to_str().unwrap(),
-    ]);
-    assert_ne!(code, 0);
-    assert!(stderr.contains("Output file exists"));
 }
 
 #[test]
