@@ -53,8 +53,8 @@ async fn merge(
     let mut parquet = AsyncParquetOutput::new(writer, "unused.ks");
     let outcome = run_diff_merge(
         DiffStreamSides {
-            left: lrx,
-            right: rrx,
+            left: vec![lrx],
+            right: vec![rrx],
         },
         &mut parquet,
     )

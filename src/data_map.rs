@@ -665,14 +665,19 @@ fn epoch_secs() -> u64 {
 // — and streams rows straight to Parquet.  Memory is bounded by the
 // channel buffers instead of the combined object count.
 
-/// Receiver pair for the two diff sides.
+/// Per-side, segment-ordered receivers for the two diff sides.  Segments
+/// are static key-space partitions, so draining the receivers in index
+/// order yields one globally ordered stream per side while the segments
+/// themselves list in parallel (bounded by each channel's small capacity,
+/// which acts as the prefetch window).
 pub struct DiffStreamSides {
-    pub left: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
-    pub right: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
+    pub left: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+    pub right: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
 }
 
 struct DiffSideStream {
-    rx: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
+    rx: Option<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+    pending: std::vec::IntoIter<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
     buf: std::collections::VecDeque<(ObjectKey, ObjectProps)>,
     closed: bool,
     last_key: Option<String>,
@@ -683,11 +688,14 @@ struct DiffSideStream {
 
 impl DiffSideStream {
     fn new(
-        rx: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
+        receivers: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
         name: &'static str,
     ) -> Self {
+        let mut pending = receivers.into_iter();
+        let rx = pending.next();
         Self {
             rx,
+            pending,
             buf: std::collections::VecDeque::new(),
             closed: false,
             last_key: None,
@@ -697,13 +705,25 @@ impl DiffSideStream {
         }
     }
 
+    /// Receive the next batch, advancing through the segment receivers in
+    /// index order as each segment's channel closes.
+    async fn recv_next(&mut self) -> Option<Vec<(ObjectKey, ObjectProps)>> {
+        loop {
+            let rx = self.rx.as_mut()?;
+            match rx.recv().await {
+                Some(batch) => return Some(batch),
+                None => self.rx = self.pending.next(),
+            }
+        }
+    }
+
     /// Fill the buffer until it has an item or the side is exhausted.
-    /// Enforces ascending key order (the merge's correctness contract) and
-    /// keeps the latest entry for same-key duplicates, matching the legacy
-    /// map-based behavior.
+    /// Enforces ascending key order (the merge's correctness contract,
+    /// including across segment transitions) and keeps the latest entry for
+    /// same-key duplicates, matching the legacy map-based behavior.
     async fn ensure_filled(&mut self) -> Result<bool, String> {
         while self.buf.is_empty() && !self.closed {
-            match self.rx.recv().await {
+            match self.recv_next().await {
                 Some(batch) => {
                     self.received_batches += 1;
                     self.received_objects += batch.len();

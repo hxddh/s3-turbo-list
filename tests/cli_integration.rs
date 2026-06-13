@@ -1354,8 +1354,8 @@ fn test_cli_rejects_diff_with_explicit_hints_file() {
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stderr.contains("diff with --hints-file is unsupported by design"));
-    assert!(stderr.contains("authoritative single-segment comparison"));
-    assert!(stderr.contains("left-only or right-only"));
+    assert!(stderr.contains("unsupported by design"));
+    assert!(stderr.contains("cannot describe both sides"));
     assert!(!stderr.contains("v0.2.x"));
 }
 
@@ -1373,7 +1373,7 @@ fn test_cli_rejects_diff_with_resume() {
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stderr.contains("diff --resume is unsupported by design"));
-    assert!(stderr.contains("authoritative single-segment comparison"));
+    assert!(stderr.contains("unsupported by design"));
     assert!(stderr.contains("partial paired comparisons"));
     assert!(!stderr.contains("v0.2.x"));
 }
@@ -1859,7 +1859,7 @@ estimate_mode = "full"
     );
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["hints"]["source"], "disabled_for_diff_single_segment");
+    assert_eq!(json["hints"]["source"], "diff_per_side_automatic");
     assert_eq!(json["hints"]["exists"], true);
     assert_eq!(json["hints"]["boundary_count"], 1);
     assert!(json["hints"]["warnings"]
@@ -1870,19 +1870,13 @@ estimate_mode = "full"
             warning
                 .as_str()
                 .unwrap()
-                .contains("conventional hints caches are intentionally ignored")
+                .contains("partitions each side automatically")
         }));
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
             .unwrap()
-            .contains("authoritative single-segment mode")
-    }));
-    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning
-            .as_str()
-            .unwrap()
-            .contains("left-only or right-only")
+            .contains("partitions each side automatically")
     }));
 }
 

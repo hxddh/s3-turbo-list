@@ -2079,47 +2079,51 @@ estimate_mode = "full"
 }
 
 #[test]
-fn local_mock_diff_ignores_conventional_hints_cache() {
-    let server = MockS3Server::start(|request, _sequence| {
-        if request.query.contains_key("start-after") {
-            return MockResponse::error(
-                500,
-                "UnexpectedHints",
-                "diff should ignore conventional hints and use single-segment listing",
-            );
-        }
-        let contents = if request.path.contains("/left") {
-            vec!["left-only.txt", "same.txt"]
+fn local_mock_diff_lists_sides_in_parallel_segments() {
+    // v0.7: diff partitions each side automatically. The left side has a
+    // cached hints boundary ("m/") and must list two segments; the right
+    // side has no cache and a flat namespace, so discovery yields a single
+    // segment. The merge must classify across segment boundaries with
+    // every key exactly once.
+    let left_keys = ["a.txt", "left-only.txt", "z-extra.txt"];
+    let right_keys = ["a.txt", "right-only.txt", "z-extra.txt"];
+
+    let server = MockS3Server::start(move |request, _sequence| {
+        let bucket_keys: &[&str] = if request.path.contains("/left") {
+            &left_keys
         } else if request.path.contains("/right") {
-            vec!["right-only.txt", "same.txt"]
+            &right_keys
         } else {
             return MockResponse::error(500, "UnexpectedBucket", &request.path);
         };
-        MockResponse::ok_xml(list_bucket_xml(
-            request
-                .query
-                .get("prefix")
-                .map(String::as_str)
-                .unwrap_or(""),
-            1000,
-            &contents,
-            &[],
-            false,
-            None,
-        ))
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Right-side startup discovery: flat namespace, no structure.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let contents: Vec<&str> = bucket_keys
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &contents, &[], false, None))
     });
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("diff.parquet");
     let ks = dir.path().join("diff.ks");
-    let manifest = dir.path().join("run.json");
     write_fast_config(&config);
+    // Cached hints partition the left side at "m/".
     std::fs::write(
         dir.path().join("us-east-1_left_hints.toml"),
         r#"bucket = "left"
 region = "us-east-1"
-total_objects = 2
+total_objects = 3
 boundaries = ["m/"]
 generated_at = "2026-05-18T00:00:00Z"
 scan_mode = "full"
@@ -2135,8 +2139,6 @@ estimate_mode = "full"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
-        "--run-manifest".into(),
-        manifest.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
         "--output-ks-file".into(),
@@ -2156,34 +2158,29 @@ estimate_mode = "full"
 
     let mut keys = parquet_keys(&parquet);
     keys.sort();
-    assert_eq!(keys, vec!["left-only.txt", "right-only.txt", "same.txt"]);
+    assert_eq!(
+        keys,
+        vec!["a.txt", "left-only.txt", "right-only.txt", "z-extra.txt"]
+    );
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2, "{:#?}", requests);
+    // Left side lists two segments: one chain from the start, one from m/.
+    let left_lists: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.contains("/left") && !r.query.contains_key("delimiter"))
+        .collect();
+    assert_eq!(left_lists.len(), 2, "{:#?}", left_lists);
+    assert!(left_lists
+        .iter()
+        .any(|r| !r.query.contains_key("start-after")));
+    assert!(left_lists
+        .iter()
+        .any(|r| r.query.get("start-after").map(String::as_str) == Some("m/")));
+    // Right side: discovery probe plus one listing chain.
     assert!(requests
         .iter()
-        .all(|request| !request.query.contains_key("start-after")));
-
-    let manifest_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert!(manifest_json["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| warning
-            .as_str()
-            .unwrap()
-            .contains("authoritative single-segment mode")));
-    assert!(manifest_json["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| warning
-            .as_str()
-            .unwrap()
-            .contains("left-only or right-only")));
+        .any(|r| r.path.contains("/right") && r.query.contains_key("delimiter")));
 }
-
 #[test]
 fn local_mock_auto_hints_uses_prefix_and_max_keys() {
     let server = MockS3Server::start(|request, _sequence| {

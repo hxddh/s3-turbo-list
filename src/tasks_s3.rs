@@ -1214,3 +1214,81 @@ mod flat_cut_tests {
         }
     }
 }
+
+// ── Diff: parallel per-side listing ────────────────────────
+//
+// Diff sides list their static key-space segments in parallel; the merge
+// consumes each side's segment channels in index order, which yields one
+// globally ordered stream per side (segment k's keys all precede segment
+// k+1's by boundary construction). Each segment's small channel acts as
+// the prefetch window, bounding memory. Runtime splitting stays disabled
+// for diff: the segment set must remain static for ordered consumption.
+
+/// Per-segment channel capacity (batches) — the diff prefetch window.
+pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 4;
+/// Upper bound on concurrently listing segments per diff side.
+const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+
+/// List one diff side across its static segments, writing each segment's
+/// batches to the index-aligned sender. Any segment failure marks the run
+/// fatal (non-zero exit), exactly like list mode.
+pub async fn diff_list_side_task(
+    ctx: &S3TaskContext,
+    start_prefix: &str,
+    concurrency: usize,
+    boundaries: &[String],
+    senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>>,
+) {
+    ctx.start();
+    ctx.g_state.wait_to_start().await;
+
+    let mut hints = KeySpaceHints::new_from(boundaries);
+    assert_eq!(
+        hints.total_count(),
+        senders.len(),
+        "diff side senders must align with segments"
+    );
+    info!(
+        "Diff List S3 Task — {} — started, {} segments",
+        ctx.s3_bucket_name,
+        senders.len()
+    );
+
+    let concurrency = concurrency.clamp(1, DIFF_SIDE_MAX_CONCURRENCY);
+    let mut senders = senders.into_iter();
+    let mut set = tokio::task::JoinSet::new();
+
+    loop {
+        while set.len() < concurrency {
+            let Some(pair) = hints.next() else { break };
+            let sender = senders.next().expect("sender per segment");
+            let mut task_ctx = ctx.clone();
+            task_ctx.data_map_channel = sender;
+            let start_prefix = start_prefix.to_string();
+            let control = Arc::new(SegmentControl::new(pair.end));
+            let index = pair.index;
+            let start = pair.start;
+            set.spawn(async move {
+                flat_list_run_to_complete(&task_ctx, index, &start_prefix, &start, &control, None)
+                    .await
+            });
+        }
+
+        if set.is_empty() {
+            break;
+        }
+        match set.join_next().await {
+            Some(Ok(_completed)) => {}
+            Some(Err(e)) => error!("Diff segment join error: {:?}", e),
+            None => break,
+        }
+        if ctx.is_quit() {
+            set.abort_all();
+            info!("Diff List S3 Task — {} — aborted", ctx.s3_bucket_name);
+            break;
+        }
+    }
+
+    ctx.complete();
+    info!("Diff List S3 Task — {} — completed", ctx.s3_bucket_name);
+}

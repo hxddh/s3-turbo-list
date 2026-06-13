@@ -505,7 +505,7 @@ pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>
         .and_then(inspect_hints_for_plan);
 
     HintsPlan {
-        source: "disabled_for_diff_single_segment".to_string(),
+        source: "diff_per_side_automatic".to_string(),
         path,
         exists,
         valid: report.as_ref().map(|r| r.valid),
@@ -515,7 +515,7 @@ pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>
         boundary_count: report.as_ref().map(|r| r.boundary_count),
         estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
         warnings: vec![
-            "diff uses authoritative single-segment mode; conventional hints caches are intentionally ignored for diff to avoid incomplete left-only or right-only results"
+            "diff partitions each side automatically (cached hints or startup discovery); explicit --hints-file and --resume remain unsupported for diff"
                 .to_string(),
         ],
     }

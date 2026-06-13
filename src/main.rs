@@ -1113,16 +1113,13 @@ fn main() {
         let channel_capacity = cfg.channel.capacity;
         let sdk_config = core::S3TaskContext::load_sdk_config(&cfg.s3).await;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
-            channel_capacity,
-        );
-        // Diff streams each side over its own channel so the data-map task
-        // can merge-join the two ordered streams.
-        let (right_tx, right_rx) = if mode == RunMode::BiDir {
-            let (rtx, rrx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
+        // List mode streams over one channel; diff builds per-segment
+        // channels for each side further below.
+        let (tx, rx) = if mode != RunMode::BiDir {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
                 channel_capacity,
             );
-            (Some(rtx), Some(rrx))
+            (Some(tx), Some(rx))
         } else {
             (None, None)
         };
@@ -1249,61 +1246,78 @@ fn main() {
             info!("  endpoint: {}", ep);
         }
 
-        // ── Spawn list task (left) ──────────────────────────
-        let prefix = opt_prefix.clone();
-        let dir = if mode == RunMode::BiDir {
-            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE
-        } else {
-            core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE
-        };
+        // ── Spawn list / diff side tasks ─────────────────────
+        let is_diff = mode == RunMode::BiDir;
         let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
+        let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = None;
         let s3_cfg = cfg.s3.clone();
-        let task_ctx = core::S3TaskContext::new(
-            opt_bucket,
-            opt_region,
-            cfg.s3.endpoint_url.as_deref(),
-            cfg.s3.force_path_style,
-            &sdk_config,
-            &s3_cfg,
-            tx,
-            dir,
-            g_state.clone(),
-            trace_writer.clone(),
-            &cfg.s3.addressing_style.to_string(),
-            cfg.s3.profile.as_deref(),
-            Some(&cli.delimiter),
-            cli.max_keys,
-            cfg.s3.start_after.as_deref(),
-            cli.continuation_token.as_deref(),
-            left_checkpoint.clone(),
-        );
-        set.spawn(async move {
-            tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
-        });
+        let output_config = cfg.output.clone();
+        let filename_ks_for_task = filename_ks.clone();
+        let filename_output_for_task = filename_output.clone();
 
-        // ── Spawn list task (right) if diff mode ────────────
-        let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = if mode == RunMode::BiDir
-        {
-            let prefix = opt_prefix.clone();
+        if is_diff {
+            drop(hints); // diff partitions each side independently below
+
             let target_region: Option<&str> =
                 opt_target_region.and_then(|inner: Option<&str>| inner);
             let target_bucket: &str =
                 opt_target_bucket.expect("target_bucket required for diff mode");
-            let target_ks: Vec<String> = vec![];
-            let target_hints = core::KeySpaceHints::new_from(&target_ks);
 
-            let right_cp: Arc<std::sync::Mutex<Vec<usize>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
+            // Per-side boundaries from cached hints or startup discovery —
+            // the same automatic sources as list mode. Sides need not agree:
+            // each side only has to be a complete ordered partition of its
+            // own key space.
+            let left_bounds =
+                diff_side_boundaries(opt_bucket, opt_region, &opt_prefix, &cfg, &cli, &sdk_config)
+                    .await;
+            let right_bounds = diff_side_boundaries(
+                target_bucket,
+                target_region,
+                &opt_prefix,
+                &cfg,
+                &cli,
+                &sdk_config,
+            )
+            .await;
+            info!(
+                "  diff segments: left {}, right {}",
+                left_bounds.len() + 1,
+                right_bounds.len() + 1
+            );
 
-            let task_ctx = core::S3TaskContext::new(
+            let (left_senders, left_receivers) = diff_segment_channels(left_bounds.len() + 1);
+            let (right_senders, right_receivers) = diff_segment_channels(right_bounds.len() + 1);
+
+            // Base contexts; each segment task swaps in its own sender.
+            let (placeholder_tx, _) = tokio::sync::mpsc::channel(1);
+            let left_ctx = core::S3TaskContext::new(
+                opt_bucket,
+                opt_region,
+                cfg.s3.endpoint_url.as_deref(),
+                cfg.s3.force_path_style,
+                &sdk_config,
+                &s3_cfg,
+                placeholder_tx.clone(),
+                core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                g_state.clone(),
+                trace_writer.clone(),
+                &cfg.s3.addressing_style.to_string(),
+                cfg.s3.profile.as_deref(),
+                Some(&cli.delimiter),
+                cli.max_keys,
+                cfg.s3.start_after.as_deref(),
+                cli.continuation_token.as_deref(),
+                left_checkpoint.clone(),
+            );
+            let right_ctx = core::S3TaskContext::new(
                 target_bucket,
                 target_region,
                 cfg.s3.endpoint_url.as_deref(),
                 cfg.s3.force_path_style,
                 &sdk_config,
-                &cfg.s3,
-                right_tx.expect("diff mode allocates the right channel"),
+                &s3_cfg,
+                placeholder_tx,
                 core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
                 g_state.clone(),
                 trace_writer.clone(),
@@ -1313,47 +1327,92 @@ fn main() {
                 cli.max_keys,
                 cfg.s3.start_after.as_deref(),
                 cli.continuation_token.as_deref(),
-                right_cp.clone(),
+                left_checkpoint.clone(),
             );
-            set.spawn(async move {
-                tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, target_hints).await
-            });
-            Some(right_cp)
-        } else {
-            None
-        };
 
-        // ── Spawn data map task ─────────────────────────────
-        let is_diff = mode == RunMode::BiDir;
-        let output_config = cfg.output.clone();
-        let filename_ks_for_task = filename_ks.clone();
-        let filename_output_for_task = filename_output.clone();
-        if is_diff {
+            let prefix = opt_prefix.clone();
+            set.spawn(async move {
+                tasks_s3::diff_list_side_task(
+                    &left_ctx,
+                    &prefix,
+                    concurrency,
+                    &left_bounds,
+                    left_senders,
+                )
+                .await
+            });
+            let prefix = opt_prefix.clone();
+            set.spawn(async move {
+                tasks_s3::diff_list_side_task(
+                    &right_ctx,
+                    &prefix,
+                    concurrency,
+                    &right_bounds,
+                    right_senders,
+                )
+                .await
+            });
+
             let sides = data_map::DiffStreamSides {
-                left: rx,
-                right: right_rx.expect("diff mode allocates the right channel"),
+                left: left_receivers,
+                right: right_receivers,
             };
             let diff_g_state = g_state.clone();
+            let diff_ks = filename_ks_for_task.clone();
+            let diff_output = filename_output_for_task.clone();
+            let diff_output_config = output_config.clone();
             set.spawn(async move {
                 data_map::data_map_task_diff_streaming(
                     diff_g_state,
                     sides,
-                    &filename_ks_for_task,
-                    &filename_output_for_task,
-                    output_config,
+                    &diff_ks,
+                    &diff_output,
+                    diff_output_config,
                 )
                 .await
             });
+        } else {
+            let prefix = opt_prefix.clone();
+            let task_ctx = core::S3TaskContext::new(
+                opt_bucket,
+                opt_region,
+                cfg.s3.endpoint_url.as_deref(),
+                cfg.s3.force_path_style,
+                &sdk_config,
+                &s3_cfg,
+                tx.expect("list mode allocates the streaming channel"),
+                core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+                g_state.clone(),
+                trace_writer.clone(),
+                &cfg.s3.addressing_style.to_string(),
+                cfg.s3.profile.as_deref(),
+                Some(&cli.delimiter),
+                cli.max_keys,
+                cfg.s3.start_after.as_deref(),
+                cli.continuation_token.as_deref(),
+                left_checkpoint.clone(),
+            );
+            set.spawn(async move {
+                tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
+            });
+        }
+
+        // ── Spawn data map task (list modes) ─────────────────
+        if is_diff {
+            // spawned above alongside the side tasks
         } else if cli.summary_only {
+            let rx = rx.expect("list mode allocates the streaming channel");
             let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             set.spawn(async move { data_map::data_map_task_list_summary_only(data_map_ctx).await });
         } else if list_output_format.writes_stdout_rows() {
+            let rx = rx.expect("list mode allocates the streaming channel");
             let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             let text_format = data_map::ListTextOutputFormat::from(list_output_format);
             set.spawn(async move {
                 data_map::data_map_task_list_stdout(data_map_ctx, text_format).await
             });
         } else {
+            let rx = rx.expect("list mode allocates the streaming channel");
             let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(
@@ -1868,7 +1927,7 @@ fn validate_diff_hints_command(cli: &Cli) {
     }
     if cli.hints_file.is_some() {
         eprintln!(
-            "diff with --hints-file is unsupported by design: diff uses authoritative single-segment comparison to avoid incomplete left-only or right-only results; remove --hints-file to run diff"
+            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff"
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
@@ -1877,7 +1936,7 @@ fn validate_diff_hints_command(cli: &Cli) {
 fn validate_diff_resume_command(cli: &Cli) {
     if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
         eprintln!(
-            "diff --resume is unsupported by design: diff uses authoritative single-segment comparison and does not checkpoint partial paired comparisons; remove --resume to run diff"
+            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff"
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
@@ -2456,8 +2515,8 @@ fn run_benchmark_local_diff(
         });
 
         let sides = data_map::DiffStreamSides {
-            left: left_rx,
-            right: right_rx,
+            left: vec![left_rx],
+            right: vec![right_rx],
         };
         let merged: Result<data_map::DiffMergeOutcome, String> =
             if let (Some(parquet_path), Some(ks_path)) = (&parquet_path, &ks_path) {
@@ -2930,7 +2989,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     }
     if matches!(cli.cmd, Commands::Diff { .. }) {
         warnings.push(
-            "diff uses authoritative single-segment mode; hints and resume are intentionally unsupported for diff to avoid incomplete left-only or right-only results"
+            "diff partitions each side automatically; explicit --hints-file and --resume are intentionally unsupported for diff"
                 .to_string(),
         );
     }
@@ -3211,6 +3270,59 @@ fn planned_output_paths(
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
 /// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
 /// 3. Single-segment fallback (empty vec).
+type SegmentBatchSender = tokio::sync::mpsc::Sender<Vec<(core::ObjectKey, core::ObjectProps)>>;
+type SegmentBatchReceiver = tokio::sync::mpsc::Receiver<Vec<(core::ObjectKey, core::ObjectProps)>>;
+
+/// One small channel per diff segment; the capacity is the per-segment
+/// prefetch window, keeping memory bounded while segments list in parallel.
+fn diff_segment_channels(segments: usize) -> (Vec<SegmentBatchSender>, Vec<SegmentBatchReceiver>) {
+    (0..segments)
+        .map(|_| tokio::sync::mpsc::channel(tasks_s3::DIFF_SEGMENT_CHANNEL_CAP))
+        .unzip()
+}
+
+/// Key-space boundaries for one diff side: cached hints when present,
+/// otherwise startup structural discovery (cached for future runs). The
+/// same automatic sources as list mode; explicit --hints-file remains
+/// rejected for diff. Empty means single-segment, the pre-parallel
+/// behavior.
+async fn diff_side_boundaries(
+    bucket: &str,
+    region: Option<&str>,
+    prefix: &str,
+    cfg: &S3TurboConfig,
+    cli: &Cli,
+    sdk_config: &aws_config::SdkConfig,
+) -> Vec<String> {
+    if cli.no_auto_hints
+        || !cli.delimiter.is_empty()
+        || cfg.s3.profile.as_deref() == Some("bos")
+        || cfg.s3.start_after.is_some()
+    {
+        return Vec::new();
+    }
+
+    let cache_path = agent::conventional_hints_path(bucket, region);
+    if let Ok(boundaries) = hints::parse_hints_file(&cache_path) {
+        return boundaries;
+    }
+
+    let client = core::build_s3_client(
+        sdk_config,
+        region,
+        cfg.s3.endpoint_url.as_deref(),
+        cfg.s3.force_path_style,
+    );
+    let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
+    let boundaries = auto_hints::discover_startup_boundaries(&client, bucket, prefix, target).await;
+    if !boundaries.is_empty() {
+        if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
+            log::warn!("{}", e);
+        }
+    }
+    boundaries
+}
+
 // The region supplied by the active subcommand, used for profile endpoint
 // templating before the full command dispatch.
 fn command_region(cmd: &Commands) -> Option<&str> {
@@ -3250,7 +3362,7 @@ fn load_hints(
     if no_auto_hints {
         if disabled_for_diff {
             info!(
-                "diff mode uses single-segment authoritative fallback. Skipping conventional hints cache lookup."
+                "diff partitions each side independently; per-side hints/discovery are resolved later."
             );
         } else {
             info!(
