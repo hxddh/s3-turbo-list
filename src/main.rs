@@ -221,7 +221,9 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Auto-discover KeySpace hints via a sequential object scan
+    /// DEPRECATED: startup discovery and runtime splitting partition
+    /// buckets automatically; this command will be removed in a future
+    /// release
     AutoHints {
         /// AWS region
         #[arg(long)]
@@ -244,7 +246,9 @@ enum Commands {
         max_pages: Option<usize>,
     },
 
-    /// Discover delimiter CommonPrefixes and write prefix hints
+    /// DEPRECATED: startup discovery and runtime splitting partition
+    /// buckets automatically; this command will be removed in a future
+    /// release
     DiscoverPrefixes {
         /// AWS region
         #[arg(long)]
@@ -949,6 +953,7 @@ fn main() {
             sample_limit,
             max_pages,
         } => {
+            warn_deprecated_hints_command("auto-hints");
             run_auto_hints(
                 region.as_deref(),
                 bucket,
@@ -967,6 +972,7 @@ fn main() {
             max_pages,
             toml,
         } => {
+            warn_deprecated_hints_command("discover-prefixes");
             run_discover_prefixes(
                 region.as_deref(),
                 bucket,
@@ -3302,6 +3308,15 @@ fn run_compat_probe(
             std::process::exit(agent::ExitCode::OutputWrite.code());
         }
     });
+}
+
+fn warn_deprecated_hints_command(name: &str) {
+    eprintln!(
+        "warning: {} is deprecated — startup discovery and runtime splitting \
+         partition buckets automatically; this command will be removed in a \
+         future release",
+        name
+    );
 }
 
 fn run_auto_hints(

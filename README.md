@@ -136,18 +136,12 @@ workers automatically — using real `CommonPrefixes` boundaries when the
 range has structure, and cursor-derived single-key probes when it is flat.
 Skewed and flat buckets alike scale out instead of serializing.
 
-For precise object-count-balanced segments on very large buckets, generate
-hints explicitly:
-
-```bash
-s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
-s3-turbo-list --hints-file hints.toml \
-  list --region us-east-2 --bucket my-bucket
-```
-
-Hints file formats, boundary semantics, advanced generation workflows
-(`discover-prefixes`, `hints-validate`, `hints-merge`), and all runtime
-tuning knobs are documented in [`docs/tuning.md`](docs/tuning.md).
+Explicit `--hints-file` control remains available for repeated inventories;
+hints file formats, boundary semantics, local tooling (`hints-validate`,
+`hints-merge`), and all runtime tuning knobs are documented in
+[`docs/tuning.md`](docs/tuning.md). The `auto-hints` and `discover-prefixes`
+scan commands are deprecated — automatic discovery and runtime splitting
+cover their use cases.
 
 ## Diff mode
 

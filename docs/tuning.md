@@ -71,28 +71,19 @@ generated_at = "2026-05-14T12:00:00Z"
 scan_mode = "full"
 ```
 
-Generation workflows:
+Local tooling (no S3 access):
 
 ```bash
-# Object-count-aware hints from a full or sampled sequential scan
-s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket -o hints.toml
-s3-turbo-list auto-hints --region us-east-2 --bucket my-bucket \
-  -o hints.sampled.toml --sample-limit 1000000 --max-pages 1000
-
-# Delimiter-based CommonPrefixes discovery
-s3-turbo-list --prefix logs/ --delimiter / discover-prefixes \
-  --region us-east-2 --bucket my-bucket -o logs-prefixes.txt
-
-# Validate / merge locally (no S3 access)
 s3-turbo-list hints-validate --hints-file hints.toml
 s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
 ```
 
-In sampled mode the TOML `total_objects` field is the sampled count, not the
-bucket total, and segment estimates are marked as sampled.  Prefix-scoped
-hints generated with `--prefix` are valid for that subtree only.  `auto-hints`
-performs one sequential scan; `--threads`/`--concurrency` do not parallelise
-it.
+The `auto-hints` and `discover-prefixes` scan commands are **deprecated**
+and will be removed in a future release: `auto-hints` performs a full
+sequential scan (often slower than simply running the listing), and startup
+discovery plus runtime splitting now cover both commands' use cases
+automatically.  Existing hints caches and `--hints-file` workflows keep
+working.
 
 ## Core Defaults
 
@@ -151,17 +142,6 @@ CLI flags exist for common runtime controls such as `--threads`,
 `--max-pages`.  The `auto_hints.sample_threshold`,
 `auto_hints.max_prefix_depth`, and `auto_hints.max_prefix_entries` values
 are TOML-only.
-
-## Auto-Hints Scope
-
-`auto-hints` performs one sequential ListObjectsV2 object scan.  `--prefix`
-restricts that scan to a subtree, and `--max-keys` controls page size.  The
-resulting TOML records the prefix when one was used.  Do not reuse
-prefix-scoped hints as if they described the entire bucket.
-
-Use `discover-prefixes` for delimiter-based `CommonPrefixes` discovery.  That
-command writes prefix candidates; it does not claim object-count-balanced
-segments.
 
 ## Trace-Driven Hints Iteration
 
