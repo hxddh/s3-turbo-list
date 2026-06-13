@@ -351,15 +351,6 @@ pub struct ParquetArtifactSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ConfigInspectReport {
-    pub schema_version: &'static str,
-    pub tool_version: &'static str,
-    pub status: String,
-    pub config_source: ConfigSourceSummary,
-    pub resolved_config: ResolvedConfigSummary,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub schema_version: &'static str,
     pub tool_version: &'static str,
@@ -367,6 +358,10 @@ pub struct DoctorReport {
     pub local_only: bool,
     pub cwd: String,
     pub checks: Vec<DoctorCheck>,
+    /// Resolved configuration and its provenance — doctor is the single
+    /// local-inspection command (it absorbed the former config-inspect).
+    pub config_source: ConfigSourceSummary,
+    pub resolved_config: ResolvedConfigSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,20 +686,11 @@ fn parquet_summary(path: &str) -> Result<ParquetArtifactSummary, String> {
     })
 }
 
-pub fn config_inspect_report(
+pub fn doctor_report(
+    local_only: bool,
     cfg: &S3TurboConfig,
     config_source: ConfigSourceSummary,
-) -> ConfigInspectReport {
-    ConfigInspectReport {
-        schema_version: AGENT_SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        status: "ok".to_string(),
-        config_source,
-        resolved_config: cfg.into(),
-    }
-}
-
-pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
+) -> DoctorReport {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
@@ -829,6 +815,8 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
         local_only,
         cwd,
         checks,
+        config_source,
+        resolved_config: cfg.into(),
     }
 }
 

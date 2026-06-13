@@ -134,13 +134,10 @@ fn test_cli_help_hints_validate() {
 
 #[test]
 fn test_cli_help_agent_local_commands() {
-    let (code, stdout, _stderr) = run_cli(&["config-inspect", "--help"]);
-    assert_eq!(code, 0, "config-inspect --help should exit 0");
-    assert!(stdout.contains("--json"));
-
     let (code, stdout, _stderr) = run_cli(&["doctor", "--help"]);
     assert_eq!(code, 0, "doctor --help should exit 0");
     assert!(stdout.contains("--local-only"));
+    assert!(stdout.contains("--json"));
 
     let (code, stdout, _stderr) = run_cli(&["profiles", "--help"]);
     assert_eq!(code, 0, "profiles --help should exit 0");
@@ -169,8 +166,10 @@ fn test_cli_help_agent_local_commands() {
 }
 
 #[test]
-fn test_cli_config_inspect_json_success() {
-    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+fn test_cli_doctor_json_includes_resolved_config() {
+    // doctor absorbed the former config-inspect: its JSON carries the
+    // resolved configuration and its provenance.
+    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -178,6 +177,7 @@ fn test_cli_config_inspect_json_success() {
     assert_eq!(json["status"], "ok");
     assert!(json["resolved_config"]["runtime"]["worker_threads"].is_number());
     assert!(json["resolved_config"]["s3"]["addressing_style"].is_string());
+    assert!(json["config_source"]["searched"].is_array());
 }
 
 #[test]
@@ -615,8 +615,8 @@ fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
 }
 
 #[test]
-fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+fn test_cli_doctor_reports_zstd_default_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -636,7 +636,7 @@ fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
 }
 
 #[test]
-fn test_cli_config_inspect_json_reports_explicit_config_source_no_cloud() {
+fn test_cli_doctor_json_reports_explicit_config_source_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("s3-turbo-list.toml");
     std::fs::write(
@@ -655,7 +655,8 @@ compression_level = 6
     let (code, stdout, stderr) = run_cli(&[
         "--config",
         config_path.to_str().unwrap(),
-        "config-inspect",
+        "doctor",
+        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -676,7 +677,7 @@ compression_level = 6
 }
 
 #[test]
-fn test_cli_config_inspect_human_reports_loaded_config_no_cloud() {
+fn test_cli_doctor_human_reports_loaded_config_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("s3-turbo-list.toml");
     std::fs::write(
@@ -688,19 +689,24 @@ worker_threads = 4
     )
     .unwrap();
 
-    let (code, stdout, stderr) =
-        run_cli(&["--config", config_path.to_str().unwrap(), "config-inspect"]);
+    let (code, stdout, stderr) = run_cli(&[
+        "--config",
+        config_path.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+    ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:"));
     assert!(stdout.contains(config_path.to_str().unwrap()));
 }
 
 #[test]
-fn test_cli_config_inspect_warns_for_missing_explicit_config_no_cloud() {
+fn test_cli_doctor_warns_for_missing_explicit_config_no_cloud() {
     let config_path = "/tmp/s3-turbo-list-missing-test-config.toml";
     let _ = std::fs::remove_file(config_path);
 
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect", "--json"]);
+    let (code, stdout, stderr) =
+        run_cli(&["--config", config_path, "doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["config_source"]["explicit_config"], config_path);
@@ -715,7 +721,7 @@ fn test_cli_config_inspect_warns_for_missing_explicit_config_no_cloud() {
         .iter()
         .any(|warning| warning.as_str().unwrap().contains("was not found")));
 
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect"]);
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor", "--local-only"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:       -"));
     assert!(stdout.contains("warning:"));
@@ -1837,7 +1843,8 @@ fn test_cli_bad_config_exits_with_config_code() {
     let (code, _stdout, stderr) = run_cli(&[
         "--config",
         path.to_str().unwrap(),
-        "config-inspect",
+        "doctor",
+        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 2, "bad config should use stable config exit code");

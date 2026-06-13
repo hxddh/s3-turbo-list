@@ -859,7 +859,6 @@ These commands do not contact S3-compatible cloud endpoints.
         ),
         "agent-safe" => Ok(
             r#"Agent-safe local commands:
-  s3-turbo-list config-inspect --json
   s3-turbo-list doctor --local-only --json
   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list trace-summary trace.jsonl --machine-readable

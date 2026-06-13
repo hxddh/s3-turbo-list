@@ -8,7 +8,6 @@ CI jobs, and shell automation.  The default human CLI remains unchanged.
 These commands do not contact S3 endpoints:
 
 ```bash
-s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
@@ -26,12 +25,13 @@ s3-turbo-list manifest-summary run.json --check
 s3-turbo-list trace-summary trace.jsonl --machine-readable
 ```
 
-`config-inspect --json` prints the resolved local configuration after TOML,
-CLI overrides, profile presets, and addressing-style normalization.
-It also includes `config_source`, which reports the explicit `--config` path
-when present, the config file actually loaded, the searched paths, the source
-kind (`explicit`, `workspace`, `home`, or `none`), and global CLI config
-overrides such as `compression` or `endpoint_url`.
+`doctor --local-only --json` prints the resolved local configuration (under
+`resolved_config`) after TOML, CLI overrides, profile presets, and
+addressing-style normalization, alongside its environment checks. It also
+includes `config_source`, which reports the explicit `--config` path when
+present, the config file actually loaded, the searched paths, the source kind
+(`explicit`, `workspace`, `home`, or `none`), and global CLI config overrides
+such as `compression` or `endpoint_url`.
 When an explicit `--config` path is missing, `config_source.warnings` reports
 that the command fell back to built-in defaults.
 
@@ -272,7 +272,7 @@ at runtime automatically.
 
 ## Safety expectations
 
-- `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
+- `doctor --local-only` and `--dry-run` are local-only.
 - `trace-summary` is local-only.
 - `list`, `diff`, and `compat-probe` can contact S3 unless combined with
   `--dry-run`.

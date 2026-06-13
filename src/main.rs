@@ -295,13 +295,6 @@ enum Commands {
         topic: Option<String>,
     },
 
-    /// Inspect resolved local config without contacting S3
-    ConfigInspect {
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Run local environment checks without contacting S3
     Doctor {
         /// Do not contact S3 endpoints
@@ -602,54 +595,13 @@ fn main() {
     let config_source_warnings = config_source.warnings.clone();
 
     match &cli.cmd {
-        Commands::ConfigInspect { json } => {
-            let report = agent::config_inspect_report(&cfg, config_source.clone());
-            if *json || cli.agent {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                println!("s3-turbo-list {}", env!("CARGO_PKG_VERSION"));
-                println!(
-                    "  config:       {}",
-                    report.config_source.loaded_config.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  threads:      {}",
-                    report.resolved_config.runtime.worker_threads
-                );
-                println!(
-                    "  concurrency:  {}",
-                    report.resolved_config.runtime.max_concurrency
-                );
-                println!(
-                    "  profile:      {}",
-                    report.resolved_config.s3.profile.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  endpoint:     {}",
-                    report
-                        .resolved_config
-                        .s3
-                        .endpoint_url
-                        .as_deref()
-                        .unwrap_or("-")
-                );
-                println!(
-                    "  addressing:   {}",
-                    report.resolved_config.s3.addressing_style
-                );
-                for warning in &report.config_source.warnings {
-                    println!("  warning:      {}", warning);
-                }
-            }
-            return;
-        }
         Commands::Doctor {
             local_only,
             json,
             simple,
             fix_suggestions,
         } => {
-            let report = agent::doctor_report(*local_only, &cfg);
+            let report = agent::doctor_report(*local_only, &cfg, config_source.clone());
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -659,6 +611,7 @@ fn main() {
                 for check in &report.checks {
                     println!("  {}: {} — {}", check.name, check.status, check.message);
                 }
+                print_doctor_config(&report);
                 if *fix_suggestions {
                     print_doctor_suggestions(&report);
                 }
@@ -838,7 +791,7 @@ fn main() {
             run_hints_validate(hints_file, *preview, *json);
             return;
         }
-        Commands::ConfigInspect { .. } | Commands::Doctor { .. } => {
+        Commands::Doctor { .. } => {
             unreachable!("local-only commands are handled before runtime setup")
         }
         Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
@@ -1914,6 +1867,29 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn print_doctor_config(report: &agent::DoctorReport) {
+    let config = &report.resolved_config;
+    println!("Resolved config:");
+    println!(
+        "  config:       {}",
+        report.config_source.loaded_config.as_deref().unwrap_or("-")
+    );
+    println!("  threads:      {}", config.runtime.worker_threads);
+    println!("  concurrency:  {}", config.runtime.max_concurrency);
+    println!(
+        "  profile:      {}",
+        config.s3.profile.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  endpoint:     {}",
+        config.s3.endpoint_url.as_deref().unwrap_or("-")
+    );
+    println!("  addressing:   {}", config.s3.addressing_style);
+    for warning in &report.config_source.warnings {
+        println!("  warning:      {}", warning);
+    }
+}
+
 fn print_doctor_simple(report: &agent::DoctorReport, fix_suggestions: bool) {
     for check in &report.checks {
         let label = match check.status.as_str() {
@@ -2844,9 +2820,6 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         }
         Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
         Commands::Guide { .. } => ("guide".to_string(), None, None, None, None, None),
-        Commands::ConfigInspect { .. } => {
-            ("config-inspect".to_string(), None, None, None, None, None)
-        }
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
         Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None, None),
         Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
