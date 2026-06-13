@@ -79,7 +79,6 @@ pub struct ResolvedConfigSummary {
     pub runtime: RuntimeSummary,
     pub s3: S3Summary,
     pub output: OutputSummary,
-    pub auto_hints: AutoHintsSummary,
     pub channel: ChannelSummary,
 }
 
@@ -114,13 +113,6 @@ pub struct OutputSummary {
     pub log_file: Option<String>,
     pub ks_file: Option<String>,
     pub parquet_file: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AutoHintsSummary {
-    pub sample_threshold: usize,
-    pub max_prefix_depth: usize,
-    pub max_prefix_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,11 +166,6 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 log_file: cfg.output.log_file.clone(),
                 ks_file: cfg.output.ks_file.clone(),
                 parquet_file: cfg.output.parquet_file.clone(),
-            },
-            auto_hints: AutoHintsSummary {
-                sample_threshold: cfg.auto_hints.sample_threshold,
-                max_prefix_depth: cfg.auto_hints.max_prefix_depth,
-                max_prefix_entries: cfg.auto_hints.max_prefix_entries,
             },
             channel: ChannelSummary {
                 capacity: cfg.channel.capacity,

@@ -113,31 +113,6 @@ fn test_cli_help_diff() {
 }
 
 #[test]
-fn test_cli_help_auto_hints() {
-    let (code, stdout, _stderr) = run_cli(&["auto-hints", "--help"]);
-    assert_eq!(code, 0, "s3-turbo-list auto-hints --help should exit 0");
-    assert!(
-        stdout.contains("bucket"),
-        "auto-hints help should mention 'bucket'"
-    );
-    assert!(
-        stdout.contains("always TOML"),
-        "auto-hints help should describe TOML output"
-    );
-}
-
-#[test]
-fn test_cli_help_discover_prefixes() {
-    let (code, stdout, _stderr) = run_cli(&["discover-prefixes", "--help"]);
-    assert_eq!(
-        code, 0,
-        "s3-turbo-list discover-prefixes --help should exit 0"
-    );
-    assert!(stdout.contains("--bucket"));
-    assert!(stdout.contains("--toml"));
-}
-
-#[test]
 fn test_cli_help_compat_probe() {
     let (code, stdout, _stderr) = run_cli(&["compat-probe", "--help"]);
     assert_eq!(code, 0, "s3-turbo-list compat-probe --help should exit 0");
@@ -872,28 +847,18 @@ compression_level = 6
 }
 
 #[test]
-fn test_cli_dry_run_agent_stdout_json() {
-    let (code, stdout, stderr) = run_cli(&[
-        "--agent",
-        "--dry-run",
-        "auto-hints",
-        "--bucket",
-        "agent-test-bucket",
-        "--region",
-        "us-east-1",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["inputs"]["mode"], "auto-hints");
-    assert_eq!(
-        json["outputs"]["hints_file"],
-        "us-east-1_agent-test-bucket_hints.toml"
-    );
-    assert!(json["warnings"][0]
-        .as_str()
-        .unwrap()
-        .contains("auto-hints will scan S3 pages"));
+fn test_cli_removed_subcommands_are_gone() {
+    for cmd in ["auto-hints", "discover-prefixes"] {
+        let (code, _stdout, stderr) = run_cli(&[cmd, "--help"]);
+        assert_ne!(code, 0, "{} should no longer be a valid subcommand", cmd);
+        assert!(
+            stderr.contains("unrecognized subcommand")
+                || stderr.contains("unexpected argument"),
+            "{} removal should produce a clap error, got: {}",
+            cmd,
+            stderr
+        );
+    }
 }
 
 #[test]
@@ -1010,23 +975,6 @@ fn test_cli_default_paths_sanitize_bucket_and_region_components() {
         checkpoint.contains("us_east_.._evil_bucket"),
         "{}",
         checkpoint
-    );
-
-    let (code, stdout, stderr) = run_cli_without_aws_env(&[
-        "--agent",
-        "--dry-run",
-        "discover-prefixes",
-        "--bucket",
-        "../evil/bucket",
-        "--region",
-        "us/east",
-        "--toml",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        json["outputs"]["hints_file"],
-        "us_east_.._evil_bucket_prefixes.toml"
     );
 }
 

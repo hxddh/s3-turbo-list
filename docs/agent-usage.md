@@ -103,10 +103,12 @@ checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 
 For large buckets, agents should prefer the simple high-throughput path:
-generate hints with `auto-hints`, validate them locally, then run
-`list` with `--hints-file hints.toml -c 8 -T 4` as a conservative
-starting point.  Empty delimiter is omitted from ListObjectsV2 requests, which
-keeps recursive listing compatible with providers that reject `delimiter=`.
+run `list` directly with `-c 8 -T 4` as a conservative starting point.
+Key-space partitioning is automatic — startup discovery probes the bucket
+structure and caches boundaries on the first run, and runtime splitting fans
+out long-tail segments — so no separate hints-generation step is needed.
+Empty delimiter is omitted from ListObjectsV2 requests, which keeps recursive
+listing compatible with providers that reject `delimiter=`.
 
 For `diff`, dry-run reports `hints.source =
 "disabled_for_diff_single_segment"`.  Conventional hints caches are
@@ -280,7 +282,7 @@ at runtime automatically.
 
 - `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
 - `trace-summary` and `hints-merge` are local-only.
-- `list`, `diff`, `auto-hints`, `discover-prefixes`, and `compat-probe` can contact S3 unless
-  combined with `--dry-run`.
+- `list`, `diff`, and `compat-probe` can contact S3 unless combined with
+  `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS
   pagination workarounds or change hot-path listing behavior.

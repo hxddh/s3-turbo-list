@@ -221,56 +221,6 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// DEPRECATED: startup discovery and runtime splitting partition
-    /// buckets automatically; this command will be removed in a future
-    /// release
-    AutoHints {
-        /// AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Bucket to analyze
-        #[arg(long)]
-        bucket: String,
-
-        /// Output hints file path; content is always TOML regardless of extension
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Stop after scanning this many objects; default scans the full bucket
-        #[arg(long)]
-        sample_limit: Option<usize>,
-
-        /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
-        #[arg(long)]
-        max_pages: Option<usize>,
-    },
-
-    /// DEPRECATED: startup discovery and runtime splitting partition
-    /// buckets automatically; this command will be removed in a future
-    /// release
-    DiscoverPrefixes {
-        /// AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Bucket to inspect
-        #[arg(long)]
-        bucket: String,
-
-        /// Output prefixes file; plain text by default
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
-        #[arg(long)]
-        max_pages: Option<usize>,
-
-        /// Write a TOML report instead of one prefix per line
-        #[arg(long)]
-        toml: bool,
-    },
-
     /// Validate a local hints file without contacting S3
     HintsValidate {
         /// Hints file path
@@ -942,44 +892,6 @@ fn main() {
                 bucket,
                 addressing_style,
                 output.as_deref(),
-                &cfg,
-            );
-            return;
-        }
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            sample_limit,
-            max_pages,
-        } => {
-            warn_deprecated_hints_command("auto-hints");
-            run_auto_hints(
-                region.as_deref(),
-                bucket,
-                output.as_deref(),
-                *sample_limit,
-                *max_pages,
-                &cli,
-                &cfg,
-            );
-            return;
-        }
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            max_pages,
-            toml,
-        } => {
-            warn_deprecated_hints_command("discover-prefixes");
-            run_discover_prefixes(
-                region.as_deref(),
-                bucket,
-                output.as_deref(),
-                *max_pages,
-                *toml,
-                &cli,
                 &cfg,
             );
             return;
@@ -1953,10 +1865,7 @@ fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
 fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     match &cli.cmd {
-        Commands::List { .. }
-        | Commands::Diff { .. }
-        | Commands::AutoHints { .. }
-        | Commands::DiscoverPrefixes { .. } => {
+        Commands::List { .. } | Commands::Diff { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
         }
         Commands::CompatProbe { endpoint_url, .. } => {
@@ -2044,16 +1953,6 @@ fn output_stem_with_timestamp(
     }
     parts.push(timestamp.to_string());
     parts.join("_")
-}
-
-fn prefixes_output_path(region: Option<&str>, bucket: &str, toml: bool) -> String {
-    let extension = if toml { "toml" } else { "txt" };
-    let mut parts = Vec::new();
-    if let Some(region) = region.filter(|r| !r.is_empty()) {
-        parts.push(sanitize_path_component(region));
-    }
-    parts.push(sanitize_path_component(bucket));
-    format!("{}_prefixes.{}", parts.join("_"), extension)
 }
 
 fn sanitize_path_component(value: &str) -> String {
@@ -2821,21 +2720,6 @@ fn build_plan_report(
                 .to_string(),
         );
     }
-    if matches!(cli.cmd, Commands::AutoHints { .. }) {
-        warnings.push("auto-hints will scan S3 pages when not run with --dry-run".to_string());
-        if cli.threads.is_some() || cli.concurrency.is_some() {
-            warnings.push(
-                "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
-                    .to_string(),
-            );
-        }
-    }
-    if matches!(cli.cmd, Commands::DiscoverPrefixes { .. }) {
-        warnings.push(
-            "discover-prefixes will scan S3 ListObjectsV2 pages when not run with --dry-run"
-                .to_string(),
-        );
-    }
     if inputs.mode == "list"
         && matches!(
             hints.source.as_str(),
@@ -2847,12 +2731,7 @@ fn build_plan_report(
                 .to_string(),
         );
     }
-    if cli.delimiter.is_empty()
-        && matches!(
-            cli.cmd,
-            Commands::List { .. } | Commands::AutoHints { .. } | Commands::DiscoverPrefixes { .. }
-        )
-    {
+    if cli.delimiter.is_empty() && matches!(cli.cmd, Commands::List { .. }) {
         warnings.push(
             "--delimiter '' means recursive listing and is omitted from ListObjectsV2 requests for S3-compatible provider compatibility"
                 .to_string(),
@@ -2939,11 +2818,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     if matches!(
         cli.cmd,
-        Commands::List { .. }
-            | Commands::Diff { .. }
-            | Commands::AutoHints { .. }
-            | Commands::DiscoverPrefixes { .. }
-            | Commands::CompatProbe { .. }
+        Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
     ) {
         if let Some(profile) = cfg
             .s3
@@ -3075,22 +2950,6 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             None,
             None,
         ),
-        Commands::AutoHints { region, bucket, .. } => (
-            "auto-hints".to_string(),
-            Some(bucket.clone()),
-            region.clone(),
-            None,
-            None,
-            None,
-        ),
-        Commands::DiscoverPrefixes { region, bucket, .. } => (
-            "discover-prefixes".to_string(),
-            Some(bucket.clone()),
-            region.clone(),
-            None,
-            None,
-            None,
-        ),
         Commands::HintsValidate { .. } => {
             ("hints-validate".to_string(), None, None, None, None, None)
         }
@@ -3150,26 +3009,7 @@ fn runtime_output_summary(
         };
     }
 
-    let hints_file = match &cli.cmd {
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            ..
-        } => output
-            .clone()
-            .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            toml,
-            ..
-        } => output
-            .clone()
-            .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
-        _ => None,
-    };
+    let hints_file = None;
     let compat_output = match &cli.cmd {
         Commands::CompatProbe { output, .. } => output.clone(),
         _ => None,
@@ -3232,31 +3072,6 @@ fn planned_output_paths(
                 .unwrap_or_else(|| format!("{}.parquet", stem));
             (Some(ks), Some(parquet), None)
         }
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            ..
-        } => (
-            None,
-            None,
-            output
-                .clone()
-                .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
-        ),
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            toml,
-            ..
-        } => (
-            None,
-            None,
-            output
-                .clone()
-                .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
-        ),
         _ => (None, None, None),
     }
 }
@@ -3327,10 +3142,7 @@ async fn diff_side_boundaries(
 // templating before the full command dispatch.
 fn command_region(cmd: &Commands) -> Option<&str> {
     match cmd {
-        Commands::List { region, .. }
-        | Commands::AutoHints { region, .. }
-        | Commands::DiscoverPrefixes { region, .. }
-        | Commands::Diff { region, .. } => region.as_deref(),
+        Commands::List { region, .. } | Commands::Diff { region, .. } => region.as_deref(),
         Commands::CompatProbe { region, .. } => Some(region.as_str()),
         _ => None,
     }
@@ -3419,109 +3231,6 @@ fn run_compat_probe(
             eprintln!("Compat-probe output error: {}", e);
             std::process::exit(agent::ExitCode::OutputWrite.code());
         }
-    });
-}
-
-fn warn_deprecated_hints_command(name: &str) {
-    eprintln!(
-        "warning: {} is deprecated — startup discovery and runtime splitting \
-         partition buckets automatically; this command will be removed in a \
-         future release",
-        name
-    );
-}
-
-fn run_auto_hints(
-    region: Option<&str>,
-    bucket: &str,
-    output: Option<&str>,
-    sample_limit: Option<usize>,
-    max_pages: Option<usize>,
-    cli: &Cli,
-    cfg: &S3TurboConfig,
-) {
-    let rt = build_runtime_or_exit(2);
-
-    let endpoint = cfg.s3.endpoint_url.as_deref();
-    let fps = cfg.s3.force_path_style;
-    let prefix = if cli.prefix == "/" {
-        ""
-    } else {
-        cli.prefix.as_str()
-    };
-
-    if cli.threads.is_some() || cli.concurrency.is_some() {
-        log::warn!(
-            "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
-        );
-    }
-
-    if cfg.s3.profile.as_deref() == Some("bos") {
-        log::warn!(
-            "Generating hints for BOS is allowed, but hinted multi-segment BOS scans \
-             are not authoritative until BOS fixes its ListObjectsV2 start_after + \
-             continuation-token compatibility behavior."
-        );
-    }
-
-    rt.block_on(async {
-        auto_hints::generate_hints(auto_hints::GenerateHintsOptions {
-            region,
-            bucket,
-            output,
-            endpoint_url: endpoint,
-            force_path_style: fps,
-            prefix,
-            max_keys: cli.max_keys,
-            max_attempts: cfg.s3.max_attempts,
-            initial_backoff_secs: cfg.s3.initial_backoff_secs,
-            connect_timeout_secs: cfg.s3.connect_timeout_secs,
-            operation_timeout_secs: cfg.s3.operation_timeout_secs,
-            sample_threshold: cfg.auto_hints.sample_threshold,
-            max_prefix_depth: cfg.auto_hints.max_prefix_depth,
-            max_prefix_entries: cfg.auto_hints.max_prefix_entries,
-            sample_limit,
-            max_pages,
-        })
-        .await
-    });
-}
-
-fn run_discover_prefixes(
-    region: Option<&str>,
-    bucket: &str,
-    output: Option<&str>,
-    max_pages: Option<usize>,
-    toml: bool,
-    cli: &Cli,
-    cfg: &S3TurboConfig,
-) {
-    let rt = build_runtime_or_exit(2);
-
-    let prefix = if cli.prefix == "/" {
-        ""
-    } else {
-        cli.prefix.as_str()
-    };
-
-    rt.block_on(async {
-        auto_hints::discover_prefixes(auto_hints::DiscoverPrefixesOptions {
-            region,
-            bucket,
-            output,
-            endpoint_url: cfg.s3.endpoint_url.as_deref(),
-            force_path_style: cfg.s3.force_path_style,
-            prefix,
-            delimiter: &cli.delimiter,
-            max_keys: cli.max_keys,
-            max_attempts: cfg.s3.max_attempts,
-            initial_backoff_secs: cfg.s3.initial_backoff_secs,
-            connect_timeout_secs: cfg.s3.connect_timeout_secs,
-            operation_timeout_secs: cfg.s3.operation_timeout_secs,
-            max_pages,
-            toml,
-        })
-        .await
     });
 }
 

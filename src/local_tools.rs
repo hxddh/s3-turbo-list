@@ -912,9 +912,9 @@ These commands do not contact S3-compatible cloud endpoints.
         ),
         "large-bucket" => Ok(
             r#"Large bucket:
-  s3-turbo-list --delimiter '' auto-hints --bucket my-bucket --region us-east-1 --sample-limit 1000000 -o hints.toml
-  s3-turbo-list hints-validate --hints-file hints.toml --json
-  s3-turbo-list --output-dir out --delimiter '' -c 8 -T 4 --trace-compat out/trace.jsonl -H hints.toml list --bucket my-bucket --region us-east-1
+  # Key-space partitioning is automatic: the first run probes the bucket
+  # structure at startup, lists in parallel, and caches the boundaries.
+  s3-turbo-list --output-dir out --delimiter '' -c 8 -T 4 --trace-compat out/trace.jsonl list --bucket my-bucket --region us-east-1
   s3-turbo-list trace-summary out/trace.jsonl --machine-readable
 "#
             .to_string(),
@@ -1370,7 +1370,7 @@ max_concurrency = 100
 addressing_style = "{addressing}"
 force_path_style = {force_path}
 max_attempts = 10
-initial_backoff_secs = 30
+initial_backoff_secs = 1
 connect_timeout_secs = 60
 operation_timeout_secs = 5
 
@@ -1378,11 +1378,6 @@ operation_timeout_secs = 5
 row_group_size = 100000
 compression = "zstd"
 compression_level = 1
-
-[auto_hints]
-sample_threshold = 10000
-max_prefix_depth = 5
-max_prefix_entries = 1000000
 
 [channel]
 capacity = 64

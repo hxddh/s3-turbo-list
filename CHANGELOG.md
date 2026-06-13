@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-13
+
+### Removed
+- **Removed the `auto-hints` and `discover-prefixes` subcommands** (deprecated
+  in 0.7.0). Startup structural discovery and runtime splitting partition
+  buckets automatically with zero flags, so the separate sequential-scan
+  commands no longer earned their surface area. Their config section
+  `[auto_hints]` (`sample_threshold`, `max_prefix_depth`, `max_prefix_entries`)
+  is gone as well. Existing hints caches, `--hints-file`, `hints-validate`,
+  and `hints-merge` keep working unchanged.
+
+### Changed
+- **Reduced the default retry backoff** `s3.initial_backoff_secs` from `30` to
+  `1`. A single throttle (HTTP 503 `SlowDown`) previously added 30+ seconds of
+  wall-clock to a run; the SDK still grows the delay exponentially across
+  `max_attempts`, so transient throttling recovers quickly without a
+  tail-latency spike.
+
+### Documentation
+- Documented the single-bucket `ListObjectsV2` request-rate ceiling in
+  `docs/tuning.md`: once enough segments saturate the provider's per-bucket
+  request rate, additional `--concurrency`/`--threads` cannot raise throughput.
+  Added tuning guidance and corrected stale auto-hints references across the
+  README, tuning, and agent-usage docs.
+
 ## [0.7.0] - 2026-06-13
 
 ### Changed

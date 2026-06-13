@@ -123,7 +123,7 @@ boundary sources, in precedence order:
 
 1. `--hints-file` — explicit control for repeated inventories.
 2. The conventional hints cache (`<region>_<bucket>_hints.toml`) written by
-   `auto-hints` or by a previous run's startup discovery.
+   a previous run's startup discovery.
 3. **Startup structural discovery** (automatic): a handful of delimiter
    probes at run start find real `CommonPrefixes` boundaries and cache them.
    First runs are parallel with zero flags.
@@ -139,9 +139,9 @@ Skewed and flat buckets alike scale out instead of serializing.
 Explicit `--hints-file` control remains available for repeated inventories;
 hints file formats, boundary semantics, local tooling (`hints-validate`,
 `hints-merge`), and all runtime tuning knobs are documented in
-[`docs/tuning.md`](docs/tuning.md). The `auto-hints` and `discover-prefixes`
-scan commands are deprecated — automatic discovery and runtime splitting
-cover their use cases.
+[`docs/tuning.md`](docs/tuning.md). Automatic startup discovery and runtime
+splitting partition buckets with zero flags, so no separate scan command is
+needed.
 
 ## Diff mode
 

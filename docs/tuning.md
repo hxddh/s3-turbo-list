@@ -13,8 +13,8 @@ Where boundaries come from, in precedence order:
 
 1. **Explicit `--hints-file`** — full control for repeated inventories.
 2. **Cached hints** at the conventional path
-   (`<region>_<bucket>_hints.toml`), written by `auto-hints` or by startup
-   discovery on a previous run.
+   (`<region>_<bucket>_hints.toml`), written by startup discovery on a
+   previous run.
 3. **Startup structural discovery** (recursive list runs — the default;
    hierarchical `--delimiter '/'` runs skip it) —
    a bounded set of delimiter probes (one ListObjectsV2 page each, at most
@@ -64,8 +64,7 @@ beta/
 logs/
 ```
 
-**TOML** (written by `auto-hints`, `discover-prefixes --toml`, startup
-discovery, and `hints-merge`):
+**TOML** (written by startup discovery and `hints-merge`):
 
 ```toml
 bucket = "my-bucket"
@@ -83,19 +82,17 @@ s3-turbo-list hints-validate --hints-file hints.toml
 s3-turbo-list hints-merge base.toml prefixes.txt --output merged.toml
 ```
 
-The `auto-hints` and `discover-prefixes` scan commands are **deprecated**
-and will be removed in a future release: `auto-hints` performs a full
-sequential scan (often slower than simply running the listing), and startup
-discovery plus runtime splitting now cover both commands' use cases
-automatically.  Existing hints caches and `--hints-file` workflows keep
-working.
+The `auto-hints` and `discover-prefixes` scan commands were **removed in
+v0.8.0**: startup discovery plus runtime splitting cover their use cases
+automatically and without a separate sequential scan.  Existing hints
+caches and `--hints-file` workflows keep working unchanged.
 
 ## Core Defaults
 
 | Config key | Default | Notes |
 |---|---:|---|
 | `s3.max_attempts` | `10` | Retry budget per segment. |
-| `s3.initial_backoff_secs` | `30` | Initial SDK retry backoff. |
+| `s3.initial_backoff_secs` | `1` | Initial SDK retry backoff. A single throttle (HTTP 503 SlowDown) costs ~1s of wall-clock instead of stalling the whole run; the SDK still grows the delay exponentially across `max_attempts`. |
 | `s3.connect_timeout_secs` | `60` | Connection timeout. |
 | `s3.operation_timeout_secs` | `5` | Per-page ListObjectsV2 watchdog and SDK operation/read/attempt timeout. |
 | `runtime.worker_threads` | CPU cores | Tokio worker threads; CLI override: `-T`, `--threads`. |
@@ -104,12 +101,37 @@ working.
 | `output.row_group_size` | `100000` | Parquet max row group size. |
 | `output.compression` | `zstd` | Parquet compression codec; CLI override: `--compression`. |
 | `output.compression_level` | `1` | Compression level for codecs that support levels; CLI override: `--compression-level`. |
-| `auto_hints.sample_threshold` | `10000` | Prefix count threshold used by auto-hints splitting. |
-| `auto_hints.max_prefix_depth` | `5` | Maximum prefix depth considered by auto-hints splitting. |
-| `auto_hints.max_prefix_entries` | `1000000` | Maximum unique parent prefixes retained during auto-hints counting before bounded mode. |
 
 For high-latency or cross-region endpoints, consider raising
 `s3.operation_timeout_secs` to `30` or `60` to reduce retry churn.
+
+## The single-bucket request-rate ceiling
+
+List throughput is ultimately bounded by how many `ListObjectsV2` requests
+per second the provider serves for one bucket, not by anything on the client.
+Each request returns at most 1000 keys, so the ceiling is roughly:
+
+```
+max objects/sec ≈ (requests/sec the provider allows) × 1000
+```
+
+Once enough segments are running to saturate that request rate, adding more
+`--concurrency` or `--threads` does nothing — the extra workers just wait on
+the provider.  In third-party testing on Alibaba Cloud OSS, `-c 8` and `-c 64`
+reached the same ~50K objects/sec because the bucket's request rate, not the
+tool, was the limit.  AWS S3 scales request rate per key-space prefix, so
+well-distributed prefixes (which segmented listing already exploits) reach a
+much higher ceiling than a single hot prefix.
+
+Practical guidance:
+
+- Raise `--concurrency` until throughput stops improving, then stop; past
+  that point you are only adding idle workers.
+- If you are throttled (HTTP 503 `SlowDown`), the low default
+  `initial_backoff_secs` keeps each retry cheap; lowering request pressure
+  (fewer concurrent segments) helps more than retrying harder.
+- The largest wins come from spreading load across prefixes, which segmented
+  listing does automatically.
 
 ## Config File Settings
 
@@ -132,21 +154,13 @@ row_group_size = 100000
 compression = "zstd"
 compression_level = 1
 
-[auto_hints]
-sample_threshold = 10000
-max_prefix_depth = 5
-max_prefix_entries = 1000000
-
 [channel]
 capacity = 128
 ```
 
 CLI flags exist for common runtime controls such as `--threads`,
 `--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
-`--max-keys`, `--start-after`, output file paths, `--sample-limit`, and
-`--max-pages`.  The `auto_hints.sample_threshold`,
-`auto_hints.max_prefix_depth`, and `auto_hints.max_prefix_entries` values
-are TOML-only.
+`--max-keys`, `--start-after`, and output file paths.
 
 ## Trace-Driven Hints Iteration
 
