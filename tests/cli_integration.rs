@@ -1874,9 +1874,13 @@ estimated_objects = 20
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let hints = &json["hints"];
-    assert_eq!(hints["metadata"]["scan_mode"], "sampled");
-    assert_eq!(hints["metadata"]["estimate_mode"], "sampled");
+    assert_eq!(hints["metadata"]["region"], "us-east-1");
+    assert_eq!(hints["metadata"]["generated_at"], "2026-05-17T00:00:00Z");
     assert_eq!(hints["boundary_count"], 1);
+    // Decorative legacy fields are accepted on input but no longer surfaced.
+    assert!(hints["metadata"].get("scan_mode").is_none());
+    assert!(hints["metadata"].get("estimate_mode").is_none());
+    assert!(hints["metadata"].get("total_objects").is_none());
     assert!(hints["metadata"].get("sampled_objects").is_none());
     assert!(hints.get("estimate_summary").is_none());
     assert!(hints.get("first_estimates").is_none());

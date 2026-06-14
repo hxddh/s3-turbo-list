@@ -78,11 +78,12 @@ logs/
 ```toml
 bucket = "my-bucket"
 region = "us-east-2"
-total_objects = 50000
 boundaries = ["alpha/", "beta/", "logs/"]
 generated_at = "2026-05-14T12:00:00Z"
-scan_mode = "full"
 ```
+
+Older cache files may carry extra fields (such as `total_objects` or
+`scan_mode`); they are accepted and ignored on load.
 
 Validate a hints file locally (no S3 access) with `doctor --hints-file
 hints.toml`. Hints are entirely optional: startup discovery and runtime

@@ -3,19 +3,18 @@ use std::collections::BTreeSet;
 
 // ── Cached hints format ────────────────────────────────────
 
+// `#[serde(default)]` on the whole struct (no `deny_unknown_fields`) keeps older
+// cache files readable: fields that earlier versions wrote (total_objects,
+// scan_mode, estimate_mode, and the long-removed sampled-scan fields) are simply
+// ignored on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HintsCache {
     pub bucket: String,
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    pub total_objects: usize,
     pub boundaries: Vec<String>,
     pub generated_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scan_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimate_mode: Option<String>,
 }
 
 // ── Startup structural discovery ───────────────────────────
@@ -202,11 +201,8 @@ pub fn write_startup_hints_cache(
         bucket: bucket.to_string(),
         region: region.map(|r| r.to_string()),
         prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
-        total_objects: 0,
         boundaries: boundaries.to_vec(),
         generated_at: chrono::Local::now().to_rfc3339(),
-        scan_mode: Some("structural".to_string()),
-        estimate_mode: Some("structural".to_string()),
     };
     let path = crate::agent::conventional_hints_path(bucket, region);
     let toml_str = toml::to_string_pretty(&cache)
@@ -228,23 +224,35 @@ mod tests {
             bucket: "bucket".to_string(),
             region: Some("us-east-1".to_string()),
             prefix: Some("logs/".to_string()),
-            total_objects: 100,
             boundaries: vec!["a/".to_string(), "b/".to_string()],
             generated_at: "2026-05-16T00:00:00Z".to_string(),
-            scan_mode: Some("structural".to_string()),
-            estimate_mode: Some("structural".to_string()),
         };
 
         let encoded = toml::to_string_pretty(&cache).unwrap();
-        assert!(encoded.contains("scan_mode = \"structural\""));
+        assert!(encoded.contains("generated_at = \"2026-05-16T00:00:00Z\""));
 
         let decoded: HintsCache = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.bucket, "bucket");
         assert_eq!(decoded.region.as_deref(), Some("us-east-1"));
         assert_eq!(decoded.prefix.as_deref(), Some("logs/"));
         assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
-        assert_eq!(decoded.scan_mode.as_deref(), Some("structural"));
-        assert_eq!(decoded.estimate_mode.as_deref(), Some("structural"));
+    }
+
+    #[test]
+    fn test_hints_cache_ignores_legacy_fields() {
+        // Files written by older versions carry total_objects/scan_mode/
+        // estimate_mode (and older sampled-scan fields); they must still load.
+        let legacy = r#"bucket = "bucket"
+region = "us-east-1"
+total_objects = 100
+boundaries = ["a/", "b/"]
+generated_at = "2026-05-16T00:00:00Z"
+scan_mode = "structural"
+estimate_mode = "structural"
+"#;
+        let decoded: HintsCache = toml::from_str(legacy).unwrap();
+        assert_eq!(decoded.bucket, "bucket");
+        assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
     }
 
     fn fake_tree(data: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {

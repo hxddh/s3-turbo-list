@@ -110,17 +110,16 @@ out long-tail segments — so no separate hints-generation step is needed.
 Empty delimiter is omitted from ListObjectsV2 requests, which keeps recursive
 listing compatible with providers that reject `delimiter=`.
 
-For `diff`, dry-run reports `hints.source =
-"disabled_for_diff_single_segment"`.  Conventional hints caches are
-intentionally ignored, and explicit `diff --hints-file` exits with code `2`
-before any S3 request.  Agents should treat `diff` runs as authoritative
-single-segment comparisons by design.  `diff --resume` is also intentionally
-unsupported because partial paired checkpointing can hide left-only or
-right-only objects.  Current diff mode retains its comparison map in memory
-until both sides complete; for very large bucket-to-bucket comparisons, agents
-should plan memory capacity from the combined key count or split the comparison
-into smaller external ranges when the business workflow can tolerate external
-partitioning.
+For `diff`, dry-run reports `hints.source = "diff_per_side_automatic"`.  Explicit
+`diff --hints-file` exits with code `2` before any S3 request, but each side is
+still partitioned and listed in parallel — by cached or startup-discovered
+`CommonPrefixes`, or by an up-front single-key bisection when a side is flat.
+The segment set is fixed up front (not re-split mid-run the way list mode does)
+so the ordered merge can consume it in key order.  `diff --resume` is
+intentionally unsupported because partial paired checkpointing can hide
+left-only or right-only objects.  Diff streams an ordered merge of the two
+sides, so memory stays bounded regardless of bucket size — agents do not need to
+plan memory capacity from the combined key count.
 
 ## Run manifests
 

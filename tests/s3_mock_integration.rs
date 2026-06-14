@@ -1,4 +1,4 @@
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, StringArray, UInt8Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -331,6 +331,28 @@ fn parquet_keys(path: &std::path::Path) -> Vec<String> {
         }
     }
     keys
+}
+
+/// Read the `DiffFlag` column (index 4) from a diff Parquet output.
+fn parquet_diff_flags(path: &std::path::Path) -> Vec<u8> {
+    let file = std::fs::File::open(path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut flags = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        for row in 0..column.len() {
+            flags.push(column.value(row));
+        }
+    }
+    flags
 }
 
 fn checkpoint_completed_indices(path: &std::path::Path) -> Option<Vec<u64>> {
@@ -2189,6 +2211,78 @@ estimate_mode = "full"
         "expected right-side flat-cut probes to partition the flat namespace",
     );
 }
+
+#[test]
+fn local_mock_diff_identical_sides_classify_all_equal() {
+    // Diffing two buckets with identical contents must classify every row as
+    // equal (DiffFlag = 0): the ordered merge pairs each key with its twin and
+    // none are dropped or mis-flagged.
+    let keys = ["a.txt", "m/b.txt", "z.txt"];
+
+    let server = MockS3Server::start(move |request, _sequence| {
+        if !request.path.contains("/left") && !request.path.contains("/right") {
+            return MockResponse::error(500, "UnexpectedBucket", &request.path);
+        }
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Flat namespace: structural discovery finds no CommonPrefixes.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let contents: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &contents, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("diff.parquet");
+    let ks = dir.path().join("diff.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--target-region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut got = parquet_keys(&parquet);
+    got.sort();
+    assert_eq!(got, vec!["a.txt", "m/b.txt", "z.txt"]);
+
+    let flags = parquet_diff_flags(&parquet);
+    assert_eq!(flags.len(), 3, "every key should appear exactly once");
+    assert!(
+        flags.iter().all(|&f| f == 0),
+        "identical sides must all classify as equal, got {:?}",
+        flags
+    );
+}
+
 #[test]
 fn local_mock_sdk_retries_transient_list_error() {
     let attempts = Arc::new(AtomicUsize::new(0));

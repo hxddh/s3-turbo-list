@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-14
+
+### Performance
+- **Bounded the Parquet writer pool's aggregate output buffer.** Each writer
+  used a fixed 100 MB `BufWriter`; with the v0.13.0 adaptive pool scaling to
+  `min(cores, 32)` writers, a many-core host could allocate up to ~3.2 GB of
+  output buffers. Per-writer buffer is now 8 MB, so the pool's aggregate stays
+  ~256 MB at full fan-out — making the multi-writer path safely usable on
+  many-core but modest-memory machines without ballooning resident memory. The
+  `AsyncArrowWriter` already buffers and flushes whole row groups, so this outer
+  buffer only coalesces large sequential writes; shrinking it does not affect
+  throughput (local A/B on the synthetic list-output benchmark: 8 MB and 100 MB
+  were within run-to-run noise — the page cache absorbs the writes and the
+  fast-store path is CPU-bound on encode+compress).
+
+### Removed
+- **Dropped vestigial fields from the hints cache.** `HintsCache` still wrote
+  `total_objects` (always `0`) and `scan_mode`/`estimate_mode` (always the same
+  `"structural"`), survivors of the v0.12.0 slimming that nothing read for
+  behavior. They are gone from the written file and from the `doctor
+  --hints-file` report (JSON and human output). On-disk-safe: older cache files
+  that still contain these keys (or the long-removed sampled-scan fields) parse
+  fine — the extra keys are ignored.
+
+### Documentation
+- Fixed the hints TOML example in `docs/tuning.md` to match what startup
+  discovery actually writes (no more stale `total_objects = 50000` /
+  `scan_mode = "full"`), and noted that legacy fields are accepted-and-ignored.
+- Rewrote the stale `diff` paragraph in `docs/agent-usage.md`: diff partitions
+  and lists each side in parallel (dry-run reports
+  `hints.source = "diff_per_side_automatic"`) and streams a bounded ordered
+  merge — replacing the contradictory "single-segment comparison" and
+  "comparison map in memory" wording that conflicted with the README.
+
+### Tests
+- Added a self-diff integration test asserting that diffing two identical sides
+  classifies every row as equal (`DiffFlag = 0`) with no dropped or mis-flagged
+  keys.
+
 ## [0.13.0] - 2026-06-14
 
 ### Performance

@@ -49,10 +49,7 @@ pub enum HintsFormat {
 pub struct HintsMetadata {
     pub bucket: Option<String>,
     pub region: Option<String>,
-    pub total_objects: Option<usize>,
     pub generated_at: Option<String>,
-    pub scan_mode: Option<String>,
-    pub estimate_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -368,10 +365,7 @@ impl From<&HintsCache> for HintsMetadata {
         Self {
             bucket: Some(cache.bucket.clone()),
             region: cache.region.clone(),
-            total_objects: Some(cache.total_objects),
             generated_at: Some(cache.generated_at.clone()),
-            scan_mode: cache.scan_mode.clone(),
-            estimate_mode: cache.estimate_mode.clone(),
         }
     }
 }
@@ -514,8 +508,13 @@ estimated_objects = 1
         let (_dir, path) = write_tmp(content);
         let report = inspect_hints_file(&path, 1).unwrap();
         let metadata = report.metadata.unwrap();
-        assert_eq!(metadata.scan_mode.as_deref(), Some("sampled"));
-        assert_eq!(metadata.estimate_mode.as_deref(), None);
+        // Legacy decorative fields (scan_mode/estimate_mode/total_objects) are no
+        // longer surfaced; the report keeps the boundaries and provenance.
+        assert_eq!(metadata.region.as_deref(), Some("r"));
+        assert_eq!(
+            metadata.generated_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
         assert_eq!(report.boundary_count, 2);
         assert_eq!(report.first_boundaries, vec!["a/"]);
     }

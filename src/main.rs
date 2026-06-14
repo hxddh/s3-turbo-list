@@ -2947,15 +2947,8 @@ fn print_doctor_hints(report: &hints::HintsValidationReport) {
             metadata.region.as_deref().unwrap_or("-")
         );
         println!(
-            "  Total objects:   {}",
-            metadata
-                .total_objects
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        );
-        println!(
-            "  Scan mode:       {}",
-            metadata.scan_mode.as_deref().unwrap_or("unknown")
+            "  Generated at:    {}",
+            metadata.generated_at.as_deref().unwrap_or("-")
         );
     }
     if !report.first_boundaries.is_empty() {

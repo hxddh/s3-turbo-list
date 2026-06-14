@@ -75,6 +75,17 @@ const OUTPUT_GROW_MIN_BATCHES: usize = 8;
 /// governor measures the writers' actual CPU-busy time directly.
 const OUTPUT_GROW_BUSY_FRACTION: f64 = 0.85;
 
+/// Per-writer output buffer between the Parquet encoder and the file. The
+/// `AsyncArrowWriter` already buffers and flushes whole row groups, so this only
+/// coalesces those large, sequential writes into fewer syscalls — past a few MB
+/// it stops affecting throughput (the page cache absorbs the writes, and on the
+/// fast-store path the writers are CPU-bound on encode+compress, not on file
+/// I/O). Sized so the pool's *aggregate* buffer stays bounded as the governor
+/// scales out: `MAX_LIST_OUTPUT_WORKERS` × this is ~256 MB, sane on any machine
+/// with enough cores to reach the cap. (Was a fixed 100 MB per writer, i.e. up
+/// to 3.2 GB once the pool fanned out on a many-core host.)
+const LIST_OUTPUT_WRITER_BUF_BYTES: usize = 8 * core::MB;
+
 /// Upper bound on output writers: the machine's parallelism, hard-capped. More
 /// writers than cores only thrash, since each does CPU-bound encode+compress.
 fn list_output_worker_cap() -> usize {
@@ -187,7 +198,7 @@ async fn list_output_worker(
             };
         }
     };
-    let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
+    let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
         buf_writer,
         &part_path,
@@ -1242,7 +1253,7 @@ pub async fn data_map_task_diff_streaming(
             return;
         }
     };
-    let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
+    let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
         buf_writer,
         filename_ks,
