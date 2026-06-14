@@ -54,7 +54,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     concurrency: Option<usize>,
 
-    /// Input key space hints file (overrides auto-hints)
+    /// Input key space hints file (overrides automatic discovery)
     #[arg(short = 'H', long, global = true)]
     hints_file: Option<String>,
 
@@ -98,7 +98,7 @@ struct Cli {
     #[arg(long, global = true)]
     resume: bool,
 
-    /// Disable auto-hints (forces manual hints or single-threaded)
+    /// Disable automatic startup discovery (use --hints-file or single-segment)
     #[arg(long, global = true)]
     no_auto_hints: bool,
 
@@ -834,7 +834,7 @@ fn main() {
         // ── Startup structural discovery ─────────────────────
         // When no hints exist for a flat (delimiter='') list run, probe the
         // bucket's CommonPrefix structure once at startup so the first run
-        // lists in parallel without a prior auto-hints invocation. The
+        // lists in parallel with no prior step. The
         // boundaries are persisted to the conventional hints cache, so
         // subsequent runs (including --resume) reload identical segments
         // through the existing cache path.
@@ -2739,8 +2739,8 @@ fn planned_output_paths(
 
 // ── Unified hints loader ───────────────────────────────────
 
-/// Top-level hints loader: resolves hints from explicit file, auto-hints cache,
-/// or falls back to empty (single-segment).
+/// Top-level hints loader: resolves hints from explicit file, the conventional
+/// startup-discovery cache, or falls back to empty (single-segment).
 ///
 /// Priority:
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
@@ -2880,7 +2880,7 @@ fn load_hints(
         return vec![];
     }
 
-    // 2. Try auto-hints cache at conventional path.
+    // 2. Try the startup-discovery cache at the conventional path.
     let cache_filename = if let Some(r) = region {
         agent::conventional_hints_path(bucket, Some(r))
     } else {

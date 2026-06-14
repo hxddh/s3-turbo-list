@@ -180,7 +180,7 @@ pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
 fn parse_as_toml(path: &str, content: &str) -> Result<Vec<String>, String> {
     let cached = parse_toml_cache(path, content)?;
     info!(
-        "Loaded {} auto-hints boundaries from TOML cache '{}'",
+        "Loaded {} key-space boundaries from TOML hints cache '{}'",
         cached.boundaries.len(),
         path
     );
