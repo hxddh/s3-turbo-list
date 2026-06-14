@@ -39,6 +39,13 @@ const SPLIT_MIN_PAGES: u32 = 5;
 const SPLIT_CHECK_INTERVAL_MS: u64 = 200;
 /// Maximum ancestor-directory probe rungs per split attempt.
 const SPLIT_PROBE_MAX_RUNGS: usize = 4;
+/// Minimum throughput gain (ratio) for newly added concurrency to count as
+/// "helping".  Below this, the extra segments are oversubscribing a saturated
+/// provider and fan-out is capped at the last useful level.
+const FANOUT_IMPROVE_RATIO: f64 = 1.05;
+/// Throughput sampling window for the fan-out governor.  The split tick runs
+/// at 200ms, far too jittery to read a trend from; rates are judged over ~1s.
+const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
 
 /// Right half of a split, sent from the segment task to the reactor.
 #[derive(Debug, Clone)]
@@ -265,6 +272,95 @@ fn flat_cut_candidates(cursor: &str, listing_prefix: &str, end: Option<&str>) ->
     candidates
 }
 
+// ── Throughput-aware fan-out governor ──────────────────────
+//
+// Runtime splitting fans out to use idle concurrency, but a single bucket
+// has a request-rate ceiling (e.g. ~50 req/s on OSS): past the point where
+// segments saturate it, adding more in-flight segments only raises per-request
+// latency.  The governor watches run-wide page throughput and caps fan-out at
+// the highest concurrency that was still buying throughput.  It distinguishes
+// the two split regimes by construction: while ramping up, added segments that
+// stop raising throughput lower the cap; in the long-tail tail, segments finish
+// and `set.len()` falls below the cap, so splitting resumes to refill.
+
+struct FanOutGovernor {
+    last_at: Instant,
+    last_pages: u64,
+    last_setlen: usize,
+    last_rate: f64,
+    /// Highest concurrency proven to still raise throughput; the split gate
+    /// never fans out past it.  Starts open at `flat_concurrency`.
+    cap: usize,
+    samples: u32,
+}
+
+impl FanOutGovernor {
+    fn new(max: usize) -> Self {
+        Self {
+            last_at: Instant::now(),
+            last_pages: 0,
+            last_setlen: 0,
+            last_rate: 0.0,
+            cap: max,
+            samples: 0,
+        }
+    }
+
+    fn effective_cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Sample run-wide page throughput once per `FANOUT_SAMPLE` and adjust the
+    /// cap.  `retired` is the page count of completed-and-removed segments;
+    /// live pages are summed from `controls`.  `max` is `flat_concurrency`.
+    fn observe(
+        &mut self,
+        retired: u64,
+        controls: &HashMap<usize, Arc<SegmentControl>>,
+        setlen: usize,
+        max: usize,
+    ) {
+        self.observe_at(Instant::now(), retired, live_pages(controls), setlen, max)
+    }
+
+    /// Pure core of `observe`, split out so tests can drive the clock and page
+    /// totals directly without spawning segments.
+    fn observe_at(&mut self, now: Instant, retired: u64, live: u64, setlen: usize, max: usize) {
+        let elapsed = now.duration_since(self.last_at);
+        if elapsed < FANOUT_SAMPLE {
+            return;
+        }
+        let total = retired + live;
+        let rate = (total.saturating_sub(self.last_pages)) as f64 / elapsed.as_secs_f64();
+
+        self.samples += 1;
+        // The first window only establishes a baseline; need two to judge.
+        if self.samples >= 2 {
+            if rate >= self.last_rate * FANOUT_IMPROVE_RATIO {
+                // Throughput still climbing: reopen the ceiling and keep probing.
+                self.cap = max;
+            } else if setlen > self.last_setlen {
+                // Added segments since last window without a throughput gain:
+                // we are at/above useful concurrency.  Cap at the prior level.
+                self.cap = self.last_setlen.max(1);
+            }
+            // Otherwise (no new segments, flat rate): long-tail region — hold
+            // the cap so the split gate can refill as segments finish.
+        }
+        self.last_at = now;
+        self.last_pages = total;
+        self.last_setlen = setlen;
+        self.last_rate = rate;
+    }
+}
+
+fn live_pages(controls: &HashMap<usize, Arc<SegmentControl>>) -> u64 {
+    controls
+        .values()
+        .map(|c| c.pages.load(Ordering::Relaxed) as u64)
+        .sum()
+}
+
 // ── Public entry point ─────────────────────────────────────
 
 pub async fn flat_list_main_task(
@@ -303,6 +399,8 @@ async fn flat_reactor_task(
     let mut pending_children: Vec<SplitRange> = Vec::new();
     let mut next_child_index = hints.total_count();
     let mut split_count = 0usize;
+    let mut retired_pages = 0u64;
+    let mut gov = FanOutGovernor::new(flat_concurrency);
     let mut last_ts = epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
@@ -360,6 +458,9 @@ async fn flat_reactor_task(
             joined = set.join_next() => match joined {
                 Some(Ok(outcome)) => {
                     let control = controls.remove(&outcome.index);
+                    retired_pages += control
+                        .as_ref()
+                        .map_or(0, |c| c.pages.load(Ordering::Relaxed) as u64);
                     if outcome.completed {
                         if outcome.checkpointable {
                             hints.finish(outcome.index);
@@ -410,15 +511,22 @@ async fn flat_reactor_task(
                     last_ts = now;
                 }
 
+                // Track whether added concurrency is still buying throughput;
+                // the governor caps fan-out at the saturating level so a single
+                // QPS-limited bucket is not oversubscribed.
+                gov.observe(retired_pages, &controls, set.len(), flat_concurrency);
+
                 // Idle capacity and nothing queued: probe the longest-running
-                // candidates for structural split points, enough to fill the
-                // idle slots in one pass instead of one segment per tick.
+                // candidates for structural split points, up to the governor's
+                // proven-useful concurrency cap, in one pass instead of one
+                // segment per tick.
+                let cap = gov.effective_cap();
                 if allow_split
-                    && set.len() < flat_concurrency
+                    && set.len() < cap
                     && pending_children.is_empty()
                     && hints.is_empty()
                 {
-                    let idle = flat_concurrency - set.len();
+                    let idle = cap - set.len();
                     maybe_start_split_probes(ctx, start_prefix, &controls, idle);
                 }
             },
@@ -1238,6 +1346,51 @@ mod tests {
 
         assert_eq!(select_split_targets(&controls, 2), vec![1]);
         assert!(select_split_targets(&controls, 1).is_empty());
+    }
+
+    #[test]
+    fn test_fanout_governor_caps_when_added_concurrency_stops_helping() {
+        let t0 = Instant::now();
+        let win = FANOUT_SAMPLE + Duration::from_millis(10);
+        let mut gov = FanOutGovernor::new(64);
+
+        // Baseline window: 4 segments, 400 pages. Cap stays open.
+        gov.observe_at(t0 + win, 0, 400, 4, 64);
+        assert_eq!(gov.effective_cap(), 64);
+
+        // Ramp helps: 8 segments, +800 pages (rate doubled). Cap reopened.
+        gov.observe_at(t0 + win * 2, 0, 1200, 8, 64);
+        assert_eq!(gov.effective_cap(), 64);
+
+        // Ramp to 24 segments but throughput flat (+800 again): oversubscribed.
+        // Cap drops back to the last useful level (8).
+        gov.observe_at(t0 + win * 3, 0, 2000, 24, 64);
+        assert_eq!(gov.effective_cap(), 8);
+    }
+
+    #[test]
+    fn test_fanout_governor_reopens_when_throughput_climbs_again() {
+        let t0 = Instant::now();
+        let win = FANOUT_SAMPLE + Duration::from_millis(10);
+        let mut gov = FanOutGovernor::new(32);
+
+        gov.observe_at(t0 + win, 0, 500, 8, 32); // baseline
+        gov.observe_at(t0 + win * 2, 0, 1000, 16, 32); // flat rate, added segs
+        assert_eq!(gov.effective_cap(), 8, "capped at oversubscription");
+
+        // Long-tail refill raises throughput again: ceiling reopens.
+        gov.observe_at(t0 + win * 3, 0, 2000, 12, 32);
+        assert_eq!(gov.effective_cap(), 32);
+    }
+
+    #[test]
+    fn test_fanout_governor_ignores_sub_window_samples() {
+        let t0 = Instant::now();
+        let mut gov = FanOutGovernor::new(16);
+        // Too soon: no sample taken, cap untouched, baseline not advanced.
+        gov.observe_at(t0 + Duration::from_millis(100), 0, 999, 16, 16);
+        assert_eq!(gov.effective_cap(), 16);
+        assert_eq!(gov.samples, 0);
     }
 }
 
