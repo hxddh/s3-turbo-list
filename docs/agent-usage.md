@@ -8,8 +8,8 @@ CI jobs, and shell automation.  The default human CLI remains unchanged.
 These commands do not contact S3 endpoints:
 
 ```bash
-s3-turbo-list doctor --local-only --json
-s3-turbo-list doctor --local-only --simple --fix-suggestions
+s3-turbo-list doctor --json
+s3-turbo-list doctor --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
 s3-turbo-list guide agent-safe
 s3-turbo-list guide summary
@@ -25,7 +25,7 @@ s3-turbo-list manifest-summary run.json --check
 s3-turbo-list doctor --hints-file hints.toml --json
 ```
 
-`doctor --local-only --json` prints the resolved local configuration (under
+`doctor --json` prints the resolved local configuration (under
 `resolved_config`) after TOML, CLI overrides, profile presets, and
 addressing-style normalization, alongside its environment checks. It also
 includes `config_source`, which reports the explicit `--config` path when
@@ -35,7 +35,7 @@ such as `compression` or `endpoint_url`.
 When an explicit `--config` path is missing, `config_source.warnings` reports
 that the command fell back to built-in defaults.
 
-`doctor --local-only --json` checks the binary version, current working
+`doctor --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
 endpoint compatibility profile status, local output parent directories, and
 explicitly marks network probing as skipped.  `doctor --simple` is intended for
@@ -268,7 +268,7 @@ metadata, and retry details.  The format is documented in
 
 ## Safety expectations
 
-- `doctor --local-only` and `--dry-run` are local-only.
+- `doctor` and `--dry-run` are local-only.
 - `list`, `diff`, and `compat-probe` can contact S3 unless combined with
   `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS

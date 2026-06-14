@@ -70,11 +70,6 @@ struct Cli {
     #[arg(long = "endpoint-url", global = true)]
     endpoint: Option<String>,
 
-    /// Deprecated alias for `--addressing-style path`; hidden but still
-    /// honored. Prefer `--addressing-style path`.
-    #[arg(long, global = true, hide = true)]
-    force_path_style: bool,
-
     /// Log file path (implies --log)
     #[arg(long, global = true)]
     output_log_file: Option<String>,
@@ -265,10 +260,6 @@ enum Commands {
 
     /// Run local environment checks without contacting S3
     Doctor {
-        /// Do not contact S3 endpoints
-        #[arg(long, default_value_t = true)]
-        local_only: bool,
-
         /// Emit JSON report
         #[arg(long)]
         json: bool,
@@ -476,7 +467,6 @@ fn main() {
         cli.threads,
         cli.concurrency,
         cli.endpoint.as_deref(),
-        cli.force_path_style,
         cli.addressing_style.as_deref(),
         cli.profile.as_deref(),
         cli.debug_s3,
@@ -502,7 +492,6 @@ fn main() {
 
     match &cli.cmd {
         Commands::Doctor {
-            local_only,
             json,
             simple,
             fix_suggestions,
@@ -515,7 +504,7 @@ fn main() {
                     std::process::exit(agent::ExitCode::CliConfig.code());
                 })
             });
-            let report = agent::doctor_report(*local_only, &cfg, config_source.clone(), hints);
+            let report = agent::doctor_report(&cfg, config_source.clone(), hints);
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -2465,9 +2454,6 @@ fn cli_config_overrides(cli: &Cli) -> Vec<String> {
     }
     if cli.endpoint.is_some() {
         overrides.push("endpoint_url".to_string());
-    }
-    if cli.force_path_style {
-        overrides.push("force_path_style".to_string());
     }
     if cli.addressing_style.is_some() {
         overrides.push("addressing_style".to_string());

@@ -355,7 +355,6 @@ pub struct DoctorReport {
     pub schema_version: &'static str,
     pub tool_version: &'static str,
     pub status: String,
-    pub local_only: bool,
     pub cwd: String,
     pub checks: Vec<DoctorCheck>,
     /// Resolved configuration and its provenance — doctor is the single
@@ -691,7 +690,6 @@ fn parquet_summary(path: &str) -> Result<ParquetArtifactSummary, String> {
 }
 
 pub fn doctor_report(
-    local_only: bool,
     cfg: &S3TurboConfig,
     config_source: ConfigSourceSummary,
     hints: Option<hints::HintsValidationReport>,
@@ -787,13 +785,8 @@ pub fn doctor_report(
     checks.push(endpoint_url_check(cfg));
     checks.push(DoctorCheck {
         name: "network".to_string(),
-        status: if local_only { "skipped" } else { "warn" }.to_string(),
-        message: if local_only {
-            "local-only doctor does not contact S3 endpoints".to_string()
-        } else {
-            "network probing is intentionally not implemented in doctor; use compat-probe explicitly"
-                .to_string()
-        },
+        status: "skipped".to_string(),
+        message: "doctor is a local preflight and does not contact S3 endpoints; use compat-probe to validate an endpoint".to_string(),
     });
 
     for (name, path) in [
@@ -817,7 +810,6 @@ pub fn doctor_report(
         schema_version: AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
         status: status.to_string(),
-        local_only,
         cwd,
         checks,
         config_source,
