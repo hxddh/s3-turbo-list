@@ -4,14 +4,6 @@ use std::collections::BTreeSet;
 // ── Cached hints format ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SegmentEstimate {
-    pub start_after: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_before: Option<String>,
-    pub estimated_objects: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HintsCache {
     pub bucket: String,
     pub region: Option<String>,
@@ -21,33 +13,9 @@ pub struct HintsCache {
     pub boundaries: Vec<String>,
     pub generated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_keys: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_prefix_entries: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub prefix_counts_truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_objects: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_pages: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_pages: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segment_estimates: Vec<SegmentEstimate>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 // ── Startup structural discovery ───────────────────────────
@@ -143,6 +111,85 @@ where
     boundaries.into_iter().collect()
 }
 
+// ── Flat-namespace partitioning ────────────────────────────
+//
+// Structural discovery returns nothing for a flat namespace (no
+// CommonPrefixes), which leaves a diff side listing as one serial segment —
+// the biggest remaining diff performance gap, since diff cannot use list
+// mode's runtime splitting (its ordered merge needs a fixed, key-ordered
+// segment set up front). This bisects the key range with single-key probes
+// before listing, producing exactly that: a sorted, contiguous,
+// non-overlapping partition whose boundaries are all real observed keys
+// (the same flat-cut logic runtime splitting uses), so the merge consumes
+// it in key order with no changes.
+
+/// Discover key-space boundaries for a flat namespace by recursively
+/// bisecting the key range. `probe(start_after)` returns the first key
+/// strictly after `start_after` within the listing prefix (or the first key
+/// of all when `None`). Returns up to `target_boundaries` sorted boundaries;
+/// empty means an empty range or no cuttable structure (single segment).
+pub async fn discover_flat_boundaries<F, Fut>(
+    prefix: &str,
+    target_boundaries: usize,
+    probe: F,
+) -> Vec<String>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    if target_boundaries == 0 {
+        return Vec::new();
+    }
+    // Anchor on the first real key; an empty range yields no boundaries.
+    let first = match probe(None).await {
+        Ok(Some(key)) => key,
+        _ => return Vec::new(),
+    };
+
+    let mut boundaries: BTreeSet<String> = BTreeSet::new();
+    // Ranges still to bisect: (start_key, end_boundary). start_key is a real
+    // observed key; end is an exclusive upper bound (None = open to the tail).
+    let mut frontier: Vec<(String, Option<String>)> = vec![(first, None)];
+    while boundaries.len() < target_boundaries && !frontier.is_empty() {
+        let mut next: Vec<(String, Option<String>)> = Vec::new();
+        for (start, end) in frontier.drain(..) {
+            if boundaries.len() >= target_boundaries {
+                break;
+            }
+            if let Some(cut) = find_flat_cut(prefix, &start, end.as_deref(), &probe).await {
+                boundaries.insert(cut.clone());
+                next.push((start, Some(cut.clone())));
+                next.push((cut, end));
+            }
+        }
+        frontier = next;
+    }
+    boundaries.into_iter().take(target_boundaries).collect()
+}
+
+/// Find one real observed key strictly inside `(start, end)` using the same
+/// flat-cut candidate logic runtime splitting uses. Each candidate costs one
+/// single-key probe; the first observed key in range wins.
+async fn find_flat_cut<F, Fut>(
+    prefix: &str,
+    start: &str,
+    end: Option<&str>,
+    probe: &F,
+) -> Option<String>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    for candidate in crate::tasks_s3::flat_cut_candidates(start, prefix, end) {
+        if let Ok(Some(key)) = probe(Some(candidate)).await {
+            if key.as_str() > start && end.map_or(true, |e| key.as_str() < e) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
 /// Persist startup-discovered boundaries to the conventional hints cache
 /// so subsequent runs (and --resume) load identical segments.
 pub fn write_startup_hints_cache(
@@ -158,18 +205,8 @@ pub fn write_startup_hints_cache(
         total_objects: 0,
         boundaries: boundaries.to_vec(),
         generated_at: chrono::Local::now().to_rfc3339(),
-        source_count: None,
-        source_files: Vec::new(),
-        max_keys: None,
-        max_prefix_entries: None,
-        prefix_counts_truncated: false,
         scan_mode: Some("structural".to_string()),
-        sampled_objects: None,
-        sampled_pages: None,
-        sample_limit: None,
-        max_pages: None,
         estimate_mode: Some("structural".to_string()),
-        segment_estimates: Vec::new(),
     };
     let path = crate::agent::conventional_hints_path(bucket, region);
     let toml_str = toml::to_string_pretty(&cache)
@@ -186,7 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sampled_metadata_serializes() {
+    fn test_hints_cache_round_trip() {
         let cache = HintsCache {
             bucket: "bucket".to_string(),
             region: Some("us-east-1".to_string()),
@@ -194,34 +231,20 @@ mod tests {
             total_objects: 100,
             boundaries: vec!["a/".to_string(), "b/".to_string()],
             generated_at: "2026-05-16T00:00:00Z".to_string(),
-            source_count: None,
-            source_files: Vec::new(),
-            max_keys: Some(500),
-            max_prefix_entries: Some(1_000_000),
-            prefix_counts_truncated: false,
-            scan_mode: Some("sampled".to_string()),
-            sampled_objects: Some(100),
-            sampled_pages: Some(2),
-            sample_limit: Some(100),
-            max_pages: Some(2),
-            estimate_mode: Some("sampled".to_string()),
-            segment_estimates: vec![SegmentEstimate {
-                start_after: String::new(),
-                end_before: Some("a/".to_string()),
-                estimated_objects: 50,
-            }],
+            scan_mode: Some("structural".to_string()),
+            estimate_mode: Some("structural".to_string()),
         };
 
         let encoded = toml::to_string_pretty(&cache).unwrap();
-        assert!(encoded.contains("scan_mode = \"sampled\""));
-        assert!(encoded.contains("sampled_objects = 100"));
+        assert!(encoded.contains("scan_mode = \"structural\""));
 
         let decoded: HintsCache = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded.scan_mode.as_deref(), Some("sampled"));
+        assert_eq!(decoded.bucket, "bucket");
+        assert_eq!(decoded.region.as_deref(), Some("us-east-1"));
         assert_eq!(decoded.prefix.as_deref(), Some("logs/"));
-        assert_eq!(decoded.max_keys, Some(500));
-        assert_eq!(decoded.sampled_pages, Some(2));
-        assert_eq!(decoded.segment_estimates.len(), 1);
+        assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
+        assert_eq!(decoded.scan_mode.as_deref(), Some("structural"));
+        assert_eq!(decoded.estimate_mode.as_deref(), Some("structural"));
     }
 
     fn fake_tree(data: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
@@ -253,6 +276,52 @@ mod tests {
         let tree = fake_tree(&[("", &["a/", "b/", "c/"])]);
         let boundaries = run_discovery(tree, "", 16).await;
         assert_eq!(boundaries, vec!["a/", "b/", "c/"]);
+    }
+
+    // Simulate S3 `max_keys=1`: the first key strictly after `start_after`
+    // (or the very first key when `None`) from a sorted key set.
+    async fn run_flat(keys: Vec<String>, prefix: &str, target: usize) -> Vec<String> {
+        discover_flat_boundaries(prefix, target, |start_after| {
+            let keys = keys.clone();
+            async move {
+                let next = match start_after {
+                    None => keys.first().cloned(),
+                    Some(sa) => keys.iter().find(|k| k.as_str() > sa.as_str()).cloned(),
+                };
+                Ok(next)
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_empty_range_yields_none() {
+        assert!(run_flat(Vec::new(), "", 16).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_single_key_is_uncuttable() {
+        assert!(run_flat(vec!["only".to_string()], "", 16).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_partition_is_valid() {
+        let keys: Vec<String> = (0..200).map(|i| format!("key{:04}", i)).collect();
+        let target = 8;
+        let boundaries = run_flat(keys.clone(), "key", target).await;
+
+        assert!(!boundaries.is_empty(), "a 200-key flat range should split");
+        assert!(boundaries.len() <= target);
+        // Every boundary is a real observed key, and they are strictly sorted
+        // (a contiguous, non-overlapping partition the diff merge can consume).
+        let mut prev: Option<&String> = None;
+        for b in &boundaries {
+            assert!(keys.contains(b), "boundary '{}' is not a real key", b);
+            if let Some(p) = prev {
+                assert!(b > p, "boundaries must be strictly ascending");
+            }
+            prev = Some(b);
+        }
     }
 
     #[tokio::test]

@@ -24,10 +24,11 @@ Where boundaries come from, in precedence order:
 4. **Single segment** — flat namespaces with no `/` structure, and runs
    with `--no-auto-hints`, `--start-after`, or `--continuation-token`.
 
-`diff` uses the same automatic sources per side (cached hints or startup
-discovery) and lists each side's segments in parallel; its segment set
-stays static (no runtime splitting) so the merge can consume segments in
-key order.
+`diff` partitions each side the same way (cached hints or startup discovery),
+and a flat side with no `CommonPrefixes` is partitioned up front by a single-key
+bisection so it lists in parallel too. Each side lists its segments
+concurrently; the segment set stays static (no runtime splitting) so the merge
+can consume segments in key order.
 
 Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits

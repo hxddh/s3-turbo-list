@@ -1680,10 +1680,6 @@ mode = "list"
     assert_eq!(json["hints"]["valid"], true);
     assert_eq!(json["hints"]["format"], "toml");
     assert_eq!(json["hints"]["boundary_count"], 1);
-    assert_eq!(
-        json["hints"]["estimate_summary"]["total_estimated_objects"],
-        30
-    );
 
     assert_eq!(json["checkpoint"]["enabled"], true);
     assert_eq!(json["checkpoint"]["exists"], true);
@@ -1843,7 +1839,7 @@ fn test_cli_doctor_hints_file_plain_success() {
 }
 
 #[test]
-fn test_cli_doctor_hints_file_json_estimates_summary() {
+fn test_cli_doctor_hints_file_json_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.toml");
     std::fs::write(
@@ -1879,12 +1875,11 @@ estimated_objects = 20
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let hints = &json["hints"];
     assert_eq!(hints["metadata"]["scan_mode"], "sampled");
-    assert_eq!(hints["estimate_summary"]["sampled"], true);
-    assert_eq!(hints["estimate_summary"]["count"], 2);
-    assert_eq!(hints["estimate_summary"]["min_estimated_objects"], 10);
-    assert_eq!(hints["estimate_summary"]["max_estimated_objects"], 20);
-    assert_eq!(hints["estimate_summary"]["total_estimated_objects"], 30);
-    assert_eq!(hints["first_estimates"].as_array().unwrap().len(), 2);
+    assert_eq!(hints["metadata"]["estimate_mode"], "sampled");
+    assert_eq!(hints["boundary_count"], 1);
+    assert!(hints["metadata"].get("sampled_objects").is_none());
+    assert!(hints.get("estimate_summary").is_none());
+    assert!(hints.get("first_estimates").is_none());
 }
 
 #[test]

@@ -206,9 +206,10 @@ Exit-code classes are stable. Full reference:
 
 ## Known limitations
 
-1. **Diff segments are static** (no runtime splitting), so a diff side that is
-   a single flat namespace lists serially. List mode is the fastest path for
-   one-bucket inventories.
+1. **Diff segments are static** — each side is partitioned up front (structured
+   sides by discovery, flat sides by a single-key bisection) and not re-split
+   mid-run, so a segment that turns out skewed cannot rebalance the way list
+   mode does. List mode remains the fastest path for one-bucket inventories.
 2. **Release builds on Ubuntu 20.04 arm64** may need the `aws-lc-sys`
    workaround in [BUILD.md](BUILD.md).
 

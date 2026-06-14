@@ -7,12 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-14
+
+### Performance
+- **`diff` now fans out a flat diff side.** Diff cannot use list mode's runtime
+  splitting (its ordered merge needs a fixed, key-ordered segment set up front),
+  so a side that is a flat namespace previously listed as one serial segment —
+  the largest remaining diff performance gap. When structural discovery finds no
+  `CommonPrefixes`, diff now bisects the key range with single-key probes up
+  front (reusing the same flat-cut logic runtime splitting uses) to produce a
+  static, key-ordered partition of real observed keys, so the side lists in
+  parallel. The merge is unchanged and validates each segment's ordering at
+  runtime. No new flags or config.
+
+### Removed
+- **Slimmed the hints cache format.** After the auto-hints/discover-prefixes/
+  hints-merge/sampled-scan removals, `HintsCache` carried 10 fields that nothing
+  populated. Removed them along with the dead `SegmentEstimate` struct and the
+  estimate-summary machinery (~170 lines). `doctor --hints-file --json` no
+  longer emits the dead fields. On-disk-safe: old cache files with the removed
+  keys still parse (the fields are simply ignored).
+
 ### Documentation
+- Reworded README known-limitation #1 (flat diff sides now partition).
+- Fixed the stale `recipes` command name printed by `guide <unknown-topic>`
+  (now `guide index`) and the lingering "auto-hints" wording across CLI help,
+  log lines, and comments (the command was removed; these are startup
+  discovery).
 - Trimmed redundancy across the user-facing docs: removed the duplicated
   first-run and agent-preflight blocks from `INSTALL.md`, merged the two
   overlapping trace sections in `docs/agent-usage.md`, and dropped
   version-archaeology and a stale `0.2.x` stability note from `docs/tuning.md`
-  and `docs/compat-probe.md`. No content removed that users still need.
+  and `docs/compat-probe.md`.
 
 ## [0.11.0] - 2026-06-14
 

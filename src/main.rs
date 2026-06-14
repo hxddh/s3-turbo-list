@@ -54,7 +54,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     concurrency: Option<usize>,
 
-    /// Input key space hints file (overrides auto-hints)
+    /// Input key space hints file (overrides automatic discovery)
     #[arg(short = 'H', long, global = true)]
     hints_file: Option<String>,
 
@@ -98,7 +98,7 @@ struct Cli {
     #[arg(long, global = true)]
     resume: bool,
 
-    /// Disable auto-hints (forces manual hints or single-threaded)
+    /// Disable automatic startup discovery (use --hints-file or single-segment)
     #[arg(long, global = true)]
     no_auto_hints: bool,
 
@@ -834,7 +834,7 @@ fn main() {
         // ── Startup structural discovery ─────────────────────
         // When no hints exist for a flat (delimiter='') list run, probe the
         // bucket's CommonPrefix structure once at startup so the first run
-        // lists in parallel without a prior auto-hints invocation. The
+        // lists in parallel with no prior step. The
         // boundaries are persisted to the conventional hints cache, so
         // subsequent runs (including --resume) reload identical segments
         // through the existing cache path.
@@ -2739,8 +2739,8 @@ fn planned_output_paths(
 
 // ── Unified hints loader ───────────────────────────────────
 
-/// Top-level hints loader: resolves hints from explicit file, auto-hints cache,
-/// or falls back to empty (single-segment).
+/// Top-level hints loader: resolves hints from explicit file, the conventional
+/// startup-discovery cache, or falls back to empty (single-segment).
 ///
 /// Priority:
 /// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
@@ -2791,6 +2791,41 @@ async fn diff_side_boundaries(
     );
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
     let boundaries = auto_hints::discover_startup_boundaries(&client, bucket, prefix, target).await;
+    let boundaries = if boundaries.is_empty() {
+        // Flat namespace: structural discovery found no CommonPrefixes, so the
+        // side would otherwise list as one serial segment. Bisect the key range
+        // with single-key probes so it lists in parallel. The target is smaller
+        // than structural discovery's: each cut is a one-time up-front probe,
+        // and only `max_concurrency` segments run at once, so spare boundaries
+        // beyond that would just cost probes without adding parallelism.
+        let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
+        let probe_bucket = bucket.to_string();
+        let probe_prefix = prefix.to_string();
+        auto_hints::discover_flat_boundaries(prefix, flat_target, |start_after| {
+            let client = client.clone();
+            let bucket = probe_bucket.clone();
+            let prefix = probe_prefix.clone();
+            async move {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .max_keys(1);
+                if let Some(sa) = start_after {
+                    req = req.start_after(sa);
+                }
+                let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
+                Ok(resp
+                    .contents()
+                    .first()
+                    .and_then(|o| o.key())
+                    .map(str::to_string))
+            }
+        })
+        .await
+    } else {
+        boundaries
+    };
     if !boundaries.is_empty() {
         if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
             log::warn!("{}", e);
@@ -2845,7 +2880,7 @@ fn load_hints(
         return vec![];
     }
 
-    // 2. Try auto-hints cache at conventional path.
+    // 2. Try the startup-discovery cache at the conventional path.
     let cache_filename = if let Some(r) = region {
         agent::conventional_hints_path(bucket, Some(r))
     } else {
@@ -2922,50 +2957,6 @@ fn print_doctor_hints(report: &hints::HintsValidationReport) {
             "  Scan mode:       {}",
             metadata.scan_mode.as_deref().unwrap_or("unknown")
         );
-        if metadata.scan_mode.as_deref() == Some("sampled") {
-            println!(
-                "  Sampled objects: {}",
-                metadata
-                    .sampled_objects
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
-            println!(
-                "  Sampled pages:   {}",
-                metadata
-                    .sampled_pages
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
-        }
-        if let Some(summary) = &report.estimate_summary {
-            println!(
-                "  Estimates:       {} ({})",
-                summary.count,
-                if summary.sampled {
-                    "sampled/estimated"
-                } else {
-                    "observed/full"
-                }
-            );
-            println!(
-                "  Estimate min/max/sum: {}/{}/{}",
-                summary.min_estimated_objects,
-                summary.max_estimated_objects,
-                summary.total_estimated_objects
-            );
-        }
-    }
-    if !report.first_estimates.is_empty() {
-        println!("  First {} estimates:", report.first_estimates.len());
-        for estimate in &report.first_estimates {
-            println!(
-                "    - start_after='{}', end_before='{}', estimated_objects={}",
-                estimate.start_after,
-                estimate.end_before.as_deref().unwrap_or(""),
-                estimate.estimated_objects
-            );
-        }
     }
     if !report.first_boundaries.is_empty() {
         println!("  First {} boundaries:", report.first_boundaries.len());
