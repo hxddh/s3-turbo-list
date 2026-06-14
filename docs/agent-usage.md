@@ -244,8 +244,9 @@ Agents should branch on exit codes first, then read `run.json` if it exists.
 
 ## S3 API trace
 
-`--trace-compat trace.jsonl` remains the per-request S3 API trace.  It is
-separate from `--run-manifest`:
+`--trace-compat trace.jsonl` records every S3 API call as JSONL — endpoint
+behavior, request IDs, HTTP status, S3 error codes, pagination metadata, and
+retry details. It is separate from `--run-manifest`, and the two combine:
 
 ```bash
 s3-turbo-list --trace-compat trace.jsonl --run-manifest run.json list \
@@ -253,18 +254,10 @@ s3-turbo-list --trace-compat trace.jsonl --run-manifest run.json list \
   --region us-east-1
 ```
 
-Use the manifest for final run status and aggregate metrics.  Use trace JSONL
-for endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
-metadata, and retry details.
-
-## Trace-driven inspection
-
-Long-tail segments no longer need offline rebalancing: list runs split them
-at runtime automatically.  When you want the raw events for manual inspection,
-pass `--trace-compat trace.jsonl` to a run; the JSONL records each request's
-endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
-metadata, and retry details.  The format is documented in
-[trace-reference.md](trace-reference.md).
+Use the manifest for final run status and aggregate metrics; use the trace for
+per-request endpoint behavior. Long-tail segments split at runtime, so the
+trace is for inspection only — there is no offline rebalancing step. The field
+schema is documented in [trace-reference.md](trace-reference.md).
 
 ## Safety expectations
 

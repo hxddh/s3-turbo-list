@@ -131,8 +131,7 @@ and operator triage:
 
 ## Stability Guidance
 
-- Existing report fields are intended to remain backward compatible through the
-  `0.2.x` series.
+- Existing report fields are intended to remain backward compatible.
 - New diagnostic fields may be added as optional fields.
 - Missing optional fields mean the SDK or endpoint did not provide that
   metadata; missing is not the same as an empty string.

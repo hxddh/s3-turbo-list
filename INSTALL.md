@@ -154,52 +154,21 @@ For a non-default AWS credentials profile, use the AWS SDK environment:
 export AWS_PROFILE=my-aws-profile
 ```
 
-Then run a first listing:
-
-```bash
-s3-turbo-list doctor --simple
-s3-turbo-list init-config --output s3-turbo-list.toml
-
-s3-turbo-list --dry-run --agent --output-dir out \
-  list --bucket my-bucket --region us-east-1
-
-s3-turbo-list --output-dir out \
-  list --bucket my-bucket --region us-east-1
-```
+You are ready to run — see the **30-second first run** above, or write a
+starter config first with `s3-turbo-list init-config --output
+s3-turbo-list.toml`.
 
 The s3-turbo-list `--profile` flag is for endpoint compatibility presets such
 as `minio`, `bos`, `r2`, `b2`, or `oss`; it is not a substitute for
 `AWS_PROFILE`.
 
-## Agent-safe local preflight
+## Agent and CI use
 
-Automation can inspect configuration and planned outputs without contacting S3:
-
-```bash
-s3-turbo-list doctor --json
-s3-turbo-list doctor --simple --fix-suggestions
-s3-turbo-list guide aws-basic
-s3-turbo-list guide summary
-s3-turbo-list guide pipe
-s3-turbo-list guide verify
-s3-turbo-list guide release-check
-s3-turbo-list guide diff-safe
-
-s3-turbo-list --dry-run --agent --output-dir out list \
-  --bucket my-bucket \
-  --region us-east-1
-```
-
-The local JSON reports include a `config_source` section with the loaded config
-file path and global CLI config overrides, which helps automation explain the
-effective settings before a real scan.
-
-For full details on machine-readable plans, manifests, and exit codes, see
-[`docs/agent-usage.md`](docs/agent-usage.md).  Manifest artifact summaries
-include SHA256, file sizes, line counts, and Parquet metadata.
-Provider profiles that need account- or region-specific endpoints warn locally
-until `--endpoint-url` or `s3.endpoint_url` is set.  Replace any starter config
-placeholder such as `<account-id>` before a real listing run.
+Every cloud-facing run has a local-only preflight: `doctor --json` reports the
+environment and resolved config, `--dry-run --agent` emits a JSON plan, and
+`guide <topic>` prints command recipes — none contact S3. Machine-readable
+plans, run manifests, and stable exit codes are documented in
+[`docs/agent-usage.md`](docs/agent-usage.md).
 
 ## Configure BOS
 
@@ -274,16 +243,11 @@ s3-turbo-list list \
 
 Output formats and the Parquet schema, checkpoint/resume, hints, and
 performance tuning are covered in the [README](README.md) and
-[`docs/tuning.md`](docs/tuning.md).  Quick pointers:
+[`docs/tuning.md`](docs/tuning.md). Two common follow-ups:
 
 ```bash
-# Recursive bucket inventory → Parquet + keyspace CSV
-s3-turbo-list --output-dir out \
-  list --bucket my-bucket --region us-east-1
-
 # Resume an interrupted scan (identity-verified)
-s3-turbo-list --resume \
-  list --bucket my-bucket --region us-east-1
+s3-turbo-list --resume list --bucket my-bucket --region us-east-1
 
 # Inspect the Parquet output
 python3 examples/read-parquet.py out/*.parquet
