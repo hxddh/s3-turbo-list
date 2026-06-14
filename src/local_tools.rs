@@ -541,7 +541,7 @@ pub fn render_init_config_text(report: &InitConfigReport) -> String {
     out.push_str(&format!("  Profile:         {}\n", report.profile));
     out.push_str(&format!("  Output:          {}\n", report.output));
     out.push_str("Next:\n");
-    out.push_str("  s3-turbo-list doctor --local-only --simple\n");
+    out.push_str("  s3-turbo-list doctor --simple\n");
     out.push_str("  s3-turbo-list --dry-run --agent --config ");
     out.push_str(&report.output);
     out.push_str(" --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1\n");
@@ -736,7 +736,7 @@ Run: s3-turbo-list guide <name>
         "aws-basic" => Ok(
             r#"AWS basic:
   export AWS_PROFILE=default
-  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list doctor --simple
   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
@@ -745,7 +745,7 @@ Run: s3-turbo-list guide <name>
         "summary" => Ok(
             r#"Summary only:
   export AWS_PROFILE=default
-  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list doctor --simple
   s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list manifest-summary summary.json
@@ -852,7 +852,7 @@ These commands do not contact S3-compatible cloud endpoints.
         ),
         "agent-safe" => Ok(
             r#"Agent-safe local commands:
-  s3-turbo-list doctor --local-only --json
+  s3-turbo-list doctor --json
   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
@@ -868,7 +868,7 @@ fn render_overview() -> String {
     r#"s3-turbo-list guide
 
 First run:
-  s3-turbo-list doctor --local-only --simple
+  s3-turbo-list doctor --simple
   s3-turbo-list init-config --output s3-turbo-list.toml
   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
   s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
@@ -897,7 +897,7 @@ fn render_quickstart(provider: &str) -> Result<String, String> {
 1. Set credentials:
    export AWS_PROFILE=default
 2. Check local setup:
-   s3-turbo-list doctor --local-only --simple
+   s3-turbo-list doctor --simple
 3. Dry-run:
    s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 4. First list:

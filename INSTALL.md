@@ -19,7 +19,7 @@ After installing the binary and configuring credentials, run a local check,
 then dry-run the command before the real listing:
 
 ```bash
-s3-turbo-list doctor --local-only --simple
+s3-turbo-list doctor --simple
 export AWS_PROFILE=default
 
 s3-turbo-list --dry-run --agent --output-dir out \
@@ -157,7 +157,7 @@ export AWS_PROFILE=my-aws-profile
 Then run a first listing:
 
 ```bash
-s3-turbo-list doctor --local-only --simple
+s3-turbo-list doctor --simple
 s3-turbo-list init-config --output s3-turbo-list.toml
 
 s3-turbo-list --dry-run --agent --output-dir out \
@@ -176,14 +176,14 @@ as `minio`, `bos`, `r2`, `b2`, or `oss`; it is not a substitute for
 Automation can inspect configuration and planned outputs without contacting S3:
 
 ```bash
-s3-turbo-list doctor --local-only --json
-s3-turbo-list doctor --local-only --simple --fix-suggestions
-s3-turbo-list recipes aws-basic
-s3-turbo-list recipes summary
-s3-turbo-list recipes pipe
-s3-turbo-list recipes verify
-s3-turbo-list recipes release-check
-s3-turbo-list recipes diff-safe
+s3-turbo-list doctor --json
+s3-turbo-list doctor --simple --fix-suggestions
+s3-turbo-list guide aws-basic
+s3-turbo-list guide summary
+s3-turbo-list guide pipe
+s3-turbo-list guide verify
+s3-turbo-list guide release-check
+s3-turbo-list guide diff-safe
 
 s3-turbo-list --dry-run --agent --output-dir out list \
   --bucket my-bucket \

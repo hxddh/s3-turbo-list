@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-14
+
+### Removed
+- **Removed the hidden `--force-path-style` global flag.** It was deprecated in
+  v0.9.0 in favor of `--addressing-style path`, which sets the same behavior.
+  The internal addressing machinery and the `s3.force_path_style` config field
+  are unchanged.
+- **Removed `doctor --local-only`.** `doctor` never contacts S3 (that is
+  `compat-probe`'s job), so the flag only toggled a check label. `doctor` is now
+  unconditionally a local preflight; its `network` check always reports
+  `skipped`, and the redundant `local_only` field is gone from the JSON report.
+
+### Documentation
+- **Rewrote `README.md`** for concision and accuracy: current command forms
+  throughout (no removed subcommands or flags), a refreshed third-party OSS
+  benchmark figure, the throughput-aware fan-out behavior, and the
+  `AWS_PROFILE` vs `--profile` distinction stated once.
+- Fixed stale command references in `INSTALL.md` (`recipes` → `guide`,
+  `doctor --local-only` → `doctor`) and across `docs/` and `examples/`.
+- Renamed `examples/hints-validate.sh` → `examples/validate-hints.sh` (the
+  `hints-validate` command was folded into `doctor --hints-file` in v0.10.0).
+
 ## [0.10.0] - 2026-06-14
 
 ### Performance

@@ -69,7 +69,7 @@ plus `CommonPrefixes` only.
 1. Read [`README.md`](../README.md) first — understand the tool.
 2. Run local preflight helpers:
    ```bash
-   s3-turbo-list doctor --local-only --simple
+   s3-turbo-list doctor --simple
    s3-turbo-list guide
    s3-turbo-list guide aws
    ```
@@ -80,7 +80,7 @@ plus `CommonPrefixes` only.
    ```
 4. Run **AWS S3** with an explicit bucket:
    ```bash
-   BUCKET=my-real-bucket REGION=us-east-2 ./examples/aws-basic-list.sh
+   BUCKET=my-bucket REGION=us-east-2 ./examples/aws-basic-list.sh
    ```
 5. Run **BOS** (virtual-hosted by default, as recommended by BOS):
    ```bash
@@ -114,7 +114,7 @@ on BOS should wait for a BOS-side fix or use single-segment fallback.
 | `diff-basic.sh` | Diff two buckets | `.parquet` |
 | `checkpoint-resume.sh` | List with checkpoint save and resume | `.parquet`, `.ks` |
 | `hints-file-toml.sh` | List with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
-| `hints-validate.sh` | Validate TOML or plain-text hints locally | stdout |
+| `validate-hints.sh` | Validate TOML or plain-text hints locally (`doctor --hints-file`) | stdout |
 | `agent-dry-run.sh` | Produce local-only agent plan JSON | `plan.json` |
 | `agent-run-with-manifest.sh` | Run list with manifest and trace outputs; requires `RUN_REAL_S3=1` | `.parquet`, `.ks`, `run.json`, `trace.jsonl` |
 | `read-parquet.py` | Read a Parquet file with pandas | stdout |
