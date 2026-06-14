@@ -83,16 +83,10 @@ generated_at = "2026-05-14T12:00:00Z"
 scan_mode = "full"
 ```
 
-Local tooling (no S3 access):
-
-```bash
-s3-turbo-list doctor --hints-file hints.toml
-```
-
-The `auto-hints` and `discover-prefixes` scan commands were **removed in
-v0.8.0**: startup discovery plus runtime splitting cover their use cases
-automatically and without a separate sequential scan.  Existing hints
-caches and `--hints-file` workflows keep working unchanged.
+Validate a hints file locally (no S3 access) with `doctor --hints-file
+hints.toml`. Hints are entirely optional: startup discovery and runtime
+splitting partition buckets automatically, so `--hints-file` is only for
+pinning exact boundaries on repeated inventories.
 
 ## Core Defaults
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- Trimmed redundancy across the user-facing docs: removed the duplicated
+  first-run and agent-preflight blocks from `INSTALL.md`, merged the two
+  overlapping trace sections in `docs/agent-usage.md`, and dropped
+  version-archaeology and a stale `0.2.x` stability note from `docs/tuning.md`
+  and `docs/compat-probe.md`. No content removed that users still need.
+
 ## [0.11.0] - 2026-06-14
 
 ### Removed
