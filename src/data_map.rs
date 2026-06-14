@@ -45,6 +45,115 @@ struct NdjsonRow<'a> {
     m: u64,
 }
 
+/// Capacity for the coordinator→worker channels. Stage 1 uses a single worker;
+/// this small bound matches the incoming batch cadence without unbounded buffering.
+const LIST_WORKER_CHANNEL_CAPACITY: usize = 64;
+
+/// Number of Parquet output workers. Fixed at 1 for Stage 1 (behavior-preserving).
+const LIST_WORKER_COUNT: usize = 1;
+
+/// Derive the output path for a given part index.
+///
+/// Index 0 returns `base` unchanged. For index > 0, `.partN` is inserted before
+/// the final extension of the basename (e.g. `out/a_ts.parquet` + 2 ->
+/// `out/a_ts.part2.parquet`); if the basename has no extension, `.partN` is appended.
+fn part_path(base: &str, index: usize) -> String {
+    if index == 0 {
+        return base.to_string();
+    }
+
+    // Split into directory prefix and basename so we only inspect the basename's
+    // extension (a `.` in a parent directory must not be treated as the extension).
+    let slash = base.rfind('/');
+    let (dir, name) = match slash {
+        Some(pos) => (&base[..=pos], &base[pos + 1..]),
+        None => ("", base),
+    };
+
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => {
+            let (stem, ext) = name.split_at(dot);
+            format!("{}{}.part{}{}", dir, stem, index, ext)
+        }
+        _ => format!("{}.part{}", base, index),
+    }
+}
+
+/// Result returned by a single Parquet output worker.
+struct ListWorkerResult {
+    prefix_stats: PrefixStats,
+    stats: ListStreamingStats,
+    parquet_rows: usize,
+    output_ok: bool,
+}
+
+/// A single Parquet output worker: owns one output file and its
+/// `AsyncParquetOutput`, ingests batches forwarded by the coordinator, and on
+/// channel close finalizes (closes) its own Parquet writer.
+async fn list_output_worker(
+    mut rx: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
+    part_path: String,
+    output_config: OutputConfig,
+    g_state: core::GlobalState,
+) -> ListWorkerResult {
+    let mut prefix_stats: PrefixStats = HashMap::new();
+    let mut stats = ListStreamingStats {
+        received_batches: 0,
+        received_objects: 0,
+        streamed_rows: 0,
+        bytes_total: 0,
+    };
+    let mut output_ok = true;
+
+    let output_file = match tokio::fs::File::create(&part_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("Failed to create output file {}: {}", part_path, e);
+            g_state.inc_output_error();
+            return ListWorkerResult {
+                prefix_stats,
+                stats,
+                parquet_rows: 0,
+                output_ok: false,
+            };
+        }
+    };
+    let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
+    let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
+        buf_writer,
+        &part_path,
+        output_config.row_group_size,
+        &output_config.compression,
+        output_config.compression_level,
+    );
+
+    while let Some(batch) = rx.recv().await {
+        if let Err(e) =
+            ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch).await
+        {
+            log::error!("{}", e);
+            output_ok = false;
+            g_state.inc_output_error();
+            break;
+        }
+    }
+
+    // Capture the row count before close() consumes the writer.
+    let parquet_rows = parquet.total_rows();
+    if let Err(e) = parquet.close().await {
+        log::error!("{}", e);
+        output_ok = false;
+        g_state.inc_output_error();
+    }
+
+    ListWorkerResult {
+        prefix_stats,
+        stats,
+        parquet_rows,
+        output_ok,
+    }
+}
+
 pub async fn data_map_task_list_streaming(
     mut ctx: DataMapContext,
     filename_ks: &str,
@@ -56,47 +165,52 @@ pub async fn data_map_task_list_streaming(
 
     info!("Data Map Task — list streaming started");
 
-    let output_file = match tokio::fs::File::create(filename_output).await {
-        Ok(f) => f,
-        Err(e) => {
-            log::error!("Failed to create output file {}: {}", filename_output, e);
-            ctx.g_state.inc_output_error();
-            ctx.complete();
-            ctx.quit();
-            return;
-        }
-    };
-    let buf_writer = tokio::io::BufWriter::with_capacity(100 * core::MB, output_file);
-    let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
-        buf_writer,
-        filename_ks,
-        output_config.row_group_size,
-        &output_config.compression,
-        output_config.compression_level,
-    );
+    // Spawn the worker pool (exactly one worker in Stage 1).
+    let mut senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>> =
+        Vec::with_capacity(LIST_WORKER_COUNT);
+    let mut handles: Vec<tokio::task::JoinHandle<ListWorkerResult>> =
+        Vec::with_capacity(LIST_WORKER_COUNT);
+    for index in 0..LIST_WORKER_COUNT {
+        let (w_tx, w_rx) = tokio::sync::mpsc::channel(LIST_WORKER_CHANNEL_CAPACITY);
+        let handle = tokio::spawn(list_output_worker(
+            w_rx,
+            part_path(filename_output, index),
+            output_config.clone(),
+            ctx.g_state.clone(),
+        ));
+        senders.push(w_tx);
+        handles.push(handle);
+    }
 
-    let mut prefix_stats: PrefixStats = HashMap::new();
     let started_at = Instant::now();
     let write_started_at = Instant::now();
     let mut last_ts = epoch_secs();
-    let mut stats = ListStreamingStats {
-        received_batches: 0,
-        received_objects: 0,
-        streamed_rows: 0,
-        bytes_total: 0,
-    };
+    // Coordinator-side counters for heartbeat logging only; authoritative stats
+    // come from the merged worker results at finalize time.
+    let mut routed_batches: usize = 0;
+    let mut routed_objects: usize = 0;
 
     loop {
         let recv_result = ctx.data_map_channel.recv().await;
 
         match recv_result {
             Some(batch) => {
-                if let Err(e) =
-                    ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
-                        .await
-                {
-                    log::error!("{}", e);
+                routed_batches += 1;
+                routed_objects += batch.len();
+                // Stage 1: single worker, route every batch to worker 0.
+                if senders[0].send(batch).await.is_err() {
+                    log::error!("Data Map Task — list streaming worker gone, finalizing output");
                     ctx.g_state.inc_output_error();
+                    coordinator_finalize(
+                        senders,
+                        handles,
+                        &ctx.g_state,
+                        filename_ks,
+                        filename_output,
+                        started_at,
+                        write_started_at,
+                    )
+                    .await;
                     ctx.complete();
                     ctx.quit();
                     return;
@@ -104,13 +218,12 @@ pub async fn data_map_task_list_streaming(
             }
             None => {
                 info!("Data Map Task — list streaming channel disconnected, finalizing output");
-                finalize_list_streaming_output(
-                    parquet,
+                coordinator_finalize(
+                    senders,
+                    handles,
                     &ctx.g_state,
                     filename_ks,
                     filename_output,
-                    &prefix_stats,
-                    stats,
                     started_at,
                     write_started_at,
                 )
@@ -122,13 +235,12 @@ pub async fn data_map_task_list_streaming(
 
         if ctx.is_quit() {
             info!("Data Map Task — list streaming force quit, finalizing output");
-            finalize_list_streaming_output(
-                parquet,
+            coordinator_finalize(
+                senders,
+                handles,
                 &ctx.g_state,
                 filename_ks,
                 filename_output,
-                &prefix_stats,
-                stats,
                 started_at,
                 write_started_at,
             )
@@ -137,25 +249,33 @@ pub async fn data_map_task_list_streaming(
             return;
         } else if !ctx.all_list_tasks_is_running() {
             while let Ok(batch) = ctx.data_map_channel.try_recv() {
-                if let Err(e) =
-                    ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch)
-                        .await
-                {
-                    log::error!("{}", e);
+                // Drained batches are forwarded straight to finalize; the
+                // heartbeat counters are not read again on this path.
+                if senders[0].send(batch).await.is_err() {
+                    log::error!("Data Map Task — list streaming worker gone, finalizing output");
                     ctx.g_state.inc_output_error();
+                    coordinator_finalize(
+                        senders,
+                        handles,
+                        &ctx.g_state,
+                        filename_ks,
+                        filename_output,
+                        started_at,
+                        write_started_at,
+                    )
+                    .await;
                     ctx.complete();
                     ctx.quit();
                     return;
                 }
             }
             info!("Data Map Task — list streaming all list tasks done, finalizing output");
-            finalize_list_streaming_output(
-                parquet,
+            coordinator_finalize(
+                senders,
+                handles,
                 &ctx.g_state,
                 filename_ks,
                 filename_output,
-                &prefix_stats,
-                stats,
                 started_at,
                 write_started_at,
             )
@@ -169,16 +289,107 @@ pub async fn data_map_task_list_streaming(
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
             let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
             info!(
-                "Data Map Task — list streaming prefixes {}, received batches {}, received objects {}, streamed rows {}, {:.0} objects/sec",
-                prefix_stats.len(),
-                stats.received_batches,
-                stats.received_objects,
-                stats.streamed_rows,
-                stats.received_objects as f64 / elapsed
+                "Data Map Task — list streaming received batches {}, received objects {}, {:.0} objects/sec",
+                routed_batches,
+                routed_objects,
+                routed_objects as f64 / elapsed
             );
             last_ts = now;
         }
     }
+}
+
+/// Drain the worker pool: drop all senders (so workers observe channel close and
+/// finalize their own Parquet outputs), await all workers, merge their results,
+/// then write the aggregated KS counts and record run metrics.
+async fn coordinator_finalize(
+    senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>>,
+    handles: Vec<tokio::task::JoinHandle<ListWorkerResult>>,
+    g_state: &core::GlobalState,
+    filename_ks: &str,
+    filename_output: &str,
+    started_at: Instant,
+    write_started_at: Instant,
+) {
+    // Drop senders so each worker's rx.recv() returns None and it finalizes.
+    drop(senders);
+
+    let mut merged_prefix_stats: PrefixStats = HashMap::new();
+    let mut merged_stats = ListStreamingStats {
+        received_batches: 0,
+        received_objects: 0,
+        streamed_rows: 0,
+        bytes_total: 0,
+    };
+    let mut parquet_rows: usize = 0;
+    let mut output_ok = true;
+
+    for handle in handles {
+        match handle.await {
+            Ok(result) => {
+                merged_stats.received_batches += result.stats.received_batches;
+                merged_stats.received_objects += result.stats.received_objects;
+                merged_stats.streamed_rows += result.stats.streamed_rows;
+                merged_stats.bytes_total = merged_stats
+                    .bytes_total
+                    .saturating_add(result.stats.bytes_total);
+                parquet_rows += result.parquet_rows;
+                output_ok &= result.output_ok;
+                for (prefix, agg) in result.prefix_stats {
+                    let entry = merged_prefix_stats.entry(prefix).or_default();
+                    entry.objects += agg.objects;
+                    entry.bytes = entry.bytes.saturating_add(agg.bytes);
+                }
+            }
+            Err(e) => {
+                log::error!("Data Map Task — list streaming worker join error: {}", e);
+                output_ok = false;
+            }
+        }
+    }
+
+    let ks_entries = match write_ks_counts(filename_ks, &merged_prefix_stats).await {
+        Ok(count) => count,
+        Err(e) => {
+            log::error!("{}", e);
+            output_ok = false;
+            0
+        }
+    };
+    if !output_ok {
+        g_state.inc_output_error();
+    }
+
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    let write_elapsed = write_started_at.elapsed().as_secs_f64();
+    g_state.record_data_metrics(
+        merged_stats.received_batches,
+        merged_stats.received_objects,
+        merged_stats.streamed_rows,
+        merged_prefix_stats.len(),
+        parquet_rows,
+        ks_entries,
+        merged_stats.bytes_total,
+        top_prefixes(&merged_prefix_stats, 32),
+        false,
+    );
+    info!(
+        "Data Map Task — list streaming complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",
+        merged_stats.streamed_rows,
+        merged_stats.received_batches,
+        merged_stats.received_objects,
+        merged_prefix_stats.len(),
+        elapsed,
+        merged_stats.received_objects as f64 / elapsed,
+    );
+    info!(
+        "Data Map Task — list streaming output metrics: Parquet rows {} to '{}', KS write entries {} to '{}', write elapsed {:.3}s",
+        parquet_rows,
+        filename_output,
+        ks_entries,
+        filename_ks,
+        write_elapsed,
+    );
 }
 
 pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
@@ -509,66 +720,6 @@ async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
         stats.bytes_total,
         elapsed,
         stats.received_objects as f64 / elapsed,
-    );
-}
-
-async fn finalize_list_streaming_output<W: tokio::io::AsyncWrite + Unpin + Send>(
-    parquet: crate::utils::AsyncParquetOutput<W>,
-    g_state: &core::GlobalState,
-    filename_ks: &str,
-    filename_output: &str,
-    prefix_stats: &PrefixStats,
-    stats: ListStreamingStats,
-    started_at: Instant,
-    write_started_at: Instant,
-) {
-    let parquet_rows = parquet.total_rows();
-    let mut output_ok = true;
-    let ks_entries = match write_ks_counts(filename_ks, prefix_stats).await {
-        Ok(count) => count,
-        Err(e) => {
-            log::error!("{}", e);
-            output_ok = false;
-            0
-        }
-    };
-    if let Err(e) = parquet.close().await {
-        log::error!("{}", e);
-        output_ok = false;
-    }
-    if !output_ok {
-        g_state.inc_output_error();
-    }
-
-    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
-    let write_elapsed = write_started_at.elapsed().as_secs_f64();
-    g_state.record_data_metrics(
-        stats.received_batches,
-        stats.received_objects,
-        stats.streamed_rows,
-        prefix_stats.len(),
-        parquet_rows,
-        ks_entries,
-        stats.bytes_total,
-        top_prefixes(prefix_stats, 32),
-        false,
-    );
-    info!(
-        "Data Map Task — list streaming complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",
-        stats.streamed_rows,
-        stats.received_batches,
-        stats.received_objects,
-        prefix_stats.len(),
-        elapsed,
-        stats.received_objects as f64 / elapsed,
-    );
-    info!(
-        "Data Map Task — list streaming output metrics: Parquet rows {} to '{}', KS write entries {} to '{}', write elapsed {:.3}s",
-        parquet_rows,
-        filename_output,
-        ks_entries,
-        filename_ks,
-        write_elapsed,
     );
 }
 
@@ -1046,4 +1197,42 @@ pub async fn data_map_task_diff_streaming(
 
     g_state.data_map_task_complete();
     g_state.quit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::part_path;
+
+    #[test]
+    fn part_path_index_zero_is_unchanged() {
+        assert_eq!(part_path("out/a_b_ts.parquet", 0), "out/a_b_ts.parquet");
+        assert_eq!(part_path("plain", 0), "plain");
+    }
+
+    #[test]
+    fn part_path_inserts_before_extension() {
+        assert_eq!(
+            part_path("out/a_b_ts.parquet", 2),
+            "out/a_b_ts.part2.parquet"
+        );
+        assert_eq!(part_path("file.parquet", 1), "file.part1.parquet");
+    }
+
+    #[test]
+    fn part_path_no_extension_appends() {
+        assert_eq!(part_path("out/datafile", 3), "out/datafile.part3");
+        assert_eq!(part_path("noext", 5), "noext.part5");
+    }
+
+    #[test]
+    fn part_path_ignores_dot_in_parent_dir() {
+        // The dot is in the directory component, not the basename.
+        assert_eq!(part_path("a.b/datafile", 2), "a.b/datafile.part2");
+    }
+
+    #[test]
+    fn part_path_leading_dot_basename_appends() {
+        // A dotfile with no further extension should append, not split the leading dot.
+        assert_eq!(part_path("dir/.hidden", 2), "dir/.hidden.part2");
+    }
 }
