@@ -362,6 +362,10 @@ pub struct DoctorReport {
     /// local-inspection command (it absorbed the former config-inspect).
     pub config_source: ConfigSourceSummary,
     pub resolved_config: ResolvedConfigSummary,
+    /// Hints-file validation report when --hints-file is supplied — doctor
+    /// absorbed the former hints-validate command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<hints::HintsValidationReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -690,6 +694,7 @@ pub fn doctor_report(
     local_only: bool,
     cfg: &S3TurboConfig,
     config_source: ConfigSourceSummary,
+    hints: Option<hints::HintsValidationReport>,
 ) -> DoctorReport {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -817,6 +822,7 @@ pub fn doctor_report(
         checks,
         config_source,
         resolved_config: cfg.into(),
+        hints,
     }
 }
 

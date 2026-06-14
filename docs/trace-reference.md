@@ -15,9 +15,6 @@ cat trace.jsonl | jq -r .operation | sort | uniq -c
 
 # Find errors
 cat trace.jsonl | jq 'select(.s3_error_code != null)'
-
-# Local summary tooling (no S3 access)
-s3-turbo-list trace-summary trace.jsonl --output-format json
 ```
 
 ## Event fields

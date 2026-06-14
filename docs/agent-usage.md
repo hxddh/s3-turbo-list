@@ -22,7 +22,7 @@ s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --regio
 s3-turbo-list --dry-run --agent --summary-only list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
 s3-turbo-list manifest-summary run.json --check
-s3-turbo-list trace-summary trace.jsonl --machine-readable
+s3-turbo-list doctor --hints-file hints.toml --json
 ```
 
 `doctor --local-only --json` prints the resolved local configuration (under
@@ -52,9 +52,11 @@ without editing TOML.  The default is `zstd(1)`; use
 `--compression gzip --compression-level 6` when a downstream reader requires
 traditional gzip output.
 
-`init-config`, `guide`, and `trace-summary`
+`init-config` and `guide`
 are local tooling commands.  They are handled before S3 config loading, do not
 require cloud credentials, and do not change list/diff hot-path behavior.
+`doctor --hints-file hints.toml` validates a hints file locally and embeds the
+report under `hints` in its JSON output.
 
 ## Dry-run plan files
 
@@ -257,23 +259,16 @@ metadata, and retry details.
 
 ## Trace-driven inspection
 
-The local trace tooling supports machine-readable output for agents:
-
-```bash
-s3-turbo-list trace-summary trace.jsonl --output-format json
-```
-
-`--machine-readable` is an alias for JSON report output on this command.
-Warnings and recommendations are JSON fields, so agents should not scrape human
-text.
-
 Long-tail segments no longer need offline rebalancing: list runs split them
-at runtime automatically.
+at runtime automatically.  When you want the raw events for manual inspection,
+pass `--trace-compat trace.jsonl` to a run; the JSONL records each request's
+endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
+metadata, and retry details.  The format is documented in
+[trace-reference.md](trace-reference.md).
 
 ## Safety expectations
 
 - `doctor --local-only` and `--dry-run` are local-only.
-- `trace-summary` is local-only.
 - `list`, `diff`, and `compat-probe` can contact S3 unless combined with
   `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS

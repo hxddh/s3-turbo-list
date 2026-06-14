@@ -7,8 +7,7 @@ network, change output schema, or add provider-specific pagination workarounds.
 Use profiles explicitly:
 
 ```bash
-s3-turbo-list profiles list
-s3-turbo-list profiles show r2 --json
+s3-turbo-list guide r2   # quickstart + endpoint-compatibility facts
 
 s3-turbo-list list \
   --bucket my-bucket \
@@ -70,7 +69,7 @@ report.
 
 ## Caveats
 
-- `profiles show` and `profiles list` are local-only commands.
+- `guide <provider>` prints these profile facts locally (no S3 access).
 - `compat-probe` is still the explicit command for real endpoint validation.
 - `compat-probe` reports structured HTTP status, S3 error code, and request ID
   metadata when the AWS SDK exposes those values for service errors.  See

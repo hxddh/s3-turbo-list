@@ -15,8 +15,6 @@ S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
 echo "==> Validating hints file: $HINTS_FILE"
 
-$S3TL hints-validate \
-  --hints-file "$HINTS_FILE" \
-  --preview "${PREVIEW:-5}"
+$S3TL --hints-file "$HINTS_FILE" doctor --local-only
 
 echo "==> Hints file is structurally valid."

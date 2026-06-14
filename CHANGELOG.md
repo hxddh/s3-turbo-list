@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-14
+
+### Performance
+- **Runtime split fan-out is now throughput-aware.** v0.9.0 made fan-out fast
+  and multi-candidate, which is the right move when added concurrency keeps
+  buying throughput — but a single bucket has a request-rate ceiling, and on
+  QPS-limited providers fast fan-out drove high-`--concurrency` runs past the
+  saturating point into oversubscription, raising per-request latency.
+  Third-party OSS testing showed `-c 24`/`-c 64` regressing 8–16% while `-c 8`
+  was unchanged. The reactor now samples run-wide page throughput and caps
+  fan-out at the highest concurrency still raising it, reopening the ceiling
+  whenever throughput climbs again. Long-tail refill and genuinely high-QPS
+  buckets are unaffected; only oversubscription is trimmed. `--concurrency`
+  becomes an upper bound rather than a target, matching the documented
+  single-bucket request-rate ceiling. No new flags or config.
+
+### Removed
+- **Removed the `trace-summary` subcommand.** Its purpose was offline segment
+  re-balancing, which runtime splitting now handles automatically. The
+  `--trace-compat` flag still writes the raw JSONL (documented in
+  `docs/trace-reference.md`) for manual inspection.
+- **Removed the `profiles` subcommand, folding it into `guide`.** `guide
+  <provider>` (aws/minio/r2/b2/oss/bos) now prints the quickstart plus that
+  provider's endpoint-compatibility facts in one place. The underlying profile
+  presets (applied by `--profile` and `init-config`) are unchanged.
+- **Removed the `hints-validate` subcommand, folding it into `doctor`.** Run
+  `doctor --hints-file <file>` to validate a hints file; the report appears in
+  both human and `--json` doctor output. `hints::inspect_hints_file` and
+  `--hints-file` for listing are unchanged.
+
 ## [0.9.0] - 2026-06-13
 
 ### Performance

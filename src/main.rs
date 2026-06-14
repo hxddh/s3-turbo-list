@@ -222,39 +222,6 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Validate a local hints file without contacting S3
-    HintsValidate {
-        /// Hints file path
-        #[arg(short = 'H', long)]
-        hints_file: String,
-
-        /// Number of boundaries to preview
-        #[arg(long, default_value_t = 5)]
-        preview: usize,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Summarize a local --trace-compat JSONL file without contacting S3
-    TraceSummary {
-        /// Trace JSONL file
-        trace_file: String,
-
-        /// Output format for the report
-        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-        output_format: ReportFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit JSON report with stdout reserved for machine-readable output
-        #[arg(long)]
-        machine_readable: bool,
-    },
-
     /// Summarize a local run manifest JSON file without contacting S3
     ManifestSummary {
         /// Run manifest JSON file written by --run-manifest
@@ -315,12 +282,6 @@ enum Commands {
         fix_suggestions: bool,
     },
 
-    /// Show endpoint compatibility profiles without contacting S3
-    Profiles {
-        #[command(subcommand)]
-        cmd: ProfileCommands,
-    },
-
     /// Generate shell completions without contacting S3
     Completions {
         /// Shell to generate completions for
@@ -375,13 +336,6 @@ enum Commands {
         #[arg(long)]
         keep_artifacts: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ReportFormat {
-    Text,
-    Json,
-    Markdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -473,26 +427,6 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
     }
 }
 
-#[derive(Subcommand)]
-enum ProfileCommands {
-    /// List known endpoint profiles
-    List {
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Show one endpoint profile
-    Show {
-        /// Profile name, for example aws, minio, bos, r2, b2, or oss
-        name: String,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 // ── Main ───────────────────────────────────────────────────
 
 fn main() {
@@ -505,23 +439,6 @@ fn main() {
         }
         Commands::Man => {
             generate_man_page();
-            return;
-        }
-        Commands::Profiles { cmd } => {
-            run_profiles(cmd);
-            return;
-        }
-        Commands::TraceSummary {
-            trace_file,
-            output_format,
-            json,
-            machine_readable,
-        } => {
-            run_trace_summary(
-                trace_file,
-                *output_format,
-                *json || *machine_readable || cli.agent,
-            );
             return;
         }
         Commands::ManifestSummary {
@@ -546,18 +463,6 @@ fn main() {
             return;
         }
         _ => {}
-    }
-
-    // This command is intentionally local-only and should not depend on S3
-    // credentials, endpoint configuration, or a valid runtime config file.
-    if let Commands::HintsValidate {
-        hints_file,
-        preview,
-        json,
-    } = &cli.cmd
-    {
-        run_hints_validate(hints_file, *preview, *json);
-        return;
     }
 
     // Load config.
@@ -602,7 +507,15 @@ fn main() {
             simple,
             fix_suggestions,
         } => {
-            let report = agent::doctor_report(*local_only, &cfg, config_source.clone());
+            // doctor absorbed the former hints-validate command: when a hints
+            // file is supplied it is linted and embedded in the report.
+            let hints = cli.hints_file.as_deref().map(|path| {
+                hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
+                    eprintln!("Hints validation failed: {}", e);
+                    std::process::exit(agent::ExitCode::CliConfig.code());
+                })
+            });
+            let report = agent::doctor_report(*local_only, &cfg, config_source.clone(), hints);
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -613,6 +526,9 @@ fn main() {
                     println!("  {}: {} — {}", check.name, check.status, check.message);
                 }
                 print_doctor_config(&report);
+                if let Some(hints) = &report.hints {
+                    print_doctor_hints(hints);
+                }
                 if *fix_suggestions {
                     print_doctor_suggestions(&report);
                 }
@@ -784,24 +700,13 @@ fn main() {
             );
             return;
         }
-        Commands::HintsValidate {
-            hints_file,
-            preview,
-            json,
-        } => {
-            run_hints_validate(hints_file, *preview, *json);
-            return;
-        }
         Commands::Doctor { .. } => {
             unreachable!("local-only commands are handled before runtime setup")
         }
-        Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
+        Commands::Completions { .. } | Commands::Man => {
             unreachable!("local-only commands are handled before config load")
         }
-        Commands::TraceSummary { .. }
-        | Commands::ManifestSummary { .. }
-        | Commands::InitConfig { .. }
-        | Commands::Guide { .. } => {
+        Commands::ManifestSummary { .. } | Commands::InitConfig { .. } | Commands::Guide { .. } => {
             unreachable!("local tooling commands are handled before config load")
         }
         Commands::BenchmarkLocal { .. } => {
@@ -1464,24 +1369,6 @@ fn run_guide(topic: Option<&str>) {
     }
 }
 
-fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) {
-    match local_tools::trace_summary(trace_file) {
-        Ok(report) => {
-            if json || output_format == ReportFormat::Json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else if output_format == ReportFormat::Markdown {
-                print!("{}", local_tools::render_trace_summary_markdown(&report));
-            } else {
-                print!("{}", local_tools::render_trace_summary_text(&report));
-            }
-        }
-        Err(e) => {
-            eprintln!("Trace summary failed: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
 fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
     match local_tools::manifest_summary(manifest_file, check) {
         Ok(report) => {
@@ -1499,65 +1386,6 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
             eprintln!("Manifest summary failed: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
-    }
-}
-
-fn run_profiles(cmd: &ProfileCommands) {
-    match cmd {
-        ProfileCommands::List { json } => {
-            if *json {
-                println!("{}", agent::to_pretty_json(&profiles::all_profiles()));
-            } else {
-                println!("Known endpoint compatibility profiles:");
-                for profile in profiles::all_profiles() {
-                    println!(
-                        "  {:<6} {:<36} addressing={:<7} status={}",
-                        profile.name,
-                        profile.provider,
-                        profile.recommended_addressing_style,
-                        profile.status
-                    );
-                }
-            }
-        }
-        ProfileCommands::Show { name, json } => match profiles::get_profile(name) {
-            Some(profile) if *json => println!("{}", agent::to_pretty_json(profile)),
-            Some(profile) => {
-                println!("profile: {}", profile.name);
-                println!("provider: {}", profile.provider);
-                println!("status: {}", profile.status);
-                println!("default_region: {}", profile.default_region.unwrap_or("-"));
-                println!(
-                    "default_endpoint_url: {}",
-                    profile.default_endpoint_url.unwrap_or("-")
-                );
-                println!(
-                    "recommended_addressing_style: {}",
-                    profile.recommended_addressing_style
-                );
-                println!(
-                    "requires_explicit_endpoint: {}",
-                    profile.requires_explicit_endpoint
-                );
-                println!("tested_by_project: {}", profile.tested_by_project);
-                if !profile.notes.is_empty() {
-                    println!("notes:");
-                    for note in profile.notes {
-                        println!("  - {}", note);
-                    }
-                }
-                if !profile.limitations.is_empty() {
-                    println!("limitations:");
-                    for limitation in profile.limitations {
-                        println!("  - {}", limitation);
-                    }
-                }
-            }
-            None => {
-                eprintln!("Unknown endpoint profile '{}'", name);
-                std::process::exit(agent::ExitCode::CliConfig.code());
-            }
-        },
     }
 }
 
@@ -1922,7 +1750,7 @@ fn print_doctor_suggestions(report: &agent::DoctorReport) {
                 }
             }
             "endpoint_profile" if check.status == "warn" => {
-                println!("NEXT s3-turbo-list profiles list");
+                println!("NEXT s3-turbo-list guide <provider>");
             }
             _ => {}
         }
@@ -2810,19 +2638,12 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             None,
             None,
         ),
-        Commands::HintsValidate { .. } => {
-            ("hints-validate".to_string(), None, None, None, None, None)
-        }
-        Commands::TraceSummary { .. } => {
-            ("trace-summary".to_string(), None, None, None, None, None)
-        }
         Commands::ManifestSummary { .. } => {
             ("manifest-summary".to_string(), None, None, None, None, None)
         }
         Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
         Commands::Guide { .. } => ("guide".to_string(), None, None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
-        Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None, None),
         Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
         Commands::Man => ("man".to_string(), None, None, None, None, None),
         Commands::BenchmarkLocal { .. } => {
@@ -3088,101 +2909,88 @@ fn run_compat_probe(
     });
 }
 
-fn run_hints_validate(path: &str, preview: usize, json: bool) {
-    match hints::inspect_hints_file(path, preview) {
-        Ok(report) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).expect("serialize hints report")
-                );
-                return;
-            }
-
-            println!("Hints file: {}", report.path);
-            println!("  Format:          {:?}", report.format);
-            println!("  Boundary count:  {}", report.boundary_count);
-            if let Some(metadata) = &report.metadata {
-                println!(
-                    "  Bucket:          {}",
-                    metadata.bucket.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  Region:          {}",
-                    metadata.region.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  Total objects:   {}",
-                    metadata
-                        .total_objects
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string())
-                );
-                println!(
-                    "  Scan mode:       {}",
-                    metadata.scan_mode.as_deref().unwrap_or("unknown")
-                );
-                if metadata.scan_mode.as_deref() == Some("sampled") {
-                    println!(
-                        "  Sampled objects: {}",
-                        metadata
-                            .sampled_objects
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                    println!(
-                        "  Sampled pages:   {}",
-                        metadata
-                            .sampled_pages
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                }
-                if let Some(summary) = &report.estimate_summary {
-                    println!(
-                        "  Estimates:       {} ({})",
-                        summary.count,
-                        if summary.sampled {
-                            "sampled/estimated"
-                        } else {
-                            "observed/full"
-                        }
-                    );
-                    println!(
-                        "  Estimate min/max/sum: {}/{}/{}",
-                        summary.min_estimated_objects,
-                        summary.max_estimated_objects,
-                        summary.total_estimated_objects
-                    );
-                }
-            }
-            if !report.first_estimates.is_empty() {
-                println!("  First {} estimates:", report.first_estimates.len());
-                for estimate in &report.first_estimates {
-                    println!(
-                        "    - start_after='{}', end_before='{}', estimated_objects={}",
-                        estimate.start_after,
-                        estimate.end_before.as_deref().unwrap_or(""),
-                        estimate.estimated_objects
-                    );
-                }
-            }
-            if !report.first_boundaries.is_empty() {
-                println!("  First {} boundaries:", report.first_boundaries.len());
-                for boundary in &report.first_boundaries {
-                    println!("    - {}", boundary);
-                }
-            }
-            if !report.warnings.is_empty() {
-                println!("  Warnings:");
-                for warning in &report.warnings {
-                    println!("    - {}", warning);
-                }
-            }
+/// Render the hints-file validation section in human doctor output. Doctor
+/// absorbed the former hints-validate command; the formatting matches its old
+/// `Hints file:` block.
+fn print_doctor_hints(report: &hints::HintsValidationReport) {
+    println!("Hints file: {}", report.path);
+    println!("  Format:          {:?}", report.format);
+    println!("  Boundary count:  {}", report.boundary_count);
+    if let Some(metadata) = &report.metadata {
+        println!(
+            "  Bucket:          {}",
+            metadata.bucket.as_deref().unwrap_or("-")
+        );
+        println!(
+            "  Region:          {}",
+            metadata.region.as_deref().unwrap_or("-")
+        );
+        println!(
+            "  Total objects:   {}",
+            metadata
+                .total_objects
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  Scan mode:       {}",
+            metadata.scan_mode.as_deref().unwrap_or("unknown")
+        );
+        if metadata.scan_mode.as_deref() == Some("sampled") {
+            println!(
+                "  Sampled objects: {}",
+                metadata
+                    .sampled_objects
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            println!(
+                "  Sampled pages:   {}",
+                metadata
+                    .sampled_pages
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
         }
-        Err(e) => {
-            eprintln!("Hints validation failed: {}", e);
-            std::process::exit(1);
+        if let Some(summary) = &report.estimate_summary {
+            println!(
+                "  Estimates:       {} ({})",
+                summary.count,
+                if summary.sampled {
+                    "sampled/estimated"
+                } else {
+                    "observed/full"
+                }
+            );
+            println!(
+                "  Estimate min/max/sum: {}/{}/{}",
+                summary.min_estimated_objects,
+                summary.max_estimated_objects,
+                summary.total_estimated_objects
+            );
+        }
+    }
+    if !report.first_estimates.is_empty() {
+        println!("  First {} estimates:", report.first_estimates.len());
+        for estimate in &report.first_estimates {
+            println!(
+                "    - start_after='{}', end_before='{}', estimated_objects={}",
+                estimate.start_after,
+                estimate.end_before.as_deref().unwrap_or(""),
+                estimate.estimated_objects
+            );
+        }
+    }
+    if !report.first_boundaries.is_empty() {
+        println!("  First {} boundaries:", report.first_boundaries.len());
+        for boundary in &report.first_boundaries {
+            println!("    - {}", boundary);
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("  Warnings:");
+        for warning in &report.warnings {
+            println!("    - {}", warning);
         }
     }
 }

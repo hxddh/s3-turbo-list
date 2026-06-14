@@ -37,12 +37,17 @@ range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
 candidate cuts are derived from the segment's cursor and validated with
 single-key probes, so the boundary is always a real observed key.  The reactor
 probes the busiest long-tail segments as soon as slots are idle (not on a fixed
-once-per-second tick) and fans out several at once up to the idle-slot budget,
-so a flat namespace — where this is the only fan-out mechanism — reaches full
-concurrency in a few page round-trips rather than one segment per second.
-Skewed and flat buckets alike fan out until concurrency is used.  Splitting
-never applies to `diff` (static segments by design), `--start-after`, or
-`--continuation-token` runs.  Split segments conservatively do not record
+once-per-second tick) and fans out several at once, so a flat namespace — where
+this is the only fan-out mechanism — ramps in a few page round-trips rather than
+one segment per second.  Fan-out is **throughput-aware**: the reactor watches
+run-wide page throughput and only keeps splitting while added concurrency is
+still raising it, so a single bucket at its request-rate ceiling (see below) is
+not oversubscribed past the point where more in-flight segments only add
+latency.  `--concurrency` is the upper bound; the effective fan-out settles at
+whatever lower number saturates the bucket, and reopens automatically if
+throughput climbs again (for example as long-tail segments finish and free
+slots).  Splitting never applies to `diff` (static segments by design),
+`--start-after`, or `--continuation-token` runs.  Split segments conservatively do not record
 checkpoint progress, so `--resume` re-lists the original segment.
 
 **Defaults are designed to be the right choice**: `worker_threads` follows
@@ -81,7 +86,7 @@ scan_mode = "full"
 Local tooling (no S3 access):
 
 ```bash
-s3-turbo-list hints-validate --hints-file hints.toml
+s3-turbo-list doctor --hints-file hints.toml
 ```
 
 The `auto-hints` and `discover-prefixes` scan commands were **removed in
@@ -166,11 +171,7 @@ CLI flags exist for common runtime controls such as `--threads`,
 
 ## Trace-Driven Inspection
 
-After a run, inspect segment balance from the `--trace-compat` JSONL locally:
-
-```bash
-s3-turbo-list trace-summary trace.jsonl
-```
-
-This reads local files only and does not contact S3.  Long-tail segments are
-split at runtime automatically, so no offline rebalancing workflow is needed.
+Long-tail segments are split at runtime automatically, so no offline
+rebalancing workflow is needed.  When you want the raw per-page and
+per-segment events for manual inspection, pass `--trace-compat trace.jsonl` to
+a run; the JSONL format is documented in [trace-reference.md](trace-reference.md).
