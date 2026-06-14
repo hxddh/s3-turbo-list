@@ -3,7 +3,9 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
@@ -45,12 +47,78 @@ struct NdjsonRow<'a> {
     m: u64,
 }
 
-/// Capacity for the coordinator→worker channels. Stage 1 uses a single worker;
-/// this small bound matches the incoming batch cadence without unbounded buffering.
+/// Capacity for the coordinator→worker channels. A small bound matches the
+/// incoming batch cadence; when it stays full the output governor reads that as
+/// saturation and adds a writer.
 const LIST_WORKER_CHANNEL_CAPACITY: usize = 64;
 
-/// Number of Parquet output workers. Fixed at 1 for Stage 1 (behavior-preserving).
-const LIST_WORKER_COUNT: usize = 1;
+/// Parquet output workers the coordinator starts with; the governor grows this
+/// on demand up to the worker cap.
+const INITIAL_LIST_WORKERS: usize = 1;
+
+/// Hard cap on output workers regardless of core count (bounds part-file count
+/// on very large machines).
+const MAX_LIST_OUTPUT_WORKERS: usize = 32;
+
+/// Window over which the coordinator judges output saturation before adding a
+/// writer. Short enough to ramp quickly on a fast store, long enough to ignore
+/// momentary bursts.
+const OUTPUT_GROW_SAMPLE: Duration = Duration::from_millis(250);
+
+/// Minimum batches observed in a window before a grow decision is trusted.
+const OUTPUT_GROW_MIN_BATCHES: usize = 8;
+
+/// Per-writer busy fraction above which the writers are the bottleneck (they
+/// spent most of the window encoding+compressing rather than waiting for input),
+/// so adding a writer should raise throughput. A channel-full signal is too
+/// brittle here — the bounded prefetch buffer masks the bottleneck — so the
+/// governor measures the writers' actual CPU-busy time directly.
+const OUTPUT_GROW_BUSY_FRACTION: f64 = 0.85;
+
+/// Upper bound on output writers: the machine's parallelism, hard-capped. More
+/// writers than cores only thrash, since each does CPU-bound encode+compress.
+fn list_output_worker_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(INITIAL_LIST_WORKERS, MAX_LIST_OUTPUT_WORKERS)
+}
+
+/// Grow the writer pool when the writers were CPU-busy at least
+/// `OUTPUT_GROW_BUSY_FRACTION` of the window (so they, not the input, are the
+/// bottleneck) and we are still below the cap. On a rate-limited store the
+/// writers idle waiting for input, busy fraction stays low, and the pool stays
+/// at one writer.
+fn output_should_grow(busy_fraction: f64, batches: usize, workers: usize, cap: usize) -> bool {
+    workers < cap
+        && batches >= OUTPUT_GROW_MIN_BATCHES
+        && busy_fraction >= OUTPUT_GROW_BUSY_FRACTION
+}
+
+/// Route one batch to a worker, round-robin. Prefers a worker with buffer space
+/// (non-blocking `try_send`); if all are full, blocks on the round-robin target.
+/// Returns `Err` only if a worker is gone.
+async fn route_batch(
+    senders: &[tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>],
+    rr: &mut usize,
+    mut batch: Vec<(ObjectKey, ObjectProps)>,
+) -> Result<(), ()> {
+    let k = senders.len();
+    for off in 0..k {
+        let i = (*rr + off) % k;
+        match senders[i].try_send(batch) {
+            Ok(()) => {
+                *rr = (i + 1) % k;
+                return Ok(());
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(b)) => batch = b,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Err(()),
+        }
+    }
+    let i = *rr % k;
+    *rr = (i + 1) % k;
+    senders[i].send(batch).await.map_err(|_| ())
+}
 
 /// Derive the output path for a given part index.
 ///
@@ -95,6 +163,7 @@ async fn list_output_worker(
     part_path: String,
     output_config: OutputConfig,
     g_state: core::GlobalState,
+    busy_nanos: Arc<AtomicU64>,
 ) -> ListWorkerResult {
     let mut prefix_stats: PrefixStats = HashMap::new();
     let mut stats = ListStreamingStats {
@@ -128,9 +197,13 @@ async fn list_output_worker(
     );
 
     while let Some(batch) = rx.recv().await {
-        if let Err(e) =
-            ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch).await
-        {
+        // Time the encode+compress so the coordinator can see when writers are
+        // the bottleneck and add another.
+        let work_start = Instant::now();
+        let result =
+            ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch).await;
+        busy_nanos.fetch_add(work_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Err(e) = result {
             log::error!("{}", e);
             output_ok = false;
             g_state.inc_output_error();
@@ -165,18 +238,22 @@ pub async fn data_map_task_list_streaming(
 
     info!("Data Map Task — list streaming started");
 
-    // Spawn the worker pool (exactly one worker in Stage 1).
+    // Start the worker pool; the output governor grows it on demand.
+    let worker_cap = list_output_worker_cap();
+    // Shared CPU-busy accumulator across all writers (encode+compress nanos).
+    let busy_nanos = Arc::new(AtomicU64::new(0));
     let mut senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>> =
-        Vec::with_capacity(LIST_WORKER_COUNT);
+        Vec::with_capacity(worker_cap);
     let mut handles: Vec<tokio::task::JoinHandle<ListWorkerResult>> =
-        Vec::with_capacity(LIST_WORKER_COUNT);
-    for index in 0..LIST_WORKER_COUNT {
+        Vec::with_capacity(worker_cap);
+    for index in 0..INITIAL_LIST_WORKERS {
         let (w_tx, w_rx) = tokio::sync::mpsc::channel(LIST_WORKER_CHANNEL_CAPACITY);
         let handle = tokio::spawn(list_output_worker(
             w_rx,
             part_path(filename_output, index),
             output_config.clone(),
             ctx.g_state.clone(),
+            Arc::clone(&busy_nanos),
         ));
         senders.push(w_tx);
         handles.push(handle);
@@ -189,6 +266,12 @@ pub async fn data_map_task_list_streaming(
     // come from the merged worker results at finalize time.
     let mut routed_batches: usize = 0;
     let mut routed_objects: usize = 0;
+    // Output governor state: round-robin cursor, per-window batch count, and the
+    // writers' cumulative busy-nanos at the last evaluation.
+    let mut rr: usize = 0;
+    let mut batch_window: usize = 0;
+    let mut last_busy_nanos: u64 = 0;
+    let mut last_grow_eval = Instant::now();
 
     loop {
         let recv_result = ctx.data_map_channel.recv().await;
@@ -197,8 +280,7 @@ pub async fn data_map_task_list_streaming(
             Some(batch) => {
                 routed_batches += 1;
                 routed_objects += batch.len();
-                // Stage 1: single worker, route every batch to worker 0.
-                if senders[0].send(batch).await.is_err() {
+                if route_batch(&senders, &mut rr, batch).await.is_err() {
                     log::error!("Data Map Task — list streaming worker gone, finalizing output");
                     ctx.g_state.inc_output_error();
                     coordinator_finalize(
@@ -214,6 +296,40 @@ pub async fn data_map_task_list_streaming(
                     ctx.complete();
                     ctx.quit();
                     return;
+                }
+                batch_window += 1;
+
+                // Output governor: if the writers were CPU-busy most of the
+                // window (they, not the input, are the bottleneck) and we are
+                // below the cap, add a writer with its own part-file.
+                let now_i = Instant::now();
+                let window = now_i.duration_since(last_grow_eval);
+                if window >= OUTPUT_GROW_SAMPLE {
+                    let busy_now = busy_nanos.load(Ordering::Relaxed);
+                    let busy_delta = busy_now.saturating_sub(last_busy_nanos);
+                    // Busy fraction = writer CPU time / (wall window × current writers).
+                    let capacity_nanos = window.as_secs_f64() * senders.len() as f64 * 1e9;
+                    let busy_fraction = busy_delta as f64 / capacity_nanos.max(1.0);
+                    if output_should_grow(busy_fraction, batch_window, senders.len(), worker_cap) {
+                        let index = senders.len();
+                        let (w_tx, w_rx) = tokio::sync::mpsc::channel(LIST_WORKER_CHANNEL_CAPACITY);
+                        handles.push(tokio::spawn(list_output_worker(
+                            w_rx,
+                            part_path(filename_output, index),
+                            output_config.clone(),
+                            ctx.g_state.clone(),
+                            Arc::clone(&busy_nanos),
+                        )));
+                        senders.push(w_tx);
+                        info!(
+                            "Data Map Task — output scaled to {} Parquet writers (writers {:.0}% busy)",
+                            senders.len(),
+                            busy_fraction * 100.0
+                        );
+                    }
+                    batch_window = 0;
+                    last_busy_nanos = busy_now;
+                    last_grow_eval = now_i;
                 }
             }
             None => {
@@ -249,9 +365,9 @@ pub async fn data_map_task_list_streaming(
             return;
         } else if !ctx.all_list_tasks_is_running() {
             while let Ok(batch) = ctx.data_map_channel.try_recv() {
-                // Drained batches are forwarded straight to finalize; the
-                // heartbeat counters are not read again on this path.
-                if senders[0].send(batch).await.is_err() {
+                // Drained batches are forwarded straight to finalize; no further
+                // pool growth on this path.
+                if route_batch(&senders, &mut rr, batch).await.is_err() {
                     log::error!("Data Map Task — list streaming worker gone, finalizing output");
                     ctx.g_state.inc_output_error();
                     coordinator_finalize(
@@ -1201,7 +1317,28 @@ pub async fn data_map_task_diff_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::part_path;
+    use super::{output_should_grow, part_path, OUTPUT_GROW_MIN_BATCHES};
+
+    #[test]
+    fn output_governor_grows_only_when_writers_busy_and_below_cap() {
+        let cap = 4;
+        let batches = 100;
+        // Writers CPU-busy above threshold, below cap -> grow.
+        assert!(output_should_grow(0.95, batches, 1, cap));
+        assert!(output_should_grow(0.85, batches, 3, cap));
+        // At the cap: never grow, however busy.
+        assert!(!output_should_grow(1.0, batches, cap, cap));
+        // Writers have idle time (input-bound, not writer-bound) -> hold.
+        assert!(!output_should_grow(0.84, batches, 1, cap));
+        assert!(!output_should_grow(0.1, batches, 1, cap));
+        // Too few batches to judge -> hold even if fully busy.
+        assert!(!output_should_grow(
+            1.0,
+            OUTPUT_GROW_MIN_BATCHES - 1,
+            1,
+            cap
+        ));
+    }
 
     #[test]
     fn part_path_index_zero_is_unchanged() {
