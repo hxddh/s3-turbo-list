@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-14
+
+### Performance
+- **Parquet list output now parallelizes adaptively.** A single writer encoding
+  and compressing Parquet caps throughput well below what a non-rate-limited
+  store can feed on a many-core machine (local benchmark: ~2.2M obj/s Parquet vs
+  ~4.8M obj/s for cheap text output on the same input — the writer is the
+  bottleneck). The data-map task is now a coordinator over a pool of writer
+  tasks: each writer reports its CPU-busy time, and while the writers are busy
+  ≥85% of the time (they, not the input, are the limit) the coordinator adds a
+  writer — up to the machine's core count — each streaming its own part-file
+  (`<name>.partN.parquet`). On a rate-limited store the writers idle and the
+  pool stays at one writer, so output is a single file exactly as before (no
+  flag, no config). Local benchmark on 4 cores with a no-limit feed: Parquet
+  throughput 2.22M → 4.50M obj/s (2.0×). Part-files read transparently as a
+  directory in pandas/duckdb/pyarrow; the `.ks` counts and run metrics are
+  merged across writers. Streaming TSV/NDJSON and `diff` output stay
+  single-writer by nature.
+
 ## [0.12.0] - 2026-06-14
 
 ### Performance

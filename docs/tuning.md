@@ -135,6 +135,28 @@ Practical guidance:
 - The largest wins come from spreading load across prefixes, which segmented
   listing does automatically.
 
+## Adaptive Parquet output
+
+The single-bucket request-rate ceiling means listing is usually I/O-bound, and
+one task encoding and compressing Parquet keeps up easily.  But on a store that
+is *not* rate-limited (well-distributed AWS prefixes, a large self-hosted
+MinIO/Ceph cluster, a LAN) on a many-core machine, listing can feed faster than
+one writer can encode+compress — the writer becomes the bottleneck.
+
+Parquet list output adapts automatically.  It starts with one writer and, only
+while the writers are CPU-bound (busy encoding most of the time rather than
+waiting for input), adds more writers up to the machine's core count.  Each
+extra writer streams to its own part-file (`<name>.part1.parquet`,
+`<name>.part2.parquet`, …) alongside the primary `<name>.parquet`.  There is no
+flag — on a rate-limited store the writers idle, the pool stays at one writer,
+and the output is a single file exactly as before.
+
+When output does scale to multiple part-files, read them as a directory —
+pandas, duckdb, and pyarrow all read a directory of Parquet parts transparently
+(`pq.read_table("out/")`).  The companion `.ks` counts and all run metrics are
+merged across the parts into one set.  Streaming TSV/NDJSON to stdout and `diff`
+output stay single-writer by nature (one ordered stream / one pipe).
+
 ## Config File Settings
 
 Some advanced settings are easiest to keep in a TOML config file and pass with
