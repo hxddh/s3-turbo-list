@@ -341,7 +341,6 @@ impl S3TurboConfig {
         threads: Option<usize>,
         concurrency: Option<usize>,
         endpoint: Option<&str>,
-        force_path_style: bool,
         addressing_style: Option<&str>,
         profile: Option<&str>,
         debug_s3: bool,
@@ -379,10 +378,6 @@ impl S3TurboConfig {
                     }
                 }
             }
-        }
-        if force_path_style {
-            self.s3.force_path_style = true;
-            self.s3.addressing_style = AddressingStyle::Path;
         }
         if let Some(p) = profile {
             self.s3.profile = Some(p.to_string());
@@ -585,7 +580,6 @@ profile = "bos"
             Some(4),
             Some(200),
             Some("https://custom.example.com"),
-            true,
             Some("path"),
             Some("test-profile"),
             true,
@@ -712,7 +706,6 @@ profile = "bos"
             None,
             None,
             Some("https://s3.bj.bcebos.com"),
-            false,
             None,
             None,
             false,
@@ -738,7 +731,6 @@ profile = "bos"
             None,
             None,
             None,
-            false,
             Some("virtual"),
             None,
             false,

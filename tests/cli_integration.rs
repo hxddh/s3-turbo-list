@@ -138,7 +138,6 @@ fn test_cli_hints_validate_removed() {
 fn test_cli_help_agent_local_commands() {
     let (code, stdout, _stderr) = run_cli(&["doctor", "--help"]);
     assert_eq!(code, 0, "doctor --help should exit 0");
-    assert!(stdout.contains("--local-only"));
     assert!(stdout.contains("--json"));
 
     let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
@@ -163,7 +162,7 @@ fn test_cli_help_agent_local_commands() {
 fn test_cli_doctor_json_includes_resolved_config() {
     // doctor absorbed the former config-inspect: its JSON carries the
     // resolved configuration and its provenance.
-    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
+    let (code, stdout, stderr) = run_cli(&["doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -327,7 +326,6 @@ fn test_cli_doctor_simple_fix_suggestions() {
         "--output-parquet-file",
         missing_parent.to_str().unwrap(),
         "doctor",
-        "--local-only",
         "--simple",
         "--fix-suggestions",
     ]);
@@ -338,13 +336,12 @@ fn test_cli_doctor_simple_fix_suggestions() {
 
 #[test]
 fn test_cli_doctor_json_local_only_success() {
-    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
+    let (code, stdout, stderr) = run_cli(&["doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["local_only"], true);
     let checks = json["checks"].as_array().unwrap();
     assert!(checks
         .iter()
@@ -353,8 +350,7 @@ fn test_cli_doctor_json_local_only_success() {
 
 #[test]
 fn test_cli_doctor_warns_when_aws_profile_matches_endpoint_preset_name() {
-    let (code, stdout, stderr) =
-        run_cli_with_aws_profile(&["doctor", "--local-only", "--json"], "bos");
+    let (code, stdout, stderr) = run_cli_with_aws_profile(&["doctor", "--json"], "bos");
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -614,7 +610,7 @@ fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
 
 #[test]
 fn test_cli_doctor_reports_zstd_default_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
+    let (code, stdout, stderr) = run_cli(&["doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -654,7 +650,6 @@ compression_level = 6
         "--config",
         config_path.to_str().unwrap(),
         "doctor",
-        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -687,12 +682,7 @@ worker_threads = 4
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_cli(&[
-        "--config",
-        config_path.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-    ]);
+    let (code, stdout, stderr) = run_cli(&["--config", config_path.to_str().unwrap(), "doctor"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:"));
     assert!(stdout.contains(config_path.to_str().unwrap()));
@@ -703,8 +693,7 @@ fn test_cli_doctor_warns_for_missing_explicit_config_no_cloud() {
     let config_path = "/tmp/s3-turbo-list-missing-test-config.toml";
     let _ = std::fs::remove_file(config_path);
 
-    let (code, stdout, stderr) =
-        run_cli(&["--config", config_path, "doctor", "--local-only", "--json"]);
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["config_source"]["explicit_config"], config_path);
@@ -719,7 +708,7 @@ fn test_cli_doctor_warns_for_missing_explicit_config_no_cloud() {
         .iter()
         .any(|warning| warning.as_str().unwrap().contains("was not found")));
 
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor", "--local-only"]);
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:       -"));
     assert!(stdout.contains("warning:"));
@@ -1074,13 +1063,8 @@ endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_cli(&[
-        "--config",
-        config.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-        "--json",
-    ]);
+    let (code, stdout, stderr) =
+        run_cli(&["--config", config.to_str().unwrap(), "doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(json["checks"].as_array().unwrap().iter().any(|check| {
@@ -1838,13 +1822,8 @@ fn test_cli_bad_config_exits_with_config_code() {
     let path = dir.path().join("bad.toml");
     std::fs::write(&path, "[s3\n").unwrap();
 
-    let (code, _stdout, stderr) = run_cli(&[
-        "--config",
-        path.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-        "--json",
-    ]);
+    let (code, _stdout, stderr) =
+        run_cli(&["--config", path.to_str().unwrap(), "doctor", "--json"]);
     assert_eq!(code, 2, "bad config should use stable config exit code");
     assert!(stderr.contains("Config error"));
 }
@@ -1856,12 +1835,7 @@ fn test_cli_doctor_hints_file_plain_success() {
     let path = dir.path().join("hints.txt");
     std::fs::write(&path, "alpha/\nbeta/\n").unwrap();
 
-    let (code, stdout, stderr) = run_cli(&[
-        "--hints-file",
-        path.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-    ]);
+    let (code, stdout, stderr) = run_cli(&["--hints-file", path.to_str().unwrap(), "doctor"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Hints file:"));
     assert!(stdout.contains("Boundary count"));
@@ -1898,13 +1872,8 @@ estimated_objects = 20
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_cli(&[
-        "--hints-file",
-        path.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-        "--json",
-    ]);
+    let (code, stdout, stderr) =
+        run_cli(&["--hints-file", path.to_str().unwrap(), "doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1924,12 +1893,7 @@ fn test_cli_doctor_hints_file_malformed_failure() {
     let path = dir.path().join("hints.txt");
     std::fs::write(&path, "boundaries = [\nalpha/\n]\n").unwrap();
 
-    let (code, _stdout, stderr) = run_cli(&[
-        "--hints-file",
-        path.to_str().unwrap(),
-        "doctor",
-        "--local-only",
-    ]);
+    let (code, _stdout, stderr) = run_cli(&["--hints-file", path.to_str().unwrap(), "doctor"]);
     assert_ne!(code, 0, "malformed hints should fail");
     assert!(stderr.contains("Hints validation failed"));
 }
