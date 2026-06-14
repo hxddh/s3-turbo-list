@@ -2080,11 +2080,13 @@ estimate_mode = "full"
 
 #[test]
 fn local_mock_diff_lists_sides_in_parallel_segments() {
-    // v0.7: diff partitions each side automatically. The left side has a
-    // cached hints boundary ("m/") and must list two segments; the right
-    // side has no cache and a flat namespace, so discovery yields a single
-    // segment. The merge must classify across segment boundaries with
-    // every key exactly once.
+    // diff partitions each side automatically. The left side has a cached
+    // hints boundary ("m/") and lists two segments; the right side has no
+    // cache and a flat namespace, so structural discovery finds nothing and
+    // the flat-cut bisection (max-keys=1 probes) partitions it instead — so it
+    // also lists in parallel rather than as one serial segment. The merge must
+    // classify across both sides' segment boundaries with every key exactly
+    // once.
     let left_keys = ["a.txt", "left-only.txt", "z-extra.txt"];
     let right_keys = ["a.txt", "right-only.txt", "z-extra.txt"];
 
@@ -2176,10 +2178,16 @@ estimate_mode = "full"
     assert!(left_lists
         .iter()
         .any(|r| r.query.get("start-after").map(String::as_str) == Some("m/")));
-    // Right side: discovery probe plus one listing chain.
+    // Right side: structural discovery probe, then flat-cut bisection probes
+    // (max-keys=1) that partition the flat namespace for parallel listing.
     assert!(requests
         .iter()
         .any(|r| r.path.contains("/right") && r.query.contains_key("delimiter")));
+    assert!(
+        requests.iter().any(|r| r.path.contains("/right")
+            && r.query.get("max-keys").map(String::as_str) == Some("1")),
+        "expected right-side flat-cut probes to partition the flat namespace",
+    );
 }
 #[test]
 fn local_mock_sdk_retries_transient_list_error() {

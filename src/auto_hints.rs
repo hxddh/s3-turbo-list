@@ -143,6 +143,85 @@ where
     boundaries.into_iter().collect()
 }
 
+// ── Flat-namespace partitioning ────────────────────────────
+//
+// Structural discovery returns nothing for a flat namespace (no
+// CommonPrefixes), which leaves a diff side listing as one serial segment —
+// the biggest remaining diff performance gap, since diff cannot use list
+// mode's runtime splitting (its ordered merge needs a fixed, key-ordered
+// segment set up front). This bisects the key range with single-key probes
+// before listing, producing exactly that: a sorted, contiguous,
+// non-overlapping partition whose boundaries are all real observed keys
+// (the same flat-cut logic runtime splitting uses), so the merge consumes
+// it in key order with no changes.
+
+/// Discover key-space boundaries for a flat namespace by recursively
+/// bisecting the key range. `probe(start_after)` returns the first key
+/// strictly after `start_after` within the listing prefix (or the first key
+/// of all when `None`). Returns up to `target_boundaries` sorted boundaries;
+/// empty means an empty range or no cuttable structure (single segment).
+pub async fn discover_flat_boundaries<F, Fut>(
+    prefix: &str,
+    target_boundaries: usize,
+    probe: F,
+) -> Vec<String>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    if target_boundaries == 0 {
+        return Vec::new();
+    }
+    // Anchor on the first real key; an empty range yields no boundaries.
+    let first = match probe(None).await {
+        Ok(Some(key)) => key,
+        _ => return Vec::new(),
+    };
+
+    let mut boundaries: BTreeSet<String> = BTreeSet::new();
+    // Ranges still to bisect: (start_key, end_boundary). start_key is a real
+    // observed key; end is an exclusive upper bound (None = open to the tail).
+    let mut frontier: Vec<(String, Option<String>)> = vec![(first, None)];
+    while boundaries.len() < target_boundaries && !frontier.is_empty() {
+        let mut next: Vec<(String, Option<String>)> = Vec::new();
+        for (start, end) in frontier.drain(..) {
+            if boundaries.len() >= target_boundaries {
+                break;
+            }
+            if let Some(cut) = find_flat_cut(prefix, &start, end.as_deref(), &probe).await {
+                boundaries.insert(cut.clone());
+                next.push((start, Some(cut.clone())));
+                next.push((cut, end));
+            }
+        }
+        frontier = next;
+    }
+    boundaries.into_iter().take(target_boundaries).collect()
+}
+
+/// Find one real observed key strictly inside `(start, end)` using the same
+/// flat-cut candidate logic runtime splitting uses. Each candidate costs one
+/// single-key probe; the first observed key in range wins.
+async fn find_flat_cut<F, Fut>(
+    prefix: &str,
+    start: &str,
+    end: Option<&str>,
+    probe: &F,
+) -> Option<String>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    for candidate in crate::tasks_s3::flat_cut_candidates(start, prefix, end) {
+        if let Ok(Some(key)) = probe(Some(candidate)).await {
+            if key.as_str() > start && end.map_or(true, |e| key.as_str() < e) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
 /// Persist startup-discovered boundaries to the conventional hints cache
 /// so subsequent runs (and --resume) load identical segments.
 pub fn write_startup_hints_cache(
@@ -253,6 +332,52 @@ mod tests {
         let tree = fake_tree(&[("", &["a/", "b/", "c/"])]);
         let boundaries = run_discovery(tree, "", 16).await;
         assert_eq!(boundaries, vec!["a/", "b/", "c/"]);
+    }
+
+    // Simulate S3 `max_keys=1`: the first key strictly after `start_after`
+    // (or the very first key when `None`) from a sorted key set.
+    async fn run_flat(keys: Vec<String>, prefix: &str, target: usize) -> Vec<String> {
+        discover_flat_boundaries(prefix, target, |start_after| {
+            let keys = keys.clone();
+            async move {
+                let next = match start_after {
+                    None => keys.first().cloned(),
+                    Some(sa) => keys.iter().find(|k| k.as_str() > sa.as_str()).cloned(),
+                };
+                Ok(next)
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_empty_range_yields_none() {
+        assert!(run_flat(Vec::new(), "", 16).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_single_key_is_uncuttable() {
+        assert!(run_flat(vec!["only".to_string()], "", 16).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_partition_is_valid() {
+        let keys: Vec<String> = (0..200).map(|i| format!("key{:04}", i)).collect();
+        let target = 8;
+        let boundaries = run_flat(keys.clone(), "key", target).await;
+
+        assert!(!boundaries.is_empty(), "a 200-key flat range should split");
+        assert!(boundaries.len() <= target);
+        // Every boundary is a real observed key, and they are strictly sorted
+        // (a contiguous, non-overlapping partition the diff merge can consume).
+        let mut prev: Option<&String> = None;
+        for b in &boundaries {
+            assert!(keys.contains(b), "boundary '{}' is not a real key", b);
+            if let Some(p) = prev {
+                assert!(b > p, "boundaries must be strictly ascending");
+            }
+            prev = Some(b);
+        }
     }
 
     #[tokio::test]

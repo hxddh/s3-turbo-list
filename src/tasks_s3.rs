@@ -242,7 +242,11 @@ async fn probe_flat_cut(
 
 /// Candidate cuts for a flat range, mid-depth first (most balanced for
 /// structured tails), then deeper (closer to the cursor, higher hit rate).
-fn flat_cut_candidates(cursor: &str, listing_prefix: &str, end: Option<&str>) -> Vec<String> {
+pub(crate) fn flat_cut_candidates(
+    cursor: &str,
+    listing_prefix: &str,
+    end: Option<&str>,
+) -> Vec<String> {
     let tail_start = listing_prefix.len().min(cursor.len());
     let tail_len = cursor.len() - tail_start;
     if tail_len == 0 {

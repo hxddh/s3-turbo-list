@@ -2791,6 +2791,41 @@ async fn diff_side_boundaries(
     );
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
     let boundaries = auto_hints::discover_startup_boundaries(&client, bucket, prefix, target).await;
+    let boundaries = if boundaries.is_empty() {
+        // Flat namespace: structural discovery found no CommonPrefixes, so the
+        // side would otherwise list as one serial segment. Bisect the key range
+        // with single-key probes so it lists in parallel. The target is smaller
+        // than structural discovery's: each cut is a one-time up-front probe,
+        // and only `max_concurrency` segments run at once, so spare boundaries
+        // beyond that would just cost probes without adding parallelism.
+        let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
+        let probe_bucket = bucket.to_string();
+        let probe_prefix = prefix.to_string();
+        auto_hints::discover_flat_boundaries(prefix, flat_target, |start_after| {
+            let client = client.clone();
+            let bucket = probe_bucket.clone();
+            let prefix = probe_prefix.clone();
+            async move {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .max_keys(1);
+                if let Some(sa) = start_after {
+                    req = req.start_after(sa);
+                }
+                let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
+                Ok(resp
+                    .contents()
+                    .first()
+                    .and_then(|o| o.key())
+                    .map(str::to_string))
+            }
+        })
+        .await
+    } else {
+        boundaries
+    };
     if !boundaries.is_empty() {
         if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
             log::warn!("{}", e);
