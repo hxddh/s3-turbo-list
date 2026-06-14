@@ -84,6 +84,12 @@ The Parquet schema is five columns:
 In list mode every row carries `DiffFlag = 0`. The companion `.ks` file is a
 two-column CSV of prefix and object count.
 
+Parquet output parallelizes itself: on a fast (non-rate-limited) store and a
+multi-core machine, when one writer can't keep up it automatically scales to
+several writers, each streaming a part-file (`<name>.part1.parquet`, …) — read
+the directory with pandas/duckdb/pyarrow. On a rate-limited store it stays a
+single file. No flag; details in [`docs/tuning.md`](docs/tuning.md).
+
 ```python
 import pyarrow.parquet as pq
 df = pq.read_table("us-east-2_my-bucket_20260514120000.parquet").to_pandas()
