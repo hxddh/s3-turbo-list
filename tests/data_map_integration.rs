@@ -176,6 +176,82 @@ async fn test_merge_same_side_duplicate_keeps_latest() {
     assert_eq!(rows, vec![("dup.txt".to_string(), 0)]);
 }
 
+/// Guards the parallel-diff completion contract: the merge consumes each
+/// side's per-segment receivers strictly in index order while producers fill
+/// them concurrently under bounded backpressure. With more segments than the
+/// production per-side concurrency cap (32), capacity-`DIFF_SEGMENT_CHANNEL_CAP`
+/// channels, and more batches per segment than that capacity, higher-index
+/// producers block on `send` while the merge is still draining lower-index
+/// segments. Because segments are emitted and consumed in the same index
+/// order, this never deadlocks — this test pins that invariant on a
+/// single-threaded runtime (the strictest scheduler) with a hard timeout so a
+/// regression fails loudly instead of hanging.
+#[tokio::test]
+async fn test_merge_many_parallel_segments_does_not_deadlock() {
+    use s3_turbo_list::tasks_s3::DIFF_SEGMENT_CHANNEL_CAP;
+
+    const SEGMENTS: usize = 40; // exceeds the 32-way per-side concurrency cap
+    const KEYS_PER_SEGMENT: usize = 12;
+    const BATCH: usize = 2; // 6 batches/segment > channel cap, so senders block
+
+    // Build one side as per-segment channels filled by concurrent producers.
+    // Keys are globally ascending (zero-padded, ascending segment index), as
+    // the merge's cross-segment ordering guard requires.
+    fn build_side(is_left: bool) -> Vec<tokio::sync::mpsc::Receiver<Batch>> {
+        let mut receivers = Vec::with_capacity(SEGMENTS);
+        for seg in 0..SEGMENTS {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(DIFF_SEGMENT_CHANNEL_CAP);
+            receivers.push(rx);
+            tokio::spawn(async move {
+                let mut batch: Batch = Vec::new();
+                for k in 0..KEYS_PER_SEGMENT {
+                    let key = format!("seg-{:03}/key-{:03}", seg, k);
+                    let obj = if is_left {
+                        left_obj(&key, 100, [7; 16])
+                    } else {
+                        right_obj(&key, 100, [7; 16])
+                    };
+                    batch.push(obj);
+                    if batch.len() == BATCH && tx.send(std::mem::take(&mut batch)).await.is_err() {
+                        return;
+                    }
+                }
+                if !batch.is_empty() {
+                    let _ = tx.send(batch).await;
+                }
+            });
+        }
+        receivers
+    }
+
+    let left = build_side(true);
+    let right = build_side(false);
+
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("diff.parquet");
+    let file = tokio::fs::File::create(&parquet_path).await.unwrap();
+    let writer = tokio::io::BufWriter::new(file);
+    let mut parquet = AsyncParquetOutput::new(writer, "unused.ks");
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_diff_merge(DiffStreamSides { left, right }, &mut parquet),
+    )
+    .await
+    .expect("diff merge over many parallel segments must not hang")
+    .expect("diff merge should succeed");
+    parquet.close().await.unwrap();
+
+    let total = SEGMENTS * KEYS_PER_SEGMENT;
+    assert_eq!(outcome.rows, total, "every key should produce one row");
+    assert_eq!(
+        outcome.equal, total,
+        "identical sides should classify every key equal"
+    );
+    assert_eq!(outcome.received_objects, total * 2);
+    assert_eq!(outcome.unique_prefixes(), SEGMENTS);
+}
+
 #[tokio::test]
 async fn test_merge_writes_ks_counts() {
     let dir = tempfile::tempdir().unwrap();

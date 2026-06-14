@@ -8,31 +8,30 @@ CI jobs, and shell automation.  The default human CLI remains unchanged.
 These commands do not contact S3 endpoints:
 
 ```bash
-s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list init-config --output s3-turbo-list.toml
-s3-turbo-list recipes agent-safe
-s3-turbo-list recipes summary
-s3-turbo-list recipes pipe
-s3-turbo-list recipes filter
-s3-turbo-list recipes verify
-s3-turbo-list recipes release-check
-s3-turbo-list recipes diff-safe
+s3-turbo-list guide agent-safe
+s3-turbo-list guide summary
+s3-turbo-list guide pipe
+s3-turbo-list guide filter
+s3-turbo-list guide verify
+s3-turbo-list guide release-check
+s3-turbo-list guide diff-safe
 s3-turbo-list --dry-run --agent --output-dir out list --bucket my-bucket --region us-east-1
 s3-turbo-list --dry-run --agent --summary-only list --bucket my-bucket --region us-east-1
 s3-turbo-list manifest-summary run.json --json
 s3-turbo-list manifest-summary run.json --check
-s3-turbo-list trace-summary trace.jsonl --machine-readable
-s3-turbo-list hints-merge hints-a.toml hints-b.txt --output merged.toml --machine-readable
+s3-turbo-list doctor --hints-file hints.toml --json
 ```
 
-`config-inspect --json` prints the resolved local configuration after TOML,
-CLI overrides, profile presets, and addressing-style normalization.
-It also includes `config_source`, which reports the explicit `--config` path
-when present, the config file actually loaded, the searched paths, the source
-kind (`explicit`, `workspace`, `home`, or `none`), and global CLI config
-overrides such as `compression` or `endpoint_url`.
+`doctor --local-only --json` prints the resolved local configuration (under
+`resolved_config`) after TOML, CLI overrides, profile presets, and
+addressing-style normalization, alongside its environment checks. It also
+includes `config_source`, which reports the explicit `--config` path when
+present, the config file actually loaded, the searched paths, the source kind
+(`explicit`, `workspace`, `home`, or `none`), and global CLI config overrides
+such as `compression` or `endpoint_url`.
 When an explicit `--config` path is missing, `config_source.warnings` reports
 that the command fell back to built-in defaults.
 
@@ -53,10 +52,11 @@ without editing TOML.  The default is `zstd(1)`; use
 `--compression gzip --compression-level 6` when a downstream reader requires
 traditional gzip output.
 
-`init-config`, `recipes`, `quickstart`, `cheatsheet`, `trace-summary`,
-and `hints-merge` are local tooling commands.  They are
-handled before S3 config loading, do not require cloud credentials, and do not
-change list/diff hot-path behavior.
+`init-config` and `guide`
+are local tooling commands.  They are handled before S3 config loading, do not
+require cloud credentials, and do not change list/diff hot-path behavior.
+`doctor --hints-file hints.toml` validates a hints file locally and embeds the
+report under `hints` in its JSON output.
 
 ## Dry-run plan files
 
@@ -103,10 +103,12 @@ checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 
 For large buckets, agents should prefer the simple high-throughput path:
-generate hints with `auto-hints`, validate them locally, then run
-`list` with `--hints-file hints.toml -c 8 -T 4` as a conservative
-starting point.  Empty delimiter is omitted from ListObjectsV2 requests, which
-keeps recursive listing compatible with providers that reject `delimiter=`.
+run `list` directly with `-c 8 -T 4` as a conservative starting point.
+Key-space partitioning is automatic — startup discovery probes the bucket
+structure and caches boundaries on the first run, and runtime splitting fans
+out long-tail segments — so no separate hints-generation step is needed.
+Empty delimiter is omitted from ListObjectsV2 requests, which keeps recursive
+listing compatible with providers that reject `delimiter=`.
 
 For `diff`, dry-run reports `hints.source =
 "disabled_for_diff_single_segment"`.  Conventional hints caches are
@@ -255,32 +257,19 @@ Use the manifest for final run status and aggregate metrics.  Use trace JSONL
 for endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
 metadata, and retry details.
 
-## Trace-driven hints tooling
-
-The local hints tooling commands support machine-readable output for agents:
-
-```bash
-s3-turbo-list trace-summary trace.jsonl --output-format json
-
-s3-turbo-list hints-merge \
-  base.toml prefixes.txt \
-  --output merged.toml \
-  --emit-manifest merge.manifest.json \
-  --machine-readable
-```
-
-`--machine-readable` is an alias for JSON report output on these commands.
-Warnings and recommendations are JSON fields, so agents should not scrape human
-text.  `--emit-manifest` records input/output file hashes for reproducibility.
+## Trace-driven inspection
 
 Long-tail segments no longer need offline rebalancing: list runs split them
-at runtime automatically.
+at runtime automatically.  When you want the raw events for manual inspection,
+pass `--trace-compat trace.jsonl` to a run; the JSONL records each request's
+endpoint behavior, request IDs, HTTP status, S3 error codes, pagination
+metadata, and retry details.  The format is documented in
+[trace-reference.md](trace-reference.md).
 
 ## Safety expectations
 
-- `config-inspect`, `doctor --local-only`, and `--dry-run` are local-only.
-- `trace-summary` and `hints-merge` are local-only.
-- `list`, `diff`, `auto-hints`, `discover-prefixes`, and `compat-probe` can contact S3 unless
-  combined with `--dry-run`.
+- `doctor --local-only` and `--dry-run` are local-only.
+- `list`, `diff`, and `compat-probe` can contact S3 unless combined with
+  `--dry-run`.
 - Provider-specific caveats still apply; `--agent` does not enable BOS
   pagination workarounds or change hot-path listing behavior.

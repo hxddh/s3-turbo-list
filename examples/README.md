@@ -70,8 +70,8 @@ plus `CommonPrefixes` only.
 2. Run local preflight helpers:
    ```bash
    s3-turbo-list doctor --local-only --simple
-   s3-turbo-list recipes
-   s3-turbo-list quickstart aws
+   s3-turbo-list guide
+   s3-turbo-list guide aws
    ```
 3. Run **MinIO** locally (no cloud credentials needed):
    ```bash

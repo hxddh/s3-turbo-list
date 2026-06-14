@@ -143,28 +143,6 @@ impl Default for OutputConfig {
     }
 }
 
-// ── AutoHintsConfig ───────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AutoHintsConfig {
-    #[serde(default = "default_sample_threshold")]
-    pub sample_threshold: usize,
-    #[serde(default = "default_max_prefix_depth")]
-    pub max_prefix_depth: usize,
-    #[serde(default = "default_max_prefix_entries")]
-    pub max_prefix_entries: usize,
-}
-
-impl Default for AutoHintsConfig {
-    fn default() -> Self {
-        Self {
-            sample_threshold: default_sample_threshold(),
-            max_prefix_depth: default_max_prefix_depth(),
-            max_prefix_entries: default_max_prefix_entries(),
-        }
-    }
-}
-
 // ── ChannelConfig ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -192,8 +170,6 @@ pub struct S3TurboConfig {
     #[serde(default)]
     pub output: OutputConfig,
     #[serde(default)]
-    pub auto_hints: AutoHintsConfig,
-    #[serde(default)]
     pub channel: ChannelConfig,
 }
 
@@ -212,7 +188,6 @@ impl Default for S3TurboConfig {
             s3: S3Config::default(),
             runtime: RuntimeConfig::default(),
             output: OutputConfig::default(),
-            auto_hints: AutoHintsConfig::default(),
             channel: ChannelConfig::default(),
         }
     }
@@ -224,7 +199,7 @@ fn default_max_attempts() -> u32 {
     10
 }
 fn default_initial_backoff_secs() -> u64 {
-    30
+    1
 }
 fn default_connect_timeout_secs() -> u64 {
     60
@@ -250,15 +225,6 @@ fn default_compression() -> String {
 }
 fn default_compression_level() -> u32 {
     1
-}
-fn default_sample_threshold() -> usize {
-    10000
-}
-fn default_max_prefix_depth() -> usize {
-    5
-}
-fn default_max_prefix_entries() -> usize {
-    1_000_000
 }
 fn default_channel_capacity() -> usize {
     64
@@ -367,9 +333,6 @@ impl S3TurboConfig {
         if other.output.parquet_file.is_some() {
             self.output.parquet_file = other.output.parquet_file;
         }
-        self.auto_hints.sample_threshold = other.auto_hints.sample_threshold;
-        self.auto_hints.max_prefix_depth = other.auto_hints.max_prefix_depth;
-        self.auto_hints.max_prefix_entries = other.auto_hints.max_prefix_entries;
         self.channel.capacity = other.channel.capacity;
     }
 
@@ -537,7 +500,7 @@ mod tests {
     fn test_default_config() {
         let config = S3TurboConfig::default();
         assert_eq!(config.s3.max_attempts, 10);
-        assert_eq!(config.s3.initial_backoff_secs, 30);
+        assert_eq!(config.s3.initial_backoff_secs, 1);
         assert_eq!(
             config.runtime.worker_threads,
             std::thread::available_parallelism()
@@ -567,7 +530,7 @@ max_concurrency = 50
         let config: S3TurboConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.s3.max_attempts, 5);
         assert_eq!(config.runtime.max_concurrency, 50);
-        assert_eq!(config.s3.initial_backoff_secs, 30);
+        assert_eq!(config.s3.initial_backoff_secs, 1);
     }
 
     #[test]

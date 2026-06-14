@@ -32,10 +32,20 @@ struct SegmentOutcome {
 
 /// Pages a segment must have processed before it is a split candidate.
 const SPLIT_MIN_PAGES: u32 = 5;
-/// Reactor split/heartbeat tick.
-const SPLIT_CHECK_INTERVAL_SECS: u64 = 1;
+/// Reactor split-probe cadence. Sub-second so cold-start fan-out on flat
+/// namespaces — where startup discovery finds no structure and runtime
+/// splitting is the only mechanism that fans out — ramps toward full
+/// concurrency in a few page-latencies instead of one segment per second.
+const SPLIT_CHECK_INTERVAL_MS: u64 = 200;
 /// Maximum ancestor-directory probe rungs per split attempt.
 const SPLIT_PROBE_MAX_RUNGS: usize = 4;
+/// Minimum throughput gain (ratio) for newly added concurrency to count as
+/// "helping".  Below this, the extra segments are oversubscribing a saturated
+/// provider and fan-out is capped at the last useful level.
+const FANOUT_IMPROVE_RATIO: f64 = 1.05;
+/// Throughput sampling window for the fan-out governor.  The split tick runs
+/// at 200ms, far too jittery to read a trend from; rates are judged over ~1s.
+const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
 
 /// Right half of a split, sent from the segment task to the reactor.
 #[derive(Debug, Clone)]
@@ -262,6 +272,95 @@ fn flat_cut_candidates(cursor: &str, listing_prefix: &str, end: Option<&str>) ->
     candidates
 }
 
+// ── Throughput-aware fan-out governor ──────────────────────
+//
+// Runtime splitting fans out to use idle concurrency, but a single bucket
+// has a request-rate ceiling (e.g. ~50 req/s on OSS): past the point where
+// segments saturate it, adding more in-flight segments only raises per-request
+// latency.  The governor watches run-wide page throughput and caps fan-out at
+// the highest concurrency that was still buying throughput.  It distinguishes
+// the two split regimes by construction: while ramping up, added segments that
+// stop raising throughput lower the cap; in the long-tail tail, segments finish
+// and `set.len()` falls below the cap, so splitting resumes to refill.
+
+struct FanOutGovernor {
+    last_at: Instant,
+    last_pages: u64,
+    last_setlen: usize,
+    last_rate: f64,
+    /// Highest concurrency proven to still raise throughput; the split gate
+    /// never fans out past it.  Starts open at `flat_concurrency`.
+    cap: usize,
+    samples: u32,
+}
+
+impl FanOutGovernor {
+    fn new(max: usize) -> Self {
+        Self {
+            last_at: Instant::now(),
+            last_pages: 0,
+            last_setlen: 0,
+            last_rate: 0.0,
+            cap: max,
+            samples: 0,
+        }
+    }
+
+    fn effective_cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Sample run-wide page throughput once per `FANOUT_SAMPLE` and adjust the
+    /// cap.  `retired` is the page count of completed-and-removed segments;
+    /// live pages are summed from `controls`.  `max` is `flat_concurrency`.
+    fn observe(
+        &mut self,
+        retired: u64,
+        controls: &HashMap<usize, Arc<SegmentControl>>,
+        setlen: usize,
+        max: usize,
+    ) {
+        self.observe_at(Instant::now(), retired, live_pages(controls), setlen, max)
+    }
+
+    /// Pure core of `observe`, split out so tests can drive the clock and page
+    /// totals directly without spawning segments.
+    fn observe_at(&mut self, now: Instant, retired: u64, live: u64, setlen: usize, max: usize) {
+        let elapsed = now.duration_since(self.last_at);
+        if elapsed < FANOUT_SAMPLE {
+            return;
+        }
+        let total = retired + live;
+        let rate = (total.saturating_sub(self.last_pages)) as f64 / elapsed.as_secs_f64();
+
+        self.samples += 1;
+        // The first window only establishes a baseline; need two to judge.
+        if self.samples >= 2 {
+            if rate >= self.last_rate * FANOUT_IMPROVE_RATIO {
+                // Throughput still climbing: reopen the ceiling and keep probing.
+                self.cap = max;
+            } else if setlen > self.last_setlen {
+                // Added segments since last window without a throughput gain:
+                // we are at/above useful concurrency.  Cap at the prior level.
+                self.cap = self.last_setlen.max(1);
+            }
+            // Otherwise (no new segments, flat rate): long-tail region — hold
+            // the cap so the split gate can refill as segments finish.
+        }
+        self.last_at = now;
+        self.last_pages = total;
+        self.last_setlen = setlen;
+        self.last_rate = rate;
+    }
+}
+
+fn live_pages(controls: &HashMap<usize, Arc<SegmentControl>>) -> u64 {
+    controls
+        .values()
+        .map(|c| c.pages.load(Ordering::Relaxed) as u64)
+        .sum()
+}
+
 // ── Public entry point ─────────────────────────────────────
 
 pub async fn flat_list_main_task(
@@ -300,10 +399,12 @@ async fn flat_reactor_task(
     let mut pending_children: Vec<SplitRange> = Vec::new();
     let mut next_child_index = hints.total_count();
     let mut split_count = 0usize;
+    let mut retired_pages = 0u64;
+    let mut gov = FanOutGovernor::new(flat_concurrency);
     let mut last_ts = epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
-    let mut split_check = tokio::time::interval(Duration::from_secs(SPLIT_CHECK_INTERVAL_SECS));
+    let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -357,6 +458,9 @@ async fn flat_reactor_task(
             joined = set.join_next() => match joined {
                 Some(Ok(outcome)) => {
                     let control = controls.remove(&outcome.index);
+                    retired_pages += control
+                        .as_ref()
+                        .map_or(0, |c| c.pages.load(Ordering::Relaxed) as u64);
                     if outcome.completed {
                         if outcome.checkpointable {
                             hints.finish(outcome.index);
@@ -407,14 +511,23 @@ async fn flat_reactor_task(
                     last_ts = now;
                 }
 
+                // Track whether added concurrency is still buying throughput;
+                // the governor caps fan-out at the saturating level so a single
+                // QPS-limited bucket is not oversubscribed.
+                gov.observe(retired_pages, &controls, set.len(), flat_concurrency);
+
                 // Idle capacity and nothing queued: probe the longest-running
-                // candidate for a structural split point.
+                // candidates for structural split points, up to the governor's
+                // proven-useful concurrency cap, in one pass instead of one
+                // segment per tick.
+                let cap = gov.effective_cap();
                 if allow_split
-                    && set.len() < flat_concurrency
+                    && set.len() < cap
                     && pending_children.is_empty()
                     && hints.is_empty()
                 {
-                    maybe_start_split_probe(ctx, start_prefix, &controls);
+                    let idle = cap - set.len();
+                    maybe_start_split_probes(ctx, start_prefix, &controls, idle);
                 }
             },
         }
@@ -430,48 +543,79 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
 }
 
-/// Pick the busiest splittable in-flight segment and probe it in the
-/// background.  The probe only proposes a cut; the segment task decides.
-fn maybe_start_split_probe(
+/// Choose which in-flight segments to probe for a split this tick.  Returns
+/// segment indices busiest-first (most pages = most remaining range), bounded
+/// so that total outstanding probes never exceed the idle slots: probes
+/// already in flight (segments marked `splitting`, including ones with a
+/// proposal pending acceptance) count against the budget.  This fills all
+/// idle slots in a single pass while keeping probe-request cost bounded on
+/// rate-limited providers.
+fn select_split_targets(
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+    idle_capacity: usize,
+) -> Vec<usize> {
+    let in_flight = controls
+        .values()
+        .filter(|c| c.splitting.load(Ordering::Relaxed))
+        .count();
+    let budget = idle_capacity.saturating_sub(in_flight);
+    if budget == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(usize, u32)> = controls
+        .iter()
+        .filter(|(_, c)| c.is_split_candidate())
+        .map(|(index, c)| (*index, c.pages.load(Ordering::Relaxed)))
+        .collect();
+    // Busiest first; index breaks ties for deterministic selection.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    candidates
+        .into_iter()
+        .take(budget)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Probe the busiest splittable in-flight segments in the background, up to
+/// the idle-slot budget.  Each probe only proposes a cut; the segment task
+/// decides at its next page boundary.
+fn maybe_start_split_probes(
     ctx: &S3TaskContext,
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
+    idle_capacity: usize,
 ) {
-    let candidate = controls
-        .iter()
-        .filter(|(_, c)| c.is_split_candidate())
-        .max_by_key(|(_, c)| c.pages.load(Ordering::Relaxed));
-    let Some((&index, control)) = candidate else {
-        return;
-    };
-
-    control.splitting.store(true, Ordering::Relaxed);
-    let control = Arc::clone(control);
-    let probe_ctx = ctx.clone();
-    let listing_prefix = start_prefix.to_string();
-    tokio::spawn(async move {
-        let (cursor, end) = control.snapshot();
-        if cursor.is_empty() {
-            control.splitting.store(false, Ordering::Relaxed);
-            return;
-        }
-        match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await {
-            Some(mid) => {
-                debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
-                *control.pending_split.lock().unwrap() = Some(mid);
-                // The segment task clears `splitting` when it accepts or
-                // rejects the proposal at its next page boundary.
-            }
-            None => {
-                debug!(
-                    "Split probe for segment {}: no structural boundary in remaining range",
-                    index
-                );
-                control.unsplittable.store(true, Ordering::Relaxed);
+    for index in select_split_targets(controls, idle_capacity) {
+        let control = Arc::clone(&controls[&index]);
+        control.splitting.store(true, Ordering::Relaxed);
+        let probe_ctx = ctx.clone();
+        let listing_prefix = start_prefix.to_string();
+        tokio::spawn(async move {
+            let (cursor, end) = control.snapshot();
+            if cursor.is_empty() {
                 control.splitting.store(false, Ordering::Relaxed);
+                return;
             }
-        }
-    });
+            match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await
+            {
+                Some(mid) => {
+                    debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
+                    *control.pending_split.lock().unwrap() = Some(mid);
+                    // The segment task clears `splitting` when it accepts or
+                    // rejects the proposal at its next page boundary.
+                }
+                None => {
+                    debug!(
+                        "Split probe for segment {}: no structural boundary in remaining range",
+                        index
+                    );
+                    control.unsplittable.store(true, Ordering::Relaxed);
+                    control.splitting.store(false, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 }
 
 // ── Run one segment to completion (with retry) ─────────────
@@ -1164,6 +1308,89 @@ mod tests {
         assert!(control.is_split_candidate());
         control.unsplittable.store(true, Ordering::Relaxed);
         assert!(!control.is_split_candidate(), "unsplittable is sticky");
+    }
+
+    fn control_with_pages(pages: u32) -> Arc<SegmentControl> {
+        let control = SegmentControl::new(None);
+        for i in 0..pages {
+            control.record_page(&format!("k{}", i));
+        }
+        Arc::new(control)
+    }
+
+    #[test]
+    fn test_select_split_targets_busiest_first_and_budget_bounded() {
+        let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+        controls.insert(0, control_with_pages(10)); // busiest
+        controls.insert(1, control_with_pages(6));
+        controls.insert(2, control_with_pages(SPLIT_MIN_PAGES));
+        controls.insert(3, control_with_pages(SPLIT_MIN_PAGES - 1)); // below threshold
+
+        // Two idle slots, nothing in flight: the two busiest candidates,
+        // busiest first. The sub-threshold segment is never selected.
+        assert_eq!(select_split_targets(&controls, 2), vec![0, 1]);
+        // Ample idle capacity: every eligible candidate, still ordered.
+        assert_eq!(select_split_targets(&controls, 10), vec![0, 1, 2]);
+        // No idle capacity: no probes.
+        assert!(select_split_targets(&controls, 0).is_empty());
+    }
+
+    #[test]
+    fn test_select_split_targets_counts_in_flight_against_budget() {
+        let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+        controls.insert(0, control_with_pages(10));
+        controls.insert(1, control_with_pages(8));
+        // Segment 0 is already probing: excluded as a candidate and it spends
+        // one unit of the idle budget so total outstanding probes stay bounded.
+        controls[&0].splitting.store(true, Ordering::Relaxed);
+
+        assert_eq!(select_split_targets(&controls, 2), vec![1]);
+        assert!(select_split_targets(&controls, 1).is_empty());
+    }
+
+    #[test]
+    fn test_fanout_governor_caps_when_added_concurrency_stops_helping() {
+        let t0 = Instant::now();
+        let win = FANOUT_SAMPLE + Duration::from_millis(10);
+        let mut gov = FanOutGovernor::new(64);
+
+        // Baseline window: 4 segments, 400 pages. Cap stays open.
+        gov.observe_at(t0 + win, 0, 400, 4, 64);
+        assert_eq!(gov.effective_cap(), 64);
+
+        // Ramp helps: 8 segments, +800 pages (rate doubled). Cap reopened.
+        gov.observe_at(t0 + win * 2, 0, 1200, 8, 64);
+        assert_eq!(gov.effective_cap(), 64);
+
+        // Ramp to 24 segments but throughput flat (+800 again): oversubscribed.
+        // Cap drops back to the last useful level (8).
+        gov.observe_at(t0 + win * 3, 0, 2000, 24, 64);
+        assert_eq!(gov.effective_cap(), 8);
+    }
+
+    #[test]
+    fn test_fanout_governor_reopens_when_throughput_climbs_again() {
+        let t0 = Instant::now();
+        let win = FANOUT_SAMPLE + Duration::from_millis(10);
+        let mut gov = FanOutGovernor::new(32);
+
+        gov.observe_at(t0 + win, 0, 500, 8, 32); // baseline
+        gov.observe_at(t0 + win * 2, 0, 1000, 16, 32); // flat rate, added segs
+        assert_eq!(gov.effective_cap(), 8, "capped at oversubscription");
+
+        // Long-tail refill raises throughput again: ceiling reopens.
+        gov.observe_at(t0 + win * 3, 0, 2000, 12, 32);
+        assert_eq!(gov.effective_cap(), 32);
+    }
+
+    #[test]
+    fn test_fanout_governor_ignores_sub_window_samples() {
+        let t0 = Instant::now();
+        let mut gov = FanOutGovernor::new(16);
+        // Too soon: no sample taken, cap untouched, baseline not advanced.
+        gov.observe_at(t0 + Duration::from_millis(100), 0, 999, 16, 16);
+        assert_eq!(gov.effective_cap(), 16);
+        assert_eq!(gov.samples, 0);
     }
 }
 

@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-14
+
+### Performance
+- **Runtime split fan-out is now throughput-aware.** v0.9.0 made fan-out fast
+  and multi-candidate, which is the right move when added concurrency keeps
+  buying throughput — but a single bucket has a request-rate ceiling, and on
+  QPS-limited providers fast fan-out drove high-`--concurrency` runs past the
+  saturating point into oversubscription, raising per-request latency.
+  Third-party OSS testing showed `-c 24`/`-c 64` regressing 8–16% while `-c 8`
+  was unchanged. The reactor now samples run-wide page throughput and caps
+  fan-out at the highest concurrency still raising it, reopening the ceiling
+  whenever throughput climbs again. Long-tail refill and genuinely high-QPS
+  buckets are unaffected; only oversubscription is trimmed. `--concurrency`
+  becomes an upper bound rather than a target, matching the documented
+  single-bucket request-rate ceiling. No new flags or config.
+
+### Removed
+- **Removed the `trace-summary` subcommand.** Its purpose was offline segment
+  re-balancing, which runtime splitting now handles automatically. The
+  `--trace-compat` flag still writes the raw JSONL (documented in
+  `docs/trace-reference.md`) for manual inspection.
+- **Removed the `profiles` subcommand, folding it into `guide`.** `guide
+  <provider>` (aws/minio/r2/b2/oss/bos) now prints the quickstart plus that
+  provider's endpoint-compatibility facts in one place. The underlying profile
+  presets (applied by `--profile` and `init-config`) are unchanged.
+- **Removed the `hints-validate` subcommand, folding it into `doctor`.** Run
+  `doctor --hints-file <file>` to validate a hints file; the report appears in
+  both human and `--json` doctor output. `hints::inspect_hints_file` and
+  `--hints-file` for listing are unchanged.
+
+## [0.9.0] - 2026-06-13
+
+### Performance
+- **Runtime split fan-out is now event-driven and multi-candidate.** The
+  reactor previously probed at most one segment per one-second tick, so
+  cold-start parallelism on flat/unstructured namespaces — where startup
+  discovery finds no `CommonPrefixes` and runtime splitting is the only fan-out
+  mechanism — ramped at roughly one segment per second, leaving the run far
+  under the provider's request-rate ceiling. It now probes the busiest
+  candidates at a 200ms cadence up to the idle-slot budget (counting in-flight
+  probes so total outstanding probes never exceed idle capacity), reaching full
+  concurrency in a few page round-trips instead. Structured buckets are
+  unchanged (startup discovery still seeds them).
+
+### Removed
+- **Removed the `hints-merge` subcommand.** With auto-hints and
+  discover-prefixes gone, nothing produces multiple hints files to merge.
+  `hints-validate` and `--hints-file` are unchanged.
+- **Removed `config-inspect`, folding it into `doctor`.** `doctor` already
+  covered the environment view; its report now also carries `resolved_config`
+  and `config_source` in both JSON and human output. Use
+  `doctor --local-only --json` for local inspection.
+
+### Changed
+- **Consolidated `recipes`, `cheatsheet`, and `quickstart` into one `guide`
+  command.** A bare `guide` prints the overview, a provider name
+  (aws/minio/r2/bos) prints that quickstart, and any other topic is a recipe
+  name (`index` lists them).
+- **Hid `--force-path-style` in favor of `--addressing-style path`.** The flag
+  remains honored for compatibility but no longer appears in `--help`; the
+  documented canonical form is `--addressing-style path`.
+
+## [0.8.0] - 2026-06-13
+
+### Removed
+- **Removed the `auto-hints` and `discover-prefixes` subcommands** (deprecated
+  in 0.7.0). Startup structural discovery and runtime splitting partition
+  buckets automatically with zero flags, so the separate sequential-scan
+  commands no longer earned their surface area. Their config section
+  `[auto_hints]` (`sample_threshold`, `max_prefix_depth`, `max_prefix_entries`)
+  is gone as well. Existing hints caches, `--hints-file`, `hints-validate`,
+  and `hints-merge` keep working unchanged.
+
+### Changed
+- **Reduced the default retry backoff** `s3.initial_backoff_secs` from `30` to
+  `1`. A single throttle (HTTP 503 `SlowDown`) previously added 30+ seconds of
+  wall-clock to a run; the SDK still grows the delay exponentially across
+  `max_attempts`, so transient throttling recovers quickly without a
+  tail-latency spike.
+
+### Documentation
+- Documented the single-bucket `ListObjectsV2` request-rate ceiling in
+  `docs/tuning.md`: once enough segments saturate the provider's per-bucket
+  request rate, additional `--concurrency`/`--threads` cannot raise throughput.
+  Added tuning guidance and corrected stale auto-hints references across the
+  README, tuning, and agent-usage docs.
+
 ## [0.7.0] - 2026-06-13
 
 ### Changed

@@ -79,7 +79,6 @@ pub struct ResolvedConfigSummary {
     pub runtime: RuntimeSummary,
     pub s3: S3Summary,
     pub output: OutputSummary,
-    pub auto_hints: AutoHintsSummary,
     pub channel: ChannelSummary,
 }
 
@@ -114,13 +113,6 @@ pub struct OutputSummary {
     pub log_file: Option<String>,
     pub ks_file: Option<String>,
     pub parquet_file: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AutoHintsSummary {
-    pub sample_threshold: usize,
-    pub max_prefix_depth: usize,
-    pub max_prefix_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,11 +166,6 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 log_file: cfg.output.log_file.clone(),
                 ks_file: cfg.output.ks_file.clone(),
                 parquet_file: cfg.output.parquet_file.clone(),
-            },
-            auto_hints: AutoHintsSummary {
-                sample_threshold: cfg.auto_hints.sample_threshold,
-                max_prefix_depth: cfg.auto_hints.max_prefix_depth,
-                max_prefix_entries: cfg.auto_hints.max_prefix_entries,
             },
             channel: ChannelSummary {
                 capacity: cfg.channel.capacity,
@@ -364,15 +351,6 @@ pub struct ParquetArtifactSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ConfigInspectReport {
-    pub schema_version: &'static str,
-    pub tool_version: &'static str,
-    pub status: String,
-    pub config_source: ConfigSourceSummary,
-    pub resolved_config: ResolvedConfigSummary,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub schema_version: &'static str,
     pub tool_version: &'static str,
@@ -380,6 +358,14 @@ pub struct DoctorReport {
     pub local_only: bool,
     pub cwd: String,
     pub checks: Vec<DoctorCheck>,
+    /// Resolved configuration and its provenance — doctor is the single
+    /// local-inspection command (it absorbed the former config-inspect).
+    pub config_source: ConfigSourceSummary,
+    pub resolved_config: ResolvedConfigSummary,
+    /// Hints-file validation report when --hints-file is supplied — doctor
+    /// absorbed the former hints-validate command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<hints::HintsValidationReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -704,20 +690,12 @@ fn parquet_summary(path: &str) -> Result<ParquetArtifactSummary, String> {
     })
 }
 
-pub fn config_inspect_report(
+pub fn doctor_report(
+    local_only: bool,
     cfg: &S3TurboConfig,
     config_source: ConfigSourceSummary,
-) -> ConfigInspectReport {
-    ConfigInspectReport {
-        schema_version: AGENT_SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        status: "ok".to_string(),
-        config_source,
-        resolved_config: cfg.into(),
-    }
-}
-
-pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
+    hints: Option<hints::HintsValidationReport>,
+) -> DoctorReport {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
@@ -842,6 +820,9 @@ pub fn doctor_report(local_only: bool, cfg: &S3TurboConfig) -> DoctorReport {
         local_only,
         cwd,
         checks,
+        config_source,
+        resolved_config: cfg.into(),
+        hints,
     }
 }
 

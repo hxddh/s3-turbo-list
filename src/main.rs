@@ -70,8 +70,9 @@ struct Cli {
     #[arg(long = "endpoint-url", global = true)]
     endpoint: Option<String>,
 
-    /// Force path-style addressing
-    #[arg(long, global = true)]
+    /// Deprecated alias for `--addressing-style path`; hidden but still
+    /// honored. Prefer `--addressing-style path`.
+    #[arg(long, global = true, hide = true)]
     force_path_style: bool,
 
     /// Log file path (implies --log)
@@ -221,120 +222,6 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// DEPRECATED: startup discovery and runtime splitting partition
-    /// buckets automatically; this command will be removed in a future
-    /// release
-    AutoHints {
-        /// AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Bucket to analyze
-        #[arg(long)]
-        bucket: String,
-
-        /// Output hints file path; content is always TOML regardless of extension
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Stop after scanning this many objects; default scans the full bucket
-        #[arg(long)]
-        sample_limit: Option<usize>,
-
-        /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
-        #[arg(long)]
-        max_pages: Option<usize>,
-    },
-
-    /// DEPRECATED: startup discovery and runtime splitting partition
-    /// buckets automatically; this command will be removed in a future
-    /// release
-    DiscoverPrefixes {
-        /// AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Bucket to inspect
-        #[arg(long)]
-        bucket: String,
-
-        /// Output prefixes file; plain text by default
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Stop after scanning this many ListObjectsV2 pages; default scans all pages
-        #[arg(long)]
-        max_pages: Option<usize>,
-
-        /// Write a TOML report instead of one prefix per line
-        #[arg(long)]
-        toml: bool,
-    },
-
-    /// Validate a local hints file without contacting S3
-    HintsValidate {
-        /// Hints file path
-        #[arg(short = 'H', long)]
-        hints_file: String,
-
-        /// Number of boundaries to preview
-        #[arg(long, default_value_t = 5)]
-        preview: usize,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Merge local TOML/plain hints files without contacting S3
-    HintsMerge {
-        /// Input hints files
-        #[arg(required = true)]
-        inputs: Vec<String>,
-
-        /// Output hints file path; content is always TOML regardless of extension
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Output format for the command report
-        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-        output_format: ReportFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit JSON report with stdout reserved for machine-readable output
-        #[arg(long)]
-        machine_readable: bool,
-
-        /// Write local tooling manifest JSON to this path
-        #[arg(long)]
-        emit_manifest: Option<String>,
-
-        /// Allow replacing an existing output hints file
-        #[arg(long)]
-        overwrite: bool,
-    },
-
-    /// Summarize a local --trace-compat JSONL file without contacting S3
-    TraceSummary {
-        /// Trace JSONL file
-        trace_file: String,
-
-        /// Output format for the report
-        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-        output_format: ReportFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit JSON report with stdout reserved for machine-readable output
-        #[arg(long)]
-        machine_readable: bool,
-    },
-
     /// Summarize a local run manifest JSON file without contacting S3
     ManifestSummary {
         /// Run manifest JSON file written by --run-manifest
@@ -368,26 +255,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Print concise command recipes without contacting S3
-    Recipes {
-        /// Recipe name, for example aws-basic, large-bucket, local-minio, or agent-safe
-        name: Option<String>,
-    },
-
-    /// Print a compact command cheatsheet without contacting S3
-    Cheatsheet,
-
-    /// Print provider-specific first-run steps without contacting S3
-    Quickstart {
-        /// Provider name: aws, minio, r2, or bos
-        provider: String,
-    },
-
-    /// Inspect resolved local config without contacting S3
-    ConfigInspect {
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
+    /// Print guidance without contacting S3: an overview when no topic is
+    /// given, a provider quickstart (aws/minio/r2/bos), or a named recipe
+    Guide {
+        /// Topic: a provider (aws/minio/r2/bos), a recipe name (e.g.
+        /// large-bucket, filter, release-check), or `index` to list recipes
+        topic: Option<String>,
     },
 
     /// Run local environment checks without contacting S3
@@ -407,12 +280,6 @@ enum Commands {
         /// Include command suggestions for common local issues
         #[arg(long)]
         fix_suggestions: bool,
-    },
-
-    /// Show endpoint compatibility profiles without contacting S3
-    Profiles {
-        #[command(subcommand)]
-        cmd: ProfileCommands,
     },
 
     /// Generate shell completions without contacting S3
@@ -469,13 +336,6 @@ enum Commands {
         #[arg(long)]
         keep_artifacts: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ReportFormat {
-    Text,
-    Json,
-    Markdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -567,26 +427,6 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
     }
 }
 
-#[derive(Subcommand)]
-enum ProfileCommands {
-    /// List known endpoint profiles
-    List {
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Show one endpoint profile
-    Show {
-        /// Profile name, for example aws, minio, bos, r2, b2, or oss
-        name: String,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 // ── Main ───────────────────────────────────────────────────
 
 fn main() {
@@ -599,43 +439,6 @@ fn main() {
         }
         Commands::Man => {
             generate_man_page();
-            return;
-        }
-        Commands::Profiles { cmd } => {
-            run_profiles(cmd);
-            return;
-        }
-        Commands::HintsMerge {
-            inputs,
-            output,
-            output_format,
-            json,
-            machine_readable,
-            emit_manifest,
-            overwrite,
-        } => {
-            run_hints_merge(
-                inputs,
-                output.as_deref(),
-                cli.dry_run,
-                *overwrite,
-                *output_format,
-                *json || *machine_readable || cli.agent,
-                emit_manifest.as_deref(),
-            );
-            return;
-        }
-        Commands::TraceSummary {
-            trace_file,
-            output_format,
-            json,
-            machine_readable,
-        } => {
-            run_trace_summary(
-                trace_file,
-                *output_format,
-                *json || *machine_readable || cli.agent,
-            );
             return;
         }
         Commands::ManifestSummary {
@@ -655,31 +458,11 @@ fn main() {
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
         }
-        Commands::Recipes { name } => {
-            run_recipes(name.as_deref());
-            return;
-        }
-        Commands::Cheatsheet => {
-            print!("{}", local_tools::render_cheatsheet());
-            return;
-        }
-        Commands::Quickstart { provider } => {
-            run_quickstart(provider);
+        Commands::Guide { topic } => {
+            run_guide(topic.as_deref());
             return;
         }
         _ => {}
-    }
-
-    // This command is intentionally local-only and should not depend on S3
-    // credentials, endpoint configuration, or a valid runtime config file.
-    if let Commands::HintsValidate {
-        hints_file,
-        preview,
-        json,
-    } = &cli.cmd
-    {
-        run_hints_validate(hints_file, *preview, *json);
-        return;
     }
 
     // Load config.
@@ -718,54 +501,21 @@ fn main() {
     let config_source_warnings = config_source.warnings.clone();
 
     match &cli.cmd {
-        Commands::ConfigInspect { json } => {
-            let report = agent::config_inspect_report(&cfg, config_source.clone());
-            if *json || cli.agent {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                println!("s3-turbo-list {}", env!("CARGO_PKG_VERSION"));
-                println!(
-                    "  config:       {}",
-                    report.config_source.loaded_config.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  threads:      {}",
-                    report.resolved_config.runtime.worker_threads
-                );
-                println!(
-                    "  concurrency:  {}",
-                    report.resolved_config.runtime.max_concurrency
-                );
-                println!(
-                    "  profile:      {}",
-                    report.resolved_config.s3.profile.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  endpoint:     {}",
-                    report
-                        .resolved_config
-                        .s3
-                        .endpoint_url
-                        .as_deref()
-                        .unwrap_or("-")
-                );
-                println!(
-                    "  addressing:   {}",
-                    report.resolved_config.s3.addressing_style
-                );
-                for warning in &report.config_source.warnings {
-                    println!("  warning:      {}", warning);
-                }
-            }
-            return;
-        }
         Commands::Doctor {
             local_only,
             json,
             simple,
             fix_suggestions,
         } => {
-            let report = agent::doctor_report(*local_only, &cfg);
+            // doctor absorbed the former hints-validate command: when a hints
+            // file is supplied it is linted and embedded in the report.
+            let hints = cli.hints_file.as_deref().map(|path| {
+                hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
+                    eprintln!("Hints validation failed: {}", e);
+                    std::process::exit(agent::ExitCode::CliConfig.code());
+                })
+            });
+            let report = agent::doctor_report(*local_only, &cfg, config_source.clone(), hints);
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -774,6 +524,10 @@ fn main() {
                 println!("Doctor status: {}", report.status);
                 for check in &report.checks {
                     println!("  {}: {} — {}", check.name, check.status, check.message);
+                }
+                print_doctor_config(&report);
+                if let Some(hints) = &report.hints {
+                    print_doctor_hints(hints);
                 }
                 if *fix_suggestions {
                     print_doctor_suggestions(&report);
@@ -946,65 +700,13 @@ fn main() {
             );
             return;
         }
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            sample_limit,
-            max_pages,
-        } => {
-            warn_deprecated_hints_command("auto-hints");
-            run_auto_hints(
-                region.as_deref(),
-                bucket,
-                output.as_deref(),
-                *sample_limit,
-                *max_pages,
-                &cli,
-                &cfg,
-            );
-            return;
-        }
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            max_pages,
-            toml,
-        } => {
-            warn_deprecated_hints_command("discover-prefixes");
-            run_discover_prefixes(
-                region.as_deref(),
-                bucket,
-                output.as_deref(),
-                *max_pages,
-                *toml,
-                &cli,
-                &cfg,
-            );
-            return;
-        }
-        Commands::HintsValidate {
-            hints_file,
-            preview,
-            json,
-        } => {
-            run_hints_validate(hints_file, *preview, *json);
-            return;
-        }
-        Commands::ConfigInspect { .. } | Commands::Doctor { .. } => {
+        Commands::Doctor { .. } => {
             unreachable!("local-only commands are handled before runtime setup")
         }
-        Commands::Profiles { .. } | Commands::Completions { .. } | Commands::Man => {
+        Commands::Completions { .. } | Commands::Man => {
             unreachable!("local-only commands are handled before config load")
         }
-        Commands::HintsMerge { .. }
-        | Commands::TraceSummary { .. }
-        | Commands::ManifestSummary { .. }
-        | Commands::InitConfig { .. }
-        | Commands::Recipes { .. }
-        | Commands::Cheatsheet
-        | Commands::Quickstart { .. } => {
+        Commands::ManifestSummary { .. } | Commands::InitConfig { .. } | Commands::Guide { .. } => {
             unreachable!("local tooling commands are handled before config load")
         }
         Commands::BenchmarkLocal { .. } => {
@@ -1657,77 +1359,11 @@ fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: b
     }
 }
 
-fn run_recipes(name: Option<&str>) {
-    match local_tools::render_recipe(name) {
+fn run_guide(topic: Option<&str>) {
+    match local_tools::render_guide(topic) {
         Ok(rendered) => print!("{}", rendered),
         Err(e) => {
-            eprintln!("Recipe error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-fn run_quickstart(provider: &str) {
-    match local_tools::render_quickstart(provider) {
-        Ok(rendered) => print!("{}", rendered),
-        Err(e) => {
-            eprintln!("Quickstart error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-fn run_hints_merge(
-    inputs: &[String],
-    output: Option<&str>,
-    dry_run: bool,
-    overwrite: bool,
-    output_format: ReportFormat,
-    json: bool,
-    emit_manifest: Option<&str>,
-) {
-    match local_tools::merge_hints_files(inputs, output, dry_run, overwrite) {
-        Ok(report) => {
-            if let Some(manifest_path) = emit_manifest {
-                let outputs = output.map(|p| vec![p.to_string()]).unwrap_or_default();
-                if let Err(e) = local_tools::write_local_manifest(
-                    manifest_path,
-                    "hints-merge",
-                    inputs,
-                    &outputs,
-                    &report,
-                    &report.warnings,
-                ) {
-                    eprintln!("Manifest write error: {}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
-                }
-            }
-            if json || output_format == ReportFormat::Json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                print!("{}", local_tools::render_merge_text(&report));
-            }
-        }
-        Err(e) => {
-            eprintln!("Hints merge failed: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        }
-    }
-}
-
-fn run_trace_summary(trace_file: &str, output_format: ReportFormat, json: bool) {
-    match local_tools::trace_summary(trace_file) {
-        Ok(report) => {
-            if json || output_format == ReportFormat::Json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else if output_format == ReportFormat::Markdown {
-                print!("{}", local_tools::render_trace_summary_markdown(&report));
-            } else {
-                print!("{}", local_tools::render_trace_summary_text(&report));
-            }
-        }
-        Err(e) => {
-            eprintln!("Trace summary failed: {}", e);
+            eprintln!("Guide error: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -1750,65 +1386,6 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
             eprintln!("Manifest summary failed: {}", e);
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
-    }
-}
-
-fn run_profiles(cmd: &ProfileCommands) {
-    match cmd {
-        ProfileCommands::List { json } => {
-            if *json {
-                println!("{}", agent::to_pretty_json(&profiles::all_profiles()));
-            } else {
-                println!("Known endpoint compatibility profiles:");
-                for profile in profiles::all_profiles() {
-                    println!(
-                        "  {:<6} {:<36} addressing={:<7} status={}",
-                        profile.name,
-                        profile.provider,
-                        profile.recommended_addressing_style,
-                        profile.status
-                    );
-                }
-            }
-        }
-        ProfileCommands::Show { name, json } => match profiles::get_profile(name) {
-            Some(profile) if *json => println!("{}", agent::to_pretty_json(profile)),
-            Some(profile) => {
-                println!("profile: {}", profile.name);
-                println!("provider: {}", profile.provider);
-                println!("status: {}", profile.status);
-                println!("default_region: {}", profile.default_region.unwrap_or("-"));
-                println!(
-                    "default_endpoint_url: {}",
-                    profile.default_endpoint_url.unwrap_or("-")
-                );
-                println!(
-                    "recommended_addressing_style: {}",
-                    profile.recommended_addressing_style
-                );
-                println!(
-                    "requires_explicit_endpoint: {}",
-                    profile.requires_explicit_endpoint
-                );
-                println!("tested_by_project: {}", profile.tested_by_project);
-                if !profile.notes.is_empty() {
-                    println!("notes:");
-                    for note in profile.notes {
-                        println!("  - {}", note);
-                    }
-                }
-                if !profile.limitations.is_empty() {
-                    println!("limitations:");
-                    for limitation in profile.limitations {
-                        println!("  - {}", limitation);
-                    }
-                }
-            }
-            None => {
-                eprintln!("Unknown endpoint profile '{}'", name);
-                std::process::exit(agent::ExitCode::CliConfig.code());
-            }
-        },
     }
 }
 
@@ -1953,10 +1530,7 @@ fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
 fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     match &cli.cmd {
-        Commands::List { .. }
-        | Commands::Diff { .. }
-        | Commands::AutoHints { .. }
-        | Commands::DiscoverPrefixes { .. } => {
+        Commands::List { .. } | Commands::Diff { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
         }
         Commands::CompatProbe { endpoint_url, .. } => {
@@ -2046,16 +1620,6 @@ fn output_stem_with_timestamp(
     parts.join("_")
 }
 
-fn prefixes_output_path(region: Option<&str>, bucket: &str, toml: bool) -> String {
-    let extension = if toml { "toml" } else { "txt" };
-    let mut parts = Vec::new();
-    if let Some(region) = region.filter(|r| !r.is_empty()) {
-        parts.push(sanitize_path_component(region));
-    }
-    parts.push(sanitize_path_component(bucket));
-    format!("{}_prefixes.{}", parts.join("_"), extension)
-}
-
 fn sanitize_path_component(value: &str) -> String {
     agent::sanitize_path_component(value)
 }
@@ -2132,6 +1696,29 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn print_doctor_config(report: &agent::DoctorReport) {
+    let config = &report.resolved_config;
+    println!("Resolved config:");
+    println!(
+        "  config:       {}",
+        report.config_source.loaded_config.as_deref().unwrap_or("-")
+    );
+    println!("  threads:      {}", config.runtime.worker_threads);
+    println!("  concurrency:  {}", config.runtime.max_concurrency);
+    println!(
+        "  profile:      {}",
+        config.s3.profile.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  endpoint:     {}",
+        config.s3.endpoint_url.as_deref().unwrap_or("-")
+    );
+    println!("  addressing:   {}", config.s3.addressing_style);
+    for warning in &report.config_source.warnings {
+        println!("  warning:      {}", warning);
+    }
+}
+
 fn print_doctor_simple(report: &agent::DoctorReport, fix_suggestions: bool) {
     for check in &report.checks {
         let label = match check.status.as_str() {
@@ -2163,7 +1750,7 @@ fn print_doctor_suggestions(report: &agent::DoctorReport) {
                 }
             }
             "endpoint_profile" if check.status == "warn" => {
-                println!("NEXT s3-turbo-list profiles list");
+                println!("NEXT s3-turbo-list guide <provider>");
             }
             _ => {}
         }
@@ -2821,21 +2408,6 @@ fn build_plan_report(
                 .to_string(),
         );
     }
-    if matches!(cli.cmd, Commands::AutoHints { .. }) {
-        warnings.push("auto-hints will scan S3 pages when not run with --dry-run".to_string());
-        if cli.threads.is_some() || cli.concurrency.is_some() {
-            warnings.push(
-                "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
-                    .to_string(),
-            );
-        }
-    }
-    if matches!(cli.cmd, Commands::DiscoverPrefixes { .. }) {
-        warnings.push(
-            "discover-prefixes will scan S3 ListObjectsV2 pages when not run with --dry-run"
-                .to_string(),
-        );
-    }
     if inputs.mode == "list"
         && matches!(
             hints.source.as_str(),
@@ -2847,12 +2419,7 @@ fn build_plan_report(
                 .to_string(),
         );
     }
-    if cli.delimiter.is_empty()
-        && matches!(
-            cli.cmd,
-            Commands::List { .. } | Commands::AutoHints { .. } | Commands::DiscoverPrefixes { .. }
-        )
-    {
+    if cli.delimiter.is_empty() && matches!(cli.cmd, Commands::List { .. }) {
         warnings.push(
             "--delimiter '' means recursive listing and is omitted from ListObjectsV2 requests for S3-compatible provider compatibility"
                 .to_string(),
@@ -2939,11 +2506,7 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     if matches!(
         cli.cmd,
-        Commands::List { .. }
-            | Commands::Diff { .. }
-            | Commands::AutoHints { .. }
-            | Commands::DiscoverPrefixes { .. }
-            | Commands::CompatProbe { .. }
+        Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
     ) {
         if let Some(profile) = cfg
             .s3
@@ -3075,41 +2638,12 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             None,
             None,
         ),
-        Commands::AutoHints { region, bucket, .. } => (
-            "auto-hints".to_string(),
-            Some(bucket.clone()),
-            region.clone(),
-            None,
-            None,
-            None,
-        ),
-        Commands::DiscoverPrefixes { region, bucket, .. } => (
-            "discover-prefixes".to_string(),
-            Some(bucket.clone()),
-            region.clone(),
-            None,
-            None,
-            None,
-        ),
-        Commands::HintsValidate { .. } => {
-            ("hints-validate".to_string(), None, None, None, None, None)
-        }
-        Commands::HintsMerge { .. } => ("hints-merge".to_string(), None, None, None, None, None),
-        Commands::TraceSummary { .. } => {
-            ("trace-summary".to_string(), None, None, None, None, None)
-        }
         Commands::ManifestSummary { .. } => {
             ("manifest-summary".to_string(), None, None, None, None, None)
         }
         Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
-        Commands::Recipes { .. } => ("recipes".to_string(), None, None, None, None, None),
-        Commands::Cheatsheet => ("cheatsheet".to_string(), None, None, None, None, None),
-        Commands::Quickstart { .. } => ("quickstart".to_string(), None, None, None, None, None),
-        Commands::ConfigInspect { .. } => {
-            ("config-inspect".to_string(), None, None, None, None, None)
-        }
+        Commands::Guide { .. } => ("guide".to_string(), None, None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
-        Commands::Profiles { .. } => ("profiles".to_string(), None, None, None, None, None),
         Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
         Commands::Man => ("man".to_string(), None, None, None, None, None),
         Commands::BenchmarkLocal { .. } => {
@@ -3150,26 +2684,7 @@ fn runtime_output_summary(
         };
     }
 
-    let hints_file = match &cli.cmd {
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            ..
-        } => output
-            .clone()
-            .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            toml,
-            ..
-        } => output
-            .clone()
-            .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
-        _ => None,
-    };
+    let hints_file = None;
     let compat_output = match &cli.cmd {
         Commands::CompatProbe { output, .. } => output.clone(),
         _ => None,
@@ -3232,31 +2747,6 @@ fn planned_output_paths(
                 .unwrap_or_else(|| format!("{}.parquet", stem));
             (Some(ks), Some(parquet), None)
         }
-        Commands::AutoHints {
-            region,
-            bucket,
-            output,
-            ..
-        } => (
-            None,
-            None,
-            output
-                .clone()
-                .or_else(|| Some(agent::conventional_hints_path(bucket, region.as_deref()))),
-        ),
-        Commands::DiscoverPrefixes {
-            region,
-            bucket,
-            output,
-            toml,
-            ..
-        } => (
-            None,
-            None,
-            output
-                .clone()
-                .or_else(|| Some(prefixes_output_path(region.as_deref(), bucket, *toml))),
-        ),
         _ => (None, None, None),
     }
 }
@@ -3327,10 +2817,7 @@ async fn diff_side_boundaries(
 // templating before the full command dispatch.
 fn command_region(cmd: &Commands) -> Option<&str> {
     match cmd {
-        Commands::List { region, .. }
-        | Commands::AutoHints { region, .. }
-        | Commands::DiscoverPrefixes { region, .. }
-        | Commands::Diff { region, .. } => region.as_deref(),
+        Commands::List { region, .. } | Commands::Diff { region, .. } => region.as_deref(),
         Commands::CompatProbe { region, .. } => Some(region.as_str()),
         _ => None,
     }
@@ -3422,204 +2909,88 @@ fn run_compat_probe(
     });
 }
 
-fn warn_deprecated_hints_command(name: &str) {
-    eprintln!(
-        "warning: {} is deprecated — startup discovery and runtime splitting \
-         partition buckets automatically; this command will be removed in a \
-         future release",
-        name
-    );
-}
-
-fn run_auto_hints(
-    region: Option<&str>,
-    bucket: &str,
-    output: Option<&str>,
-    sample_limit: Option<usize>,
-    max_pages: Option<usize>,
-    cli: &Cli,
-    cfg: &S3TurboConfig,
-) {
-    let rt = build_runtime_or_exit(2);
-
-    let endpoint = cfg.s3.endpoint_url.as_deref();
-    let fps = cfg.s3.force_path_style;
-    let prefix = if cli.prefix == "/" {
-        ""
-    } else {
-        cli.prefix.as_str()
-    };
-
-    if cli.threads.is_some() || cli.concurrency.is_some() {
-        log::warn!(
-            "auto-hints performs a single sequential object scan; --threads and --concurrency do not change scan parallelism"
+/// Render the hints-file validation section in human doctor output. Doctor
+/// absorbed the former hints-validate command; the formatting matches its old
+/// `Hints file:` block.
+fn print_doctor_hints(report: &hints::HintsValidationReport) {
+    println!("Hints file: {}", report.path);
+    println!("  Format:          {:?}", report.format);
+    println!("  Boundary count:  {}", report.boundary_count);
+    if let Some(metadata) = &report.metadata {
+        println!(
+            "  Bucket:          {}",
+            metadata.bucket.as_deref().unwrap_or("-")
         );
-    }
-
-    if cfg.s3.profile.as_deref() == Some("bos") {
-        log::warn!(
-            "Generating hints for BOS is allowed, but hinted multi-segment BOS scans \
-             are not authoritative until BOS fixes its ListObjectsV2 start_after + \
-             continuation-token compatibility behavior."
+        println!(
+            "  Region:          {}",
+            metadata.region.as_deref().unwrap_or("-")
         );
-    }
-
-    rt.block_on(async {
-        auto_hints::generate_hints(auto_hints::GenerateHintsOptions {
-            region,
-            bucket,
-            output,
-            endpoint_url: endpoint,
-            force_path_style: fps,
-            prefix,
-            max_keys: cli.max_keys,
-            max_attempts: cfg.s3.max_attempts,
-            initial_backoff_secs: cfg.s3.initial_backoff_secs,
-            connect_timeout_secs: cfg.s3.connect_timeout_secs,
-            operation_timeout_secs: cfg.s3.operation_timeout_secs,
-            sample_threshold: cfg.auto_hints.sample_threshold,
-            max_prefix_depth: cfg.auto_hints.max_prefix_depth,
-            max_prefix_entries: cfg.auto_hints.max_prefix_entries,
-            sample_limit,
-            max_pages,
-        })
-        .await
-    });
-}
-
-fn run_discover_prefixes(
-    region: Option<&str>,
-    bucket: &str,
-    output: Option<&str>,
-    max_pages: Option<usize>,
-    toml: bool,
-    cli: &Cli,
-    cfg: &S3TurboConfig,
-) {
-    let rt = build_runtime_or_exit(2);
-
-    let prefix = if cli.prefix == "/" {
-        ""
-    } else {
-        cli.prefix.as_str()
-    };
-
-    rt.block_on(async {
-        auto_hints::discover_prefixes(auto_hints::DiscoverPrefixesOptions {
-            region,
-            bucket,
-            output,
-            endpoint_url: cfg.s3.endpoint_url.as_deref(),
-            force_path_style: cfg.s3.force_path_style,
-            prefix,
-            delimiter: &cli.delimiter,
-            max_keys: cli.max_keys,
-            max_attempts: cfg.s3.max_attempts,
-            initial_backoff_secs: cfg.s3.initial_backoff_secs,
-            connect_timeout_secs: cfg.s3.connect_timeout_secs,
-            operation_timeout_secs: cfg.s3.operation_timeout_secs,
-            max_pages,
-            toml,
-        })
-        .await
-    });
-}
-
-fn run_hints_validate(path: &str, preview: usize, json: bool) {
-    match hints::inspect_hints_file(path, preview) {
-        Ok(report) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).expect("serialize hints report")
-                );
-                return;
-            }
-
-            println!("Hints file: {}", report.path);
-            println!("  Format:          {:?}", report.format);
-            println!("  Boundary count:  {}", report.boundary_count);
-            if let Some(metadata) = &report.metadata {
-                println!(
-                    "  Bucket:          {}",
-                    metadata.bucket.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  Region:          {}",
-                    metadata.region.as_deref().unwrap_or("-")
-                );
-                println!(
-                    "  Total objects:   {}",
-                    metadata
-                        .total_objects
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string())
-                );
-                println!(
-                    "  Scan mode:       {}",
-                    metadata.scan_mode.as_deref().unwrap_or("unknown")
-                );
-                if metadata.scan_mode.as_deref() == Some("sampled") {
-                    println!(
-                        "  Sampled objects: {}",
-                        metadata
-                            .sampled_objects
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                    println!(
-                        "  Sampled pages:   {}",
-                        metadata
-                            .sampled_pages
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                }
-                if let Some(summary) = &report.estimate_summary {
-                    println!(
-                        "  Estimates:       {} ({})",
-                        summary.count,
-                        if summary.sampled {
-                            "sampled/estimated"
-                        } else {
-                            "observed/full"
-                        }
-                    );
-                    println!(
-                        "  Estimate min/max/sum: {}/{}/{}",
-                        summary.min_estimated_objects,
-                        summary.max_estimated_objects,
-                        summary.total_estimated_objects
-                    );
-                }
-            }
-            if !report.first_estimates.is_empty() {
-                println!("  First {} estimates:", report.first_estimates.len());
-                for estimate in &report.first_estimates {
-                    println!(
-                        "    - start_after='{}', end_before='{}', estimated_objects={}",
-                        estimate.start_after,
-                        estimate.end_before.as_deref().unwrap_or(""),
-                        estimate.estimated_objects
-                    );
-                }
-            }
-            if !report.first_boundaries.is_empty() {
-                println!("  First {} boundaries:", report.first_boundaries.len());
-                for boundary in &report.first_boundaries {
-                    println!("    - {}", boundary);
-                }
-            }
-            if !report.warnings.is_empty() {
-                println!("  Warnings:");
-                for warning in &report.warnings {
-                    println!("    - {}", warning);
-                }
-            }
+        println!(
+            "  Total objects:   {}",
+            metadata
+                .total_objects
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  Scan mode:       {}",
+            metadata.scan_mode.as_deref().unwrap_or("unknown")
+        );
+        if metadata.scan_mode.as_deref() == Some("sampled") {
+            println!(
+                "  Sampled objects: {}",
+                metadata
+                    .sampled_objects
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            println!(
+                "  Sampled pages:   {}",
+                metadata
+                    .sampled_pages
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
         }
-        Err(e) => {
-            eprintln!("Hints validation failed: {}", e);
-            std::process::exit(1);
+        if let Some(summary) = &report.estimate_summary {
+            println!(
+                "  Estimates:       {} ({})",
+                summary.count,
+                if summary.sampled {
+                    "sampled/estimated"
+                } else {
+                    "observed/full"
+                }
+            );
+            println!(
+                "  Estimate min/max/sum: {}/{}/{}",
+                summary.min_estimated_objects,
+                summary.max_estimated_objects,
+                summary.total_estimated_objects
+            );
+        }
+    }
+    if !report.first_estimates.is_empty() {
+        println!("  First {} estimates:", report.first_estimates.len());
+        for estimate in &report.first_estimates {
+            println!(
+                "    - start_after='{}', end_before='{}', estimated_objects={}",
+                estimate.start_after,
+                estimate.end_before.as_deref().unwrap_or(""),
+                estimate.estimated_objects
+            );
+        }
+    }
+    if !report.first_boundaries.is_empty() {
+        println!("  First {} boundaries:", report.first_boundaries.len());
+        for boundary in &report.first_boundaries {
+            println!("    - {}", boundary);
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("  Warnings:");
+        for warning in &report.warnings {
+            println!("    - {}", warning);
         }
     }
 }

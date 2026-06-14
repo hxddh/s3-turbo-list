@@ -176,7 +176,6 @@ as `minio`, `bos`, `r2`, `b2`, or `oss`; it is not a substitute for
 Automation can inspect configuration and planned outputs without contacting S3:
 
 ```bash
-s3-turbo-list config-inspect --json
 s3-turbo-list doctor --local-only --json
 s3-turbo-list doctor --local-only --simple --fix-suggestions
 s3-turbo-list recipes aws-basic

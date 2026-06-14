@@ -8,7 +8,7 @@ Run the release environment checker first:
 
 ```bash
 ./scripts/check-release-env.sh
-s3-turbo-list recipes release-check
+s3-turbo-list guide release-check
 ```
 
 It prints OS, architecture, Rust toolchain, C compilers, git state,

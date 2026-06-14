@@ -59,7 +59,7 @@ boundaries, and lists the segments in parallel. Use `--delimiter '/'` for a
 hierarchical listing (top-level objects plus `CommonPrefixes` only).
 
 Preview any run without contacting S3 by adding `--dry-run --agent`.
-`init-config`, `quickstart`, `recipes`, and `cheatsheet` provide local help;
+`init-config` and `guide` provide local setup help and command examples;
 `completions` and `man` generate shell completions and a man page.
 
 Output files (auto-named):
@@ -123,7 +123,7 @@ boundary sources, in precedence order:
 
 1. `--hints-file` — explicit control for repeated inventories.
 2. The conventional hints cache (`<region>_<bucket>_hints.toml`) written by
-   `auto-hints` or by a previous run's startup discovery.
+   a previous run's startup discovery.
 3. **Startup structural discovery** (automatic): a handful of delimiter
    probes at run start find real `CommonPrefixes` boundaries and cache them.
    First runs are parallel with zero flags.
@@ -137,11 +137,11 @@ range has structure, and cursor-derived single-key probes when it is flat.
 Skewed and flat buckets alike scale out instead of serializing.
 
 Explicit `--hints-file` control remains available for repeated inventories;
-hints file formats, boundary semantics, local tooling (`hints-validate`,
-`hints-merge`), and all runtime tuning knobs are documented in
-[`docs/tuning.md`](docs/tuning.md). The `auto-hints` and `discover-prefixes`
-scan commands are deprecated — automatic discovery and runtime splitting
-cover their use cases.
+hints file formats, boundary semantics, local tooling (`doctor --hints-file`),
+and all runtime tuning knobs are documented in
+[`docs/tuning.md`](docs/tuning.md). Automatic startup discovery and runtime
+splitting partition buckets with zero flags, so no separate scan command is
+needed.
 
 ## Diff mode
 
@@ -178,7 +178,7 @@ Works against any S3-compatible endpoint via `--endpoint-url` and
 `--addressing-style`. Optional presets exist for common providers:
 
 ```bash
-s3-turbo-list profiles list
+s3-turbo-list guide oss   # quickstart + endpoint-compatibility facts
 
 # Profiles with region-derived endpoints need no --endpoint-url:
 s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket
@@ -218,9 +218,10 @@ Every S3 API call can be recorded as structured JSONL:
 ```bash
 s3-turbo-list list --region us-east-2 --bucket my-bucket \
   --trace-compat trace.jsonl
-s3-turbo-list trace-summary trace.jsonl --output-format json
 ```
 
+The JSONL records every S3 API call for manual inspection; long-tail segments
+are split at runtime, so no offline rebalancing command is needed.
 Field-by-field trace schema: [`docs/trace-reference.md`](docs/trace-reference.md).
 
 For CI and agents: `--dry-run --agent` emits a JSON plan without contacting

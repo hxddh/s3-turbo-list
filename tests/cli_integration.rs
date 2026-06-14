@@ -113,31 +113,6 @@ fn test_cli_help_diff() {
 }
 
 #[test]
-fn test_cli_help_auto_hints() {
-    let (code, stdout, _stderr) = run_cli(&["auto-hints", "--help"]);
-    assert_eq!(code, 0, "s3-turbo-list auto-hints --help should exit 0");
-    assert!(
-        stdout.contains("bucket"),
-        "auto-hints help should mention 'bucket'"
-    );
-    assert!(
-        stdout.contains("always TOML"),
-        "auto-hints help should describe TOML output"
-    );
-}
-
-#[test]
-fn test_cli_help_discover_prefixes() {
-    let (code, stdout, _stderr) = run_cli(&["discover-prefixes", "--help"]);
-    assert_eq!(
-        code, 0,
-        "s3-turbo-list discover-prefixes --help should exit 0"
-    );
-    assert!(stdout.contains("--bucket"));
-    assert!(stdout.contains("--toml"));
-}
-
-#[test]
 fn test_cli_help_compat_probe() {
     let (code, stdout, _stderr) = run_cli(&["compat-probe", "--help"]);
     assert_eq!(code, 0, "s3-turbo-list compat-probe --help should exit 0");
@@ -148,28 +123,23 @@ fn test_cli_help_compat_probe() {
 }
 
 #[test]
-fn test_cli_help_hints_validate() {
-    let (code, stdout, _stderr) = run_cli(&["hints-validate", "--help"]);
-    assert_eq!(code, 0, "s3-turbo-list hints-validate --help should exit 0");
+fn test_cli_hints_validate_removed() {
+    // hints-validate was folded into `doctor --hints-file`.
+    let (code, _stdout, stderr) = run_cli(&["hints-validate"]);
+    assert_ne!(code, 0, "hints-validate should no longer be a subcommand");
     assert!(
-        stdout.contains("--hints-file"),
-        "hints-validate help should contain '--hints-file'"
+        stderr.contains("unrecognized subcommand") || stderr.contains("invalid"),
+        "stderr should report an unknown subcommand: {}",
+        stderr
     );
 }
 
 #[test]
 fn test_cli_help_agent_local_commands() {
-    let (code, stdout, _stderr) = run_cli(&["config-inspect", "--help"]);
-    assert_eq!(code, 0, "config-inspect --help should exit 0");
-    assert!(stdout.contains("--json"));
-
     let (code, stdout, _stderr) = run_cli(&["doctor", "--help"]);
     assert_eq!(code, 0, "doctor --help should exit 0");
     assert!(stdout.contains("--local-only"));
-
-    let (code, stdout, _stderr) = run_cli(&["profiles", "--help"]);
-    assert_eq!(code, 0, "profiles --help should exit 0");
-    assert!(stdout.contains("list"));
+    assert!(stdout.contains("--json"));
 
     let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
     assert_eq!(code, 0, "benchmark-local --help should exit 0");
@@ -180,30 +150,20 @@ fn test_cli_help_agent_local_commands() {
     assert_eq!(code, 0, "init-config --help should exit 0");
     assert!(stdout.contains("--overwrite"));
 
-    let (code, stdout, _stderr) = run_cli(&["recipes", "--help"]);
-    assert_eq!(code, 0, "recipes --help should exit 0");
-    assert!(stdout.contains("Recipe name"));
-
-    let (code, stdout, _stderr) = run_cli(&["quickstart", "--help"]);
-    assert_eq!(code, 0, "quickstart --help should exit 0");
-    assert!(stdout.contains("Provider name"));
-
-    let (code, stdout, _stderr) = run_cli(&["trace-summary", "--help"]);
-    assert_eq!(code, 0, "trace-summary --help should exit 0");
-    assert!(stdout.contains("--machine-readable"));
+    let (code, stdout, _stderr) = run_cli(&["guide", "--help"]);
+    assert_eq!(code, 0, "guide --help should exit 0");
+    assert!(stdout.contains("provider quickstart") || stdout.contains("recipe"));
 
     let (code, stdout, _stderr) = run_cli(&["manifest-summary", "--help"]);
     assert_eq!(code, 0, "manifest-summary --help should exit 0");
     assert!(stdout.contains("--json"));
-
-    let (code, stdout, _stderr) = run_cli(&["hints-merge", "--help"]);
-    assert_eq!(code, 0, "hints-merge --help should exit 0");
-    assert!(stdout.contains("--emit-manifest"));
 }
 
 #[test]
-fn test_cli_config_inspect_json_success() {
-    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+fn test_cli_doctor_json_includes_resolved_config() {
+    // doctor absorbed the former config-inspect: its JSON carries the
+    // resolved configuration and its provenance.
+    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -211,6 +171,7 @@ fn test_cli_config_inspect_json_success() {
     assert_eq!(json["status"], "ok");
     assert!(json["resolved_config"]["runtime"]["worker_threads"].is_number());
     assert!(json["resolved_config"]["s3"]["addressing_style"].is_string());
+    assert!(json["config_source"]["searched"].is_array());
 }
 
 #[test]
@@ -262,31 +223,32 @@ fn test_cli_init_config_writes_and_requires_overwrite() {
 }
 
 #[test]
-fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
-    let (code, stdout, stderr) = run_cli(&["recipes", "aws-basic"]);
+fn test_cli_guide_local_only() {
+    // Named recipes.
+    let (code, stdout, stderr) = run_cli(&["guide", "aws-basic"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--output-dir"));
     assert!(stdout.contains("--delimiter ''"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "summary"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "summary"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--summary-only"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "pipe"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "pipe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("--output-format tsv"));
     assert!(stdout.contains("--output-format ndjson"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "filter"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "filter"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("SOURCE.size > 1073741824"));
     assert!(stdout.contains("SOURCE.last_modified"));
     assert!(stdout.contains("Rejected before network"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "release-check"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "release-check"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("./scripts/check-release-env.sh"));
     assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
@@ -298,24 +260,32 @@ fn test_cli_recipes_quickstart_and_cheatsheet_local_only() {
     assert!(stdout.contains("./scripts/verify-release-assets.sh"));
     assert!(stdout.contains("do not contact S3-compatible cloud endpoints"));
 
-    let (code, stdout, stderr) = run_cli(&["recipes", "diff-safe"]);
+    let (code, stdout, stderr) = run_cli(&["guide", "diff-safe"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("Safe diff"));
     assert!(stdout.contains("diff --bucket"));
     assert!(stdout.contains("manifest-summary"));
 
-    let (code, stdout, stderr) = run_cli(&["quickstart", "r2"]);
+    // Provider topics dispatch to quickstarts.
+    let (code, stdout, stderr) = run_cli(&["guide", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("AWS_PROFILE"));
     assert!(stdout.contains("--profile r2"));
     assert!(stdout.contains("--delimiter ''"));
 
-    let (code, stdout, stderr) = run_cli(&["cheatsheet"]);
+    // No topic prints the overview, which points back at guide topics.
+    let (code, stdout, stderr) = run_cli(&["guide"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("First run"));
     assert!(stdout.contains("--delimiter ''"));
-    assert!(stdout.contains("recipes filter"));
-    assert!(stdout.contains("recipes release-check"));
+    assert!(stdout.contains("guide filter"));
+    assert!(stdout.contains("release-check"));
+
+    // index lists the recipe names.
+    let (code, stdout, stderr) = run_cli(&["guide", "index"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Available recipes"));
+    assert!(stdout.contains("guide <name>"));
 }
 
 #[test]
@@ -400,28 +370,32 @@ fn test_cli_doctor_warns_when_aws_profile_matches_endpoint_preset_name() {
 }
 
 #[test]
-fn test_cli_profiles_list_json_local_only() {
-    let (code, stdout, stderr) = run_cli(&["profiles", "list", "--json"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let profiles = json.as_array().unwrap();
-    assert!(profiles.iter().any(|profile| profile["name"] == "bos"));
-    assert!(profiles.iter().any(|profile| profile["name"] == "r2"));
-    assert!(profiles.iter().any(|profile| profile["name"] == "b2"));
-    assert!(profiles.iter().any(|profile| profile["name"] == "oss"));
+fn test_cli_profiles_removed() {
+    // The profiles subcommand was folded into `guide <provider>`.
+    let (code, _stdout, stderr) = run_cli(&["profiles"]);
+    assert_ne!(code, 0, "profiles should no longer be a subcommand");
+    assert!(
+        stderr.contains("unrecognized subcommand") || stderr.contains("invalid"),
+        "stderr should report an unknown subcommand: {}",
+        stderr
+    );
 }
 
 #[test]
-fn test_cli_profiles_show_r2_json_local_only() {
-    let (code, stdout, stderr) = run_cli(&["profiles", "show", "r2", "--json"]);
+fn test_cli_guide_provider_shows_profile_facts() {
+    // `guide aws` prints the quickstart plus the endpoint-compatibility facts.
+    let (code, stdout, stderr) = run_cli(&["guide", "aws"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("AWS quickstart"));
+    assert!(stdout.contains("Endpoint compatibility profile:"));
+    assert!(stdout.contains("provider: AWS S3"));
+    assert!(stdout.contains("requires_explicit_endpoint: false"));
 
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["name"], "r2");
-    assert_eq!(json["default_region"], "auto");
-    assert_eq!(json["requires_explicit_endpoint"], true);
-    assert_eq!(json["tested_by_project"], false);
+    // Providers without a hand-written quickstart still print profile facts.
+    let (code, stdout, stderr) = run_cli(&["guide", "oss"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Endpoint compatibility profile:"));
+    assert!(stdout.contains("Alibaba Cloud OSS"));
 }
 
 #[test]
@@ -639,8 +613,8 @@ fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
 }
 
 #[test]
-fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&["config-inspect", "--json"]);
+fn test_cli_doctor_reports_zstd_default_no_cloud() {
+    let (code, stdout, stderr) = run_cli(&["doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -660,7 +634,7 @@ fn test_cli_config_inspect_reports_zstd_default_no_cloud() {
 }
 
 #[test]
-fn test_cli_config_inspect_json_reports_explicit_config_source_no_cloud() {
+fn test_cli_doctor_json_reports_explicit_config_source_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("s3-turbo-list.toml");
     std::fs::write(
@@ -679,7 +653,8 @@ compression_level = 6
     let (code, stdout, stderr) = run_cli(&[
         "--config",
         config_path.to_str().unwrap(),
-        "config-inspect",
+        "doctor",
+        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -700,7 +675,7 @@ compression_level = 6
 }
 
 #[test]
-fn test_cli_config_inspect_human_reports_loaded_config_no_cloud() {
+fn test_cli_doctor_human_reports_loaded_config_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("s3-turbo-list.toml");
     std::fs::write(
@@ -712,19 +687,24 @@ worker_threads = 4
     )
     .unwrap();
 
-    let (code, stdout, stderr) =
-        run_cli(&["--config", config_path.to_str().unwrap(), "config-inspect"]);
+    let (code, stdout, stderr) = run_cli(&[
+        "--config",
+        config_path.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+    ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:"));
     assert!(stdout.contains(config_path.to_str().unwrap()));
 }
 
 #[test]
-fn test_cli_config_inspect_warns_for_missing_explicit_config_no_cloud() {
+fn test_cli_doctor_warns_for_missing_explicit_config_no_cloud() {
     let config_path = "/tmp/s3-turbo-list-missing-test-config.toml";
     let _ = std::fs::remove_file(config_path);
 
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect", "--json"]);
+    let (code, stdout, stderr) =
+        run_cli(&["--config", config_path, "doctor", "--local-only", "--json"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["config_source"]["explicit_config"], config_path);
@@ -739,7 +719,7 @@ fn test_cli_config_inspect_warns_for_missing_explicit_config_no_cloud() {
         .iter()
         .any(|warning| warning.as_str().unwrap().contains("was not found")));
 
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "config-inspect"]);
+    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor", "--local-only"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("config:       -"));
     assert!(stdout.contains("warning:"));
@@ -872,28 +852,17 @@ compression_level = 6
 }
 
 #[test]
-fn test_cli_dry_run_agent_stdout_json() {
-    let (code, stdout, stderr) = run_cli(&[
-        "--agent",
-        "--dry-run",
-        "auto-hints",
-        "--bucket",
-        "agent-test-bucket",
-        "--region",
-        "us-east-1",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["inputs"]["mode"], "auto-hints");
-    assert_eq!(
-        json["outputs"]["hints_file"],
-        "us-east-1_agent-test-bucket_hints.toml"
-    );
-    assert!(json["warnings"][0]
-        .as_str()
-        .unwrap()
-        .contains("auto-hints will scan S3 pages"));
+fn test_cli_removed_subcommands_are_gone() {
+    for cmd in ["auto-hints", "discover-prefixes"] {
+        let (code, _stdout, stderr) = run_cli(&[cmd, "--help"]);
+        assert_ne!(code, 0, "{} should no longer be a valid subcommand", cmd);
+        assert!(
+            stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+            "{} removal should produce a clap error, got: {}",
+            cmd,
+            stderr
+        );
+    }
 }
 
 #[test]
@@ -1010,23 +979,6 @@ fn test_cli_default_paths_sanitize_bucket_and_region_components() {
         checkpoint.contains("us_east_.._evil_bucket"),
         "{}",
         checkpoint
-    );
-
-    let (code, stdout, stderr) = run_cli_without_aws_env(&[
-        "--agent",
-        "--dry-run",
-        "discover-prefixes",
-        "--bucket",
-        "../evil/bucket",
-        "--region",
-        "us/east",
-        "--toml",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        json["outputs"]["hints_file"],
-        "us_east_.._evil_bucket_prefixes.toml"
     );
 }
 
@@ -1889,7 +1841,8 @@ fn test_cli_bad_config_exits_with_config_code() {
     let (code, _stdout, stderr) = run_cli(&[
         "--config",
         path.to_str().unwrap(),
-        "config-inspect",
+        "doctor",
+        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 2, "bad config should use stable config exit code");
@@ -1897,46 +1850,26 @@ fn test_cli_bad_config_exits_with_config_code() {
 }
 
 #[test]
-fn test_cli_hints_validate_plain_success() {
+fn test_cli_doctor_hints_file_plain_success() {
+    // hints-validate folded into `doctor --hints-file`.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.txt");
     std::fs::write(&path, "alpha/\nbeta/\n").unwrap();
 
-    let (code, stdout, stderr) =
-        run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
+    let (code, stdout, stderr) = run_cli(&[
+        "--hints-file",
+        path.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+    ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("Hints file:"));
     assert!(stdout.contains("Boundary count"));
     assert!(stdout.contains("2"));
 }
 
 #[test]
-fn test_cli_hints_validate_plain_allows_partition_and_bracket_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("hints.txt");
-    std::fs::write(&path, "dt=2026-05-23/part=0/\n[backups]\n").unwrap();
-
-    let (code, stdout, stderr) = run_cli(&[
-        "hints-validate",
-        "--hints-file",
-        path.to_str().unwrap(),
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["format"], "plain");
-    assert_eq!(json["boundary_count"], 2);
-    let first = json["first_boundaries"].as_array().unwrap();
-    assert!(first
-        .iter()
-        .any(|value| value.as_str() == Some("dt=2026-05-23/part=0/")));
-    assert!(first
-        .iter()
-        .any(|value| value.as_str() == Some("[backups]")));
-}
-
-#[test]
-fn test_cli_hints_validate_json_estimates_summary() {
+fn test_cli_doctor_hints_file_json_estimates_summary() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.toml");
     std::fs::write(
@@ -1966,106 +1899,50 @@ estimated_objects = 20
     .unwrap();
 
     let (code, stdout, stderr) = run_cli(&[
-        "hints-validate",
         "--hints-file",
         path.to_str().unwrap(),
+        "doctor",
+        "--local-only",
         "--json",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["metadata"]["scan_mode"], "sampled");
-    assert_eq!(json["estimate_summary"]["sampled"], true);
-    assert_eq!(json["estimate_summary"]["count"], 2);
-    assert_eq!(json["estimate_summary"]["min_estimated_objects"], 10);
-    assert_eq!(json["estimate_summary"]["max_estimated_objects"], 20);
-    assert_eq!(json["estimate_summary"]["total_estimated_objects"], 30);
-    assert_eq!(json["first_estimates"].as_array().unwrap().len(), 2);
+    let hints = &json["hints"];
+    assert_eq!(hints["metadata"]["scan_mode"], "sampled");
+    assert_eq!(hints["estimate_summary"]["sampled"], true);
+    assert_eq!(hints["estimate_summary"]["count"], 2);
+    assert_eq!(hints["estimate_summary"]["min_estimated_objects"], 10);
+    assert_eq!(hints["estimate_summary"]["max_estimated_objects"], 20);
+    assert_eq!(hints["estimate_summary"]["total_estimated_objects"], 30);
+    assert_eq!(hints["first_estimates"].as_array().unwrap().len(), 2);
 }
 
 #[test]
-fn test_cli_hints_validate_malformed_failure() {
+fn test_cli_doctor_hints_file_malformed_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hints.txt");
     std::fs::write(&path, "boundaries = [\nalpha/\n]\n").unwrap();
 
-    let (code, _stdout, stderr) =
-        run_cli(&["hints-validate", "--hints-file", path.to_str().unwrap()]);
+    let (code, _stdout, stderr) = run_cli(&[
+        "--hints-file",
+        path.to_str().unwrap(),
+        "doctor",
+        "--local-only",
+    ]);
     assert_ne!(code, 0, "malformed hints should fail");
     assert!(stderr.contains("Hints validation failed"));
 }
 
 #[test]
-fn test_cli_hints_merge_json_writes_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.txt");
-    let b = dir.path().join("b.toml");
-    let out = dir.path().join("merged.toml");
-    let manifest = dir.path().join("merge.manifest.json");
-    std::fs::write(&a, "logs/a/\nlogs/c/\n").unwrap();
-    std::fs::write(
-        &b,
-        r#"bucket = "b"
-total_objects = 0
-boundaries = ["logs/b/", "logs/c/"]
-generated_at = "2026-05-19T00:00:00Z"
-"#,
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run_cli(&[
-        "hints-merge",
-        a.to_str().unwrap(),
-        b.to_str().unwrap(),
-        "--output",
-        out.to_str().unwrap(),
-        "--emit-manifest",
-        manifest.to_str().unwrap(),
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["boundary_count"], 3);
-    assert_eq!(json["duplicate_count"], 1);
-    assert_eq!(json["output_written"], true);
-
-    let merged = std::fs::read_to_string(&out).unwrap();
-    assert!(merged.contains("logs/a/"));
-    assert!(merged.contains("logs/b/"));
-    assert!(merged.contains("logs/c/"));
-
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["command"], "hints-merge");
-    assert_eq!(manifest_json["outputs"].as_array().unwrap().len(), 1);
-
-    let (code, _stdout, stderr) = run_cli(&[
-        "hints-merge",
-        a.to_str().unwrap(),
-        "--output",
-        out.to_str().unwrap(),
-    ]);
-    assert_ne!(code, 0);
-    assert!(stderr.contains("Output file exists"));
-}
-
-#[test]
-fn test_cli_trace_summary_json() {
-    let dir = tempfile::tempdir().unwrap();
-    let trace = dir.path().join("trace.jsonl");
-    std::fs::write(
-        &trace,
-        r#"{"timestamp":"2026-05-19T00:00:00Z","operation":"ListObjectsV2","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":10,"retryable":false,"fatal":false,"is_truncated":true,"start_after":"a/","contents_count":2,"first_key":"a/1","last_key":"a/2"}
-{"timestamp":"2026-05-19T00:00:01Z","operation":"ListObjectsV2SegmentSummary","endpoint_url":"http://localhost","addressing_style":"path","bucket":"b","prefix":"","http_status":200,"retry_attempt":0,"latency_ms":50,"retryable":false,"fatal":false,"is_truncated":false,"segment_index":0,"segment_pages":3,"segment_objects":30,"segment_common_prefixes":0,"ended_by":"boundary","end_before":"m/"}
-"#,
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run_cli(&["trace-summary", trace.to_str().unwrap(), "--json"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["segment_count"], 1);
-    assert_eq!(json["total_pages"], 3);
-    assert_eq!(json["total_objects"], 30);
-    assert_eq!(json["list_events"], 1);
+fn test_cli_trace_summary_removed() {
+    // The offline trace-summary workflow was removed; --trace-compat still
+    // writes the raw JSONL for manual inspection.
+    let (code, _stdout, stderr) = run_cli(&["trace-summary", "trace.jsonl"]);
+    assert_ne!(code, 0, "trace-summary should no longer be a subcommand");
+    assert!(
+        stderr.contains("unrecognized subcommand") || stderr.contains("invalid"),
+        "stderr should report an unknown subcommand: {}",
+        stderr
+    );
 }
