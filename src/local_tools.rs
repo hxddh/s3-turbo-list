@@ -858,7 +858,7 @@ These commands do not contact S3-compatible cloud endpoints.
             .to_string(),
         ),
         other => Err(format!(
-            "unknown recipe '{}'. Run 's3-turbo-list recipes' to list recipes.",
+            "unknown guide topic '{}'. Run 's3-turbo-list guide index' to list recipes.",
             other
         )),
     }
