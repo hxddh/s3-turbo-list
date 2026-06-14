@@ -1,7 +1,7 @@
 use crate::checkpoint::{CheckpointIdentity, CheckpointJournal};
 use crate::config::{ConfigLoadSummary, S3TurboConfig};
 use crate::core::RunMetricsSnapshot;
-use crate::hints::{self, HintsEstimateSummary};
+use crate::hints;
 use crate::profiles;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
@@ -208,7 +208,6 @@ pub struct HintsPlan {
     pub valid: Option<bool>,
     pub format: Option<String>,
     pub boundary_count: Option<usize>,
-    pub estimate_summary: Option<HintsEstimateSummary>,
     pub warnings: Vec<String>,
 }
 
@@ -417,7 +416,6 @@ pub fn detect_hints_plan(
                 .as_ref()
                 .map(|r| format!("{:?}", r.format).to_lowercase()),
             boundary_count: report.as_ref().map(|r| r.boundary_count),
-            estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
             warnings: report
                 .map(|r| r.warnings)
                 .unwrap_or_else(|| vec!["hints file does not exist or could not be parsed".into()]),
@@ -432,7 +430,6 @@ pub fn detect_hints_plan(
             valid: None,
             format: None,
             boundary_count: None,
-            estimate_summary: None,
             warnings: vec!["--no-auto-hints skips conventional hints cache loading".to_string()],
         };
     }
@@ -455,7 +452,6 @@ pub fn detect_hints_plan(
                 .as_ref()
                 .map(|r| format!("{:?}", r.format).to_lowercase()),
             boundary_count: report.as_ref().map(|r| r.boundary_count),
-            estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
             warnings: report.map(|r| r.warnings).unwrap_or_else(|| {
                 vec![
                     "no cached hints; flat list runs probe bucket structure at startup \
@@ -473,7 +469,6 @@ pub fn detect_hints_plan(
         valid: None,
         format: None,
         boundary_count: None,
-        estimate_summary: None,
         warnings: Vec::new(),
     }
 }
@@ -498,7 +493,6 @@ pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>
             .as_ref()
             .map(|r| format!("{:?}", r.format).to_lowercase()),
         boundary_count: report.as_ref().map(|r| r.boundary_count),
-        estimate_summary: report.as_ref().and_then(|r| r.estimate_summary.clone()),
         warnings: vec![
             "diff partitions each side automatically (cached hints or startup discovery); explicit --hints-file and --resume remain unsupported for diff"
                 .to_string(),

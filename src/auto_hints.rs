@@ -4,14 +4,6 @@ use std::collections::BTreeSet;
 // ── Cached hints format ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SegmentEstimate {
-    pub start_after: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_before: Option<String>,
-    pub estimated_objects: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HintsCache {
     pub bucket: String,
     pub region: Option<String>,
@@ -21,33 +13,9 @@ pub struct HintsCache {
     pub boundaries: Vec<String>,
     pub generated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_keys: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_prefix_entries: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub prefix_counts_truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_objects: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_pages: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_pages: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segment_estimates: Vec<SegmentEstimate>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 // ── Startup structural discovery ───────────────────────────
@@ -237,18 +205,8 @@ pub fn write_startup_hints_cache(
         total_objects: 0,
         boundaries: boundaries.to_vec(),
         generated_at: chrono::Local::now().to_rfc3339(),
-        source_count: None,
-        source_files: Vec::new(),
-        max_keys: None,
-        max_prefix_entries: None,
-        prefix_counts_truncated: false,
         scan_mode: Some("structural".to_string()),
-        sampled_objects: None,
-        sampled_pages: None,
-        sample_limit: None,
-        max_pages: None,
         estimate_mode: Some("structural".to_string()),
-        segment_estimates: Vec::new(),
     };
     let path = crate::agent::conventional_hints_path(bucket, region);
     let toml_str = toml::to_string_pretty(&cache)
@@ -265,7 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sampled_metadata_serializes() {
+    fn test_hints_cache_round_trip() {
         let cache = HintsCache {
             bucket: "bucket".to_string(),
             region: Some("us-east-1".to_string()),
@@ -273,34 +231,20 @@ mod tests {
             total_objects: 100,
             boundaries: vec!["a/".to_string(), "b/".to_string()],
             generated_at: "2026-05-16T00:00:00Z".to_string(),
-            source_count: None,
-            source_files: Vec::new(),
-            max_keys: Some(500),
-            max_prefix_entries: Some(1_000_000),
-            prefix_counts_truncated: false,
-            scan_mode: Some("sampled".to_string()),
-            sampled_objects: Some(100),
-            sampled_pages: Some(2),
-            sample_limit: Some(100),
-            max_pages: Some(2),
-            estimate_mode: Some("sampled".to_string()),
-            segment_estimates: vec![SegmentEstimate {
-                start_after: String::new(),
-                end_before: Some("a/".to_string()),
-                estimated_objects: 50,
-            }],
+            scan_mode: Some("structural".to_string()),
+            estimate_mode: Some("structural".to_string()),
         };
 
         let encoded = toml::to_string_pretty(&cache).unwrap();
-        assert!(encoded.contains("scan_mode = \"sampled\""));
-        assert!(encoded.contains("sampled_objects = 100"));
+        assert!(encoded.contains("scan_mode = \"structural\""));
 
         let decoded: HintsCache = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded.scan_mode.as_deref(), Some("sampled"));
+        assert_eq!(decoded.bucket, "bucket");
+        assert_eq!(decoded.region.as_deref(), Some("us-east-1"));
         assert_eq!(decoded.prefix.as_deref(), Some("logs/"));
-        assert_eq!(decoded.max_keys, Some(500));
-        assert_eq!(decoded.sampled_pages, Some(2));
-        assert_eq!(decoded.segment_estimates.len(), 1);
+        assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
+        assert_eq!(decoded.scan_mode.as_deref(), Some("structural"));
+        assert_eq!(decoded.estimate_mode.as_deref(), Some("structural"));
     }
 
     fn fake_tree(data: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {

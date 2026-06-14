@@ -2957,50 +2957,6 @@ fn print_doctor_hints(report: &hints::HintsValidationReport) {
             "  Scan mode:       {}",
             metadata.scan_mode.as_deref().unwrap_or("unknown")
         );
-        if metadata.scan_mode.as_deref() == Some("sampled") {
-            println!(
-                "  Sampled objects: {}",
-                metadata
-                    .sampled_objects
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
-            println!(
-                "  Sampled pages:   {}",
-                metadata
-                    .sampled_pages
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
-        }
-        if let Some(summary) = &report.estimate_summary {
-            println!(
-                "  Estimates:       {} ({})",
-                summary.count,
-                if summary.sampled {
-                    "sampled/estimated"
-                } else {
-                    "observed/full"
-                }
-            );
-            println!(
-                "  Estimate min/max/sum: {}/{}/{}",
-                summary.min_estimated_objects,
-                summary.max_estimated_objects,
-                summary.total_estimated_objects
-            );
-        }
-    }
-    if !report.first_estimates.is_empty() {
-        println!("  First {} estimates:", report.first_estimates.len());
-        for estimate in &report.first_estimates {
-            println!(
-                "    - start_after='{}', end_before='{}', estimated_objects={}",
-                estimate.start_after,
-                estimate.end_before.as_deref().unwrap_or(""),
-                estimate.estimated_objects
-            );
-        }
     }
     if !report.first_boundaries.is_empty() {
         println!("  First {} boundaries:", report.first_boundaries.len());
