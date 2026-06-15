@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-15
+
+### Fixed
+- **Root-segment retry could silently drop keys sorting before `/`.** On a
+  retryable error on a segment's first page (before any key was emitted), the
+  resume key fell back to the literal `"/"`. For the root segment (whose lower
+  bound is empty) this skipped real keys that sort before `/` (e.g. keys
+  starting with `!`, `#`, `-`, `.`). The resume key now stays empty in that
+  case, so the retry lists from the segment's true start. (Non-root segments
+  were unaffected — they already resume from their real start.) From an
+  architecture review.
+
+### Changed
+- **Runtime split-probe requests now have a timeout.** The delimiter and
+  flat-cut probes that drive runtime segment splitting issued ListObjectsV2
+  without the per-operation `timeout` the main page loop uses, so a wedged probe
+  could pin a segment's split state and leak a probe-budget slot indefinitely.
+  Probes now use the same `operation_timeout_secs` watchdog.
+- **A cancelled task no longer inflates the run manifest's `fatal_errors`.**
+  Tasks cancelled during shutdown (e.g. a clean Ctrl-C aborting in-flight work)
+  were counted as fatal errors, leaving `metrics.fatal_errors > 0` on a clean
+  interrupt and tripping `manifest-summary --check`. Only genuine task panics
+  are now counted.
+
+### Internal
+- Removed a dead `if/else` whose branches were identical (output filename), and
+  skipped the per-tick whole-map page scan in the fan-out governor when no
+  sample window has elapsed. No behavior change.
+
 ### Documentation
 - Added a `## License` section to `README.md` (Apache-2.0, linking `LICENSE`/`NOTICE`).
 - Replaced the stale "Supported versions" table in `SECURITY.md` (it listed

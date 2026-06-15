@@ -731,13 +731,11 @@ fn main() {
         .ks_file
         .clone()
         .unwrap_or_else(|| format!("{}.ks", output_stem));
-    let filename_output = cfg.output.parquet_file.clone().unwrap_or_else(|| {
-        if mode == RunMode::List {
-            format!("{}.parquet", output_stem)
-        } else {
-            format!("{}.parquet", output_stem)
-        }
-    });
+    let filename_output = cfg
+        .output
+        .parquet_file
+        .clone()
+        .unwrap_or_else(|| format!("{}.parquet", output_stem));
     ensure_output_dir(&cli);
 
     // Setup Ctrl-C handler
@@ -1132,19 +1130,25 @@ fn main() {
         let mut last_checkpoint_save = std::time::Instant::now();
         while let Some(result) = set.join_next().await {
             if let Err(e) = result {
-                error!("Task panicked: {}", e);
                 if e.is_cancelled() {
+                    // Cancellation is expected during shutdown (Ctrl-C aborts
+                    // in-flight tasks); it is not a fatal error, so do not count
+                    // it — counting it inflates the run manifest's fatal_errors
+                    // on a clean interrupt and trips `manifest-summary --check`.
                     info!("Task was cancelled (abort or shutdown)");
-                } else if let Ok(panic_msg) = e.try_into_panic() {
-                    let msg: String = panic_msg
-                        .downcast_ref::<&str>()
-                        .map(|s: &&str| s.to_string())
-                        .or_else(|| panic_msg.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "<unknown panic>".to_string());
-                    error!("Task panic message: {}", msg);
+                } else {
+                    error!("Task panicked: {}", e);
+                    if let Ok(panic_msg) = e.try_into_panic() {
+                        let msg: String = panic_msg
+                            .downcast_ref::<&str>()
+                            .map(|s: &&str| s.to_string())
+                            .or_else(|| panic_msg.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<unknown panic>".to_string());
+                        error!("Task panic message: {}", msg);
+                    }
+                    // A genuine panic is a fatal failure — record it.
+                    g_state.inc_fatal_error();
                 }
-                // Propagate panic as failure — exit with non-zero code.
-                g_state.inc_fatal_error();
                 g_state.quit();
             }
 

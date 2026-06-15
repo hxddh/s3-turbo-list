@@ -167,19 +167,23 @@ async fn probe_split_candidate(
         .into_iter()
         .take(SPLIT_PROBE_MAX_RUNGS)
     {
-        let response = ctx
+        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
+        let send = ctx
             .s3_client
             .list_objects_v2()
             .bucket(&ctx.s3_bucket_name)
             .prefix(&dir)
             .start_after(cursor)
             .delimiter("/")
-            .send()
-            .await;
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
+            .send();
+        let response = match timeout_at(Instant::now() + timeout_dur, send).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 debug!("Split probe failed for prefix '{}': {:?}", dir, e);
+                return None;
+            }
+            Err(_elapsed) => {
+                debug!("Split probe timed out for prefix '{}'", dir);
                 return None;
             }
         };
@@ -215,19 +219,23 @@ async fn probe_flat_cut(
     end: Option<&str>,
 ) -> Option<String> {
     for candidate in flat_cut_candidates(cursor, listing_prefix, end) {
-        let response = ctx
+        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
+        let send = ctx
             .s3_client
             .list_objects_v2()
             .bucket(&ctx.s3_bucket_name)
             .prefix(listing_prefix)
             .start_after(&candidate)
             .max_keys(1)
-            .send()
-            .await;
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
+            .send();
+        let response = match timeout_at(Instant::now() + timeout_dur, send).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 debug!("Flat cut probe failed at '{}': {:?}", candidate, e);
+                return None;
+            }
+            Err(_elapsed) => {
+                debug!("Flat cut probe timed out at '{}'", candidate);
                 return None;
             }
         };
@@ -324,7 +332,13 @@ impl FanOutGovernor {
         setlen: usize,
         max: usize,
     ) {
-        self.observe_at(Instant::now(), retired, live_pages(controls), setlen, max)
+        // Skip the whole-map page scan when a sample window hasn't elapsed; the
+        // reactor calls this every tick but it only acts once per FANOUT_SAMPLE.
+        let now = Instant::now();
+        if now.duration_since(self.last_at) < FANOUT_SAMPLE {
+            return;
+        }
+        self.observe_at(now, retired, live_pages(controls), setlen, max)
     }
 
     /// Pure core of `observe`, split out so tests can drive the clock and page

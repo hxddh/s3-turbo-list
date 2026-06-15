@@ -51,21 +51,17 @@ impl FlatRuntimeError {
         }
     }
 
-    /// The key to resume from on retry.
+    /// The key to resume from on retry. An empty value means "resume from the
+    /// start of the segment's range" — the request omits `start-after` and lists
+    /// from the segment's lower bound. Substituting a sentinel like "/" here
+    /// would force a non-empty `start-after` on the root segment and silently
+    /// skip real keys that sort before it (e.g. keys starting with `!`/`#`/`-`).
     pub fn next_start(&self) -> &str {
-        if self.next_start.is_empty() {
-            "/"
-        } else {
-            &self.next_start
-        }
+        &self.next_start
     }
 
     pub fn next_start_owned(&self) -> String {
-        if self.next_start.is_empty() {
-            "/".to_string()
-        } else {
-            self.next_start.clone()
-        }
+        self.next_start.clone()
     }
 
     /// Returns `true` if this error is transient and the operation should be retried.
@@ -280,9 +276,12 @@ mod tests {
     }
 
     #[test]
-    fn test_flat_error_next_start_defaults_to_slash() {
+    fn test_flat_error_empty_next_start_stays_empty() {
+        // Empty must stay empty (resume from the segment start), not "/" — a
+        // sentinel would skip keys sorting before it on the root segment.
         let err = FlatRuntimeError::new(ERROR_UNKNOWN, "msg".into(), "".into());
-        assert_eq!(err.next_start(), "/");
+        assert_eq!(err.next_start(), "");
+        assert_eq!(err.next_start_owned(), "");
     }
 
     #[test]
