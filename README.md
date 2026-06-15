@@ -225,3 +225,8 @@ One binary; list and diff done extremely fast, with observability and
 automation hooks. The CLI surface is intentionally small — new subcommands or
 global flags need an exceptional case (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 Performance work targets the default path, not new knobs.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Releases through
+v0.17 were published under the MIT license.

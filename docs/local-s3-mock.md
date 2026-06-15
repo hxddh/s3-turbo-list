@@ -1,6 +1,6 @@
 # Local S3 Protocol Mock
 
-v0.1.9 adds an integration-test-only S3-compatible mock server.  It is a local
+An integration-test-only S3-compatible mock server.  It is a local
 correctness harness for the CLI, AWS SDK request path, XML response parsing,
 trace fields, checkpoint/resume segment selection, and retry behavior.
 

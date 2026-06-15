@@ -79,7 +79,7 @@ python3 -m py_compile examples/inspect-trace.py
 
 - [ ] `README.md` internal links resolve.
 - [ ] `examples/README.md` internal links resolve.
-- [ ] Cross-references to `docs/validation-results/` files exist.
+- [ ] No broken internal links across root and `docs/` Markdown files.
 
 ## 6. Release build
 

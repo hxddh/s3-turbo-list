@@ -24,9 +24,9 @@ project safe for contributors and users:
 
 ## Supported versions
 
-| Version | Supported |
-|---|---|
-| 0.1.x (current) | ✅ |
+Only the latest published [release](https://github.com/hxddh/s3-turbo-list/releases)
+is supported. Older versions do not receive backported fixes — upgrade to the
+latest release.
 
 ## Scope
 

@@ -118,36 +118,11 @@ output path, so the results are useful for comparing CPU and file-size tradeoffs
 in Parquet writing.  They do not predict end-to-end runtime when a real endpoint
 or network link is the bottleneck.
 
-The v0.1.26 release includes a local arm64 reference run in
-[`docs/validation-results/compression-benchmark-20260524.md`](validation-results/compression-benchmark-20260524.md).
-The v0.2.3 release includes a local stdout formatter reference run in
-[`docs/validation-results/output-benchmark-20260525.md`](validation-results/output-benchmark-20260525.md).
-In that run, the v0.2.3 batch-buffered stdout path improved median local TSV
-formatter time by about 8.2% and NDJSON formatter time by about 9.4% versus the
-published v0.2.2 binary.  These numbers isolate local rendering and file
-output; real endpoint latency or network throughput can dominate end-to-end
-runtime.
-The v0.2.8 development cycle adds a diff data-map construction baseline in
-[`docs/validation-results/diff-map-benchmark-20260531.md`](validation-results/diff-map-benchmark-20260531.md).
-The v0.2.15 development cycle includes a list-mode Parquet hot-path comparison
-in
-[`docs/validation-results/list-output-hot-path-benchmark-20260606.md`](validation-results/list-output-hot-path-benchmark-20260606.md).
-The v0.2.16 development cycle includes a follow-up single-pass list-mode
-Parquet comparison in
-[`docs/validation-results/list-parquet-single-pass-benchmark-20260606.md`](validation-results/list-parquet-single-pass-benchmark-20260606.md).
-The v0.2.17 development cycle includes a list-output inclusion fast-path
-comparison in
-[`docs/validation-results/list-output-include-fast-path-benchmark-20260607.md`](validation-results/list-output-include-fast-path-benchmark-20260607.md).
-The v0.2.18 development cycle includes a list-mode Parquet ETag buffer
-comparison in
-[`docs/validation-results/list-parquet-etag-buffer-benchmark-20260611.md`](validation-results/list-parquet-etag-buffer-benchmark-20260611.md).
-
 ## Compression Notes
 
-The default Parquet compression is `zstd(1)`.  The v0.1.26 local benchmark
-showed a better speed/size balance than the previous `gzip(6)` default on the
-list-mode streaming output path.  For traditional gzip output, pass both codec
-and level explicitly:
+The default Parquet compression is `zstd(1)`, chosen for a better speed/size
+balance than `gzip(6)` on the list-mode streaming output path.  For traditional
+gzip output, pass both codec and level explicitly:
 
 ```bash
 s3-turbo-list --compression gzip --compression-level 6 \

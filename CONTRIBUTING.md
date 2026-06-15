@@ -4,7 +4,7 @@
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_ORG/s3-turbo-list.git
+git clone https://github.com/hxddh/s3-turbo-list.git
 cd s3-turbo-list
 
 # Build
@@ -16,13 +16,13 @@ cargo test
 # Check formatting
 cargo fmt --check
 
-# Static analysis
+# Type check
 cargo check
 ```
 
 ## Development workflow
 
-1. **Fork and branch.**  Create a feature branch from `master`.
+1. **Fork and branch.**  Create a feature branch from `main`.
 2. **Write tests.**  Add or update tests for any new behaviour.
 3. **Run the full suite before pushing:**
    ```bash
@@ -76,11 +76,16 @@ maintainer sign-off before any implementation work.
 ## Code style
 
 - Follow `rustfmt` defaults (`cargo fmt`).
-- Use `cargo clippy` for lint guidance (not yet enforced in CI).
+- Run `cargo clippy --all-targets -- -D warnings`; it is enforced in CI.
 - Keep functions focused; prefer the module structure already in place.
 - Write doc comments (`///`) for public APIs.
 
 ## Questions?
 
 Open an issue or start a discussion.  Before opening a bug report, check
-the [known limitations](../README.md#known-limitations) in the README.
+the [known limitations](README.md#known-limitations) in the README.
+
+## License
+
+By contributing, you agree that your contributions are licensed under the
+project's [Apache-2.0](LICENSE) license.

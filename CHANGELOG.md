@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- Added a `## License` section to `README.md` (Apache-2.0, linking `LICENSE`/`NOTICE`).
+- Replaced the stale "Supported versions" table in `SECURITY.md` (it listed
+  `0.1.x`) with a churn-free "latest release is supported" statement.
+- `CONTRIBUTING.md`: fixed the `YOUR_ORG` clone placeholder (→ `hxddh`), the
+  `master` → `main` default branch, a broken `../README.md` link, and the stale
+  "clippy not yet enforced in CI" note (it is enforced); added an inbound-license
+  (Apache-2.0) statement; relabeled `cargo check` as a type check.
+- Trimmed version-archaeology from `docs/benchmarking.md` (per-old-release
+  benchmark pointers) and `docs/local-s3-mock.md`.
+- **Removed 13 superseded, orphaned dev micro-benchmark / code-review notes from
+  `docs/validation-results/`** (v0.1.x–v0.2.x dated artifacts that nothing
+  referenced). Kept the six endpoint/provider-validation reports (AWS/MinIO/BOS
+  baselines, the validation summary, and the BOS pagination note), which retain
+  reference value. Removed files remain in git history.
+
 ## [0.18.0] - 2026-06-15
 
 ### Changed
