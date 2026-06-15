@@ -33,7 +33,6 @@ mkdir -p "$OUTDIR"
 cat > "$OUTDIR/hints.toml" << 'TOML_EOF'
 bucket = "example-bucket"
 region = "us-east-1"
-total_objects = 50000
 boundaries = [
     "alpha/",
     "beta/",
@@ -42,7 +41,6 @@ boundaries = [
     "中文/",
 ]
 generated_at = "2026-05-14T12:00:00Z"
-scan_mode = "full"
 TOML_EOF
 
 echo "==> Created hints file: $OUTDIR/hints.toml"

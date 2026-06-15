@@ -390,9 +390,9 @@ async fn flat_reactor_task(
     info!("Flat List S3 Task — {} — started", ctx.s3_bucket_name);
     tokio::task::yield_now().await;
 
-    // Adaptive splitting only applies to plain list runs: diff is
-    // authoritative single-segment by design, and --start-after /
-    // --continuation-token are single-chain modes.
+    // Adaptive splitting only applies to plain list runs: diff uses a fixed,
+    // key-ordered segment set per side (the merge needs it static), and
+    // --start-after / --continuation-token are single-chain modes.
     let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && ctx.start_after.is_none()
         && ctx.continuation_token.is_none();

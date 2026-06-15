@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-15
+
+### Performance
+- **Per-object ETag parse uses a byte index instead of a char walk.** The
+  multipart-ETag check did `etag.chars().nth(33)`, which decodes UTF-8 from the
+  start of the string on every multipart object; ETags are ASCII, so this is now
+  a direct `as_bytes().get(33)` lookup. Trivial but on the per-object hot path
+  (multipart-heavy buckets).
+
+### Removed
+- **Trimmed the hints-file detection field lists.** `TOML_FIELDS` /
+  `TOML_ASSIGNMENT_FIELDS` (used only to detect the TOML cache format and reject
+  leaked TOML in plain files) still enumerated ~13 fields removed across
+  v0.8–v0.14 (`sampled_*`, `segment_estimates`, `total_objects`, `scan_mode`,
+  …), plus a dead `[[segment_estimates]]` table-header special-case. Reduced to
+  the fields the current format writes. On-disk-safe: every cache the tool has
+  ever written carries a `boundaries = [` array, which detection short-circuits
+  on, so older caches still load (serde already ignores unknown keys).
+- **Removed two dead `#[allow(dead_code)]` functions** with no callers:
+  `AsyncParquetOutput::flush_row_group` and `GlobalState::data_map_task_is_running`.
+
+### Documentation
+- Corrected the remaining stale "authoritative single-segment diff" claims that
+  contradicted the parallel-per-side behavior fixed elsewhere in v0.12.0/v0.14.0:
+  `docs/endpoint-profiles.md`, the `diff-safe` guide summary, and two source
+  comments. Renamed the now-misleading `diff_single_segment_hints_plan` →
+  `diff_per_side_hints_plan`.
+- Removed the stale `total_objects` / `scan_mode` fields from
+  `examples/hints-file-toml.sh` (the example was missed by the v0.14.0
+  `docs/tuning.md` fix).
+- Fixed a broken README anchor in `INSTALL.md` (`#output-modes` → `#output`) and
+  repointed the BOS-limitation reference in `examples/README.md` to
+  `docs/endpoint-profiles.md` (the README "Known limitations" section no longer
+  carries it).
+
 ## [0.14.0] - 2026-06-14
 
 ### Performance

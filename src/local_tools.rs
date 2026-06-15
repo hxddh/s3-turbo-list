@@ -724,7 +724,7 @@ fn render_recipe(name: Option<&str>) -> Result<String, String> {
   filter         Local object filter examples and limits
   verify         Validate a saved run manifest locally
   release-check  Local pre-release checks without contacting S3
-  diff-safe      Authoritative single-segment diff workflow
+  diff-safe      Parallel per-side bucket diff workflow
   large-bucket   Automatic partitioning and output-dir workflow
   local-minio    Local MinIO endpoint example
   agent-safe     Local-only agent/CI commands

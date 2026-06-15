@@ -307,7 +307,7 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
                 if hex::decode_to_slice(&x[1..33], &mut md5).is_ok() {
                     return (md5, 0);
                 }
-            } else if x.len() >= 36 && x.chars().nth(33) == Some('-') {
+            } else if x.len() >= 36 && x.as_bytes().get(33) == Some(&b'-') {
                 if hex::decode_to_slice(&x[1..33], &mut md5).is_ok() {
                     if let Ok(parts) = &x[34..x.len() - 1].parse::<usize>() {
                         return (md5, *parts as u32);
@@ -602,10 +602,6 @@ impl GlobalState {
     }
     pub fn data_map_task_complete(&self) {
         self.complete(TASK_STATUS_BIT_DATA_MAP);
-    }
-    #[allow(dead_code)] // Phase 5: used in task-coordination diagnostics
-    pub fn data_map_task_is_running(&self) -> bool {
-        self.is_running(TASK_STATUS_BIT_DATA_MAP)
     }
     pub fn mon_task_start(&self) {
         self.start(TASK_STATUS_BIT_MON);

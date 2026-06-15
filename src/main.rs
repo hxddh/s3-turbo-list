@@ -2379,7 +2379,7 @@ fn build_plan_report(
         )
     });
     let hints = if inputs.mode == "diff" {
-        agent::diff_single_segment_hints_plan(inputs.bucket.as_deref(), inputs.region.as_deref())
+        agent::diff_per_side_hints_plan(inputs.bucket.as_deref(), inputs.region.as_deref())
     } else {
         agent::detect_hints_plan(
             cli.hints_file.as_deref(),

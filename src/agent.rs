@@ -473,7 +473,7 @@ pub fn detect_hints_plan(
     }
 }
 
-pub fn diff_single_segment_hints_plan(bucket: Option<&str>, region: Option<&str>) -> HintsPlan {
+pub fn diff_per_side_hints_plan(bucket: Option<&str>, region: Option<&str>) -> HintsPlan {
     let path = bucket.map(|bucket| conventional_hints_path(bucket, region));
     let exists = path
         .as_deref()

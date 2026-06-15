@@ -2,41 +2,16 @@ use crate::auto_hints::HintsCache;
 use log::info;
 use serde::Serialize;
 
-const TOML_FIELDS: &[&str] = &[
-    "bucket",
-    "region",
-    "total_objects",
-    "boundaries",
-    "generated_at",
-    "source_count",
-    "source_files",
-    "scan_mode",
-    "sampled_objects",
-    "sampled_pages",
-    "sample_limit",
-    "max_pages",
-    "estimate_mode",
-    "segment_estimates",
-];
+// Field names used only to *detect* whether a hints file is the tool's TOML
+// cache (vs a plain newline-delimited boundary list) and to reject leaked TOML
+// syntax in plain files. These are the fields the current cache format writes
+// (see `HintsCache`); every cache the tool has ever written also carries a
+// `boundaries = [` array, which `looks_like_toml_hints` short-circuits on, so
+// older caches with long-removed fields are still detected and loaded.
+const TOML_FIELDS: &[&str] = &["bucket", "region", "prefix", "boundaries", "generated_at"];
 
-const TOML_ASSIGNMENT_FIELDS: &[&str] = &[
-    "bucket",
-    "region",
-    "total_objects",
-    "boundaries",
-    "generated_at",
-    "source_count",
-    "source_files",
-    "scan_mode",
-    "sampled_objects",
-    "sampled_pages",
-    "sample_limit",
-    "max_pages",
-    "estimate_mode",
-    "start_after",
-    "end_before",
-    "estimated_objects",
-];
+const TOML_ASSIGNMENT_FIELDS: &[&str] =
+    &["bucket", "region", "prefix", "boundaries", "generated_at"];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -338,9 +313,6 @@ fn validate_boundary_line(s: &str, line_no: usize) -> Result<(), String> {
 }
 
 fn is_toml_table_header(s: &str) -> bool {
-    if s == "[[segment_estimates]]" {
-        return true;
-    }
     let Some(inner) = s.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
         return false;
     };

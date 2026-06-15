@@ -32,7 +32,7 @@ s3-turbo-list --output-dir out \
 Listing is a recursive full-bucket inventory by default.  Use
 `--delimiter '/'` for a hierarchical listing that only returns top-level
 objects plus `CommonPrefixes`.  Other output modes (summary-only, TSV,
-NDJSON, run manifests) are covered in the [README](README.md#output-modes).
+NDJSON, run manifests) are covered in the [README](README.md#output).
 
 ## Choose the correct binary
 

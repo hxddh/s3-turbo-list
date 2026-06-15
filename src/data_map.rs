@@ -936,7 +936,7 @@ fn epoch_secs() -> u64 {
 
 // ── Streaming diff (merge-join) ────────────────────────────
 //
-// Diff is authoritative single-segment per side, so each side's batches
+// Each side is listed as a fixed set of key-ordered segments, so its batches
 // arrive in strict ascending key order.  Merging the two ordered streams
 // classifies every key on the fly — left-only (Plus), right-only (Minus),
 // or present on both sides (Equal/Astrisk via ObjectProps::classify_pair)

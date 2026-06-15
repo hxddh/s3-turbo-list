@@ -98,9 +98,10 @@ official guidance.  Path-style is available only in the diagnostic example
 mode — not the recommended default.
 
 The known BOS ListObjectsV2 pagination limitation (start_after +
-continuation_token interaction) is documented in the main
-[`README.md`](../README.md#known-limitations).  Hinted multi-segment scans
-on BOS should wait for a BOS-side fix or use single-segment fallback.
+continuation_token interaction) is documented in
+[`docs/endpoint-profiles.md`](../docs/endpoint-profiles.md).  Hinted
+multi-segment scans on BOS should wait for a BOS-side fix or use
+single-segment fallback.
 
 ## File index
 

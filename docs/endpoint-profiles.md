@@ -77,7 +77,7 @@ report.
 - R2, B2, and OSS presets are documented defaults, not a claim of full project
   validation.
 - The BOS profile does not enable a default pagination workaround.
-- `diff` is authoritative single-segment by design.  It ignores conventional
-  hints caches, and `diff --hints-file` / `diff --resume` are rejected before
-  any S3 request to avoid incomplete left-only or right-only results from
-  mismatched segment boundaries.
+- `diff` partitions and lists each side in parallel (cached or discovered
+  `CommonPrefixes`, or an up-front single-key bisection for flat sides) and
+  streams an ordered merge.  It ignores conventional shared hints caches, and
+  `diff --hints-file` / `diff --resume` are rejected before any S3 request.
