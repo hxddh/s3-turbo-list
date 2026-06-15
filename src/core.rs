@@ -664,6 +664,10 @@ impl S3TaskContext {
                     ))
                     .build(),
             )
+            .app_name(
+                aws_sdk_s3::config::AppName::new("s3-turbo-list")
+                    .expect("static app name is a valid AppName"),
+            )
             .load()
             .await
     }

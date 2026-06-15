@@ -120,7 +120,7 @@ impl SegmentControl {
         let cursor = self.cursor.lock().unwrap();
         let mut end = self.end_before.lock().unwrap();
         let in_range = proposed.as_str() > cursor.as_str()
-            && end.as_deref().map_or(true, |e| proposed.as_str() < e);
+            && end.as_deref().is_none_or(|e| proposed.as_str() < e);
         if !in_range {
             self.splitting.store(false, Ordering::Relaxed);
             return None;
@@ -187,7 +187,7 @@ async fn probe_split_candidate(
             .common_prefixes()
             .iter()
             .filter_map(|cp| cp.prefix())
-            .filter(|c| *c > cursor && end.map_or(true, |e| *c < e))
+            .filter(|c| *c > cursor && end.is_none_or(|e| *c < e))
             .map(str::to_string)
             .collect();
         if !candidates.is_empty() {
@@ -232,7 +232,7 @@ async fn probe_flat_cut(
             }
         };
         if let Some(key) = response.contents().first().and_then(|o| o.key()) {
-            if key > cursor && end.map_or(true, |e| key < e) {
+            if key > cursor && end.is_none_or(|e| key < e) {
                 return Some(key.to_string());
             }
         }
@@ -267,7 +267,7 @@ pub(crate) fn flat_cut_candidates(
         let mut candidate = cursor[..pos].to_string();
         candidate.push((byte + 1) as char);
         if candidate.as_str() > cursor
-            && end.map_or(true, |e| candidate.as_str() < e)
+            && end.is_none_or(|e| candidate.as_str() < e)
             && !candidates.contains(&candidate)
         {
             candidates.push(candidate);

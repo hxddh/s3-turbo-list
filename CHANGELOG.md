@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-15
+
+### Changed
+- **Relicensed from MIT to Apache-2.0.** Future versions are distributed under
+  the Apache License 2.0, which adds an explicit patent grant and
+  patent-retaliation clause, an explicit no-trademark-grant (protecting the
+  project name), and clearer contribution terms — while remaining permissive,
+  OSI-approved, and commercial-friendly (no adoption cost versus MIT). The
+  `LICENSE` file is the verbatim Apache-2.0 text and a `NOTICE` file carries the
+  copyright. This change is not retroactive: all previously published releases
+  (v0.5–v0.17) remain available under the MIT license they shipped with.
+- **The S3 client now identifies itself in the User-Agent.** Requests previously
+  carried only the default AWS SDK UA (`aws-sdk-rust/… os/… lang/rust/…`), so the
+  tool was indistinguishable from any generic SDK app in provider logs. The
+  client now sets an app name, adding `app/s3-turbo-list` to the UA — useful when
+  validating against many S3-compatible providers and for identifying the tool's
+  traffic. No other request behavior changes.
+- **Corrected the declared MSRV.** `rust-version` was `1.75`, but the AWS SDK
+  dependency already requires Rust `1.91.1`, so the project could not actually
+  build on `1.75`. Updated `rust-version` to `1.91.1` to match reality. Release
+  binaries are built with current stable (1.96.0 at v0.17.0), well above this.
+
 ## [0.17.0] - 2026-06-15
 
 ### Performance

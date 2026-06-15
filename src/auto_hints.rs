@@ -181,7 +181,7 @@ where
 {
     for candidate in crate::tasks_s3::flat_cut_candidates(start, prefix, end) {
         if let Ok(Some(key)) = probe(Some(candidate)).await {
-            if key.as_str() > start && end.map_or(true, |e| key.as_str() < e) {
+            if key.as_str() > start && end.is_none_or(|e| key.as_str() < e) {
                 return Some(key);
             }
         }
