@@ -1,7 +1,7 @@
 # Releases are driven by this version field: see docs/release-checklist.md.
 [package]
 name = "s3-turbo-list"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.75"
@@ -38,3 +38,14 @@ dirs-next = "2"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+# Release artifacts ship from `cargo build --release` (see the release workflow),
+# so optimize that profile for a lean, fast binary: strip symbols, enable
+# cross-crate inlining (helps the CPU-bound Parquet encode/compress path on
+# fast, non-rate-limited stores), and use a single codegen unit for best code
+# generation. `panic` is left as the default (unwind) so Ctrl-C handling and
+# tests are unaffected.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

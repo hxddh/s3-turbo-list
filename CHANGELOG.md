@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-15
+
+### Performance
+- **Optimized the release build profile.** Release binaries shipped from a plain
+  `cargo build --release` with no `[profile.release]`, so they were unstripped,
+  un-LTO'd, and built with the default 16 codegen units. Added a profile that
+  strips symbols, enables thin cross-crate LTO, and uses a single codegen unit.
+  Measured result: the linux-x86_64 binary drops **38.97 MB → 25.78 MB (−34%)**,
+  a smaller download and install for every user. Throughput is unchanged — an
+  interleaved A/B of the synthetic list-output benchmark on the same host showed
+  the optimized build neutral-to-marginally-ahead, well within run-to-run noise
+  (no regression). `panic` is left at the default (unwind) so Ctrl-C handling and
+  tests are unaffected; the full test suite passes under `--release`. The CI
+  per-platform release build takes a few minutes longer (LTO link time), a
+  one-time cost per release.
+
 ## [0.16.0] - 2026-06-15
 
 ### Removed
