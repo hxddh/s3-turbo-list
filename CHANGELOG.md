@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-15
+
+### Removed
+- **Deleted a cluster of dead `pub` helpers** that lingered behind misleading
+  `#[allow(dead_code)]` "Phase 5" annotations with zero callers (verified by
+  `cargo build` + the full test suite + `clippy -D warnings`): the no-op
+  `ObjectFilter::compile` stub (which still referenced the Rhai engine removed
+  back in v0.3.0), `CheckpointJournal::new`, `FlatRuntimeError::errno` and
+  `FlatRuntimeError::with_http_status_code_tracker`,
+  `KeySpaceHints::completed_indices`, `ObjectKey::as_bytes`, and three unused
+  constants (`KB`, `GB`, `OBJECT_PROPS_FLAG_S3_DIR_BUCKET`). Also dropped stale
+  `#[allow(dead_code)]` attributes from helpers that are in fact live
+  (`AsyncParquetOutput::total_rows`, `KeySpaceHints::is_empty`, `core::MB`).
+  Internal only — no CLI, output-format, or on-disk change.
+
+### Documentation
+- `examples/README.md`: the `diff-basic.sh` file-index row now lists the `.ks`
+  companion output (diff writes a keyspace file too, not just the Parquet).
+- `docs/trace-reference.md`: documented the `first_key` / `last_key` page fields
+  that the tracer emits but the table omitted.
+
 ## [0.15.0] - 2026-06-15
 
 ### Performance

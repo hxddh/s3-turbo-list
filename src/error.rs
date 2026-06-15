@@ -74,11 +74,6 @@ impl FlatRuntimeError {
         self.errno < ERROR_NO_BUCKET
     }
 
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
-    pub fn errno(&self) -> u8 {
-        self.errno
-    }
-
     /// Returns the HTTP status code, or 0 if not set.
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn http_status_code(&self) -> u16 {
@@ -88,20 +83,6 @@ impl FlatRuntimeError {
     /// Attach an HTTP status code for diagnostics.
     #[allow(dead_code)] // Phase 5: used in log/trace formatting
     pub fn with_http_status_code(mut self, code: u16) -> Self {
-        self.http_status_code = code;
-        self
-    }
-
-    /// Attach an HTTP status code AND record it in the global tracker.
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
-    pub fn with_http_status_code_tracker(
-        mut self,
-        code: u16,
-        tracker: Arc<HttpStatusCodeTracker>,
-    ) -> Self {
-        if code != 0 {
-            tokio::spawn(async move { tracker.inc(code).await });
-        }
         self.http_status_code = code;
         self
     }

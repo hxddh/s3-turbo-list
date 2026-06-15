@@ -112,7 +112,7 @@ single-segment fallback.
 | `bos-basic-list.sh` | List a BOS bucket (virtual-hosted) | `.parquet`, `.ks` |
 | `bos-path-style-diagnostic.sh` | List a BOS bucket (path-style, diagnostic) | `.parquet`, `.ks` |
 | `trace-debug.sh` | List with trace JSONL + debug stderr | `.parquet`, `.ks`, `trace.jsonl`, `debug-stderr.log` |
-| `diff-basic.sh` | Diff two buckets | `.parquet` |
+| `diff-basic.sh` | Diff two buckets | `.parquet`, `.ks` |
 | `checkpoint-resume.sh` | List with checkpoint save and resume | `.parquet`, `.ks` |
 | `hints-file-toml.sh` | List with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
 | `validate-hints.sh` | Validate TOML or plain-text hints locally (`doctor --hints-file`) | stdout |

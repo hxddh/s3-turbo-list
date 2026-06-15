@@ -48,6 +48,8 @@ cat trace.jsonl | jq 'select(.s3_error_code != null)'
 | `contents_count` | int? | Number of `Contents` entries in the response. |
 | `common_prefixes_count` | int? | Number of `CommonPrefixes` entries. |
 | `next_continuation_token_present` | bool? | Whether the response explicitly included a next continuation token. |
+| `first_key` | string? | First object key in the page, when present. |
+| `last_key` | string? | Last object key in the page, when present. |
 | `segment_index` | uint? | Segment index for `ListObjectsV2SegmentSummary` events. |
 | `end_before` | string? | Upper segment boundary, when present. |
 | `segment_pages` | uint32? | Pages read by a completed segment summary. |

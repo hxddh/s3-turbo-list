@@ -12,11 +12,7 @@ use tokio::sync::Barrier;
 
 // ── Constants ──────────────────────────────────────────────
 
-#[allow(dead_code)] // Phase 5: used in size formatting
-pub(crate) const KB: usize = 1024;
 pub(crate) const MB: usize = 1_048_576;
-#[allow(dead_code)] // Phase 5: reserved for future size formatting
-pub(crate) const GB: usize = 1_073_741_824;
 
 pub(crate) const DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_TASK_COMPLETE_QUIT_WAIT_SECS: u64 = 1;
@@ -24,8 +20,6 @@ pub(crate) const DEFAULT_TASK_COMPLETE_QUIT_WAIT_SECS: u64 = 1;
 // ── ObjectProps: bit-flag state machine ────────────────────
 
 const OBJECT_PROPS_FLAG_S3_GP_BUCKET: u8 = 0b1;
-#[allow(dead_code)] // Phase 5: reserved for S3 directory bucket support
-const OBJECT_PROPS_FLAG_S3_DIR_BUCKET: u8 = 0b10;
 const OBJECT_PROPS_FLAG_DIR_LEFT: u8 = 0b1000_0000;
 const OBJECT_PROPS_FLAG_DIR_RIGHT: u8 = 0b0100_0000;
 const OBJECT_PROPS_FLAG_DIR_BOTH: u8 = 0b1100_0000;
@@ -112,11 +106,6 @@ impl ObjectKey {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    #[allow(dead_code)] // Phase 5: used in serialisation/encoding paths
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
     }
 }
 
@@ -347,15 +336,6 @@ impl ObjectFilter {
         predicate: Box<dyn Fn(&ObjectProps, Option<&ObjectProps>) -> Option<bool> + Send + Sync>,
     ) -> Self {
         Self { predicate }
-    }
-
-    #[allow(dead_code)] // Phase 5: legacy stub; real compile in config::compile_filter_with_mode
-    pub fn compile(expr: &str) -> Result<Self, String> {
-        // Deferred to Phase 2 (config) — for now a no-op filter.
-        // The full Rhai-based filter engine from s3-fast-list will be wired
-        // in Phase 2 once config loading is in place.
-        let _ = expr;
-        Ok(Self::new(Box::new(|_, _| Some(true))))
     }
 
     pub fn evaluate(&self, source: &ObjectProps, target: Option<&ObjectProps>) -> Option<bool> {
@@ -955,7 +935,6 @@ impl KeySpaceHints {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
-    #[allow(dead_code)] // Phase 5: used in integration tests
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -965,12 +944,6 @@ impl KeySpaceHints {
     }
     pub fn total_count(&self) -> usize {
         self.done.len() + self.inflight.len() + self.inner.len()
-    }
-
-    /// Return completed segments for checkpoint persistence.
-    #[allow(dead_code)] // Phase 5: used in integration tests
-    pub fn completed_indices(&self) -> Vec<usize> {
-        self.done.iter().map(|p| p.index).collect()
     }
 }
 

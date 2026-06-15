@@ -119,7 +119,6 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         &self.ks_path
     }
 
-    #[allow(dead_code)] // Phase 5: used in monitoring and streaming row-group flushes
     pub fn total_rows(&self) -> usize {
         self.total_rows
             + self

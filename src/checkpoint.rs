@@ -179,24 +179,6 @@ impl CheckpointJournal {
             log::warn!("Failed to write checkpoint {}: {}", path, e);
         }
     }
-
-    /// Create a new checkpoint journal for a run.
-    #[allow(dead_code)] // Phase 5: used when creating fresh checkpoints (non-resume runs)
-    pub fn new(
-        bucket: &str,
-        prefix: &str,
-        total_segments: usize,
-        identity: CheckpointIdentity,
-    ) -> Self {
-        Self {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            total_segments,
-            completed_indices: Vec::new(),
-            last_updated: chrono::Local::now().to_rfc3339(),
-            identity: Some(identity),
-        }
-    }
 }
 
 /// Generate the checkpoint file path for a given bucket.
