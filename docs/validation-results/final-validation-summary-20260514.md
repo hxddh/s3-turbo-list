@@ -3,6 +3,12 @@
 **Date**: 2026-05-14
 **Status**: ✅ All validation complete — 107/107 tests passing
 
+> **Note (2026-06-17):** The BOS finding B-1 (and the related hinted-diff
+> Finding #2) recorded below has since been **resolved service-side by BOS**.
+> See
+> [`bos-listobjectsv2-compatibility-resolved-20260617.md`](bos-listobjectsv2-compatibility-resolved-20260617.md).
+> The conclusions below are retained unchanged as historical evidence.
+
 ---
 
 ## 1. Final Repository State

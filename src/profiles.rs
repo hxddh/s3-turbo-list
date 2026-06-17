@@ -58,18 +58,18 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "bos",
             provider: "Baidu BOS S3-compatible API",
-            status: "documented",
+            status: "stable",
             default_region: Some("bj"),
             endpoint_template: Some("https://s3.{region}.bcebos.com"),
             default_endpoint_url: None,
             recommended_addressing_style: AddressingStyle::Virtual,
             requires_explicit_endpoint: false,
             tested_by_project: true,
-            notes: &["uses the standard S3-compatible ListObjectsV2 path"],
-            limitations: &[
-                "no default BOS pagination workaround is enabled",
-                "hinted multi-segment BOS scans remain non-authoritative until provider compatibility is resolved",
+            notes: &[
+                "uses the standard S3-compatible ListObjectsV2 path",
+                "fully compatible with hinted multi-segment listing and startup discovery",
             ],
+            limitations: &["virtual-hosted addressing is the recommended default"],
         },
         EndpointProfile {
             name: "r2",
@@ -82,7 +82,9 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             requires_explicit_endpoint: true,
             tested_by_project: false,
             notes: &["R2 commonly uses region 'auto' with an account-specific endpoint"],
-            limitations: &["not claimed as project-validated until compat-probe or endpoint validation is run"],
+            limitations: &[
+                "not claimed as project-validated until compat-probe or endpoint validation is run",
+            ],
         },
         EndpointProfile {
             name: "b2",
@@ -95,7 +97,9 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             requires_explicit_endpoint: false,
             tested_by_project: false,
             notes: &["the endpoint derives from the bucket's region (e.g. us-west-004)"],
-            limitations: &["not claimed as project-validated until compat-probe or endpoint validation is run"],
+            limitations: &[
+                "not claimed as project-validated until compat-probe or endpoint validation is run",
+            ],
         },
         EndpointProfile {
             name: "oss",
@@ -108,7 +112,9 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
             requires_explicit_endpoint: false,
             tested_by_project: false,
             notes: &["the endpoint derives from the region (e.g. oss-cn-beijing)"],
-            limitations: &["not claimed as project-validated until compat-probe or endpoint validation is run"],
+            limitations: &[
+                "not claimed as project-validated until compat-probe or endpoint validation is run",
+            ],
         },
     ]
 }
@@ -214,4 +220,28 @@ pub fn apply_profile_preset(
         addressing_style_applied,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod profile_metadata_tests {
+    use super::*;
+
+    /// BOS has fixed its ListObjectsV2 compatibility (start_after +
+    /// continuation-token). The profile must not carry the old
+    /// "non-authoritative" / "pagination workaround" caveats, so that hinted
+    /// multi-segment listing is presented as fully supported. Guards against
+    /// reintroducing the retired BOS-specific limitation.
+    #[test]
+    fn bos_profile_has_no_stale_compatibility_caveat() {
+        let bos = get_profile("bos").expect("bos profile must exist");
+        for text in bos.notes.iter().chain(bos.limitations.iter()) {
+            let lower = text.to_lowercase();
+            assert!(
+                !lower.contains("non-authoritative")
+                    && !lower.contains("pagination workaround")
+                    && !lower.contains("continuation-token"),
+                "stale BOS compatibility caveat resurfaced: {text:?}"
+            );
+        }
+    }
 }

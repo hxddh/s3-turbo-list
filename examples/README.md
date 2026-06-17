@@ -97,11 +97,8 @@ official guidance.  Path-style is available only in the diagnostic example
 (`bos-path-style-diagnostic.sh`) and is clearly labeled as legacy/diagnostic
 mode — not the recommended default.
 
-The known BOS ListObjectsV2 pagination limitation (start_after +
-continuation_token interaction) is documented in
-[`docs/endpoint-profiles.md`](../docs/endpoint-profiles.md).  Hinted
-multi-segment scans on BOS should wait for a BOS-side fix or use
-single-segment fallback.
+BOS is fully S3 ListObjectsV2 compatible; hinted multi-segment listing and
+startup discovery run the same as on AWS S3.
 
 ## File index
 

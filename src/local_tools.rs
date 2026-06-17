@@ -930,7 +930,7 @@ fn render_quickstart(provider: &str) -> Result<String, String> {
    export AWS_PROFILE=my-bos-creds
 2. Use virtual-hosted addressing:
    s3-turbo-list --profile bos --addressing-style virtual --output-dir out --delimiter '' list --bucket my-bucket --region bj
-3. For authoritative BOS output, prefer single-segment listing when service-side start_after + continuation-token compatibility matters.
+3. BOS is fully S3 ListObjectsV2 compatible; hinted multi-segment listing and startup discovery run the same as on AWS S3.
 "#
             .to_string(),
         ),
@@ -953,10 +953,6 @@ fn ensure_can_write(path: &str, overwrite: bool) -> Result<(), String> {
 
 fn init_config_warnings(profile: &str) -> Vec<String> {
     match profile {
-        "bos" => vec![
-            "BOS profile is a compatibility preset; it does not enable BOS pagination workarounds"
-                .to_string(),
-        ],
         "oss" | "r2" | "b2" => vec![format!(
             "{} profile is documented but should be validated with compat-probe before production use",
             profile
@@ -1053,4 +1049,17 @@ fn sha256_file(path: &str) -> Result<String, String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod init_warning_tests {
+    use super::*;
+
+    /// BOS is fully S3 ListObjectsV2 compatible, so `init` must not emit the
+    /// retired "BOS does not enable a pagination workaround" caveat. Guards
+    /// against reintroducing the BOS-specific warning.
+    #[test]
+    fn bos_init_emits_no_compatibility_warning() {
+        assert!(init_config_warnings("bos").is_empty());
+    }
 }

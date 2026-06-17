@@ -185,7 +185,7 @@ Built-in presets: `aws`, `minio`, `bos`, `r2`, `b2`, `oss`. Per-provider notes
 |---|---|
 | AWS S3 | ✅ Validated (path + virtual-hosted) |
 | MinIO | ✅ Validated (path + virtual-hosted) |
-| BOS | ✅ Validated (virtual-hosted recommended) |
+| BOS | ✅ Validated (virtual-hosted recommended; hinted multi-segment supported) |
 | Cloudflare R2 / Backblaze B2 / Alibaba OSS | 📋 Preset documented; run `compat-probe` first |
 
 Validate any endpoint before a full run:

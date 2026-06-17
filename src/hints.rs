@@ -99,19 +99,6 @@ pub fn inspect_hints_file(
     }
 }
 
-pub fn warn_bos_hinted_segments(profile: Option<&str>, boundaries: &[String]) {
-    if profile == Some("bos") && !boundaries.is_empty() {
-        log::warn!(
-            "BOS profile with hinted multi-segment listing detected ({} boundaries). \
-             BOS has a documented ListObjectsV2 start_after + continuation-token \
-             compatibility issue; hinted BOS scans are not authoritative until BOS \
-             fixes the service-side behavior. Use single-segment listing for \
-             authoritative BOS output.",
-            boundaries.len()
-        );
-    }
-}
-
 pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
     let trimmed = content.trim();
     if trimmed.is_empty() {

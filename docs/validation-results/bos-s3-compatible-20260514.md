@@ -1,5 +1,11 @@
 # BOS S3-Compatible Validation — s3-turbo-list
 
+> **Note (2026-06-17):** Finding #2 (hinted multi-segment diff dropped
+> objects on BOS) was a manifestation of the BOS service-side pagination bug,
+> now **resolved by BOS**. See
+> [`bos-listobjectsv2-compatibility-resolved-20260617.md`](bos-listobjectsv2-compatibility-resolved-20260617.md).
+> Conclusions below are retained unchanged as historical evidence.
+
 **Date**: 2026-05-14
 **Endpoint**: `https://s3.bj.bcebos.com`
 **Region**: `bj`

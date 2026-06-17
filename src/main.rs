@@ -825,7 +825,6 @@ fn main() {
             cli.hints_file.as_deref(),
             opt_bucket,
             opt_region,
-            cfg.s3.profile.as_deref(),
             cli.no_auto_hints || hints_disabled_for_diff,
             hints_disabled_for_diff,
         );
@@ -837,14 +836,9 @@ fn main() {
         // subsequent runs (including --resume) reload identical segments
         // through the existing cache path.
         let mut ks_list = ks_list;
-        // BOS is excluded: it has a documented start_after + continuation-token
-        // incompatibility, so automatically switching BOS runs to hinted
-        // multi-segment listing would silently produce non-authoritative output.
-        let bos_profile = cfg.s3.profile.as_deref() == Some("bos");
         if ks_list.is_empty()
             && mode == RunMode::List
             && !cli.no_auto_hints
-            && !bos_profile
             && cli.hints_file.is_none()
             && cli.delimiter.is_empty()
             && cli.continuation_token.is_none()
@@ -2774,11 +2768,7 @@ async fn diff_side_boundaries(
     cli: &Cli,
     sdk_config: &aws_config::SdkConfig,
 ) -> Vec<String> {
-    if cli.no_auto_hints
-        || !cli.delimiter.is_empty()
-        || cfg.s3.profile.as_deref() == Some("bos")
-        || cfg.s3.start_after.is_some()
-    {
+    if cli.no_auto_hints || !cli.delimiter.is_empty() || cfg.s3.start_after.is_some() {
         return Vec::new();
     }
 
@@ -2852,7 +2842,6 @@ fn load_hints(
     hints_file: Option<&str>,
     bucket: &str,
     region: Option<&str>,
-    profile: Option<&str>,
     no_auto_hints: bool,
     disabled_for_diff: bool,
 ) -> Vec<String> {
@@ -2860,7 +2849,6 @@ fn load_hints(
     if let Some(path) = hints_file {
         match hints::parse_hints_file(path) {
             Ok(boundaries) => {
-                hints::warn_bos_hinted_segments(profile, &boundaries);
                 return boundaries;
             }
             Err(e) => {
@@ -2892,7 +2880,6 @@ fn load_hints(
     };
 
     if let Ok(boundaries) = hints::parse_hints_file(&cache_filename) {
-        hints::warn_bos_hinted_segments(profile, &boundaries);
         return boundaries;
     }
 
