@@ -1,5 +1,10 @@
 # BOS ListObjectsV2 Pagination Compatibility Note
 
+> **SUPERSEDED (2026-06-17):** BOS has since fixed this service-side
+> incompatibility. See
+> [`bos-listobjectsv2-compatibility-resolved-20260617.md`](bos-listobjectsv2-compatibility-resolved-20260617.md).
+> This note is retained as historical evidence of the original behavior.
+
 **Date:** 2026-05-14
 **Discovered during:** Minimal BOS hints revalidation after commit `4b0abd2` (hints TOML parser fix)
 

@@ -4,9 +4,8 @@
 # BOS recommends virtual-hosted / bucket virtual hosting style.
 # Path-style is legacy/diagnostic only — see bos-path-style-diagnostic.sh.
 #
-# Avoid hinted multi-segment authoritative scans on BOS until BOS fixes the
-# ListObjectsV2 start_after + continuation_token compatibility issue.
-# Use single-segment fallback (no hints file, or empty hints).
+# BOS is fully S3 ListObjectsV2 compatible; hinted multi-segment listing and
+# startup discovery run the same as on AWS S3.
 #
 # Required env vars:
 #   BUCKET        — BOS bucket name

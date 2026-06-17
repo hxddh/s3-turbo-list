@@ -22,7 +22,7 @@ s3-turbo-list list \
 |---|---|---|---|---|
 | `aws` | AWS S3 | SDK-derived from region | virtual | validated baseline |
 | `minio` | MinIO | deployment-specific, explicit | path | validated |
-| `bos` | Baidu BOS S3-compatible API | `https://s3.{region}.bcebos.com` (default region `bj`) | virtual | validated with documented caveat |
+| `bos` | Baidu BOS S3-compatible API | `https://s3.{region}.bcebos.com` (default region `bj`) | virtual | validated |
 | `r2` | Cloudflare R2 | account-specific, explicit | path | documented preset |
 | `b2` | Backblaze B2 S3-compatible API | `https://s3.{region}.backblazeb2.com` | path | documented preset |
 | `oss` | Alibaba Cloud OSS S3-compatible API | `https://{region}.aliyuncs.com` | virtual | documented preset |
@@ -76,7 +76,6 @@ report.
   [`compat-probe`](compat-probe.md) for the report field contract.
 - R2, B2, and OSS presets are documented defaults, not a claim of full project
   validation.
-- The BOS profile does not enable a default pagination workaround.
 - `diff` partitions and lists each side in parallel (cached or discovered
   `CommonPrefixes`, or an up-front single-key bisection for flat sides) and
   streams an ordered merge.  It ignores conventional shared hints caches, and

@@ -263,5 +263,5 @@ schema is documented in [trace-reference.md](trace-reference.md).
 - `doctor` and `--dry-run` are local-only.
 - `list`, `diff`, and `compat-probe` can contact S3 unless combined with
   `--dry-run`.
-- Provider-specific caveats still apply; `--agent` does not enable BOS
-  pagination workarounds or change hot-path listing behavior.
+- Provider-specific caveats still apply; `--agent` does not change hot-path
+  listing behavior.

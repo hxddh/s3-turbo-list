@@ -30,17 +30,22 @@ relevant notes in `docs/validation-results/`.
 
 ## BOS Compatibility Position
 
-BOS has a documented ListObjectsV2 compatibility issue when both
-`start_after` and `continuation-token` are present.  This is a BOS
-service-side issue, not an architecture problem.  Consequences:
+BOS is fully compatible with the S3 ListObjectsV2 API. The historical
+incompatibility — BOS restarted listing from `start_after` when a
+`continuation-token` was also present — has been resolved service-side by
+BOS. Consequences:
 
-- Single-segment BOS listing is supported and validated.
-- Hinted multi-segment listing is safe on AWS S3 and MinIO but is **not
-  authoritative on BOS** until BOS fixes the service-side behavior; startup
-  discovery and runtime splitting are automatically disabled for the `bos`
-  profile.
-- Do not present BOS as unrestricted for multi-segment listing, and do not
-  implement BOS-specific pagination workarounds by default.
+- BOS is treated like any other S3-compatible endpoint. Single-segment
+  listing, hinted multi-segment listing, startup structural discovery, and
+  runtime splitting all run for the `bos` profile with no special-casing.
+- There is no BOS-specific gating in code. Discovery and the hints resolver
+  no longer exclude the `bos` profile. Runtime splitting is controlled only
+  by mode/flags (`allow_split` keys on diff-mode / `--start-after` /
+  `--continuation-token`, never on the profile).
+- Do not reintroduce BOS-specific pagination workarounds or profile gates;
+  the service now behaves per the S3 contract.
+- See `docs/validation-results/` for the dated note recording BOS's fix; the
+  pre-fix 2026-05-14 notes are retained as historical evidence.
 
 ## Other Design Constraints
 

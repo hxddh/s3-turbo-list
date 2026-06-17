@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-17
+
+### Changed
+- **BOS is now treated as a fully S3 ListObjectsV2-compatible endpoint.** Baidu
+  BOS has fixed its historical service-side incompatibility (it restarted the
+  listing from `start_after` when a `continuation-token` was also present,
+  ignoring the token). With the service-side bug resolved, all BOS-specific
+  defenses are removed:
+  - Startup structural discovery no longer excludes the `bos` profile, so a
+    first-run BOS scan lists in parallel like every other endpoint.
+  - The diff-side hints resolver no longer excludes the `bos` profile, so
+    hinted multi-segment diff runs on BOS as it does on AWS S3 and MinIO.
+  - Removed the `warn_bos_hinted_segments` warning and its call sites, and the
+    "non-authoritative"/"no pagination workaround" wording from the `bos`
+    endpoint-profile metadata, the `guide bos` quickstart, and the `init`
+    config warnings.
+  Runtime splitting was never profile-gated in code (it keys only on
+  diff-mode / `--start-after` / `--continuation-token`); the documentation now
+  matches that. No new flags, no pagination workaround, and no change to the
+  hot listing path.
+
+### Documentation
+- Added `docs/validation-results/bos-listobjectsv2-compatibility-resolved-20260617.md`
+  recording BOS's fix, and added "superseded" pointers to the pre-fix
+  2026-05-14 BOS notes (retained unchanged as historical evidence).
+- Updated `AGENTS.md`, `README.md`, `docs/endpoint-profiles.md`,
+  `docs/agent-usage.md`, `examples/README.md`, and `examples/bos-basic-list.sh`
+  to state BOS is fully ListObjectsV2 compatible.
+
 ## [0.20.0] - 2026-06-15
 
 ### Fixed
