@@ -730,12 +730,21 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
+    // Prefix/byte accounting covers only objects included in the output, so
+    // the KS file describes the Parquet artifact next to it and the manifest
+    // metrics agree across parquet/tsv/ndjson/summary-only runs (the stdout
+    // and summary paths always counted post-filter; this path counted every
+    // received object, so a `--filter` run reported different bytes_total
+    // and KS counts depending on the output format).
     let mut folder = PrefixRunFolder::default();
     let written = parquet
         .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
-            folder.add(prefix_stats, key.prefix(), props.size());
-            stats.bytes_total = stats.bytes_total.saturating_add(props.size());
-            props.include_in_list_output()
+            let include = props.include_in_list_output();
+            if include {
+                folder.add(prefix_stats, key.prefix(), props.size());
+                stats.bytes_total = stats.bytes_total.saturating_add(props.size());
+            }
+            include
         })
         .await?;
     folder.flush(prefix_stats);

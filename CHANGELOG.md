@@ -43,6 +43,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefixes never repeat) stays within run-to-run noise.
 
 ### Fixed
+- **Filtered runs reported different KS counts and metrics per output
+  format.** The Parquet list path recorded prefix/byte accounting for every
+  received object (pre-filter) while the stdout TSV/NDJSON and summary-only
+  paths counted only objects that passed `--filter`, so the same filtered
+  scan produced a KS file that disagreed with the Parquet artifact beside it
+  and manifest `bytes_total`/`unique_prefixes`/`top_prefixes` that changed
+  with the output format. All list paths now count post-filter: the KS file
+  describes the output artifact. (Diff KS is a separate engine and keeps its
+  documented legacy semantics — every merged key counts, including
+  filter-ignored pairs.)
+- **A fatal segment error tore down the run through the wrong lifecycle
+  signal.** A non-retryable segment failure cleared its side's
+  run-lifecycle bit while sibling segments were still listing; the data map
+  read that as "all list tasks done", finalized early, and the siblings then
+  died on "channel closed" errors — burning retry requests and inflating
+  `fatal_errors` past the one real failure. The fatal path now fails the run
+  fast via the global quit signal, and shutdown-induced errors (aborted
+  siblings, closing channels) are no longer counted or retried as segment
+  failures.
+- **The retry cursor now advances over CommonPrefixes-only pages.** In
+  delimiter mode a page can contain only `CommonPrefixes` (no `Contents`);
+  the resume cursor previously advanced only on real keys, so a transient
+  connection failure after such pages retried from many pages back — and if
+  the failure was persistent at the same spot, the retry made no progress at
+  all and exhausted its budget. The cursor now also advances over the last
+  CommonPrefix, which is safe: a prefix sorts before every key it covers,
+  and those keys are rolled up into the prefix entry, never emitted as rows.
 - **`--start-after` combined with cached hints duplicated output rows.** With a
   conventional hints cache present (written automatically by startup discovery
   on any previous run of the bucket), every hint segment overrode its start
