@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed the ordering guard's per-object `last_key` String allocation by
   reusing one cursor buffer.
 
+- **Prefix accounting folds runs of equal prefixes.** Listing batches arrive
+  in S3 key order, so consecutive objects overwhelmingly share a prefix; the
+  KS prefix accounting on the list ingest paths (Parquet workers, stdout
+  TSV/NDJSON, summary-only) previously paid one HashMap hash+lookup per
+  object. A small run folder now coalesces each run into one map update,
+  replacing the per-object lookup with a string compare against a reused
+  buffer. Interleaved A/B on the TSV list-output benchmark (8M objects,
+  4 cores): run-heavy input (`--prefixes 1`) ~3.6M → ~4.0M objects/sec
+  (+12%); the artificial zero-run worst case (`--prefixes 128`, adjacent
+  prefixes never repeat) stays within run-to-run noise.
+
 ### Fixed
 - **`--start-after` combined with cached hints duplicated output rows.** With a
   conventional hints cache present (written automatically by startup discovery

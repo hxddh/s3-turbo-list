@@ -730,13 +730,15 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
+    let mut folder = PrefixRunFolder::default();
     let written = parquet
         .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
-            record_prefix_stat(prefix_stats, key.prefix(), props.size());
+            folder.add(prefix_stats, key.prefix(), props.size());
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
             props.include_in_list_output()
         })
         .await?;
+    folder.flush(prefix_stats);
     stats.streamed_rows += written;
     Ok(())
 }
@@ -752,13 +754,14 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     stats.received_objects += batch.len();
 
     let mut out = Vec::with_capacity(batch.len().saturating_mul(96).min(1024 * 1024));
+    let mut folder = PrefixRunFolder::default();
 
     for (key, props) in batch {
         if !props.include_in_list_output() {
             continue;
         }
 
-        record_prefix_stat(prefix_stats, key.prefix(), props.size());
+        folder.add(prefix_stats, key.prefix(), props.size());
         stats.streamed_rows += 1;
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
@@ -793,6 +796,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     }
 
+    folder.flush(prefix_stats);
     if !out.is_empty() {
         if let Err(e) = writer.write_all(&out).await {
             log::error!("Stdout write error: {}", e);
@@ -811,13 +815,15 @@ fn ingest_list_summary_batch(
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
+    let mut folder = PrefixRunFolder::default();
     for (key, props) in batch {
         if props.include_in_list_output() {
-            record_prefix_stat(prefix_stats, key.prefix(), props.size());
+            folder.add(prefix_stats, key.prefix(), props.size());
             stats.streamed_rows += 1;
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
         }
     }
+    folder.flush(prefix_stats);
 }
 
 fn tsv_escape(value: &str) -> Cow<'_, str> {
@@ -848,6 +854,47 @@ fn record_prefix_stat(prefix_stats: &mut PrefixStats, prefix: &str, size: u64) {
     };
     entry.objects += 1;
     entry.bytes = entry.bytes.saturating_add(size);
+}
+
+/// Prefix accounting that coalesces runs of equal prefixes. Listing batches
+/// arrive in S3 key order, so consecutive objects overwhelmingly share a
+/// prefix; folding a whole run into one map update replaces the per-object
+/// hash lookup with a per-object string compare against a reused buffer.
+/// Callers must `flush` after their batch loop.
+#[derive(Default)]
+struct PrefixRunFolder {
+    prefix: String,
+    objects: usize,
+    bytes: u64,
+}
+
+impl PrefixRunFolder {
+    fn add(&mut self, prefix_stats: &mut PrefixStats, prefix: &str, size: u64) {
+        if self.objects > 0 && self.prefix == prefix {
+            self.objects += 1;
+            self.bytes = self.bytes.saturating_add(size);
+            return;
+        }
+        self.flush(prefix_stats);
+        self.prefix.clear();
+        self.prefix.push_str(prefix);
+        self.objects = 1;
+        self.bytes = size;
+    }
+
+    fn flush(&mut self, prefix_stats: &mut PrefixStats) {
+        if self.objects == 0 {
+            return;
+        }
+        let entry = match prefix_stats.get_mut(self.prefix.as_str()) {
+            Some(entry) => entry,
+            None => prefix_stats.entry(self.prefix.clone()).or_default(),
+        };
+        entry.objects += self.objects;
+        entry.bytes = entry.bytes.saturating_add(self.bytes);
+        self.objects = 0;
+        self.bytes = 0;
+    }
 }
 
 async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
