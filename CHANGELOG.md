@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-07-02
+
 ### Performance
 - **Diff startup discovery now probes in parallel.** Flat-namespace bisection
   (`discover_flat_boundaries`) walked its ranges strictly serially — one
