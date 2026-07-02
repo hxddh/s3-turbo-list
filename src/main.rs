@@ -966,19 +966,51 @@ fn main() {
             // Per-side boundaries from cached hints or startup discovery —
             // the same automatic sources as list mode. Sides need not agree:
             // each side only has to be a complete ordered partition of its
-            // own key space.
-            let left_bounds =
-                diff_side_boundaries(opt_bucket, opt_region, &opt_prefix, &cfg, &cli, &sdk_config)
+            // own key space. The sides resolve concurrently — each can take
+            // many network round-trips — except in the degenerate self-diff
+            // case (same bucket and region), where both sides would race
+            // writing the same hints-cache file.
+            let (left_bounds, right_bounds) =
+                if opt_bucket == target_bucket && opt_region == target_region {
+                    let left = diff_side_boundaries(
+                        opt_bucket,
+                        opt_region,
+                        &opt_prefix,
+                        &cfg,
+                        &cli,
+                        &sdk_config,
+                    )
                     .await;
-            let right_bounds = diff_side_boundaries(
-                target_bucket,
-                target_region,
-                &opt_prefix,
-                &cfg,
-                &cli,
-                &sdk_config,
-            )
-            .await;
+                    let right = diff_side_boundaries(
+                        target_bucket,
+                        target_region,
+                        &opt_prefix,
+                        &cfg,
+                        &cli,
+                        &sdk_config,
+                    )
+                    .await;
+                    (left, right)
+                } else {
+                    tokio::join!(
+                        diff_side_boundaries(
+                            opt_bucket,
+                            opt_region,
+                            &opt_prefix,
+                            &cfg,
+                            &cli,
+                            &sdk_config,
+                        ),
+                        diff_side_boundaries(
+                            target_bucket,
+                            target_region,
+                            &opt_prefix,
+                            &cfg,
+                            &cli,
+                            &sdk_config,
+                        ),
+                    )
+                };
             info!(
                 "  diff segments: left {}, right {}",
                 left_bounds.len() + 1,

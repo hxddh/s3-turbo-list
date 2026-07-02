@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Diff startup discovery now probes in parallel.** Flat-namespace bisection
+  (`discover_flat_boundaries`) walked its ranges strictly serially — one
+  network round-trip per candidate probe, ~100+ serial RTTs for a 64-boundary
+  target — and the two diff sides then resolved one after the other. Each
+  bisection level now probes all of its (disjoint) ranges concurrently, and
+  the left/right sides resolve concurrently (`tokio::join!`), reducing diff
+  startup from up to tens of seconds on high-latency endpoints to a few
+  level-latencies. The degenerate self-diff case (same bucket and region)
+  stays sequential so both sides do not race writing the same hints-cache
+  file.
+
 ### Fixed
 - **`--start-after` combined with cached hints duplicated output rows.** With a
   conventional hints cache present (written automatically by startup discovery
