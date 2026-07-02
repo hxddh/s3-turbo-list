@@ -1243,6 +1243,15 @@ async fn merge_diff_streams(
     sink: &mut DiffRowSink,
 ) -> Result<(), String> {
     loop {
+        // A dropped receiver means the writer stopped on a write error. Bail
+        // out here, per iteration, instead of waiting for the next flushed
+        // batch to fail its send: rows only reach the writer every
+        // DIFF_SINK_FLUSH_ROWS, and a diff filter that ignores the remaining
+        // pairs never sends at all — the merge would keep draining the S3
+        // listing to exhaustion after the output had already failed.
+        if writer_tx.is_closed() {
+            return Err("diff Parquet writer stopped (write error)".to_string());
+        }
         let has_left = left.ensure_filled().await?;
         let has_right = right.ensure_filled().await?;
 

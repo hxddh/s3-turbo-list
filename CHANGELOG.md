@@ -29,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `benchmark-local --benchmark diff-output` (3M objects, mixed shape,
   4 cores): ~1.8M → ~2.8M objects/sec (+60%, up to 2× on quiet runs). Also
   removed the ordering guard's per-object `last_key` String allocation by
-  reusing one cursor buffer.
+  reusing one cursor buffer. The merge checks for a stopped writer every
+  iteration, so a Parquet write failure (disk full, permissions) aborts the
+  merge — and the upstream S3 listing — immediately instead of at the next
+  flushed batch (or never, when a diff filter ignores the remaining pairs).
+  From PR review.
 
 - **Prefix accounting folds runs of equal prefixes.** Listing batches arrive
   in S3 key order, so consecutive objects overwhelmingly share a prefix; the

@@ -352,3 +352,81 @@ async fn test_list_streaming_quit_drains_buffered_batches() {
         "buffered batches must be drained on quit, not dropped"
     );
 }
+
+// ── Writer failure aborts the merge promptly ────────────────────────────
+//
+// The pipelined merge only touches the writer channel when a flushed batch
+// is sent (every DIFF_SINK_FLUSH_ROWS rows per flag). After a Parquet write
+// error the writer loop drops its receiver; the merge must notice per
+// iteration and stop consuming the side streams — not one full flush window
+// later (or never, when a diff filter ignores every remaining pair).
+#[tokio::test]
+async fn test_merge_stops_consuming_input_after_writer_failure() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    struct FailingWriter;
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const BATCHES: usize = 400;
+    const ROWS_PER_BATCH: usize = 100;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(4);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let producer_sent = Arc::clone(&sent);
+    let producer = tokio::spawn(async move {
+        for i in 0..BATCHES {
+            let batch: Batch = (0..ROWS_PER_BATCH)
+                .map(|k| left_obj(&format!("k{:06}", i * ROWS_PER_BATCH + k), 1, [1; 16]))
+                .collect();
+            if tx.send(batch).await.is_err() {
+                return;
+            }
+            producer_sent.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    // A row group smaller than the sink's flush size (8192) forces the
+    // arrow writer to hit the failing sink on the first flushed batch
+    // instead of buffering it in memory.
+    let mut parquet =
+        AsyncParquetOutput::new_with_options(FailingWriter, "unused.ks", 512, "uncompressed", 0);
+    let err = run_diff_merge(
+        DiffStreamSides {
+            left: vec![rx],
+            right: vec![],
+        },
+        &mut parquet,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("Parquet write error"), "{}", err);
+    let _ = producer.await;
+
+    // The first writer flush happens after 8192 buffered rows (~82 batches
+    // of 100). Prompt abort stops input consumption right there; waiting
+    // for the next flush to fail its send would consume ~82 more.
+    let sent = sent.load(Ordering::SeqCst);
+    assert!(
+        sent < 140,
+        "merge kept consuming after writer failure: {} of {} batches",
+        sent,
+        BATCHES
+    );
+}
