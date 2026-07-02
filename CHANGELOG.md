@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays sequential so both sides do not race writing the same hints-cache
   file.
 
+- **Diff merge and Parquet encode now run as a pipeline.** The merge loop
+  classified keys and encoded+compressed Parquet row groups inline in one
+  task, so the two CPU costs serialized. The merge now runs as its own task
+  feeding flushed row batches to the Parquet writer over a small bounded
+  channel (the pipeline depth), overlapping classification/ingest with
+  encode+compress. `run_diff_merge`'s signature and semantics are unchanged
+  (all rows are written before it returns). Interleaved A/B of
+  `benchmark-local --benchmark diff-output` (3M objects, mixed shape,
+  4 cores): ~1.8M → ~2.8M objects/sec (+60%, up to 2× on quiet runs). Also
+  removed the ordering guard's per-object `last_key` String allocation by
+  reusing one cursor buffer.
+
 ### Fixed
 - **`--start-after` combined with cached hints duplicated output rows.** With a
   conventional hints cache present (written automatically by startup discovery

@@ -1041,15 +1041,17 @@ impl DiffSideStream {
                     self.received_batches += 1;
                     self.received_objects += batch.len();
                     for (key, props) in batch {
-                        match self.last_key.as_deref() {
-                            Some(prev) if key.as_str() < prev => {
+                        // The ordering-guard cursor reuses one String buffer
+                        // instead of allocating per object.
+                        match self.last_key.as_mut() {
+                            Some(prev) if key.as_str() < prev.as_str() => {
                                 return Err(format!(
                                     "{} listing returned keys out of order ('{}' after '{}'); \
                                      diff requires S3 lexicographic ordering",
                                     self.name, key, prev
                                 ));
                             }
-                            Some(prev) if key.as_str() == prev => {
+                            Some(prev) if key.as_str() == prev.as_str() => {
                                 log::warn!(
                                     "{} listing repeated key '{}'; keeping the latest entry",
                                     self.name,
@@ -1060,9 +1062,12 @@ impl DiffSideStream {
                                 } // else: predecessor already merged; drop dup
                                 continue;
                             }
-                            _ => {}
+                            Some(prev) => {
+                                prev.clear();
+                                prev.push_str(key.as_str());
+                            }
+                            None => self.last_key = Some(key.as_str().to_string()),
                         }
-                        self.last_key = Some(key.as_str().to_string());
                         self.buf.push_back((key, props));
                     }
                 }
@@ -1088,6 +1093,13 @@ struct DiffRowSink {
 
 const DIFF_SINK_FLUSH_ROWS: usize = 8192;
 
+/// Batches queued between the merge task and the Parquet writer loop — the
+/// pipeline depth that lets classification run ahead of encode+compress.
+const DIFF_WRITE_PIPELINE_CAP: usize = 4;
+
+/// A flushed row batch on its way to the Parquet writer loop.
+type DiffWriteBatch = (Vec<(ObjectKey, ObjectProps)>, u8);
+
 impl DiffRowSink {
     fn new() -> Self {
         Self {
@@ -1108,9 +1120,9 @@ impl DiffRowSink {
         record_prefix_stat(&mut self.prefix_stats, key.prefix(), size);
     }
 
-    async fn push<W: tokio::io::AsyncWrite + Unpin + Send>(
+    async fn push(
         &mut self,
-        parquet: &mut crate::utils::AsyncParquetOutput<W>,
+        writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
         flag: u8,
         key: ObjectKey,
         props: ObjectProps,
@@ -1126,14 +1138,14 @@ impl DiffRowSink {
         buf.push((key, props));
         if buf.len() >= DIFF_SINK_FLUSH_ROWS {
             let batch = std::mem::take(buf);
-            parquet.write_batch(batch, flag).await?;
+            send_to_writer(writer_tx, batch, flag).await?;
         }
         Ok(())
     }
 
-    async fn flush_all<W: tokio::io::AsyncWrite + Unpin + Send>(
+    async fn flush_all(
         &mut self,
-        parquet: &mut crate::utils::AsyncParquetOutput<W>,
+        writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     ) -> Result<(), String> {
         for flag in [
             OUTPUT_FLAG_PLUS,
@@ -1144,19 +1156,34 @@ impl DiffRowSink {
             let buf = &mut self.bufs[flag as usize];
             if !buf.is_empty() {
                 let batch = std::mem::take(buf);
-                parquet.write_batch(batch, flag).await?;
+                send_to_writer(writer_tx, batch, flag).await?;
             }
         }
         Ok(())
     }
 }
 
-/// Merge the two ordered diff streams into the sink. Returns Err on
-/// ordering violations or write failures.
-async fn merge_diff_streams<W: tokio::io::AsyncWrite + Unpin + Send>(
+/// Hand a flushed batch to the Parquet writer loop. A closed channel means
+/// the writer stopped on a write error; that error is what the caller of
+/// `run_diff_merge` reports, this message only unblocks the merge.
+async fn send_to_writer(
+    writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
+    batch: Vec<(ObjectKey, ObjectProps)>,
+    flag: u8,
+) -> Result<(), String> {
+    writer_tx
+        .send((batch, flag))
+        .await
+        .map_err(|_| "diff Parquet writer stopped (write error)".to_string())
+}
+
+/// Merge the two ordered diff streams into the sink, handing flushed row
+/// batches to the Parquet writer loop. Returns Err on ordering violations
+/// or when the writer stopped.
+async fn merge_diff_streams(
     left: &mut DiffSideStream,
     right: &mut DiffSideStream,
-    parquet: &mut crate::utils::AsyncParquetOutput<W>,
+    writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     sink: &mut DiffRowSink,
 ) -> Result<(), String> {
     loop {
@@ -1178,12 +1205,12 @@ async fn merge_diff_streams<W: tokio::io::AsyncWrite + Unpin + Send>(
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
                 sink.record_key(&key, props.size());
-                sink.push(parquet, OUTPUT_FLAG_PLUS, key, props).await?;
+                sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
                 sink.record_key(&key, props.size());
-                sink.push(parquet, OUTPUT_FLAG_MINUS, key, props).await?;
+                sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
             }
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
@@ -1191,11 +1218,11 @@ async fn merge_diff_streams<W: tokio::io::AsyncWrite + Unpin + Send>(
                 sink.record_key(&key, left_props.size());
                 match core::ObjectProps::classify_pair(&left_props, &right_props) {
                     Some(MatchResult::Astrisk) => {
-                        sink.push(parquet, OUTPUT_FLAG_ASTRISK, key, left_props)
+                        sink.push(writer_tx, OUTPUT_FLAG_ASTRISK, key, left_props)
                             .await?;
                     }
                     Some(_) => {
-                        sink.push(parquet, OUTPUT_FLAG_EQUAL, key, left_props)
+                        sink.push(writer_tx, OUTPUT_FLAG_EQUAL, key, left_props)
                             .await?;
                     }
                     None => sink.ignored += 1,
@@ -1236,34 +1263,67 @@ impl DiffMergeOutcome {
 /// Merge two ordered diff streams into the Parquet writer and return the
 /// classification counters. The caller owns writer lifecycle (close) and
 /// KS output.
+///
+/// The merge runs as its own task while this task drives the Parquet writes,
+/// so classification/ingest overlaps encode+compress instead of serializing
+/// with it in one loop; the bounded channel between them is the pipeline
+/// depth. The `&mut parquet` contract is unchanged — all rows are written
+/// before this returns.
 pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
     sides: DiffStreamSides,
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
 ) -> Result<DiffMergeOutcome, String> {
-    let mut left = DiffSideStream::new(sides.left, "left");
-    let mut right = DiffSideStream::new(sides.right, "right");
-    let mut sink = DiffRowSink::new();
+    let (writer_tx, mut writer_rx) =
+        tokio::sync::mpsc::channel::<DiffWriteBatch>(DIFF_WRITE_PIPELINE_CAP);
 
-    merge_diff_streams(&mut left, &mut right, parquet, &mut sink).await?;
-    sink.flush_all(parquet).await?;
+    let merge_task = tokio::spawn(async move {
+        let mut left = DiffSideStream::new(sides.left, "left");
+        let mut right = DiffSideStream::new(sides.right, "right");
+        let mut sink = DiffRowSink::new();
 
-    let bytes_total = sink
-        .prefix_stats
-        .values()
-        .map(|aggregate| aggregate.bytes)
-        .fold(0u64, u64::saturating_add);
-    Ok(DiffMergeOutcome {
-        rows: sink.rows,
-        plus: sink.plus,
-        minus: sink.minus,
-        astrisk: sink.astrisk,
-        equal: sink.equal,
-        ignored: sink.ignored,
-        received_batches: left.received_batches + right.received_batches,
-        received_objects: left.received_objects + right.received_objects,
-        bytes_total,
-        prefix_stats: sink.prefix_stats,
-    })
+        merge_diff_streams(&mut left, &mut right, &writer_tx, &mut sink).await?;
+        sink.flush_all(&writer_tx).await?;
+
+        let bytes_total = sink
+            .prefix_stats
+            .values()
+            .map(|aggregate| aggregate.bytes)
+            .fold(0u64, u64::saturating_add);
+        Ok(DiffMergeOutcome {
+            rows: sink.rows,
+            plus: sink.plus,
+            minus: sink.minus,
+            astrisk: sink.astrisk,
+            equal: sink.equal,
+            ignored: sink.ignored,
+            received_batches: left.received_batches + right.received_batches,
+            received_objects: left.received_objects + right.received_objects,
+            bytes_total,
+            prefix_stats: sink.prefix_stats,
+        })
+    });
+
+    // Writer loop: drains until the merge task drops its sender (success) or
+    // a write fails (dropping the receiver unblocks the merge, whose sends
+    // then fail fast).
+    let mut write_error: Option<String> = None;
+    while let Some((batch, flag)) = writer_rx.recv().await {
+        if let Err(e) = parquet.write_batch(batch, flag).await {
+            write_error = Some(e);
+            break;
+        }
+    }
+    drop(writer_rx);
+
+    let merged = merge_task
+        .await
+        .map_err(|e| format!("diff merge task failed: {}", e))?;
+    match write_error {
+        // The write error is the root cause; the merge error it induced
+        // ("writer stopped") is secondary.
+        Some(e) => Err(e),
+        None => merged,
+    }
 }
 
 pub async fn data_map_task_diff_streaming(
