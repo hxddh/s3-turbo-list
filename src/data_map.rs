@@ -131,6 +131,24 @@ async fn route_batch(
     senders[i].send(batch).await.map_err(|_| ())
 }
 
+/// Forward every batch the channel has already buffered to the workers.
+/// Returns `false` if a worker is gone. Called before finalizing on quit or
+/// completion: batches of segments the checkpoint records as completed are
+/// already queued here, and dropping them would silently lose their objects
+/// (an interrupt followed by `--resume` skips those segments forever).
+async fn drain_buffered_batches(
+    rx: &mut tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
+    senders: &[tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>],
+    rr: &mut usize,
+) -> bool {
+    while let Ok(batch) = rx.try_recv() {
+        if route_batch(senders, rr, batch).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Derive the output path for a given part index.
 ///
 /// Index 0 returns `base` unchanged. For index > 0, `.partN` is inserted before
@@ -361,6 +379,14 @@ pub async fn data_map_task_list_streaming(
         }
 
         if ctx.is_quit() {
+            // Drain buffered batches before finalizing; without this, an
+            // interrupt drops in-channel batches from segments the final
+            // checkpoint save records as completed, and a later --resume
+            // skips those segments — a silent hole in the combined output.
+            if !drain_buffered_batches(&mut ctx.data_map_channel, &senders, &mut rr).await {
+                log::error!("Data Map Task — list streaming worker gone, finalizing output");
+                ctx.g_state.inc_output_error();
+            }
             info!("Data Map Task — list streaming force quit, finalizing output");
             coordinator_finalize(
                 senders,
@@ -375,26 +401,11 @@ pub async fn data_map_task_list_streaming(
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
-            while let Ok(batch) = ctx.data_map_channel.try_recv() {
-                // Drained batches are forwarded straight to finalize; no further
-                // pool growth on this path.
-                if route_batch(&senders, &mut rr, batch).await.is_err() {
-                    log::error!("Data Map Task — list streaming worker gone, finalizing output");
-                    ctx.g_state.inc_output_error();
-                    coordinator_finalize(
-                        senders,
-                        handles,
-                        &ctx.g_state,
-                        filename_ks,
-                        filename_output,
-                        started_at,
-                        write_started_at,
-                    )
-                    .await;
-                    ctx.complete();
-                    ctx.quit();
-                    return;
-                }
+            // Drained batches are forwarded straight to finalize; no further
+            // pool growth on this path.
+            if !drain_buffered_batches(&mut ctx.data_map_channel, &senders, &mut rr).await {
+                log::error!("Data Map Task — list streaming worker gone, finalizing output");
+                ctx.g_state.inc_output_error();
             }
             info!("Data Map Task — list streaming all list tasks done, finalizing output");
             coordinator_finalize(
@@ -551,6 +562,11 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
         }
 
         if ctx.is_quit() {
+            // Count batches the channel already buffered so interrupt metrics
+            // (and any checkpointed-completed segments) match received data.
+            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+                ingest_list_summary_batch(&mut prefix_stats, &mut stats, batch);
+            }
             info!("Data Map Task — list summary-only force quit, finalizing");
             finalize_list_summary_only(&ctx.g_state, &prefix_stats, stats, started_at);
             ctx.complete();
@@ -641,6 +657,25 @@ pub async fn data_map_task_list_text_writer<W>(
         }
 
         if ctx.is_quit() {
+            // Write out batches the channel already buffered: they were
+            // received before the interrupt and dropping them would silently
+            // truncate the streamed rows.
+            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+                if !ingest_list_stdout_batch(
+                    &mut writer,
+                    format,
+                    &mut prefix_stats,
+                    &mut stats,
+                    batch,
+                )
+                .await
+                {
+                    ctx.g_state.inc_output_error();
+                    ctx.complete();
+                    ctx.quit();
+                    return;
+                }
+            }
             info!("Data Map Task — list stdout force quit, finalizing");
             finalize_list_stdout(&ctx.g_state, &mut writer, &prefix_stats, stats, started_at).await;
             ctx.complete();

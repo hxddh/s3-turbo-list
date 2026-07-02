@@ -630,8 +630,9 @@ pub struct S3TaskContext {
     pub max_keys: Option<i32>,
     pub max_attempts: u32,
     pub operation_timeout_secs: u64,
-    /// CLI `--start-after` override — if set, the first segment uses this
-    /// instead of the hint-segment start.
+    /// CLI `--start-after` override — single-chain mode: hints and startup
+    /// discovery are skipped when this is set, so exactly one segment exists
+    /// and it starts after this key.
     pub start_after: Option<String>,
     /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
     pub continuation_token: Option<String>,

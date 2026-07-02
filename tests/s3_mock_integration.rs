@@ -2338,3 +2338,162 @@ fn local_mock_sdk_retries_transient_list_error() {
     );
     assert_eq!(parquet_keys(&parquet), vec!["retry/succeeded.txt"]);
 }
+
+// ── --start-after single-chain guarantees ──────────────────
+//
+// A cached conventional hints file must not fan a --start-after run out into
+// multiple segments: every segment would override its start with the CLI key
+// and list overlapping ranges, duplicating output rows. The cache is skipped
+// (single chain); explicit --hints-file and --resume are rejected up front.
+
+#[test]
+fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
+    // Real-S3 semantics: sorted keys, honor start-after, single page.
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let keys: Vec<&str> = ["a.txt", "b.txt", "m/x.txt", "z.txt"]
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &keys, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    // Conventional startup-discovery cache (cwd-relative), as written by a
+    // previous run of the same bucket: two segments split at "m/".
+    std::fs::write(
+        dir.path().join("us-east-1_mock-bucket_hints.toml"),
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Every key after a.txt exactly once — no duplicates from overlapping
+    // segments, no keys dropped.
+    assert_eq!(parquet_keys(&parquet), vec!["b.txt", "m/x.txt", "z.txt"]);
+
+    // Single chain: one ListObjectsV2 request, starting after the CLI key.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{:#?}", requests);
+    assert_eq!(
+        requests[0].query.get("start-after").map(String::as_str),
+        Some("a.txt")
+    );
+}
+
+#[test]
+fn local_mock_start_after_with_hints_file_is_rejected() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "Unexpected", "validation must fail before any request")
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("--start-after is single-chain only"),
+        "{}",
+        stderr
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn local_mock_start_after_with_resume_is_rejected() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "Unexpected", "validation must fail before any request")
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("--start-after cannot be combined with --resume"),
+        "{}",
+        stderr
+    );
+    assert!(server.requests().is_empty());
+}

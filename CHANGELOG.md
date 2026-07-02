@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`--start-after` combined with cached hints duplicated output rows.** With a
+  conventional hints cache present (written automatically by startup discovery
+  on any previous run of the bucket), every hint segment overrode its start
+  with the CLI `--start-after` key, so segments listed overlapping ranges: keys
+  were written to the output multiple times and the same range was re-listed
+  once per segment (request amplification up to the segment count).
+  `--start-after` is now consistently single-chain, matching the
+  `--continuation-token` guards from v0.1.16: the cached-hints load is skipped
+  (logged), and the explicit conflicts `--hints-file` + `--start-after` and
+  `--resume` + `--start-after` are rejected at CLI validation before any S3
+  request. From a performance-focused code review, confirmed by a local-mock
+  reproduction.
+- **Periodic checkpoint saves never ran during a healthy listing run.** The
+  every-30s save was evaluated only when `JoinSet::join_next` returned — i.e.
+  when one of the few long-lived tasks (list/data_map/mon) finished — and its
+  `all_list_tasks_is_running` condition is false by then, so the "periodic"
+  save was unreachable in steady state and a crash (OOM, kill, power loss)
+  lost all `--resume` progress. The wait loop now runs a real 30-second ticker
+  (`tokio::select!` over `join_next` and the tick), saving under the same
+  conditions as before.
+- **An interrupt could drop received batches that the checkpoint recorded as
+  completed.** On Ctrl-C the data-map quit path finalized immediately, dropping
+  batches still buffered in the channel; segments whose batches were dropped
+  could already be recorded as completed by the final checkpoint save, so a
+  later `--resume` skipped them forever — a silent hole in the combined output.
+  All three list data-map paths (Parquet streaming, stdout TSV/NDJSON,
+  summary-only) now drain already-buffered batches before finalizing on quit,
+  exactly like the normal completion path always did.
+
 ## [0.21.0] - 2026-06-17
 
 ### Changed
