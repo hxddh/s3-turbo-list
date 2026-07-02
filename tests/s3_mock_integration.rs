@@ -21,6 +21,7 @@ struct MockResponse {
     status: u16,
     reason: &'static str,
     body: String,
+    drop_connection: bool,
 }
 
 impl MockResponse {
@@ -29,6 +30,7 @@ impl MockResponse {
             status: 200,
             reason: "OK",
             body,
+            drop_connection: false,
         }
     }
 
@@ -37,6 +39,18 @@ impl MockResponse {
             status: 200,
             reason: "OK",
             body: String::new(),
+            drop_connection: false,
+        }
+    }
+
+    /// Close the TCP connection without writing a response, simulating a
+    /// connection-level failure (the SDK surfaces a DispatchFailure).
+    fn drop_connection() -> Self {
+        Self {
+            status: 0,
+            reason: "",
+            body: String::new(),
+            drop_connection: true,
         }
     }
 
@@ -52,6 +66,7 @@ impl MockResponse {
                 r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message><RequestId>mock-request</RequestId></Error>"#,
                 code, message
             ),
+            drop_connection: false,
         }
     }
 }
@@ -133,6 +148,10 @@ fn handle_connection(
     };
     requests.lock().unwrap().push(request.clone());
     let response = handler(request, sequence);
+    if response.drop_connection {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     write_response(&mut stream, response);
 }
 
@@ -2337,4 +2356,388 @@ fn local_mock_sdk_retries_transient_list_error() {
         "SDK should retry the initial 503 SlowDown"
     );
     assert_eq!(parquet_keys(&parquet), vec!["retry/succeeded.txt"]);
+}
+
+// ── --start-after single-chain guarantees ──────────────────
+//
+// A cached conventional hints file must not fan a --start-after run out into
+// multiple segments: every segment would override its start with the CLI key
+// and list overlapping ranges, duplicating output rows. The cache is skipped
+// (single chain); explicit --hints-file and --resume are rejected up front.
+
+#[test]
+fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
+    // Real-S3 semantics: sorted keys, honor start-after, single page.
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let keys: Vec<&str> = ["a.txt", "b.txt", "m/x.txt", "z.txt"]
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &keys, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    // Conventional startup-discovery cache (cwd-relative), as written by a
+    // previous run of the same bucket: two segments split at "m/".
+    std::fs::write(
+        dir.path().join("us-east-1_mock-bucket_hints.toml"),
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Every key after a.txt exactly once — no duplicates from overlapping
+    // segments, no keys dropped.
+    assert_eq!(parquet_keys(&parquet), vec!["b.txt", "m/x.txt", "z.txt"]);
+
+    // Single chain: one ListObjectsV2 request, starting after the CLI key.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{:#?}", requests);
+    assert_eq!(
+        requests[0].query.get("start-after").map(String::as_str),
+        Some("a.txt")
+    );
+}
+
+#[test]
+fn local_mock_start_after_with_hints_file_is_rejected() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "Unexpected", "validation must fail before any request")
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("--start-after is single-chain only"),
+        "{}",
+        stderr
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn local_mock_start_after_with_resume_is_rejected() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "Unexpected", "validation must fail before any request")
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--start-after".into(),
+        "a.txt".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("--start-after cannot be combined with --resume"),
+        "{}",
+        stderr
+    );
+    assert!(server.requests().is_empty());
+}
+
+// ── Filtered-run KS/metrics consistency ─────────────────────
+//
+// Prefix/byte accounting must describe the objects included in the output:
+// the Parquet path previously counted every received object (pre-filter)
+// while stdout/summary counted post-filter, so the same filtered scan
+// reported different KS counts and bytes_total per output format.
+#[test]
+fn local_mock_filtered_list_ks_counts_only_included_objects() {
+    let server = MockS3Server::start(|request, _sequence| {
+        // Sizes are 100+index: p/a.txt=100, p/b.txt=101, p/c.txt=102.
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["p/a.txt", "p/b.txt", "p/c.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--filter".into(),
+        "SOURCE.size > 101".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Only p/c.txt (size 102) passes the filter.
+    assert_eq!(parquet_keys(&parquet), vec!["p/c.txt"]);
+    // The KS counts must describe the Parquet artifact, not the raw listing.
+    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"p\",\"1\"\n");
+}
+
+// ── Fatal segment fails the run without inflating errors ────
+//
+// A non-retryable failure in one segment fails the whole run fast via the
+// global quit signal. It must not clear the side's lifecycle bit while
+// sibling segments are still listing (which made the data map finalize
+// early and killed the siblings with channel errors, inflating
+// fatal_errors past the one real failure).
+#[test]
+fn local_mock_fatal_segment_counts_one_fatal_error() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.get("start-after").map(String::as_str) == Some("m/") {
+            return MockResponse::error(404, "NoSuchBucket", "injected fatal");
+        }
+        // Root segment: several truncated pages so it is still listing when
+        // the sibling segment fails.
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &["a1.txt"],
+                &[],
+                true,
+                Some("r1"),
+            )),
+            Some("r1") => MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &["a2.txt"],
+                &[],
+                true,
+                Some("r2"),
+            )),
+            Some("r2") => {
+                MockResponse::ok_xml(list_bucket_xml("", 1000, &["a3.txt"], &[], false, None))
+            }
+            Some(other) => MockResponse::error(400, "InvalidToken", other),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    let manifest = dir.path().join("manifest.json");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["m/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        manifest_json["metrics"]["fatal_errors"], 1,
+        "exactly the one injected failure must be counted: {}",
+        manifest_json["metrics"]
+    );
+    // The sibling segment must not die on "channel closed" errors.
+    assert!(!stderr.contains("Data map channel closed"), "{}", stderr);
+}
+
+// ── Retry cursor advances over CommonPrefixes-only pages ────
+//
+// Delimiter pages can contain only CommonPrefixes (no Contents). The resume
+// cursor previously only advanced on real keys, so a retry after such pages
+// restarted from many pages back and re-listed them; with the CP-only page
+// followed by a persistent transient error, the retry made no progress at
+// all and the run failed. The cursor now advances over the last
+// CommonPrefix (safe: a prefix sorts before every key it covers, and those
+// keys are rolled up into the prefix, never emitted).
+#[test]
+fn local_mock_retry_resumes_after_common_prefixes_only_page() {
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.query.get("continuation-token").map(String::as_str) == Some("t1") {
+            // Persistent connection-level failure on the token chain (named
+            // S3 service errors classify fatal once the SDK's own retries
+            // are spent; only connection/timeout errors reach the outer
+            // cursor-resume retry). The retry must restart from
+            // start-after=cp2/, not from scratch.
+            return MockResponse::drop_connection();
+        }
+        match request.query.get("start-after").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &[],
+                &["cp1/", "cp2/"],
+                true,
+                Some("t1"),
+            )),
+            Some("cp2/") => {
+                MockResponse::ok_xml(list_bucket_xml("", 1000, &["zz.txt"], &[], false, None))
+            }
+            Some(other) => MockResponse::error(400, "UnexpectedStartAfter", other),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--delimiter".into(),
+        "/".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet), vec!["zz.txt"]);
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.query.get("start-after").map(String::as_str) == Some("cp2/")),
+        "retry must resume after the last CommonPrefix: {:#?}",
+        requests
+    );
 }

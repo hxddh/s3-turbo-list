@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Diff startup discovery now probes in parallel.** Flat-namespace bisection
+  (`discover_flat_boundaries`) walked its ranges strictly serially — one
+  network round-trip per candidate probe, ~100+ serial RTTs for a 64-boundary
+  target — and the two diff sides then resolved one after the other. Each
+  bisection level now probes all of its (disjoint) ranges concurrently, and
+  the left/right sides resolve concurrently (`tokio::join!`), reducing diff
+  startup from up to tens of seconds on high-latency endpoints to a few
+  level-latencies. The degenerate self-diff case (same bucket and region)
+  stays sequential so both sides do not race writing the same hints-cache
+  file.
+
+- **Diff merge and Parquet encode now run as a pipeline.** The merge loop
+  classified keys and encoded+compressed Parquet row groups inline in one
+  task, so the two CPU costs serialized. The merge now runs as its own task
+  feeding flushed row batches to the Parquet writer over a small bounded
+  channel (the pipeline depth), overlapping classification/ingest with
+  encode+compress. `run_diff_merge`'s signature and semantics are unchanged
+  (all rows are written before it returns). Interleaved A/B of
+  `benchmark-local --benchmark diff-output` (3M objects, mixed shape,
+  4 cores): ~1.8M → ~2.8M objects/sec (+60%, up to 2× on quiet runs). Also
+  removed the ordering guard's per-object `last_key` String allocation by
+  reusing one cursor buffer. The merge checks for a stopped writer every
+  iteration, so a Parquet write failure (disk full, permissions) aborts the
+  merge — and the upstream S3 listing — immediately instead of at the next
+  flushed batch (or never, when a diff filter ignores the remaining pairs).
+  From PR review.
+
+- **Prefix accounting folds runs of equal prefixes.** Listing batches arrive
+  in S3 key order, so consecutive objects overwhelmingly share a prefix; the
+  KS prefix accounting on the list ingest paths (Parquet workers, stdout
+  TSV/NDJSON, summary-only) previously paid one HashMap hash+lookup per
+  object. A small run folder now coalesces each run into one map update,
+  replacing the per-object lookup with a string compare against a reused
+  buffer. Interleaved A/B on the TSV list-output benchmark (8M objects,
+  4 cores): run-heavy input (`--prefixes 1`) ~3.6M → ~4.0M objects/sec
+  (+12%); the artificial zero-run worst case (`--prefixes 128`, adjacent
+  prefixes never repeat) stays within run-to-run noise.
+
+### Fixed
+- **Filtered runs reported different KS counts and metrics per output
+  format.** The Parquet list path recorded prefix/byte accounting for every
+  received object (pre-filter) while the stdout TSV/NDJSON and summary-only
+  paths counted only objects that passed `--filter`, so the same filtered
+  scan produced a KS file that disagreed with the Parquet artifact beside it
+  and manifest `bytes_total`/`unique_prefixes`/`top_prefixes` that changed
+  with the output format. All list paths now count post-filter: the KS file
+  describes the output artifact. (Diff KS is a separate engine and keeps its
+  documented legacy semantics — every merged key counts, including
+  filter-ignored pairs.)
+- **A fatal segment error tore down the run through the wrong lifecycle
+  signal.** A non-retryable segment failure cleared its side's
+  run-lifecycle bit while sibling segments were still listing; the data map
+  read that as "all list tasks done", finalized early, and the siblings then
+  died on "channel closed" errors — burning retry requests and inflating
+  `fatal_errors` past the one real failure. The fatal path now fails the run
+  fast via the global quit signal, and shutdown-induced errors (aborted
+  siblings, closing channels) are no longer counted or retried as segment
+  failures.
+- **The retry cursor now advances over CommonPrefixes-only pages.** In
+  delimiter mode a page can contain only `CommonPrefixes` (no `Contents`);
+  the resume cursor previously advanced only on real keys, so a transient
+  connection failure after such pages retried from many pages back — and if
+  the failure was persistent at the same spot, the retry made no progress at
+  all and exhausted its budget. The cursor now also advances over the last
+  CommonPrefix, which is safe: a prefix sorts before every key it covers,
+  and those keys are rolled up into the prefix entry, never emitted as rows.
+- **`--start-after` combined with cached hints duplicated output rows.** With a
+  conventional hints cache present (written automatically by startup discovery
+  on any previous run of the bucket), every hint segment overrode its start
+  with the CLI `--start-after` key, so segments listed overlapping ranges: keys
+  were written to the output multiple times and the same range was re-listed
+  once per segment (request amplification up to the segment count).
+  `--start-after` is now consistently single-chain, matching the
+  `--continuation-token` guards from v0.1.16: the cached-hints load is skipped
+  (logged), and the explicit conflicts `--hints-file` + `--start-after` and
+  `--resume` + `--start-after` are rejected at CLI validation before any S3
+  request. From a performance-focused code review, confirmed by a local-mock
+  reproduction.
+- **Periodic checkpoint saves never ran during a healthy listing run.** The
+  every-30s save was evaluated only when `JoinSet::join_next` returned — i.e.
+  when one of the few long-lived tasks (list/data_map/mon) finished — and its
+  `all_list_tasks_is_running` condition is false by then, so the "periodic"
+  save was unreachable in steady state and a crash (OOM, kill, power loss)
+  lost all `--resume` progress. The wait loop now runs a real 30-second ticker
+  (`tokio::select!` over `join_next` and the tick), saving under the same
+  conditions as before.
+- **An interrupt could drop received batches that the checkpoint recorded as
+  completed.** On Ctrl-C the data-map quit path finalized immediately, dropping
+  batches still buffered in the channel; segments whose batches were dropped
+  could already be recorded as completed by the final checkpoint save, so a
+  later `--resume` skipped them forever — a silent hole in the combined output.
+  All three list data-map paths (Parquet streaming, stdout TSV/NDJSON,
+  summary-only) now drain already-buffered batches before finalizing on quit,
+  exactly like the normal completion path always did.
+
 ## [0.21.0] - 2026-06-17
 
 ### Changed

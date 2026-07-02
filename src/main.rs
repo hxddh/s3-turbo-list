@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Cadence of periodic checkpoint-journal saves during a `--resume` run.
+const CHECKPOINT_SAVE_INTERVAL_SECS: u64 = 30;
+
 // ── CLI definition ─────────────────────────────────────────
 
 #[derive(Parser)]
@@ -113,7 +116,8 @@ struct Cli {
     #[arg(long, global = true)]
     max_keys: Option<i32>,
 
-    /// Start listing after this key
+    /// Start listing after this key (single-chain: skips hints and
+    /// lists as one segment; cannot combine with --hints-file/--resume)
     #[arg(long, global = true)]
     start_after: Option<String>,
 
@@ -485,6 +489,7 @@ fn main() {
     validate_summary_only_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
+    validate_start_after_command(&cli, &cfg);
     validate_diff_hints_command(&cli);
     validate_diff_resume_command(&cli);
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
@@ -821,13 +826,24 @@ fn main() {
 
         // ── Load or generate KeySpace hints ─────────────────
         let hints_disabled_for_diff = mode == RunMode::BiDir;
-        let ks_list: Vec<String> = load_hints(
-            cli.hints_file.as_deref(),
-            opt_bucket,
-            opt_region,
-            cli.no_auto_hints || hints_disabled_for_diff,
-            hints_disabled_for_diff,
-        );
+        // --start-after is single-chain: hint segments would each override
+        // their start with the CLI key and list overlapping ranges, so the
+        // cached-hints load is skipped just like startup discovery below.
+        // (--hints-file plus --start-after is rejected at CLI validation.)
+        let ks_list: Vec<String> = if cfg.s3.start_after.is_some() {
+            info!(
+                "--start-after is single-chain: skipping cached hints and listing as one segment"
+            );
+            Vec::new()
+        } else {
+            load_hints(
+                cli.hints_file.as_deref(),
+                opt_bucket,
+                opt_region,
+                cli.no_auto_hints || hints_disabled_for_diff,
+                hints_disabled_for_diff,
+            )
+        };
         // ── Startup structural discovery ─────────────────────
         // When no hints exist for a flat (delimiter='') list run, probe the
         // bucket's CommonPrefix structure once at startup so the first run
@@ -950,19 +966,51 @@ fn main() {
             // Per-side boundaries from cached hints or startup discovery —
             // the same automatic sources as list mode. Sides need not agree:
             // each side only has to be a complete ordered partition of its
-            // own key space.
-            let left_bounds =
-                diff_side_boundaries(opt_bucket, opt_region, &opt_prefix, &cfg, &cli, &sdk_config)
+            // own key space. The sides resolve concurrently — each can take
+            // many network round-trips — except in the degenerate self-diff
+            // case (same bucket and region), where both sides would race
+            // writing the same hints-cache file.
+            let (left_bounds, right_bounds) =
+                if opt_bucket == target_bucket && opt_region == target_region {
+                    let left = diff_side_boundaries(
+                        opt_bucket,
+                        opt_region,
+                        &opt_prefix,
+                        &cfg,
+                        &cli,
+                        &sdk_config,
+                    )
                     .await;
-            let right_bounds = diff_side_boundaries(
-                target_bucket,
-                target_region,
-                &opt_prefix,
-                &cfg,
-                &cli,
-                &sdk_config,
-            )
-            .await;
+                    let right = diff_side_boundaries(
+                        target_bucket,
+                        target_region,
+                        &opt_prefix,
+                        &cfg,
+                        &cli,
+                        &sdk_config,
+                    )
+                    .await;
+                    (left, right)
+                } else {
+                    tokio::join!(
+                        diff_side_boundaries(
+                            opt_bucket,
+                            opt_region,
+                            &opt_prefix,
+                            &cfg,
+                            &cli,
+                            &sdk_config,
+                        ),
+                        diff_side_boundaries(
+                            target_bucket,
+                            target_region,
+                            &opt_prefix,
+                            &cfg,
+                            &cli,
+                            &sdk_config,
+                        ),
+                    )
+                };
             info!(
                 "  diff segments: left {}, right {}",
                 left_bounds.len() + 1,
@@ -1120,56 +1168,68 @@ fn main() {
         // The channel senders are moved into the list-task contexts, so each
         // channel closes when its side's task finishes.
 
-        // Wait for all tasks — save checkpoints on segment completion.
-        let mut last_checkpoint_save = std::time::Instant::now();
-        while let Some(result) = set.join_next().await {
-            if let Err(e) = result {
-                if e.is_cancelled() {
-                    // Cancellation is expected during shutdown (Ctrl-C aborts
-                    // in-flight tasks); it is not a fatal error, so do not count
-                    // it — counting it inflates the run manifest's fatal_errors
-                    // on a clean interrupt and trips `manifest-summary --check`.
-                    info!("Task was cancelled (abort or shutdown)");
-                } else {
-                    error!("Task panicked: {}", e);
-                    if let Ok(panic_msg) = e.try_into_panic() {
-                        let msg: String = panic_msg
-                            .downcast_ref::<&str>()
-                            .map(|s: &&str| s.to_string())
-                            .or_else(|| panic_msg.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "<unknown panic>".to_string());
-                        error!("Task panic message: {}", msg);
+        // Wait for all tasks. Periodic checkpoint saves are driven by a
+        // ticker: `join_next` only returns when one of the few long-lived
+        // tasks (list/data_map/mon) finishes, so a save evaluated only on
+        // task completion would never run during a healthy listing run and
+        // a crash would lose all resume progress.
+        let mut checkpoint_tick = tokio::time::interval_at(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
+            std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
+        );
+        checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let Some(result) = joined else { break };
+                    if let Err(e) = result {
+                        if e.is_cancelled() {
+                            // Cancellation is expected during shutdown (Ctrl-C aborts
+                            // in-flight tasks); it is not a fatal error, so do not count
+                            // it — counting it inflates the run manifest's fatal_errors
+                            // on a clean interrupt and trips `manifest-summary --check`.
+                            info!("Task was cancelled (abort or shutdown)");
+                        } else {
+                            error!("Task panicked: {}", e);
+                            if let Ok(panic_msg) = e.try_into_panic() {
+                                let msg: String = panic_msg
+                                    .downcast_ref::<&str>()
+                                    .map(|s: &&str| s.to_string())
+                                    .or_else(|| panic_msg.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<unknown panic>".to_string());
+                                error!("Task panic message: {}", msg);
+                            }
+                            // A genuine panic is a fatal failure — record it.
+                            g_state.inc_fatal_error();
+                        }
+                        g_state.quit();
                     }
-                    // A genuine panic is a fatal failure — record it.
-                    g_state.inc_fatal_error();
                 }
-                g_state.quit();
-            }
-
-            // Save checkpoint progress periodically (every 30s or on state change).
-            let progress_metrics = g_state.metrics_snapshot();
-            if cli.resume
-                && last_checkpoint_save.elapsed().as_secs() >= 30
-                && g_state.all_list_tasks_is_running()
-                && progress_metrics.fatal_errors == 0
-                && progress_metrics.output_errors == 0
-            {
-                if let Some(ref cp_path) = checkpoint_path_opt {
-                    let completed = merged_completed_indices(
-                        checkpoint_journal.as_ref(),
-                        &left_checkpoint,
-                        right_checkpoint.as_ref(),
-                    );
-                    let journal = checkpoint::CheckpointJournal {
-                        bucket: opt_bucket.to_string(),
-                        prefix: opt_prefix.clone(),
-                        total_segments: original_hints_count,
-                        completed_indices: completed,
-                        last_updated: chrono::Local::now().to_rfc3339(),
-                        identity: Some(current_identity.clone()),
-                    };
-                    journal.save(cp_path);
-                    last_checkpoint_save = std::time::Instant::now();
+                _ = checkpoint_tick.tick() => {
+                    let progress_metrics = g_state.metrics_snapshot();
+                    if cli.resume
+                        && g_state.all_list_tasks_is_running()
+                        && progress_metrics.fatal_errors == 0
+                        && progress_metrics.output_errors == 0
+                    {
+                        if let Some(ref cp_path) = checkpoint_path_opt {
+                            let completed = merged_completed_indices(
+                                checkpoint_journal.as_ref(),
+                                &left_checkpoint,
+                                right_checkpoint.as_ref(),
+                            );
+                            let journal = checkpoint::CheckpointJournal {
+                                bucket: opt_bucket.to_string(),
+                                prefix: opt_prefix.clone(),
+                                total_segments: original_hints_count,
+                                completed_indices: completed,
+                                last_updated: chrono::Local::now().to_rfc3339(),
+                                identity: Some(current_identity.clone()),
+                            };
+                            journal.save(cp_path);
+                        }
+                    }
                 }
             }
         }
@@ -1482,6 +1542,32 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
             );
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
+    }
+}
+
+/// `--start-after` is a single-chain mode: with multiple hint segments, every
+/// segment would override its start with the CLI key and list overlapping
+/// ranges, duplicating output rows. Reject explicit multi-segment inputs; the
+/// conventional hints cache is skipped at load time (with a log line) instead
+/// of erroring, because startup discovery writes it automatically on first run.
+fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
+    if cfg.s3.start_after.is_none() {
+        return;
+    }
+    // Diff resolves per-side boundaries itself and already skips hints and
+    // discovery when --start-after is set; local commands ignore the flag.
+    if !matches!(cli.cmd, Commands::List { .. }) {
+        return;
+    }
+    if cli.resume {
+        eprintln!(
+            "--start-after cannot be combined with --resume; checkpoint segments describe the full key space and would mis-resume a partial-range listing"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if cli.hints_file.is_some() {
+        eprintln!("--start-after is single-chain only and cannot be combined with --hints-file");
+        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 

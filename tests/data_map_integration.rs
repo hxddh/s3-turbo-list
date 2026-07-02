@@ -268,3 +268,165 @@ async fn test_merge_writes_ks_counts() {
     let content = std::fs::read_to_string(&ks_path).unwrap();
     assert_eq!(content, "\"a\",\"2\"\n\"b\",\"1\"\n");
 }
+
+// ── Quit-path drain (interrupt + --resume data-loss guard) ─────────────
+//
+// On Ctrl-C the streaming list data-map finalizes via its quit branch. Any
+// batches already buffered in the channel at that moment can belong to
+// segments the final checkpoint save records as completed — dropping them
+// would make a later --resume skip those segments forever, silently losing
+// objects from the combined output. The quit branch must drain the buffered
+// batches before finalizing.
+#[tokio::test]
+async fn test_list_streaming_quit_drains_buffered_batches() {
+    use s3_turbo_list::config::OutputConfig;
+    use s3_turbo_list::core::{DataMapContext, GlobalState, S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn list_obj(key: &str) -> (ObjectKey, ObjectProps) {
+        (
+            ObjectKey::from(key),
+            ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE, 1, [1; 16]),
+        )
+    }
+
+    let quit = Arc::new(AtomicBool::new(false));
+    // tasks_count = 1: only the data-map task participates in the barrier.
+    let g_state = GlobalState::new(quit, 1);
+    // Keep the list task "running" so the data map takes the quit branch,
+    // not the all-tasks-done branch (which already drains).
+    g_state.list_task_start(S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let mut expected: Vec<String> = Vec::new();
+    for batch_index in 0..3 {
+        let batch: Batch = (0..4)
+            .map(|k| {
+                let key = format!("p/batch-{}-key-{}", batch_index, k);
+                expected.push(key.clone());
+                list_obj(&key)
+            })
+            .collect();
+        tx.send(batch).await.unwrap();
+    }
+    // Quit is already set when the task starts: it processes the first
+    // received batch, observes quit, and must drain the two still-buffered
+    // batches before finalizing.
+    g_state.quit();
+
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("quit.parquet");
+    let ks_path = dir.path().join("quit.ks");
+    let ctx = DataMapContext::new(rx, g_state.clone());
+    s3_turbo_list::data_map::data_map_task_list_streaming(
+        ctx,
+        ks_path.to_str().unwrap(),
+        parquet_path.to_str().unwrap(),
+        OutputConfig::default(),
+    )
+    .await;
+    drop(tx);
+
+    let std_file = std::fs::File::open(&parquet_path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut keys = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            keys.push(column.value(i).to_string());
+        }
+    }
+    keys.sort();
+    expected.sort();
+    assert_eq!(
+        keys, expected,
+        "buffered batches must be drained on quit, not dropped"
+    );
+}
+
+// ── Writer failure aborts the merge promptly ────────────────────────────
+//
+// The pipelined merge only touches the writer channel when a flushed batch
+// is sent (every DIFF_SINK_FLUSH_ROWS rows per flag). After a Parquet write
+// error the writer loop drops its receiver; the merge must notice per
+// iteration and stop consuming the side streams — not one full flush window
+// later (or never, when a diff filter ignores every remaining pair).
+#[tokio::test]
+async fn test_merge_stops_consuming_input_after_writer_failure() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    struct FailingWriter;
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const BATCHES: usize = 400;
+    const ROWS_PER_BATCH: usize = 100;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(4);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let producer_sent = Arc::clone(&sent);
+    let producer = tokio::spawn(async move {
+        for i in 0..BATCHES {
+            let batch: Batch = (0..ROWS_PER_BATCH)
+                .map(|k| left_obj(&format!("k{:06}", i * ROWS_PER_BATCH + k), 1, [1; 16]))
+                .collect();
+            if tx.send(batch).await.is_err() {
+                return;
+            }
+            producer_sent.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    // A row group smaller than the sink's flush size (8192) forces the
+    // arrow writer to hit the failing sink on the first flushed batch
+    // instead of buffering it in memory.
+    let mut parquet =
+        AsyncParquetOutput::new_with_options(FailingWriter, "unused.ks", 512, "uncompressed", 0);
+    let err = run_diff_merge(
+        DiffStreamSides {
+            left: vec![rx],
+            right: vec![],
+        },
+        &mut parquet,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("Parquet write error"), "{}", err);
+    let _ = producer.await;
+
+    // The first writer flush happens after 8192 buffered rows (~82 batches
+    // of 100). Prompt abort stops input consumption right there; waiting
+    // for the next flush to fail its send would consume ~82 more.
+    let sent = sent.load(Ordering::SeqCst);
+    assert!(
+        sent < 140,
+        "merge kept consuming after writer failure: {} of {} batches",
+        sent,
+        BATCHES
+    );
+}

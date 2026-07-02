@@ -671,6 +671,13 @@ async fn flat_list_run_to_complete(
         {
             Ok(()) => return true,
             Err(err) => {
+                // Errors induced by shutdown (aborted siblings, the data-map
+                // channel closing) are not segment failures: counting or
+                // retrying them would inflate fatal_errors and burn S3
+                // requests against a run that is already ending.
+                if ctx.is_quit() {
+                    return false;
+                }
                 let next_retry_attempt = retry_attempt.saturating_add(1);
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
                     start_after = err.next_start_owned();
@@ -682,7 +689,11 @@ async fn flat_list_run_to_complete(
                     );
                     continue;
                 }
-                // Fatal error.
+                // Fatal error: fail the whole run fast via the global quit
+                // signal. (Clearing this side's lifecycle bit here instead —
+                // as this path once did — lied while sibling segments were
+                // still running: the data map finalized early and the
+                // siblings died on channel errors, inflating fatal_errors.)
                 error!(
                     "Flat List S3 Task — {} — fatal after {} attempt(s): {}",
                     ctx.s3_bucket_name,
@@ -690,9 +701,7 @@ async fn flat_list_run_to_complete(
                     err
                 );
                 ctx.g_state.inc_fatal_error();
-                if ctx.is_running() {
-                    ctx.complete();
-                }
+                ctx.g_state.quit();
                 return false;
             }
         }
@@ -842,6 +851,11 @@ async fn flat_list(
                 let cp_count = objects.common_prefixes().len() as i32;
                 common_prefixes_count =
                     common_prefixes_count.saturating_add(objects.common_prefixes().len());
+                let last_common_prefix = objects
+                    .common_prefixes()
+                    .last()
+                    .and_then(|cp| cp.prefix())
+                    .map(str::to_string);
 
                 // Emit trace event for this page.
                 emit_trace_compat(
@@ -907,6 +921,19 @@ async fn flat_list(
                 if let Some((key, _)) = batch.last() {
                     next_start.clear();
                     next_start.push_str(key.as_str());
+                }
+                // Delimiter pages can hold only CommonPrefixes; advance the
+                // resume cursor over them too, or a retry restarts from many
+                // pages back and re-lists them. Safe: a prefix string sorts
+                // before every key it covers, and its keys are rolled up into
+                // the prefix (never emitted), so nothing is skipped.
+                if !is_ended {
+                    if let Some(cp) = &last_common_prefix {
+                        if cp.as_str() > next_start.as_str() {
+                            next_start.clear();
+                            next_start.push_str(cp);
+                        }
+                    }
                 }
                 control.record_page(&next_start);
 

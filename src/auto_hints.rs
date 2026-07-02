@@ -127,6 +127,11 @@ where
 /// strictly after `start_after` within the listing prefix (or the first key
 /// of all when `None`). Returns up to `target_boundaries` sorted boundaries;
 /// empty means an empty range or no cuttable structure (single segment).
+///
+/// Each bisection level probes all of its ranges concurrently: the ranges are
+/// disjoint, so their cuts are independent. A serial walk paid one network
+/// round-trip per candidate probe (~100+ serial RTTs for a 64-boundary
+/// target); waves reduce that to ~log2(target) level latencies.
 pub async fn discover_flat_boundaries<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
@@ -150,12 +155,19 @@ where
     // observed key; end is an exclusive upper bound (None = open to the tail).
     let mut frontier: Vec<(String, Option<String>)> = vec![(first, None)];
     while boundaries.len() < target_boundaries && !frontier.is_empty() {
+        // Each successful cut adds one boundary, so ranges beyond the
+        // remaining budget are dropped — the same early-stop the serial
+        // walk applied, decided before the wave instead of during it.
+        frontier.truncate(target_boundaries - boundaries.len());
+        let cuts = futures::future::join_all(
+            frontier
+                .iter()
+                .map(|(start, end)| find_flat_cut(prefix, start, end.as_deref(), &probe)),
+        )
+        .await;
         let mut next: Vec<(String, Option<String>)> = Vec::new();
-        for (start, end) in frontier.drain(..) {
-            if boundaries.len() >= target_boundaries {
-                break;
-            }
-            if let Some(cut) = find_flat_cut(prefix, &start, end.as_deref(), &probe).await {
+        for ((start, end), cut) in frontier.drain(..).zip(cuts) {
+            if let Some(cut) = cut {
                 boundaries.insert(cut.clone());
                 next.push((start, Some(cut.clone())));
                 next.push((cut, end));
@@ -330,6 +342,46 @@ estimate_mode = "structural"
             }
             prev = Some(b);
         }
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_probe_waves_run_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let keys: Vec<String> = (0..200).map(|i| format!("key{:04}", i)).collect();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let probe_in_flight = Arc::clone(&in_flight);
+        let probe_max = Arc::clone(&max_in_flight);
+        let boundaries = discover_flat_boundaries("key", 8, |start_after| {
+            let keys = keys.clone();
+            let in_flight = Arc::clone(&probe_in_flight);
+            let max_in_flight = Arc::clone(&probe_max);
+            async move {
+                // Track overlap deterministically: yield_now parks this probe
+                // once, so sibling probes of the same wave get polled while it
+                // is "in flight" — no timing or sleeps involved.
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let next = match start_after {
+                    None => keys.first().cloned(),
+                    Some(sa) => keys.iter().find(|k| k.as_str() > sa.as_str()).cloned(),
+                };
+                Ok(next)
+            }
+        })
+        .await;
+
+        assert!(!boundaries.is_empty());
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "bisection-wave probes must overlap, got max in-flight {}",
+            max_in_flight.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
