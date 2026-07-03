@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discarded. Summaries are now computed only when a manifest is actually
   emitted.
 
+- **Parquet output writes chunk-level statistics instead of per-page.**
+  Readers of these listings scan whole files, so per-page min/max on the
+  near-unique Key/ETag strings cost encode CPU and header bytes without
+  buying pruning; chunk-level statistics keep coarse row-group pruning
+  intact. Interleaved A/B on the pooled list-output benchmark (6M objects,
+  4 cores): throughput at the edge of run-to-run noise (median ~4.19M →
+  ~4.30M objects/sec, +2.6%, ahead in 3 of 4 rounds) with the Parquet
+  output consistently ~4% smaller in every round.
+
 ### Fixed
 - **A segment that crossed its boundary no longer accepts a runtime split.**
   A split proposal racing the segment's final page could be accepted after

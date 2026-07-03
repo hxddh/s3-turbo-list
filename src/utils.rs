@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding};
-use parquet::file::properties::{WriterProperties, WriterVersion};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
@@ -98,6 +98,11 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         let writer_props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_encoding(Encoding::PLAIN)
+            // Chunk-level statistics instead of the per-page default: readers
+            // of these listings scan whole files, so page-level min/max on the
+            // near-unique Key/ETag strings costs encode CPU without buying
+            // pruning. Chunk keeps coarse row-group pruning intact.
+            .set_statistics_enabled(EnabledStatistics::Chunk)
             .set_compression(compression)
             .set_max_row_group_size(row_group_size.max(1))
             .build();
