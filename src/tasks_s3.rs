@@ -938,8 +938,12 @@ async fn flat_list(
                 control.record_page(&next_start);
 
                 // A split proposal is decided here, at a page boundary,
-                // against the authoritative cursor.
-                if let Some(tx) = split_tx {
+                // against the authoritative cursor. A segment that already
+                // crossed its boundary must not accept one: S3 order means
+                // no keys remain in its range, so the child would be an
+                // empty segment (a wasted request) and `was_split` would
+                // withhold this fully-completed segment's checkpoint record.
+                if let (Some(tx), false) = (split_tx, is_ended) {
                     if let Some(child) = control.try_accept_split() {
                         info!(
                             "Segment {} accepted runtime split at '{}'",
