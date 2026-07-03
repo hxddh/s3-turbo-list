@@ -238,9 +238,12 @@ fn list_bucket_xml(
         .enumerate()
         .map(|(index, key)| {
             format!(
-                "<Contents><Key>{}</Key><LastModified>2026-05-17T00:00:{:02}.000Z</LastModified><ETag>&quot;{:032x}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+                "<Contents><Key>{}</Key><LastModified>2026-05-17T00:{:02}:{:02}.000Z</LastModified><ETag>&quot;{:032x}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
                 xml_escape(key),
-                index,
+                // Keep the timestamp valid for pages of any size (index used
+                // directly as seconds broke pages past 60 entries).
+                (index / 60) % 60,
+                index % 60,
                 index + 1,
                 100 + index
             )
@@ -889,6 +892,10 @@ fn local_mock_list_flat_namespace_runtime_split() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        // Skip startup discovery (which now pre-partitions flat namespaces
+        // too) so the run starts single-segment and the RUNTIME split path
+        // is what fans out — the mechanism under test here.
+        "--no-auto-hints".into(),
         "--max-keys".into(),
         "2".into(),
         "--output-parquet-file".into(),
@@ -2740,4 +2747,106 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
         "retry must resume after the last CommonPrefix: {:#?}",
         requests
     );
+}
+
+// ── Flat-namespace startup pre-partitioning ─────────────────
+//
+// When structural discovery finds no CommonPrefixes, list mode now bisects
+// the flat key range up front (the same partitioner diff sides use) instead
+// of starting single-segment and ramping via runtime splits. The first run
+// must list in parallel segments with every key emitted exactly once, and
+// the boundaries must land in the conventional hints cache.
+#[test]
+fn local_mock_list_flat_namespace_prepartitions_at_startup() {
+    let keys: Vec<String> = (0..200).map(|i| format!("obj-{:04}", i)).collect();
+
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Structural discovery: flat namespace, no CommonPrefixes.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        if request.query.get("max-keys").map(String::as_str) == Some("1") {
+            // Bisection probe: first real key after the candidate.
+            let first: Vec<&str> = all_keys
+                .iter()
+                .find(|k| k.as_str() > start_after.as_str())
+                .map(|k| vec![k.as_str()])
+                .unwrap_or_default();
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
+        }
+        // Segment listing: real-S3 semantics, single page (well under 1000).
+        let page: Vec<&str> = all_keys
+            .iter()
+            .filter(|k| k.as_str() > start_after.as_str())
+            .map(String::as_str)
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Every key exactly once — parallel segments must not overlap or drop.
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    let requests = server.requests();
+    // Bisection probes ran at startup.
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.query.get("max-keys").map(String::as_str) == Some("1")),
+        "expected startup bisection probes (max-keys=1)"
+    );
+    // The listing itself fanned out: multiple segment requests with distinct
+    // real-key start-after boundaries, from the very first run.
+    let segment_starts: std::collections::BTreeSet<&str> = requests
+        .iter()
+        .filter(|r| {
+            !r.query.contains_key("delimiter")
+                && r.query.get("max-keys").map(String::as_str) != Some("1")
+        })
+        .filter_map(|r| r.query.get("start-after").map(String::as_str))
+        .collect();
+    assert!(
+        segment_starts.len() >= 2,
+        "expected multiple parallel segments from startup pre-partitioning, got starts {:?}",
+        segment_starts
+    );
+    // Boundaries were cached for future runs (and --resume).
+    let cache = std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml"))
+        .expect("startup hints cache written");
+    assert!(cache.contains("boundaries"), "{}", cache);
 }

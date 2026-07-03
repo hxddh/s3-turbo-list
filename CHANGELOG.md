@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Flat namespaces now pre-partition at startup in list mode.** When
+  structural discovery finds no CommonPrefixes, the run previously started
+  as a single segment and relied on runtime splitting to ramp up (at least
+  `SPLIT_MIN_PAGES` page round-trips per fan-out generation). Startup now
+  bisects the flat key range with single-key probes — the same partitioner
+  diff sides have used since v0.12.0, made wave-parallel in v0.22.0 — so the
+  first run starts at full concurrency. The boundaries land in the
+  conventional hints cache, so later runs (including `--resume`) reload
+  identical segments. Runtime splitting is unchanged and still covers
+  mid-run skew.
+- **The run manifest no longer re-reads every output when nobody asked for
+  it.** Artifact summaries (full-file SHA256, Parquet footer metadata, line
+  counts — `line_count` reads the whole file into memory) were computed at
+  the end of every run, even without `--agent`/`--run-manifest`, where the
+  only consumer was the human `Wrote:` path summary. On a multi-GB listing
+  that was minutes of tail latency plus a KS-sized memory spike, all
+  discarded. Summaries are now computed only when a manifest is actually
+  emitted.
+
+### Fixed
+- **A segment that crossed its boundary no longer accepts a runtime split.**
+  A split proposal racing the segment's final page could be accepted after
+  the boundary was already reached: the child covered a range S3 ordering
+  guarantees is empty (a wasted request), and `was_split` withheld the
+  fully-completed segment's checkpoint record, forcing `--resume` to re-list
+  it.
+
 ## [0.22.0] - 2026-07-02
 
 ### Performance

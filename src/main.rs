@@ -875,9 +875,28 @@ fn main() {
                 target_boundaries,
             )
             .await;
+            // Flat namespace: no CommonPrefix structure, which previously
+            // meant starting as a single segment and relying on runtime
+            // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
+            // Bisect the key range with single-key probes instead — the same
+            // partitioner diff sides use — so the first run starts at full
+            // concurrency. The boundaries land in the same cache below.
+            let boundaries = if boundaries.is_empty() {
+                info!("Startup discovery found no prefix structure — bisecting flat key space");
+                let flat_target = concurrency.clamp(8, 64);
+                discover_flat_boundaries_via_client(
+                    &probe_client,
+                    opt_bucket,
+                    &opt_prefix,
+                    flat_target,
+                )
+                .await
+            } else {
+                boundaries
+            };
             if boundaries.is_empty() {
                 info!(
-                    "Startup discovery found no prefix structure — using single-segment listing"
+                    "Startup discovery found no cuttable key space — using single-segment listing"
                 );
             } else {
                 info!(
@@ -1303,6 +1322,11 @@ fn main() {
         list_writes_artifacts(&cli).then_some(filename_ks.as_str()),
         list_writes_artifacts(&cli).then_some(filename_output.as_str()),
     );
+    // Artifact summaries re-read every output in full (SHA256, Parquet footer,
+    // line counts) — minutes of tail latency on a multi-GB listing. Only pay
+    // that when a manifest is actually emitted; the human "Wrote:" summary
+    // needs just the paths.
+    let manifest_emitted = cli.agent || cli.run_manifest.is_some();
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -1313,7 +1337,11 @@ fn main() {
         elapsed_secs: run_timer.elapsed().as_secs_f64(),
         command: agent::redacted_command_args(),
         inputs: command_input_summary(&cli, &cfg),
-        artifacts: agent::collect_artifacts(&manifest_outputs),
+        artifacts: if manifest_emitted {
+            agent::collect_artifacts(&manifest_outputs)
+        } else {
+            Vec::new()
+        },
         outputs: manifest_outputs,
         config_source,
         metrics: metrics.into(),
@@ -2879,30 +2907,7 @@ async fn diff_side_boundaries(
         // and only `max_concurrency` segments run at once, so spare boundaries
         // beyond that would just cost probes without adding parallelism.
         let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-        let probe_bucket = bucket.to_string();
-        let probe_prefix = prefix.to_string();
-        auto_hints::discover_flat_boundaries(prefix, flat_target, |start_after| {
-            let client = client.clone();
-            let bucket = probe_bucket.clone();
-            let prefix = probe_prefix.clone();
-            async move {
-                let mut req = client
-                    .list_objects_v2()
-                    .bucket(&bucket)
-                    .prefix(&prefix)
-                    .max_keys(1);
-                if let Some(sa) = start_after {
-                    req = req.start_after(sa);
-                }
-                let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
-                Ok(resp
-                    .contents()
-                    .first()
-                    .and_then(|o| o.key())
-                    .map(str::to_string))
-            }
-        })
-        .await
+        discover_flat_boundaries_via_client(&client, bucket, prefix, flat_target).await
     } else {
         boundaries
     };
@@ -2912,6 +2917,41 @@ async fn diff_side_boundaries(
         }
     }
     boundaries
+}
+
+/// Bisect a flat key range into boundaries via single-key ListObjectsV2
+/// probes on the given client. Shared by list-mode startup discovery and the
+/// per-side diff hints resolver.
+async fn discover_flat_boundaries_via_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    target: usize,
+) -> Vec<String> {
+    let probe_bucket = bucket.to_string();
+    let probe_prefix = prefix.to_string();
+    auto_hints::discover_flat_boundaries(prefix, target, |start_after| {
+        let client = client.clone();
+        let bucket = probe_bucket.clone();
+        let prefix = probe_prefix.clone();
+        async move {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(&prefix)
+                .max_keys(1);
+            if let Some(sa) = start_after {
+                req = req.start_after(sa);
+            }
+            let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
+            Ok(resp
+                .contents()
+                .first()
+                .and_then(|o| o.key())
+                .map(str::to_string))
+        }
+    })
+    .await
 }
 
 // The region supplied by the active subcommand, used for profile endpoint
