@@ -883,11 +883,12 @@ fn main() {
                 cfg.s3.force_path_style,
             );
             let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
-            let boundaries = auto_hints::discover_startup_boundaries(
+            let discovery = auto_hints::discover_startup_boundaries(
                 &probe_client,
                 opt_bucket,
                 &opt_prefix,
                 target_boundaries,
+                cfg.s3.operation_timeout_secs,
             )
             .await;
             // Flat namespace: no CommonPrefix structure, which previously
@@ -896,18 +897,31 @@ fn main() {
             // Bisect the key range with single-key probes instead — the same
             // partitioner diff sides use — so the first run starts at full
             // concurrency. The boundaries land in the same cache below.
-            let boundaries = if boundaries.is_empty() {
+            let boundaries = if !discovery.boundaries.is_empty() {
+                discovery.boundaries
+            } else if !discovery.root_page_truncated {
+                // The discovery probe's page was not truncated and held no
+                // CommonPrefixes: the whole listing fits in one page. Bisecting
+                // it would cost several probes per cut to partition work the
+                // single segment finishes in one request, and would cache
+                // boundaries that pin that shape for later runs.
+                info!(
+                    "Startup discovery found a single-page listing — using single-segment listing"
+                );
+                Vec::new()
+            } else {
                 info!("Startup discovery found no prefix structure — bisecting flat key space");
-                let flat_target = concurrency.clamp(8, 64);
+                // Runtime splitting still covers this run, so one boundary per
+                // worker is enough; spare boundaries would only cost probes.
+                let flat_target = concurrency.clamp(1, 64);
                 discover_flat_boundaries_via_client(
                     &probe_client,
                     opt_bucket,
                     &opt_prefix,
                     flat_target,
+                    cfg.s3.operation_timeout_secs,
                 )
                 .await
-            } else {
-                boundaries
             };
             if boundaries.is_empty() {
                 info!(
@@ -2932,18 +2946,37 @@ async fn diff_side_boundaries(
         cfg.s3.force_path_style,
     );
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
-    let boundaries = auto_hints::discover_startup_boundaries(&client, bucket, prefix, target).await;
-    let boundaries = if boundaries.is_empty() {
+    let discovery = auto_hints::discover_startup_boundaries(
+        &client,
+        bucket,
+        prefix,
+        target,
+        cfg.s3.operation_timeout_secs,
+    )
+    .await;
+    let boundaries = if !discovery.boundaries.is_empty() {
+        discovery.boundaries
+    } else if !discovery.root_page_truncated {
+        // Single-page side: nothing to partition, and the probes would cost
+        // more requests than the listing.
+        Vec::new()
+    } else {
         // Flat namespace: structural discovery found no CommonPrefixes, so the
         // side would otherwise list as one serial segment. Bisect the key range
         // with single-key probes so it lists in parallel. The target is smaller
         // than structural discovery's: each cut is a one-time up-front probe,
         // and only `max_concurrency` segments run at once, so spare boundaries
-        // beyond that would just cost probes without adding parallelism.
+        // beyond that would just cost probes without adding parallelism. Diff
+        // has no runtime splitting to fall back on, so it keeps a floor.
         let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-        discover_flat_boundaries_via_client(&client, bucket, prefix, flat_target).await
-    } else {
-        boundaries
+        discover_flat_boundaries_via_client(
+            &client,
+            bucket,
+            prefix,
+            flat_target,
+            cfg.s3.operation_timeout_secs,
+        )
+        .await
     };
     if !boundaries.is_empty() {
         if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
@@ -2961,6 +2994,7 @@ async fn discover_flat_boundaries_via_client(
     bucket: &str,
     prefix: &str,
     target: usize,
+    timeout_secs: u64,
 ) -> Vec<String> {
     let probe_bucket = bucket.to_string();
     let probe_prefix = prefix.to_string();
@@ -2977,7 +3011,18 @@ async fn discover_flat_boundaries_via_client(
             if let Some(sa) = start_after {
                 req = req.start_after(sa);
             }
-            let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
+            // Same watchdog the runtime split probes use: startup runs before
+            // a single object is listed, so a stalled endpoint must not hang
+            // the run there.
+            let resp = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                req.send(),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| s3_turbo_list::error::concise_sdk_error(&e))?,
+                Err(_) => return Err("probe timed out".to_string()),
+            };
             Ok(resp
                 .contents()
                 .first()

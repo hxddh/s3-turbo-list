@@ -2154,8 +2154,9 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
             return MockResponse::error(500, "UnexpectedBucket", &request.path);
         };
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
-            // Right-side startup discovery: flat namespace, no structure.
-            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+            // Right-side startup discovery: flat namespace, no structure, and
+            // more pages to come — a side worth partitioning.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("token")));
         }
         let start_after = request
             .query
@@ -2775,8 +2776,9 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
             .cloned()
             .unwrap_or_default();
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
-            // Structural discovery: flat namespace, no CommonPrefixes.
-            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+            // Structural discovery: flat namespace, no CommonPrefixes, and
+            // more pages to come — a bucket worth partitioning.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("token")));
         }
         if request.query.get("max-keys").map(String::as_str) == Some("1") {
             // Bisection probe: first real key after the candidate.
@@ -3046,8 +3048,16 @@ fn local_mock_prefixed_run_does_not_reuse_whole_bucket_cache() {
     let keys = ["logs/a.txt", "logs/b.txt", "logs/c.txt"];
     let server = MockS3Server::start(move |request, _sequence| {
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
-            // Structural discovery under logs/: no deeper structure.
-            return MockResponse::ok_xml(list_bucket_xml("logs/", 1000, &[], &[], false, None));
+            // Structural discovery under logs/: no deeper structure, more
+            // pages to come, so the run partitions and caches boundaries.
+            return MockResponse::ok_xml(list_bucket_xml(
+                "logs/",
+                1000,
+                &[],
+                &[],
+                true,
+                Some("token"),
+            ));
         }
         let start_after = request
             .query
@@ -3190,4 +3200,73 @@ fn local_mock_unwritable_trace_path_exits_output_write() {
 #[test]
 fn local_mock_unwritable_log_path_exits_output_write() {
     run_expecting_output_write_failure(&["--output-log-file", "/nonexistent-dir/run.log"]);
+}
+
+// A listing that fits in one page has nothing to partition: bisecting it
+// costs several single-key probes per cut to split work one request already
+// finishes, and caches boundaries that pin that shape for later runs.
+#[test]
+fn local_mock_single_page_flat_listing_skips_bisection() {
+    let keys: Vec<String> = (0..200).map(|i| format!("obj-{:04}", i)).collect();
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let page: Vec<&str> = all_keys
+            .iter()
+            .filter(|k| k.as_str() > start_after.as_str())
+            .map(String::as_str)
+            .collect();
+        // Flat (no CommonPrefixes) and untruncated, whether probed with a
+        // delimiter or not: the whole bucket is one page.
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "16".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    let requests = server.requests();
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.query.get("max-keys").map(String::as_str) == Some("1")),
+        "a single-page listing must not pay bisection probes, got {:?}",
+        requests
+    );
+    // One structural probe plus one listing request.
+    assert_eq!(requests.len(), 2, "{:?}", requests);
+    // Nothing worth caching either: no boundaries were discovered.
+    assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }

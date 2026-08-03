@@ -31,36 +31,67 @@ const STARTUP_DISCOVERY_MAX_DEPTH: usize = 3;
 /// Maximum delimiter probes issued per BFS level.
 const STARTUP_DISCOVERY_MAX_PROBES_PER_LEVEL: usize = 64;
 
+/// Outcome of startup structural discovery.
+pub struct StartupDiscovery {
+    /// Sorted boundary list; empty means no structure was found (flat
+    /// namespace) and the caller should partition or fall back to one segment.
+    pub boundaries: Vec<String>,
+    /// Whether the root probe's page was truncated.  An untruncated root page
+    /// with no CommonPrefixes means the entire listing fits in one page:
+    /// there is nothing to partition, and probing for cut points would cost
+    /// far more requests than the listing itself.
+    pub root_page_truncated: bool,
+}
+
 /// Discover key-space boundaries by probing real CommonPrefixes.
-/// Returns a sorted boundary list; empty means no structure was found
-/// (flat namespace) and the caller should fall back to a single segment.
 pub async fn discover_startup_boundaries(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     target_boundaries: usize,
-) -> Vec<String> {
+    timeout_secs: u64,
+) -> StartupDiscovery {
     discover_with_probe(prefix, target_boundaries, |p| {
         let client = client.clone();
         let bucket = bucket.to_string();
         async move {
-            let response = client
+            let send = client
                 .list_objects_v2()
                 .bucket(&bucket)
                 .prefix(&p)
                 .delimiter("/")
-                .send()
-                .await
-                .map_err(|e| format!("{:?}", e))?;
-            Ok(response
-                .common_prefixes()
-                .iter()
-                .filter_map(|cp| cp.prefix())
-                .map(str::to_string)
-                .collect())
+                .send();
+            // Startup discovery runs before the first object is listed; a
+            // stalled endpoint must not hang the run there. Same watchdog the
+            // runtime split probes use.
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                send,
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| crate::error::concise_sdk_error(&e))?,
+                Err(_) => return Err("probe timed out".to_string()),
+            };
+            Ok(ProbePage {
+                prefixes: response
+                    .common_prefixes()
+                    .iter()
+                    .filter_map(|cp| cp.prefix())
+                    .map(str::to_string)
+                    .collect(),
+                truncated: response.is_truncated().unwrap_or(false),
+            })
         }
     })
     .await
+}
+
+/// One structural probe's page: the CommonPrefixes it found and whether more
+/// pages follow.
+pub struct ProbePage {
+    pub prefixes: Vec<String>,
+    pub truncated: bool,
 }
 
 /// BFS over CommonPrefixes via an injected probe (one request per call).
@@ -70,13 +101,16 @@ async fn discover_with_probe<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
     probe: F,
-) -> Vec<String>
+) -> StartupDiscovery
 where
     F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+    Fut: std::future::Future<Output = Result<ProbePage, String>>,
 {
     let mut boundaries: BTreeSet<String> = BTreeSet::new();
     let mut frontier: Vec<String> = vec![prefix.to_string()];
+    // Assume more pages until the root probe says otherwise: a failed probe
+    // must not be read as "this bucket is tiny".
+    let mut root_page_truncated = true;
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -89,11 +123,14 @@ where
         let results = futures::future::join_all(level.iter().map(|p| probe(p.clone()))).await;
         for (parent, result) in level.iter().zip(results) {
             match result {
-                Ok(children) => {
-                    for child in &children {
+                Ok(page) => {
+                    if depth == 0 {
+                        root_page_truncated = page.truncated;
+                    }
+                    for child in &page.prefixes {
                         boundaries.insert(child.clone());
                     }
-                    frontier.extend(children);
+                    frontier.extend(page.prefixes);
                 }
                 Err(e) => {
                     log::warn!(
@@ -107,7 +144,10 @@ where
         }
     }
 
-    boundaries.into_iter().collect()
+    StartupDiscovery {
+        boundaries: boundaries.into_iter().collect(),
+        root_page_truncated,
+    }
 }
 
 // ── Flat-namespace partitioning ────────────────────────────
@@ -278,9 +318,25 @@ estimate_mode = "structural"
         prefix: &str,
         target: usize,
     ) -> Vec<String> {
+        run_discovery_full(tree, prefix, target, true)
+            .await
+            .boundaries
+    }
+
+    async fn run_discovery_full(
+        tree: std::collections::HashMap<String, Vec<String>>,
+        prefix: &str,
+        target: usize,
+        truncated: bool,
+    ) -> StartupDiscovery {
         discover_with_probe(prefix, target, |p| {
             let children = tree.get(&p).cloned().unwrap_or_default();
-            async move { Ok(children) }
+            async move {
+                Ok(ProbePage {
+                    prefixes: children,
+                    truncated,
+                })
+            }
         })
         .await
     }
@@ -416,15 +472,38 @@ estimate_mode = "structural"
 
     #[tokio::test]
     async fn test_startup_discovery_probe_errors_are_non_fatal() {
-        let boundaries = discover_with_probe("", 16, |p| async move {
+        let discovery = discover_with_probe("", 16, |p| async move {
             if p.is_empty() {
-                Ok(vec!["a/".to_string(), "b/".to_string()])
+                Ok(ProbePage {
+                    prefixes: vec!["a/".to_string(), "b/".to_string()],
+                    truncated: true,
+                })
             } else {
                 Err("probe failed".to_string())
             }
         })
         .await;
-        assert_eq!(boundaries, vec!["a/", "b/"]);
+        assert_eq!(discovery.boundaries, vec!["a/", "b/"]);
+    }
+
+    #[tokio::test]
+    async fn test_untruncated_root_page_reports_single_page_listing() {
+        // No CommonPrefixes and no next page: the whole listing fits in one
+        // request, so the caller must not pay bisection probes to split it.
+        let discovery = run_discovery_full(fake_tree(&[]), "", 16, false).await;
+        assert!(discovery.boundaries.is_empty());
+        assert!(!discovery.root_page_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_failed_root_probe_does_not_claim_single_page() {
+        // A failed probe must not be read as "this bucket is tiny".
+        let discovery = discover_with_probe("", 16, |_p| async move {
+            Err::<ProbePage, String>("probe failed".to_string())
+        })
+        .await;
+        assert!(discovery.boundaries.is_empty());
+        assert!(discovery.root_page_truncated);
     }
 
     #[test]
