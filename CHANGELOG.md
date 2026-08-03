@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`--resume` verified only the number of key-space segments, not which
+  segments they were.** Completed segments are recorded by index, so a
+  checkpoint carried over to a *different* boundary set of the same size
+  marked ranges complete that were never listed — the run exited 0 with
+  those keys silently missing. The size check was weakest exactly where it
+  mattered most after v0.23.0: flat-namespace bisection always produces
+  exactly `target` boundaries and every boundary is a real observed key, so
+  two runs against a bucket that took writes in between agree on the count
+  and disagree on every boundary. The checkpoint identity now carries a
+  fingerprint of the boundary set its indices refer to; a checkpoint that
+  does not match it (including one written without a fingerprint) is
+  discarded and the run starts fresh.
+- **The conventional hints cache ignored the listing prefix.** The cache was
+  keyed on bucket and region alone and the `prefix` it records was never
+  checked on load, so a cache generated under one prefix was reused for
+  another: every boundary sorts outside the other prefix's range, leaving
+  one segment holding all the keys while the rest issue empty requests.
+  v0.23.0 made the collision far more likely — flat namespaces now write a
+  cache too, and their boundaries are concrete object keys. Prefixed runs
+  now use their own cache file (`<region>_<bucket>_<prefix-hash>_hints.toml`),
+  whole-bucket runs keep the historical path, and a cache whose recorded
+  prefix does not match is ignored with a warning.
+- **Hierarchical (`--delimiter`) runs no longer load the conventional hints
+  cache.** Startup discovery and the diff resolver already skipped hints for
+  these runs; the list-mode cache load did not. Because a page's
+  CommonPrefixes are not range-filtered, every cached segment re-listed the
+  same prefix set: N× the requests and an N×-inflated CommonPrefix count,
+  with no parallelism gained.
+- **The run manifest recorded only the first Parquet output file.** A pooled
+  list run scales to several writers, each streaming its own `.partN` file.
+  An agent reading `outputs.parquet` processed a fraction of the listing,
+  `manifest-check --verify-artifacts` reported a green `artifacts_checked: 1`
+  while the rest went unverified, and the recorded artifact's own
+  `parquet.row_count` (base file) contradicted `metrics.parquet_rows` (all
+  parts) inside the same manifest. Every part is now an artifact, and the
+  `Wrote:` summary lists them too.
+- **An unwritable `--trace-compat` or `--output-log-file` path panicked**
+  (exit 101, not one of the documented stable exit codes) instead of
+  reporting the failure and exiting `OutputWrite` (5).
+- **An unknown `--addressing-style` value was silently ignored**, leaving the
+  run on whatever the config resolved to while looking like the flag had
+  applied. It is now rejected with the accepted values.
+
+### Performance
+- **Startup no longer bisects a listing that fits in one page.** v0.23.0
+  bisected any flat namespace regardless of size, and each cut costs up to
+  four single-key probes: a 200-key flat bucket — one page, one request —
+  paid 52 requests (37 bisection probes, one structural probe, 14 segment
+  listings) and cached boundaries that pinned that shape for later runs.
+  Structural discovery now reports whether its page was truncated; an
+  untruncated page with no CommonPrefixes means there is nothing to
+  partition, so the run lists as a single segment and caches nothing (the
+  same bucket is back to 2 requests). A failed probe is never read as
+  "single page". List mode also targets one boundary per worker instead of a
+  floor of eight, since runtime splitting still covers mid-run skew; `diff`
+  keeps the floor because it has no runtime splitting.
+
+### Robustness
+- **Startup discovery probes now run under the `operation_timeout_secs`
+  watchdog** that runtime split probes already used. They run before a single
+  object is listed, so a stalled endpoint could hang the run there with no
+  bound — with far more probes in flight since v0.23.0.
+- **Failed discovery probes log one line** (error code, message, status)
+  instead of the `{:?}` dump of the whole SDK error, response headers and raw
+  body included, once per failed probe.
+
 ## [0.23.0] - 2026-07-03
 
 ### Performance

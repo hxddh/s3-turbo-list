@@ -467,6 +467,7 @@ fn main() {
             std::process::exit(agent::ExitCode::CliConfig.code());
         });
 
+    validate_addressing_style_command(&cli);
     cfg.apply_cli_overrides(
         cli.threads,
         cli.concurrency,
@@ -1552,6 +1553,22 @@ fn validate_output_format_command(cli: &Cli) {
     if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
         eprintln!(
             "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
+/// An unparseable `--addressing-style` used to be dropped silently, leaving
+/// the run on whatever the config resolved to — a typo then looked like it
+/// had been applied.
+fn validate_addressing_style_command(cli: &Cli) {
+    let Some(style) = cli.addressing_style.as_deref() else {
+        return;
+    };
+    if style.parse::<config::AddressingStyle>().is_err() {
+        eprintln!(
+            "--addressing-style '{}' is not one of: path, virtual, auto",
+            style
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }

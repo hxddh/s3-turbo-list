@@ -121,7 +121,12 @@ from, in precedence order:
 3. **Startup structural discovery** (automatic) — a handful of delimiter
    probes find real `CommonPrefixes` boundaries and cache them. First runs are
    parallel with zero flags.
-4. A single segment for flat namespaces; runtime splitting then fans it out.
+4. **Startup bisection** (automatic) — a flat namespace with no
+   `CommonPrefixes` is partitioned by single-key probes instead, so it also
+   starts parallel. Runtime splitting still covers mid-run skew.
+5. A single segment for listings that fit in one page (nothing to partition)
+   and for `--no-auto-hints`, `--start-after`, `--continuation-token`, and
+   `--delimiter` runs.
 
 Segments also **split at runtime**: when one segment turns out to hold most of
 the data, the run probes its remaining range and fans it across idle workers —
@@ -156,8 +161,10 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
 
 Progress is saved every 30 seconds and on graceful shutdown. The checkpoint
 identity covers bucket, region, prefix, delimiter, max-keys, addressing style,
-profile, mode, and segment count — a mismatched checkpoint is discarded with a
-warning rather than mis-resuming.
+profile, mode, and the key-space boundary set itself (count and fingerprint) —
+completed segments are recorded by index, so a checkpoint is discarded with a
+warning unless the boundaries it was written against are the ones this run
+resolved.
 
 ## Providers
 
