@@ -633,12 +633,20 @@ fn main() {
             cfg.output.log_file.clone().unwrap_or_else(|| {
                 format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"))
             });
-        let logfile = std::fs::OpenOptions::new()
+        let logfile = match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(logfile_s)
-            .expect("unable to open log file");
+            .open(&logfile_s)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                // An unwritable log path is an output failure, reported
+                // through the documented exit codes like every other one.
+                eprintln!("Failed to open log file '{}': {}", logfile_s, e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            }
+        };
         env_logger::Builder::new()
             .parse_filters(&loglevel)
             .target(env_logger::Target::Pipe(Box::new(logfile)))
@@ -821,8 +829,13 @@ fn main() {
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
         let trace_writer: Option<Arc<dyn S3TraceWriter>> =
-            trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3)
-                .map(Arc::from);
+            match trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3) {
+                Ok(writer) => writer.map(Arc::from),
+                Err(e) => {
+                    error!("{}", e);
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            };
 
         // ── Load or generate KeySpace hints ─────────────────
         let hints_disabled_for_diff = mode == RunMode::BiDir;
@@ -1750,6 +1763,9 @@ fn print_wrote_summary(outputs: &agent::OutputPathSummary) {
     println!("Wrote:");
     if let Some(path) = &outputs.parquet_file {
         println!("  Parquet: {}", path);
+        for part in agent::parquet_part_paths(path) {
+            println!("  Parquet: {}", part);
+        }
     }
     if let Some(path) = &outputs.ks_file {
         println!("  KeySpace: {}", path);

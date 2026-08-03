@@ -3140,3 +3140,54 @@ generated_at = "2026-05-17T00:00:00Z"
         prefixed
     );
 }
+
+// ── Unwritable output paths exit, never panic ───────────────
+//
+// Both paths are resolved before any listing request, so the run must fail
+// with the documented OutputWrite code (5) instead of a panic (101, which is
+// not part of the exit-code contract agents branch on).
+fn run_expecting_output_write_failure(extra: &[&str]) {
+    let server = MockS3Server::start(|_request, _sequence| {
+        panic!("no S3 request should be issued when output setup fails")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let mut args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--summary-only".into(),
+    ];
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    args.extend([
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ]);
+
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 5, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "expected a clean failure, got a panic: {}",
+        stderr
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn local_mock_unwritable_trace_path_exits_output_write() {
+    run_expecting_output_write_failure(&["--trace-compat", "/nonexistent-dir/trace.jsonl"]);
+}
+
+#[test]
+fn local_mock_unwritable_log_path_exits_output_write() {
+    run_expecting_output_write_failure(&["--output-log-file", "/nonexistent-dir/run.log"]);
+}

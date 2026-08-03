@@ -631,10 +631,27 @@ fn parent_writable(path: PathBuf) -> Option<bool> {
     Some(!metadata.permissions().readonly())
 }
 
+/// Every Parquet file a run wrote for `base`: the base path plus the
+/// `.partN` files a pooled list run's extra writers streamed to.  Parts are
+/// created in order from index 1, so the first gap ends the set.
+pub fn parquet_part_paths(base: &str) -> Vec<String> {
+    (1..=crate::data_map::MAX_LIST_OUTPUT_WORKERS)
+        .map(|index| crate::data_map::part_path(base, index))
+        .take_while(|path| Path::new(path).exists())
+        .collect()
+}
+
 pub fn collect_artifacts(outputs: &OutputPathSummary) -> Vec<ArtifactSummary> {
     let mut artifacts = Vec::new();
     if let Some(path) = &outputs.parquet_file {
         artifacts.push(summarize_artifact("parquet", path));
+        // A pooled list run scales to several writers, each with its own
+        // part-file. Recording only the base path left most of the output
+        // unlisted and unverifiable, and made the manifest's own
+        // artifact row count disagree with metrics.parquet_rows.
+        for part in parquet_part_paths(path) {
+            artifacts.push(summarize_artifact("parquet", &part));
+        }
     }
     if let Some(path) = &outputs.ks_file {
         artifacts.push(summarize_artifact("ks", path));
@@ -935,6 +952,50 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
+
+    #[test]
+    fn manifest_enumerates_every_parquet_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        let base_str = base.to_str().unwrap().to_string();
+        for name in ["out.parquet", "out.part1.parquet", "out.part2.parquet"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // A gap ends the set: part4 without part3 is not this run's output.
+        std::fs::write(dir.path().join("out.part4.parquet"), b"x").unwrap();
+
+        let parts = super::parquet_part_paths(&base_str);
+        assert_eq!(parts.len(), 2, "{:?}", parts);
+        assert!(parts[0].ends_with("out.part1.parquet"));
+        assert!(parts[1].ends_with("out.part2.parquet"));
+
+        let outputs = super::OutputPathSummary {
+            parquet_file: Some(base_str),
+            ks_file: None,
+            hints_file: None,
+            trace_compat: None,
+            log_file: None,
+        };
+        let artifacts = super::collect_artifacts(&outputs);
+        assert_eq!(artifacts.len(), 3, "{:?}", artifacts);
+        assert!(artifacts.iter().all(|a| a.kind == "parquet" && a.exists));
+        assert!(artifacts.iter().all(|a| a.sha256.is_some()));
+    }
+
+    #[test]
+    fn manifest_parquet_artifacts_are_just_the_base_file_without_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        std::fs::write(&base, b"x").unwrap();
+        let outputs = super::OutputPathSummary {
+            parquet_file: Some(base.to_str().unwrap().to_string()),
+            ks_file: None,
+            hints_file: None,
+            trace_compat: None,
+            log_file: None,
+        };
+        assert_eq!(super::collect_artifacts(&outputs).len(), 1);
+    }
 
     #[test]
     fn hints_cache_path_is_scoped_to_the_listing_prefix() {
