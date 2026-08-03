@@ -2960,3 +2960,183 @@ boundaries_digest = "{}"
         keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
     );
 }
+
+// ── Conventional hints cache scoping ────────────────────────
+//
+// A hierarchical run rolls every key under a CommonPrefix and a page's
+// CommonPrefixes are not range-filtered, so cached segments would each
+// re-list the same prefix set — N× the requests, N× the reported
+// CommonPrefix count, and no parallelism to show for it.
+#[test]
+fn local_mock_delimiter_run_ignores_conventional_hints_cache() {
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            start_after.is_empty(),
+            "a delimiter run must list as one segment, got start-after '{}'",
+            start_after
+        );
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["top-level.txt"],
+            &["logs/", "data/"],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    // A cache left behind by an earlier recursive run of the same bucket.
+    std::fs::write(
+        dir.path().join("us-east-1_mock-bucket_hints.toml"),
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["data/", "logs/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--delimiter".into(),
+        "/".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet), vec!["top-level.txt".to_string()]);
+    // One request total: no cached segment fan-out.
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "expected a single hierarchical listing request, got {:?}",
+        server.requests()
+    );
+}
+
+// A cache generated under one prefix describes boundaries that all sort
+// outside another prefix's range: reusing it leaves one segment holding every
+// key while the rest issue empty requests. Prefixed runs get their own cache
+// file, and a stale cross-prefix cache at the whole-bucket path is ignored.
+#[test]
+fn local_mock_prefixed_run_does_not_reuse_whole_bucket_cache() {
+    let keys = ["logs/a.txt", "logs/b.txt", "logs/c.txt"];
+    let server = MockS3Server::start(move |request, _sequence| {
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Structural discovery under logs/: no deeper structure.
+            return MockResponse::ok_xml(list_bucket_xml("logs/", 1000, &[], &[], false, None));
+        }
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let max_keys = request.query.get("max-keys").map(String::as_str);
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .take(if max_keys == Some("1") { 1 } else { keys.len() })
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml(
+            "logs/",
+            if max_keys == Some("1") { 1 } else { 1000 },
+            &page,
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    // Whole-bucket boundaries from an earlier unprefixed run: every one of
+    // them sorts before "logs/", so all three keys would land in one segment.
+    std::fs::write(
+        dir.path().join("us-east-1_mock-bucket_hints.toml"),
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["aaa/", "bbb/", "ccc/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--prefix".into(),
+        "logs/".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(
+        listed,
+        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
+    );
+
+    // The whole-bucket cache was left untouched, and this run cached its own
+    // boundaries under a prefix-scoped path.
+    let whole_bucket =
+        std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml")).unwrap();
+    assert!(
+        whole_bucket.contains("aaa/"),
+        "the whole-bucket cache must not be overwritten by a prefixed run: {}",
+        whole_bucket
+    );
+    let prefixed: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            (name.ends_with("_hints.toml") && name != "us-east-1_mock-bucket_hints.toml")
+                .then_some(name)
+        })
+        .collect();
+    assert_eq!(
+        prefixed.len(),
+        1,
+        "expected exactly one prefix-scoped hints cache, got {:?}",
+        prefixed
+    );
+}

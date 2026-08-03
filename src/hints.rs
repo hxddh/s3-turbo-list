@@ -49,6 +49,38 @@ pub fn parse_hints_file(path: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Load the conventional hints cache, rejecting one generated for a different
+/// listing prefix.  The cache path is prefix-scoped, but a cache written by an
+/// older version — which keyed the path on bucket and region alone — can still
+/// sit at the whole-bucket path with a `prefix` recorded inside it.  Its
+/// boundaries all sort outside this run's range, which costs an empty request
+/// per segment and concentrates every key in one of them.
+pub fn parse_conventional_hints_file(path: &str, prefix: &str) -> Result<Vec<String>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read hints file '{}': {}", path, e))?;
+
+    if !looks_like_toml_hints(&content) {
+        // Plain files carry no provenance; they are user-managed, so they are
+        // taken at face value exactly as `--hints-file` would.
+        return parse_as_plain(path, &content);
+    }
+
+    let cache = parse_toml_cache(path, &content)?;
+    let cached_prefix = cache.prefix.as_deref().unwrap_or("");
+    if cached_prefix != prefix {
+        return Err(format!(
+            "hints cache '{}' was generated for prefix '{}' but this run lists prefix '{}'",
+            path, cached_prefix, prefix
+        ));
+    }
+    info!(
+        "Loaded {} key-space boundaries from TOML hints cache '{}'",
+        cache.boundaries.len(),
+        path
+    );
+    Ok(cache.boundaries)
+}
+
 pub fn inspect_hints_file(
     path: &str,
     preview_limit: usize,
@@ -440,6 +472,50 @@ generated_at = "2026-01-01T00:00:00Z"
         assert_eq!(report.boundary_count, 2);
         assert!(report.warnings.iter().any(|w| w.contains("not sorted")));
         assert!(report.warnings.iter().any(|w| w.contains("duplicate")));
+    }
+
+    #[test]
+    fn test_conventional_cache_rejects_other_prefix() {
+        let content = r#"bucket = "b"
+region = "r"
+prefix = "logs/"
+boundaries = ["logs/a", "logs/b"]
+generated_at = "2026-01-01T00:00:00Z"
+"#;
+        let (_dir, path) = write_tmp(content);
+        // A cache written under logs/ describes boundaries that all sort
+        // outside a whole-bucket run's useful range.
+        let err = parse_conventional_hints_file(&path, "").unwrap_err();
+        assert!(err.contains("generated for prefix 'logs/'"), "{}", err);
+        // The run it was generated for still loads it.
+        assert_eq!(
+            parse_conventional_hints_file(&path, "logs/").unwrap(),
+            vec!["logs/a", "logs/b"]
+        );
+    }
+
+    #[test]
+    fn test_conventional_cache_without_prefix_field_is_whole_bucket() {
+        let content = r#"bucket = "b"
+boundaries = ["a/", "b/"]
+generated_at = "2026-01-01T00:00:00Z"
+"#;
+        let (_dir, path) = write_tmp(content);
+        assert_eq!(
+            parse_conventional_hints_file(&path, "").unwrap(),
+            vec!["a/", "b/"]
+        );
+        assert!(parse_conventional_hints_file(&path, "logs/").is_err());
+    }
+
+    #[test]
+    fn test_conventional_cache_plain_file_is_taken_at_face_value() {
+        // Plain files carry no provenance and are user-managed.
+        let (_dir, path) = write_tmp("alpha/\nbeta/\n");
+        assert_eq!(
+            parse_conventional_hints_file(&path, "logs/").unwrap(),
+            vec!["alpha/", "beta/"]
+        );
     }
 
     #[test]

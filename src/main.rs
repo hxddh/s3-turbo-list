@@ -840,6 +840,8 @@ fn main() {
                 cli.hints_file.as_deref(),
                 opt_bucket,
                 opt_region,
+                &opt_prefix,
+                &cli.delimiter,
                 cli.no_auto_hints || hints_disabled_for_diff,
                 hints_disabled_for_diff,
             )
@@ -1528,6 +1530,16 @@ fn validate_output_format_command(cli: &Cli) {
     }
 }
 
+/// The prefix the run lists under, with the `/` "whole bucket" spelling
+/// normalized away — the same normalization the run itself applies.
+fn listing_prefix(cli: &Cli) -> String {
+    if cli.prefix == "/" {
+        String::new()
+    } else {
+        cli.prefix.clone()
+    }
+}
+
 fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
     let Some(token) = cli.continuation_token.as_deref() else {
         return;
@@ -1555,7 +1567,11 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if !cli.no_auto_hints {
-        let hints_path = agent::conventional_hints_path(bucket, region.as_deref());
+        let hints_path = agent::conventional_hints_path_for_prefix(
+            bucket,
+            region.as_deref(),
+            &listing_prefix(cli),
+        );
         if std::path::Path::new(&hints_path).exists() {
             eprintln!(
                 "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
@@ -2484,12 +2500,17 @@ fn build_plan_report(
         )
     });
     let hints = if inputs.mode == "diff" {
-        agent::diff_per_side_hints_plan(inputs.bucket.as_deref(), inputs.region.as_deref())
+        agent::diff_per_side_hints_plan(
+            inputs.bucket.as_deref(),
+            inputs.region.as_deref(),
+            &inputs.prefix,
+        )
     } else {
         agent::detect_hints_plan(
             cli.hints_file.as_deref(),
             inputs.bucket.as_deref(),
             inputs.region.as_deref(),
+            &inputs.prefix,
             cli.no_auto_hints,
         )
     };
@@ -2879,9 +2900,13 @@ async fn diff_side_boundaries(
         return Vec::new();
     }
 
-    let cache_path = agent::conventional_hints_path(bucket, region);
-    if let Ok(boundaries) = hints::parse_hints_file(&cache_path) {
-        return boundaries;
+    let cache_path = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
+    match hints::parse_conventional_hints_file(&cache_path, prefix) {
+        Ok(boundaries) => return boundaries,
+        Err(e) if std::path::Path::new(&cache_path).exists() => {
+            log::warn!("Ignoring conventional hints cache: {}", e);
+        }
+        Err(_) => {}
     }
 
     let client = core::build_s3_client(
@@ -2961,6 +2986,8 @@ fn load_hints(
     hints_file: Option<&str>,
     bucket: &str,
     region: Option<&str>,
+    prefix: &str,
+    delimiter: &str,
     no_auto_hints: bool,
     disabled_for_diff: bool,
 ) -> Vec<String> {
@@ -2991,18 +3018,33 @@ fn load_hints(
         return vec![];
     }
 
-    // 2. Try the startup-discovery cache at the conventional path.
-    let cache_filename = if let Some(r) = region {
-        agent::conventional_hints_path(bucket, Some(r))
-    } else {
-        agent::conventional_hints_path(bucket, None)
-    };
-
-    if let Ok(boundaries) = hints::parse_hints_file(&cache_filename) {
-        return boundaries;
+    // 2. A hierarchical run rolls every key under a CommonPrefix, and a page's
+    //    CommonPrefixes are not range-filtered: each cached segment would
+    //    re-list the same prefix set, multiplying requests and the reported
+    //    CommonPrefix count with no parallelism to show for it. Startup
+    //    discovery and the diff resolver already skip hints for these runs.
+    if !delimiter.is_empty() {
+        info!(
+            "--delimiter '{}' lists hierarchically: skipping the conventional hints cache and using single-segment listing",
+            delimiter
+        );
+        return vec![];
     }
 
-    // 3. No hints — the caller may attempt startup structural discovery
+    // 3. Try the startup-discovery cache at the conventional path.
+    let cache_filename = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
+
+    match hints::parse_conventional_hints_file(&cache_filename, prefix) {
+        Ok(boundaries) => return boundaries,
+        Err(e) if std::path::Path::new(&cache_filename).exists() => {
+            // Present but unusable (wrong prefix, malformed). Rediscovery
+            // below overwrites it with boundaries that fit this run.
+            log::warn!("Ignoring conventional hints cache: {}", e);
+        }
+        Err(_) => {}
+    }
+
+    // 4. No hints — the caller may attempt startup structural discovery
     //    before falling back to a single segment.
     info!(
         "No hints file or cached hints found for bucket '{}'",

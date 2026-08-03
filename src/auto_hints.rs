@@ -216,7 +216,7 @@ pub fn write_startup_hints_cache(
         boundaries: boundaries.to_vec(),
         generated_at: chrono::Local::now().to_rfc3339(),
     };
-    let path = crate::agent::conventional_hints_path(bucket, region);
+    let path = crate::agent::conventional_hints_path_for_prefix(bucket, region, prefix);
     let toml_str = toml::to_string_pretty(&cache)
         .map_err(|e| format!("failed to serialize hints cache: {}", e))?;
     std::fs::write(&path, &toml_str)

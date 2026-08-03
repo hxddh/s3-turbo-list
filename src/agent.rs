@@ -381,6 +381,35 @@ pub fn conventional_hints_path(bucket: &str, region: Option<&str>) -> String {
     }
 }
 
+/// Conventional hints cache path for a run listing under `prefix`.
+///
+/// Boundaries only partition the range the run actually lists, so a cache
+/// generated under one prefix is useless (and badly skewed) for another:
+/// every boundary sorts outside the other prefix's range, leaving one segment
+/// with all the keys and the rest issuing empty requests. Prefixed runs
+/// therefore get their own cache file. A whole-bucket run keeps the plain
+/// path, so existing caches stay valid.
+pub fn conventional_hints_path_for_prefix(
+    bucket: &str,
+    region: Option<&str>,
+    prefix: &str,
+) -> String {
+    if prefix.is_empty() {
+        return conventional_hints_path(bucket, region);
+    }
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+    let bucket = sanitize_path_component(bucket);
+    match region {
+        Some(r) => format!(
+            "{}_{}_{}_hints.toml",
+            sanitize_path_component(r),
+            bucket,
+            &digest[..8]
+        ),
+        None => format!("{}_{}_hints.toml", bucket, &digest[..8]),
+    }
+}
+
 pub fn sanitize_path_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -403,6 +432,7 @@ pub fn detect_hints_plan(
     explicit_hints_file: Option<&str>,
     bucket: Option<&str>,
     region: Option<&str>,
+    prefix: &str,
     no_auto_hints: bool,
 ) -> HintsPlan {
     if let Some(path) = explicit_hints_file {
@@ -435,7 +465,7 @@ pub fn detect_hints_plan(
     }
 
     if let Some(bucket) = bucket {
-        let path = conventional_hints_path(bucket, region);
+        let path = conventional_hints_path_for_prefix(bucket, region, prefix);
         let exists = Path::new(&path).exists();
         let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
         return HintsPlan {
@@ -473,8 +503,12 @@ pub fn detect_hints_plan(
     }
 }
 
-pub fn diff_per_side_hints_plan(bucket: Option<&str>, region: Option<&str>) -> HintsPlan {
-    let path = bucket.map(|bucket| conventional_hints_path(bucket, region));
+pub fn diff_per_side_hints_plan(
+    bucket: Option<&str>,
+    region: Option<&str>,
+    prefix: &str,
+) -> HintsPlan {
+    let path = bucket.map(|bucket| conventional_hints_path_for_prefix(bucket, region, prefix));
     let exists = path
         .as_deref()
         .map(|path| Path::new(path).exists())
@@ -900,7 +934,37 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_command_args;
+    use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
+
+    #[test]
+    fn hints_cache_path_is_scoped_to_the_listing_prefix() {
+        // A whole-bucket run keeps the historical path, so caches written by
+        // earlier versions stay valid.
+        assert_eq!(
+            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), ""),
+            conventional_hints_path("my-bucket", Some("us-east-1"))
+        );
+        // Prefixed runs get their own file: boundaries under one prefix sort
+        // outside every other prefix's range.
+        let logs = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/");
+        let data = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "data/");
+        assert_ne!(
+            logs,
+            conventional_hints_path("my-bucket", Some("us-east-1"))
+        );
+        assert_ne!(logs, data);
+        assert!(logs.starts_with("us-east-1_my-bucket_"), "{}", logs);
+        assert!(logs.ends_with("_hints.toml"), "{}", logs);
+        // Stable across calls, and defined without a region too.
+        assert_eq!(
+            logs,
+            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/")
+        );
+        assert_ne!(
+            conventional_hints_path_for_prefix("my-bucket", None, "logs/"),
+            conventional_hints_path("my-bucket", None)
+        );
+    }
 
     #[test]
     fn redacts_sensitive_command_values() {
