@@ -37,10 +37,33 @@ pub struct StartupDiscovery {
     /// namespace) and the caller should partition or fall back to one segment.
     pub boundaries: Vec<String>,
     /// Whether the root probe's page was truncated.  An untruncated root page
-    /// with no CommonPrefixes means the entire listing fits in one page:
-    /// there is nothing to partition, and probing for cut points would cost
-    /// far more requests than the listing itself.
+    /// with no CommonPrefixes means the whole listing came back in that one
+    /// page: there is nothing to partition, and probing for cut points would
+    /// cost far more requests than the listing itself.
     pub root_page_truncated: bool,
+    /// Keys the root probe's page returned.  The probe uses the provider's
+    /// default page size, so a run with a smaller `--max-keys` paginates over
+    /// the same keys and is *not* single-page — the caller compares this
+    /// against its configured page size before taking that shortcut.
+    pub root_page_keys: usize,
+}
+
+impl StartupDiscovery {
+    /// Whether the run will list everything in a single request, so there is
+    /// nothing worth partitioning.  Requires both that the probe's page held
+    /// the whole listing and that the run's own page size (`--max-keys`, when
+    /// set below the provider default) is large enough to return it in one
+    /// page — otherwise the run paginates over those same keys and does want
+    /// segments.
+    pub fn is_single_page_listing(&self, max_keys: Option<i32>) -> bool {
+        if self.root_page_truncated || !self.boundaries.is_empty() {
+            return false;
+        }
+        match max_keys {
+            Some(limit) => limit >= 0 && (limit as usize) >= self.root_page_keys,
+            None => true,
+        }
+    }
 }
 
 /// Discover key-space boundaries by probing real CommonPrefixes.
@@ -81,6 +104,7 @@ pub async fn discover_startup_boundaries(
                     .map(str::to_string)
                     .collect(),
                 truncated: response.is_truncated().unwrap_or(false),
+                keys: response.contents().len(),
             })
         }
     })
@@ -92,6 +116,7 @@ pub async fn discover_startup_boundaries(
 pub struct ProbePage {
     pub prefixes: Vec<String>,
     pub truncated: bool,
+    pub keys: usize,
 }
 
 /// BFS over CommonPrefixes via an injected probe (one request per call).
@@ -111,6 +136,7 @@ where
     // Assume more pages until the root probe says otherwise: a failed probe
     // must not be read as "this bucket is tiny".
     let mut root_page_truncated = true;
+    let mut root_page_keys = 0usize;
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -126,6 +152,7 @@ where
                 Ok(page) => {
                     if depth == 0 {
                         root_page_truncated = page.truncated;
+                        root_page_keys = page.keys;
                     }
                     for child in &page.prefixes {
                         boundaries.insert(child.clone());
@@ -147,6 +174,7 @@ where
     StartupDiscovery {
         boundaries: boundaries.into_iter().collect(),
         root_page_truncated,
+        root_page_keys,
     }
 }
 
@@ -335,6 +363,7 @@ estimate_mode = "structural"
                 Ok(ProbePage {
                     prefixes: children,
                     truncated,
+                    keys: 0,
                 })
             }
         })
@@ -477,6 +506,7 @@ estimate_mode = "structural"
                 Ok(ProbePage {
                     prefixes: vec!["a/".to_string(), "b/".to_string()],
                     truncated: true,
+                    keys: 0,
                 })
             } else {
                 Err("probe failed".to_string())
@@ -493,6 +523,41 @@ estimate_mode = "structural"
         let discovery = run_discovery_full(fake_tree(&[]), "", 16, false).await;
         assert!(discovery.boundaries.is_empty());
         assert!(!discovery.root_page_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_single_page_decision_honors_max_keys() {
+        let discovery = StartupDiscovery {
+            boundaries: Vec::new(),
+            root_page_truncated: false,
+            root_page_keys: 500,
+        };
+        // The probe returned the whole listing in one page, and the run's page
+        // size can too.
+        assert!(discovery.is_single_page_listing(None));
+        assert!(discovery.is_single_page_listing(Some(1000)));
+        assert!(discovery.is_single_page_listing(Some(500)));
+        // A smaller page size paginates over those same keys — 50 pages at
+        // --max-keys 10 — so the run does want segments.
+        assert!(!discovery.is_single_page_listing(Some(10)));
+        assert!(!discovery.is_single_page_listing(Some(499)));
+    }
+
+    #[tokio::test]
+    async fn test_single_page_decision_requires_untruncated_page() {
+        let truncated = StartupDiscovery {
+            boundaries: Vec::new(),
+            root_page_truncated: true,
+            root_page_keys: 1000,
+        };
+        assert!(!truncated.is_single_page_listing(None));
+        // Structure found: partitioned by boundaries, not by this shortcut.
+        let structured = StartupDiscovery {
+            boundaries: vec!["a/".to_string()],
+            root_page_truncated: false,
+            root_page_keys: 3,
+        };
+        assert!(!structured.is_single_page_listing(None));
     }
 
     #[tokio::test]

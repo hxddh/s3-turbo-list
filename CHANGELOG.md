@@ -45,7 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the rest went unverified, and the recorded artifact's own
   `parquet.row_count` (base file) contradicted `metrics.parquet_rows` (all
   parts) inside the same manifest. Every part is now an artifact, and the
-  `Wrote:` summary lists them too.
+  `Wrote:` summary lists them too. The part set comes from the run's own
+  writer count, not from what is on disk: an explicit output path reused
+  after a wider run still has that run's higher-numbered parts beside it, and
+  reporting those would let verification pass over objects from an earlier
+  listing.
 - **An unwritable `--trace-compat` or `--output-log-file` path panicked**
   (exit 101, not one of the documented stable exit codes) instead of
   reporting the failure and exiting `OutputWrite` (5).
@@ -63,7 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untruncated page with no CommonPrefixes means there is nothing to
   partition, so the run lists as a single segment and caches nothing (the
   same bucket is back to 2 requests). A failed probe is never read as
-  "single page". List mode also targets one boundary per worker instead of a
+  "single page", and neither is an untruncated probe page when `--max-keys`
+  is smaller than the keys it returned — the probe uses the provider's
+  default page size, so the run would paginate over those same keys and does
+  want segments. List mode also targets one boundary per worker instead of a
   floor of eight, since runtime splitting still covers mid-run skew; `diff`
   keeps the floor because it has no runtime splitting.
 

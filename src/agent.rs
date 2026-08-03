@@ -631,17 +631,20 @@ fn parent_writable(path: PathBuf) -> Option<bool> {
     Some(!metadata.permissions().readonly())
 }
 
-/// Every Parquet file a run wrote for `base`: the base path plus the
-/// `.partN` files a pooled list run's extra writers streamed to.  Parts are
-/// created in order from index 1, so the first gap ends the set.
-pub fn parquet_part_paths(base: &str) -> Vec<String> {
-    (1..=crate::data_map::MAX_LIST_OUTPUT_WORKERS)
+/// The `.partN` paths a pooled list run's extra writers streamed to, given the
+/// number of output files the run reported writing (base plus one per extra
+/// writer).  Derived from the run's own writer count rather than from what is
+/// on disk: an explicit output path reused after a wider run still has that
+/// run's higher-numbered parts sitting next to it, and reporting those as this
+/// run's output would let verification pass over objects from an earlier
+/// listing.
+pub fn parquet_part_paths(base: &str, output_files: usize) -> Vec<String> {
+    (1..output_files.min(crate::data_map::MAX_LIST_OUTPUT_WORKERS))
         .map(|index| crate::data_map::part_path(base, index))
-        .take_while(|path| Path::new(path).exists())
         .collect()
 }
 
-pub fn collect_artifacts(outputs: &OutputPathSummary) -> Vec<ArtifactSummary> {
+pub fn collect_artifacts(outputs: &OutputPathSummary, output_files: usize) -> Vec<ArtifactSummary> {
     let mut artifacts = Vec::new();
     if let Some(path) = &outputs.parquet_file {
         artifacts.push(summarize_artifact("parquet", path));
@@ -649,7 +652,7 @@ pub fn collect_artifacts(outputs: &OutputPathSummary) -> Vec<ArtifactSummary> {
         // part-file. Recording only the base path left most of the output
         // unlisted and unverifiable, and made the manifest's own
         // artifact row count disagree with metrics.parquet_rows.
-        for part in parquet_part_paths(path) {
+        for part in parquet_part_paths(path, output_files) {
             artifacts.push(summarize_artifact("parquet", &part));
         }
     }
@@ -953,6 +956,16 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
 mod tests {
     use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
 
+    fn parquet_outputs(base: &str) -> super::OutputPathSummary {
+        super::OutputPathSummary {
+            parquet_file: Some(base.to_string()),
+            ks_file: None,
+            hints_file: None,
+            trace_compat: None,
+            log_file: None,
+        }
+    }
+
     #[test]
     fn manifest_enumerates_every_parquet_part_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -961,25 +974,39 @@ mod tests {
         for name in ["out.parquet", "out.part1.parquet", "out.part2.parquet"] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
-        // A gap ends the set: part4 without part3 is not this run's output.
-        std::fs::write(dir.path().join("out.part4.parquet"), b"x").unwrap();
 
-        let parts = super::parquet_part_paths(&base_str);
+        // Three writers: the base file plus two parts.
+        let parts = super::parquet_part_paths(&base_str, 3);
         assert_eq!(parts.len(), 2, "{:?}", parts);
         assert!(parts[0].ends_with("out.part1.parquet"));
         assert!(parts[1].ends_with("out.part2.parquet"));
 
-        let outputs = super::OutputPathSummary {
-            parquet_file: Some(base_str),
-            ks_file: None,
-            hints_file: None,
-            trace_compat: None,
-            log_file: None,
-        };
-        let artifacts = super::collect_artifacts(&outputs);
+        let artifacts = super::collect_artifacts(&parquet_outputs(&base_str), 3);
         assert_eq!(artifacts.len(), 3, "{:?}", artifacts);
         assert!(artifacts.iter().all(|a| a.kind == "parquet" && a.exists));
         assert!(artifacts.iter().all(|a| a.sha256.is_some()));
+    }
+
+    #[test]
+    fn manifest_ignores_part_files_this_run_did_not_write() {
+        // An explicit output path reused after a wider run: the old run's
+        // higher-numbered parts are still on disk, holding objects from an
+        // earlier listing. Only what this run wrote may be reported.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        let base_str = base.to_str().unwrap().to_string();
+        for name in [
+            "out.parquet",
+            "out.part1.parquet",
+            "out.part2.parquet",
+            "out.part3.parquet",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        let artifacts = super::collect_artifacts(&parquet_outputs(&base_str), 2);
+        assert_eq!(artifacts.len(), 2, "{:?}", artifacts);
+        assert!(artifacts[1].path.ends_with("out.part1.parquet"));
     }
 
     #[test]
@@ -987,14 +1014,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("out.parquet");
         std::fs::write(&base, b"x").unwrap();
-        let outputs = super::OutputPathSummary {
-            parquet_file: Some(base.to_str().unwrap().to_string()),
-            ks_file: None,
-            hints_file: None,
-            trace_compat: None,
-            log_file: None,
-        };
-        assert_eq!(super::collect_artifacts(&outputs).len(), 1);
+        let base_str = base.to_str().unwrap().to_string();
+        // One writer, and the degenerate "nothing recorded" case (a run that
+        // failed before the data map reported): base file only either way.
+        assert_eq!(
+            super::collect_artifacts(&parquet_outputs(&base_str), 1).len(),
+            1
+        );
+        assert_eq!(
+            super::collect_artifacts(&parquet_outputs(&base_str), 0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn parquet_part_paths_stay_within_the_writer_cap() {
+        // Indices run 0..=cap-1, so the highest part is cap-1 — never `.part32`
+        // with a 32-writer cap.
+        let parts = super::parquet_part_paths("out.parquet", 10_000);
+        assert_eq!(
+            parts.len(),
+            super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
+        );
+        assert!(parts.last().unwrap().ends_with(&format!(
+            "out.part{}.parquet",
+            super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
+        )));
     }
 
     #[test]

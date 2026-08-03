@@ -3270,3 +3270,98 @@ fn local_mock_single_page_flat_listing_skips_bisection() {
     // Nothing worth caching either: no boundaries were discovered.
     assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }
+
+// The discovery probe uses the provider's default page size, so an
+// untruncated probe page does not mean the *run* is single-page: with
+// --max-keys below that default the same keys paginate, and the run wants
+// segments after all.
+#[test]
+fn local_mock_small_max_keys_still_partitions_untruncated_listing() {
+    let keys: Vec<String> = (0..200).map(|i| format!("obj-{:04}", i)).collect();
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Structural discovery: flat, and the whole listing fits in the
+            // probe's default-sized page.
+            let all: Vec<&str> = all_keys.iter().map(String::as_str).collect();
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &all, &[], false, None));
+        }
+        // Offset-encoded continuation tokens; pages are --max-keys long.
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => all_keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = all_keys[start_idx..]
+            .iter()
+            .take(max_keys)
+            .map(String::as_str)
+            .collect();
+        let next_idx = start_idx + page.len();
+        let truncated = next_idx < all_keys.len();
+        let token = format!("off-{}", next_idx);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            max_keys as i32,
+            &page,
+            &[],
+            truncated,
+            truncated.then_some(token.as_str()),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--max-keys".into(),
+        "5".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.query.get("max-keys").map(String::as_str) == Some("1")),
+        "a run paginating at --max-keys 5 must still pre-partition, got {:?}",
+        requests
+    );
+}

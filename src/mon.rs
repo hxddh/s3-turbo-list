@@ -21,7 +21,7 @@ pub async fn mon_task(ctx: MonContext) {
             return;
         }
 
-        let tracker_stats = format!("{}", &*ctx.get_tracker());
+        let tracker_stats = format!("{}", *ctx.get_tracker());
         if !tracker_stats.is_empty() {
             info!("Mon Task — http status: {}", tracker_stats);
         } else {

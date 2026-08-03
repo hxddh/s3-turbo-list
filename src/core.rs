@@ -387,6 +387,7 @@ pub struct GlobalState {
     pub data_bytes_total: Arc<AtomicU64>,
     pub data_top_prefixes: Arc<Mutex<Vec<PrefixMetric>>>,
     pub data_summary_only: Arc<AtomicBool>,
+    pub data_output_files: Arc<AtomicUsize>,
     pub(crate) task_rendez: TaskRendezvous,
 }
 
@@ -413,6 +414,10 @@ pub struct RunMetricsSnapshot {
     pub data_bytes_total: u64,
     pub data_top_prefixes: Vec<PrefixMetric>,
     pub data_summary_only: bool,
+    /// Parquet output files this run wrote: 1 plus one per extra pooled
+    /// writer.  The manifest records exactly these, so a reused output path
+    /// cannot pick up part-files left by an earlier, wider run.
+    pub data_output_files: usize,
 }
 
 impl GlobalState {
@@ -435,6 +440,7 @@ impl GlobalState {
             data_bytes_total: Arc::new(AtomicU64::new(0)),
             data_top_prefixes: Arc::new(Mutex::new(Vec::new())),
             data_summary_only: Arc::new(AtomicBool::new(false)),
+            data_output_files: Arc::new(AtomicUsize::new(0)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
     }
@@ -475,6 +481,7 @@ impl GlobalState {
     pub fn read_output_error(&self) -> usize {
         self.output_error_count.load(Ordering::Relaxed)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn record_data_metrics(
         &self,
         received_batches: usize,
@@ -486,7 +493,10 @@ impl GlobalState {
         bytes_total: u64,
         top_prefixes: Vec<PrefixMetric>,
         summary_only: bool,
+        output_files: usize,
     ) {
+        self.data_output_files
+            .store(output_files, Ordering::Relaxed);
         self.data_received_batches
             .store(received_batches, Ordering::Relaxed);
         self.data_received_objects
@@ -519,6 +529,7 @@ impl GlobalState {
             data_bytes_total: self.data_bytes_total.load(Ordering::Relaxed),
             data_top_prefixes: self.data_top_prefixes.lock().unwrap().clone(),
             data_summary_only: self.data_summary_only.load(Ordering::Relaxed),
+            data_output_files: self.data_output_files.load(Ordering::Relaxed),
         }
     }
     pub fn get_tracker(&self) -> Arc<HttpStatusCodeTracker> {

@@ -900,12 +900,13 @@ fn main() {
             // concurrency. The boundaries land in the same cache below.
             let boundaries = if !discovery.boundaries.is_empty() {
                 discovery.boundaries
-            } else if !discovery.root_page_truncated {
+            } else if discovery.is_single_page_listing(cli.max_keys) {
                 // The discovery probe's page was not truncated and held no
-                // CommonPrefixes: the whole listing fits in one page. Bisecting
-                // it would cost several probes per cut to partition work the
-                // single segment finishes in one request, and would cache
-                // boundaries that pin that shape for later runs.
+                // CommonPrefixes, and this run's page size returns those keys
+                // in one request too: the whole listing is a single page.
+                // Bisecting it would cost several probes per cut to partition
+                // work the single segment finishes in one request, and would
+                // cache boundaries that pin that shape for later runs.
                 info!(
                     "Startup discovery found a single-page listing — using single-segment listing"
                 );
@@ -1321,6 +1322,9 @@ fn main() {
     rt.shutdown_background();
 
     let metrics = g_state.metrics_snapshot();
+    // Parquet outputs this run wrote (base plus one per extra pooled writer);
+    // read before the snapshot is folded into the manifest.
+    let output_files = metrics.data_output_files;
     let interrupted = interrupted.load(Ordering::SeqCst);
     let exit_code = if interrupted {
         agent::ExitCode::Interrupted
@@ -1361,7 +1365,7 @@ fn main() {
         command: agent::redacted_command_args(),
         inputs: command_input_summary(&cli, &cfg),
         artifacts: if manifest_emitted {
-            agent::collect_artifacts(&manifest_outputs)
+            agent::collect_artifacts(&manifest_outputs, output_files)
         } else {
             Vec::new()
         },
@@ -1403,7 +1407,7 @@ fn main() {
     } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
         // stdout is reserved for TSV/NDJSON rows.
     } else if exit_code == agent::ExitCode::Success {
-        print_wrote_summary(&manifest.outputs);
+        print_wrote_summary(&manifest.outputs, output_files);
     }
     if exit_code != agent::ExitCode::Success {
         std::process::exit(exit_code.code());
@@ -1790,11 +1794,11 @@ fn ensure_output_dir(cli: &Cli) {
     }
 }
 
-fn print_wrote_summary(outputs: &agent::OutputPathSummary) {
+fn print_wrote_summary(outputs: &agent::OutputPathSummary, output_files: usize) {
     println!("Wrote:");
     if let Some(path) = &outputs.parquet_file {
         println!("  Parquet: {}", path);
-        for part in agent::parquet_part_paths(path) {
+        for part in agent::parquet_part_paths(path, output_files) {
             println!("  Parquet: {}", part);
         }
     }
@@ -2973,7 +2977,7 @@ async fn diff_side_boundaries(
     .await;
     let boundaries = if !discovery.boundaries.is_empty() {
         discovery.boundaries
-    } else if !discovery.root_page_truncated {
+    } else if discovery.is_single_page_listing(cli.max_keys) {
         // Single-page side: nothing to partition, and the probes would cost
         // more requests than the listing.
         Vec::new()
