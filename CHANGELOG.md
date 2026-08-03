@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-03
+
 ### Fixed
 - **`--resume` verified only the number of key-space segments, not which
   segments they were.** Completed segments are recorded by index, so a
