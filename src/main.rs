@@ -920,21 +920,14 @@ fn main() {
         let ks_list = ks_list;
         let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
 
-        // Discard a resume journal whose segment count does not match the
-        // current hints — completed indices would otherwise skip the wrong
-        // segments and silently drop keys.
-        let checkpoint_journal = checkpoint_journal.filter(|cj| {
-            if cj.total_segments == original_hints_count {
-                return true;
-            }
-            log::warn!(
-                "Checkpoint segment count {} does not match current hints ({}) — \
-                 discarding checkpoint and starting fresh",
-                cj.total_segments,
-                original_hints_count
-            );
-            false
-        });
+        // Discard a resume journal whose segment set does not match the
+        // current hints — completed indices are positional, so a mismatch
+        // would skip the wrong segments and silently drop keys.
+        let checkpoint_journal =
+            checkpoint_journal.filter(|cj| cj.verify_segments(&ks_list, original_hints_count));
+        // The checkpoint records progress against *this* boundary set; the
+        // fingerprint is what a later --resume verifies it against.
+        let current_identity = current_identity.with_boundaries(&ks_list);
 
         // Filter out completed segments when resuming.
         let hints = if let Some(ref cj) = checkpoint_journal {

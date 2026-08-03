@@ -1607,9 +1607,13 @@ estimate_mode = "full"
 "#,
     )
     .unwrap();
+    // The identity carries the fingerprint of the boundary set the completed
+    // indices refer to (["m/"], the same set --hints-file supplies below);
+    // resume verifies it before trusting the indices.
     std::fs::write(
         &checkpoint,
-        r#"bucket = "mock-bucket"
+        format!(
+            r#"bucket = "mock-bucket"
 prefix = ""
 total_segments = 2
 completed_indices = [0]
@@ -1622,7 +1626,10 @@ prefix = ""
 delimiter = ""
 addressing_style = "path"
 mode = "list"
+boundaries_digest = "{}"
 "#,
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+        ),
     )
     .unwrap();
 
@@ -2849,4 +2856,107 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     let cache = std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml"))
         .expect("startup hints cache written");
     assert!(cache.contains("boundaries"), "{}", cache);
+}
+
+// ── Resume boundary verification ────────────────────────────
+//
+// Completed segment indices are positional. A checkpoint carried over to a
+// different boundary set with the same segment count (the normal outcome of
+// re-deriving flat-namespace boundaries against a bucket that took writes)
+// used to be accepted, marking ranges complete that were never listed — the
+// run then exited 0 with those keys silently missing from the output.
+#[test]
+fn local_mock_resume_rejects_same_count_different_boundaries() {
+    let keys = ["a-first.txt", "n-middle.txt", "z-last.txt"];
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    let parquet = dir.path().join("resume.parquet");
+    let ks = dir.path().join("resume.ks");
+    write_fast_config(&config);
+    // This run partitions at "n/" ...
+    std::fs::write(
+        &hints,
+        r#"bucket = "mock-bucket"
+region = "us-east-1"
+boundaries = ["n/"]
+generated_at = "2026-05-17T00:00:00Z"
+"#,
+    )
+    .unwrap();
+    // ... but the checkpoint recorded segment 0 complete against "m/": same
+    // two segments, different ranges.
+    std::fs::write(
+        &checkpoint,
+        format!(
+            r#"bucket = "mock-bucket"
+prefix = ""
+total_segments = 2
+completed_indices = [0]
+last_updated = "2026-05-17T00:00:00Z"
+
+[identity]
+bucket = "mock-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = ""
+addressing_style = "path"
+mode = "list"
+boundaries_digest = "{}"
+"#,
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+        ),
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("discarding checkpoint and starting fresh"),
+        "expected the mismatched checkpoint to be discarded: {}",
+        stderr
+    );
+
+    // Nothing was skipped: the whole key space is in the output.
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(
+        listed,
+        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
+    );
 }
