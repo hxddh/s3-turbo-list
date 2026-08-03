@@ -1909,3 +1909,24 @@ fn test_cli_trace_summary_removed() {
         stderr
     );
 }
+
+#[test]
+fn test_cli_rejects_unknown_addressing_style() {
+    // A typo used to be dropped silently, leaving the run on whatever the
+    // config resolved to while looking like the flag had been applied.
+    let (code, stdout, stderr) = run_cli(&["--addressing-style", "bogus", "doctor"]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("path, virtual, auto"),
+        "expected the accepted values in the error: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_cli_accepts_known_addressing_styles() {
+    for style in ["path", "virtual", "auto"] {
+        let (code, stdout, stderr) = run_cli(&["--addressing-style", style, "doctor"]);
+        assert_eq!(code, 0, "{}: stdout: {}\nstderr: {}", style, stdout, stderr);
+    }
+}

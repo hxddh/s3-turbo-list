@@ -177,3 +177,88 @@ fn test_checkpoint_path_format() {
     let path_without_region = checkpoint::checkpoint_path("my-bucket", None);
     assert_eq!(path_without_region, "my-bucket_checkpoint.toml");
 }
+
+// ── Boundary-set verification ─────────────────────────────
+//
+// Completed segment indices are positional: carrying a checkpoint over to a
+// different boundary set marks ranges complete that were never listed.  The
+// segment count alone does not catch it — flat-namespace bisection always
+// produces exactly `target` boundaries, so two runs of a bucket that took
+// writes in between agree on the count and disagree on every boundary.
+
+fn journal_for(boundaries: &[String], completed: Vec<usize>) -> CheckpointJournal {
+    let identity =
+        make_identity(Some(""), None, None, Some("path"), Some("list")).with_boundaries(boundaries);
+    CheckpointJournal {
+        bucket: "test-bucket".into(),
+        prefix: "".into(),
+        total_segments: boundaries.len() + 1,
+        completed_indices: completed,
+        last_updated: String::new(),
+        identity: Some(identity),
+    }
+}
+
+fn boundaries(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| v.to_string()).collect()
+}
+
+#[test]
+fn test_same_boundaries_resume_accepted() {
+    let current = boundaries(&["obj-0050", "obj-0100", "obj-0150"]);
+    let journal = journal_for(&current, vec![0, 2]);
+    assert!(journal.verify_segments(&current, current.len() + 1));
+}
+
+#[test]
+fn test_same_count_different_boundaries_rejected() {
+    let recorded = boundaries(&["obj-0050", "obj-0100", "obj-0150"]);
+    let journal = journal_for(&recorded, vec![0, 2]);
+    // Same segment count, every boundary shifted — the old count-only guard
+    // accepted this and silently skipped whatever indices 0 and 2 now cover.
+    let current = boundaries(&["obj-0060", "obj-0120", "obj-0180"]);
+    assert_eq!(recorded.len(), current.len());
+    assert!(!journal.verify_segments(&current, current.len() + 1));
+}
+
+#[test]
+fn test_segment_count_mismatch_still_rejected() {
+    let recorded = boundaries(&["a/", "b/"]);
+    let journal = journal_for(&recorded, vec![0]);
+    let current = boundaries(&["a/", "b/", "c/"]);
+    assert!(!journal.verify_segments(&current, current.len() + 1));
+}
+
+#[test]
+fn test_checkpoint_without_boundary_digest_rejected() {
+    // Written by a version that recorded no fingerprint: the boundary set it
+    // resumed against cannot be verified, so it is discarded.
+    let current = boundaries(&["a/", "b/"]);
+    let identity = make_identity(Some(""), None, None, Some("path"), Some("list"));
+    let journal = CheckpointJournal {
+        bucket: "test-bucket".into(),
+        prefix: "".into(),
+        total_segments: current.len() + 1,
+        completed_indices: vec![0],
+        last_updated: String::new(),
+        identity: Some(identity),
+    };
+    assert!(!journal.verify_segments(&current, current.len() + 1));
+}
+
+#[test]
+fn test_boundaries_digest_is_order_and_separator_sensitive() {
+    // "ab" + "c" must not collide with "a" + "bc".
+    assert_ne!(
+        checkpoint::boundaries_digest(&boundaries(&["ab", "c"])),
+        checkpoint::boundaries_digest(&boundaries(&["a", "bc"]))
+    );
+    assert_ne!(
+        checkpoint::boundaries_digest(&boundaries(&["a", "b"])),
+        checkpoint::boundaries_digest(&boundaries(&["b", "a"]))
+    );
+    assert_eq!(
+        checkpoint::boundaries_digest(&boundaries(&["a", "b"])),
+        checkpoint::boundaries_digest(&boundaries(&["a", "b"]))
+    );
+}

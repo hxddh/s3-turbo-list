@@ -142,7 +142,7 @@ fn test_create_trace_writer_with_file() {
     let path = dir.path().join("trace.jsonl");
     let path_str = path.to_str().unwrap();
 
-    let w = create_trace_writer(Some(path_str), false);
+    let w = create_trace_writer(Some(path_str), false).unwrap();
 
     w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
 
@@ -160,7 +160,7 @@ fn test_create_trace_writer_debug_s3_combo() {
     let path = dir.path().join("trace.jsonl");
     let path_str = path.to_str().unwrap();
 
-    let w = create_trace_writer(Some(path_str), true);
+    let w = create_trace_writer(Some(path_str), true).unwrap();
     w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
     // No panic = success.
 }

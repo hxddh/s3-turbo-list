@@ -381,6 +381,35 @@ pub fn conventional_hints_path(bucket: &str, region: Option<&str>) -> String {
     }
 }
 
+/// Conventional hints cache path for a run listing under `prefix`.
+///
+/// Boundaries only partition the range the run actually lists, so a cache
+/// generated under one prefix is useless (and badly skewed) for another:
+/// every boundary sorts outside the other prefix's range, leaving one segment
+/// with all the keys and the rest issuing empty requests. Prefixed runs
+/// therefore get their own cache file. A whole-bucket run keeps the plain
+/// path, so existing caches stay valid.
+pub fn conventional_hints_path_for_prefix(
+    bucket: &str,
+    region: Option<&str>,
+    prefix: &str,
+) -> String {
+    if prefix.is_empty() {
+        return conventional_hints_path(bucket, region);
+    }
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+    let bucket = sanitize_path_component(bucket);
+    match region {
+        Some(r) => format!(
+            "{}_{}_{}_hints.toml",
+            sanitize_path_component(r),
+            bucket,
+            &digest[..8]
+        ),
+        None => format!("{}_{}_hints.toml", bucket, &digest[..8]),
+    }
+}
+
 pub fn sanitize_path_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -403,6 +432,7 @@ pub fn detect_hints_plan(
     explicit_hints_file: Option<&str>,
     bucket: Option<&str>,
     region: Option<&str>,
+    prefix: &str,
     no_auto_hints: bool,
 ) -> HintsPlan {
     if let Some(path) = explicit_hints_file {
@@ -435,7 +465,7 @@ pub fn detect_hints_plan(
     }
 
     if let Some(bucket) = bucket {
-        let path = conventional_hints_path(bucket, region);
+        let path = conventional_hints_path_for_prefix(bucket, region, prefix);
         let exists = Path::new(&path).exists();
         let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
         return HintsPlan {
@@ -473,8 +503,12 @@ pub fn detect_hints_plan(
     }
 }
 
-pub fn diff_per_side_hints_plan(bucket: Option<&str>, region: Option<&str>) -> HintsPlan {
-    let path = bucket.map(|bucket| conventional_hints_path(bucket, region));
+pub fn diff_per_side_hints_plan(
+    bucket: Option<&str>,
+    region: Option<&str>,
+    prefix: &str,
+) -> HintsPlan {
+    let path = bucket.map(|bucket| conventional_hints_path_for_prefix(bucket, region, prefix));
     let exists = path
         .as_deref()
         .map(|path| Path::new(path).exists())
@@ -597,10 +631,30 @@ fn parent_writable(path: PathBuf) -> Option<bool> {
     Some(!metadata.permissions().readonly())
 }
 
-pub fn collect_artifacts(outputs: &OutputPathSummary) -> Vec<ArtifactSummary> {
+/// The `.partN` paths a pooled list run's extra writers streamed to, given the
+/// number of output files the run reported writing (base plus one per extra
+/// writer).  Derived from the run's own writer count rather than from what is
+/// on disk: an explicit output path reused after a wider run still has that
+/// run's higher-numbered parts sitting next to it, and reporting those as this
+/// run's output would let verification pass over objects from an earlier
+/// listing.
+pub fn parquet_part_paths(base: &str, output_files: usize) -> Vec<String> {
+    (1..output_files.min(crate::data_map::MAX_LIST_OUTPUT_WORKERS))
+        .map(|index| crate::data_map::part_path(base, index))
+        .collect()
+}
+
+pub fn collect_artifacts(outputs: &OutputPathSummary, output_files: usize) -> Vec<ArtifactSummary> {
     let mut artifacts = Vec::new();
     if let Some(path) = &outputs.parquet_file {
         artifacts.push(summarize_artifact("parquet", path));
+        // A pooled list run scales to several writers, each with its own
+        // part-file. Recording only the base path left most of the output
+        // unlisted and unverifiable, and made the manifest's own
+        // artifact row count disagree with metrics.parquet_rows.
+        for part in parquet_part_paths(path, output_files) {
+            artifacts.push(summarize_artifact("parquet", &part));
+        }
     }
     if let Some(path) = &outputs.ks_file {
         artifacts.push(summarize_artifact("ks", path));
@@ -900,7 +954,123 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_command_args;
+    use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
+
+    fn parquet_outputs(base: &str) -> super::OutputPathSummary {
+        super::OutputPathSummary {
+            parquet_file: Some(base.to_string()),
+            ks_file: None,
+            hints_file: None,
+            trace_compat: None,
+            log_file: None,
+        }
+    }
+
+    #[test]
+    fn manifest_enumerates_every_parquet_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        let base_str = base.to_str().unwrap().to_string();
+        for name in ["out.parquet", "out.part1.parquet", "out.part2.parquet"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        // Three writers: the base file plus two parts.
+        let parts = super::parquet_part_paths(&base_str, 3);
+        assert_eq!(parts.len(), 2, "{:?}", parts);
+        assert!(parts[0].ends_with("out.part1.parquet"));
+        assert!(parts[1].ends_with("out.part2.parquet"));
+
+        let artifacts = super::collect_artifacts(&parquet_outputs(&base_str), 3);
+        assert_eq!(artifacts.len(), 3, "{:?}", artifacts);
+        assert!(artifacts.iter().all(|a| a.kind == "parquet" && a.exists));
+        assert!(artifacts.iter().all(|a| a.sha256.is_some()));
+    }
+
+    #[test]
+    fn manifest_ignores_part_files_this_run_did_not_write() {
+        // An explicit output path reused after a wider run: the old run's
+        // higher-numbered parts are still on disk, holding objects from an
+        // earlier listing. Only what this run wrote may be reported.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        let base_str = base.to_str().unwrap().to_string();
+        for name in [
+            "out.parquet",
+            "out.part1.parquet",
+            "out.part2.parquet",
+            "out.part3.parquet",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        let artifacts = super::collect_artifacts(&parquet_outputs(&base_str), 2);
+        assert_eq!(artifacts.len(), 2, "{:?}", artifacts);
+        assert!(artifacts[1].path.ends_with("out.part1.parquet"));
+    }
+
+    #[test]
+    fn manifest_parquet_artifacts_are_just_the_base_file_without_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("out.parquet");
+        std::fs::write(&base, b"x").unwrap();
+        let base_str = base.to_str().unwrap().to_string();
+        // One writer, and the degenerate "nothing recorded" case (a run that
+        // failed before the data map reported): base file only either way.
+        assert_eq!(
+            super::collect_artifacts(&parquet_outputs(&base_str), 1).len(),
+            1
+        );
+        assert_eq!(
+            super::collect_artifacts(&parquet_outputs(&base_str), 0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn parquet_part_paths_stay_within_the_writer_cap() {
+        // Indices run 0..=cap-1, so the highest part is cap-1 — never `.part32`
+        // with a 32-writer cap.
+        let parts = super::parquet_part_paths("out.parquet", 10_000);
+        assert_eq!(
+            parts.len(),
+            super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
+        );
+        assert!(parts.last().unwrap().ends_with(&format!(
+            "out.part{}.parquet",
+            super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
+        )));
+    }
+
+    #[test]
+    fn hints_cache_path_is_scoped_to_the_listing_prefix() {
+        // A whole-bucket run keeps the historical path, so caches written by
+        // earlier versions stay valid.
+        assert_eq!(
+            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), ""),
+            conventional_hints_path("my-bucket", Some("us-east-1"))
+        );
+        // Prefixed runs get their own file: boundaries under one prefix sort
+        // outside every other prefix's range.
+        let logs = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/");
+        let data = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "data/");
+        assert_ne!(
+            logs,
+            conventional_hints_path("my-bucket", Some("us-east-1"))
+        );
+        assert_ne!(logs, data);
+        assert!(logs.starts_with("us-east-1_my-bucket_"), "{}", logs);
+        assert!(logs.ends_with("_hints.toml"), "{}", logs);
+        // Stable across calls, and defined without a region too.
+        assert_eq!(
+            logs,
+            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/")
+        );
+        assert_ne!(
+            conventional_hints_path_for_prefix("my-bucket", None, "logs/"),
+            conventional_hints_path("my-bucket", None)
+        );
+    }
 
     #[test]
     fn redacts_sensitive_command_values() {

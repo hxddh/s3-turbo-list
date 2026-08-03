@@ -226,6 +226,12 @@ The `artifacts` array describes generated files:
 - `parquet.row_count`, `parquet.row_group_count`, and `parquet.schema_fields`
   for Parquet outputs
 
+A pooled list run scales to several Parquet writers, each streaming its own
+part-file, so the array can hold more than one `parquet` entry: the base path
+plus `<name>.partN.parquet` for each extra writer.  Read all of them — each
+carries its own `sha256` and `row_count`, and `metrics.parquet_rows` is the
+total across the set.
+
 ## Stable exit codes
 
 | Code | Meaning |
@@ -240,6 +246,13 @@ The `artifacts` array describes generated files:
 | 7 | Interrupted; checkpoint may be available |
 
 Agents should branch on exit codes first, then read `run.json` if it exists.
+
+A non-zero exit means the output artifacts are not trustworthy, even when they
+exist and parse.  A run that failed mid-listing (exit 4) leaves a structurally
+valid Parquet file holding only the keys it got to, and in `diff` mode a side
+that failed is merged as if it had ended, so the remaining keys of the other
+side are classified as present-on-one-side.  Only treat outputs as complete on
+exit 0.
 
 ## S3 API trace
 

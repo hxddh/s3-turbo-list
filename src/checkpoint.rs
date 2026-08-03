@@ -22,6 +22,11 @@ pub struct CheckpointIdentity {
     pub addressing_style: Option<String>,
     #[serde(default)]
     pub mode: Option<String>, // "list" or "bidir"
+    /// Fingerprint of the key-space boundary set the checkpoint's segment
+    /// indices refer to.  Absent in checkpoints written before boundary
+    /// verification existed.
+    #[serde(default)]
+    pub boundaries_digest: Option<String>,
 }
 
 impl CheckpointIdentity {
@@ -45,7 +50,16 @@ impl CheckpointIdentity {
             profile: profile.map(|p| p.to_string()),
             addressing_style: addressing_style.map(|a| a.to_string()),
             mode: mode.map(|m| m.to_string()),
+            boundaries_digest: None,
         }
+    }
+
+    /// Attach the fingerprint of the boundary set this run is partitioned by.
+    /// Resolved after the identity is built, because hints resolution needs
+    /// the identity-verified checkpoint first.
+    pub fn with_boundaries(mut self, boundaries: &[String]) -> Self {
+        self.boundaries_digest = Some(boundaries_digest(boundaries));
+        self
     }
 
     /// Compare the checkpoint identity against the current run's identity.
@@ -172,6 +186,50 @@ impl CheckpointJournal {
         Some(journal)
     }
 
+    /// Verify that this checkpoint's completed segment indices still describe
+    /// the boundary set the current run resolved.  Completed indices are
+    /// positional, so a checkpoint carried over to a *different* boundary set
+    /// would mark ranges complete that were never listed — silently dropping
+    /// keys from the output.  The segment count alone does not catch this:
+    /// flat-namespace bisection always produces exactly `target` boundaries,
+    /// so two runs of a bucket that took writes in between agree on the count
+    /// while disagreeing on every boundary.
+    pub fn verify_segments(&self, boundaries: &[String], total_segments: usize) -> bool {
+        if self.total_segments != total_segments {
+            warn!(
+                "Checkpoint segment count {} does not match current hints ({}) — \
+                 discarding checkpoint and starting fresh",
+                self.total_segments, total_segments
+            );
+            return false;
+        }
+
+        let current = boundaries_digest(boundaries);
+        match self.identity.as_ref().and_then(|id| {
+            id.boundaries_digest
+                .as_deref()
+                .filter(|digest| !digest.is_empty())
+        }) {
+            Some(stored) if stored == current => true,
+            Some(_) => {
+                warn!(
+                    "Checkpoint key-space boundaries differ from this run's ({} segments either \
+                     way) — resuming would mark ranges complete that were never listed; \
+                     discarding checkpoint and starting fresh",
+                    total_segments
+                );
+                false
+            }
+            None => {
+                warn!(
+                    "Checkpoint has no key-space boundary fingerprint (written by an older \
+                     version) — discarding checkpoint and starting fresh"
+                );
+                false
+            }
+        }
+    }
+
     /// Write the current checkpoint state.
     pub fn save(&self, path: &str) {
         let toml_str = toml::to_string_pretty(self).expect("Failed to serialize checkpoint");
@@ -179,6 +237,18 @@ impl CheckpointJournal {
             log::warn!("Failed to write checkpoint {}: {}", path, e);
         }
     }
+}
+
+/// Fingerprint of a key-space boundary set.  Boundaries are separated by a
+/// NUL byte so no concatenation of different boundaries can collide.
+pub fn boundaries_digest(boundaries: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for boundary in boundaries {
+        hasher.update(boundary.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Generate the checkpoint file path for a given bucket.

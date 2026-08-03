@@ -58,7 +58,7 @@ const INITIAL_LIST_WORKERS: usize = 1;
 
 /// Hard cap on output workers regardless of core count (bounds part-file count
 /// on very large machines).
-const MAX_LIST_OUTPUT_WORKERS: usize = 32;
+pub const MAX_LIST_OUTPUT_WORKERS: usize = 32;
 
 /// Window over which the coordinator judges output saturation before adding a
 /// writer. Short enough to ramp quickly on a fast store, long enough to ignore
@@ -149,12 +149,13 @@ async fn drain_buffered_batches(
     true
 }
 
-/// Derive the output path for a given part index.
+/// Derive the output path for a given part index.  Public so the run
+/// manifest can enumerate the part-files a pooled run wrote.
 ///
 /// Index 0 returns `base` unchanged. For index > 0, `.partN` is inserted before
 /// the final extension of the basename (e.g. `out/a_ts.parquet` + 2 ->
 /// `out/a_ts.part2.parquet`); if the basename has no extension, `.partN` is appended.
-fn part_path(base: &str, index: usize) -> String {
+pub fn part_path(base: &str, index: usize) -> String {
     if index == 0 {
         return base.to_string();
     }
@@ -461,6 +462,10 @@ async fn coordinator_finalize(
     };
     let mut parquet_rows: usize = 0;
     let mut output_ok = true;
+    // One output file per writer: the base path plus one `.partN` each. The
+    // manifest records exactly these, so a reused output path cannot pick up
+    // part-files left behind by an earlier, wider run.
+    let output_files = handles.len();
 
     for handle in handles {
         match handle.await {
@@ -510,6 +515,7 @@ async fn coordinator_finalize(
         merged_stats.bytes_total,
         top_prefixes(&merged_prefix_stats, 32),
         false,
+        output_files,
     );
     info!(
         "Data Map Task — list streaming complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",
@@ -928,6 +934,7 @@ async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
         stats.bytes_total,
         top_prefixes(prefix_stats, 32),
         false,
+        0,
     );
     info!(
         "Data Map Task — list stdout complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, bytes {}, elapsed {:.3}s, {:.0} objects/sec",
@@ -958,6 +965,7 @@ fn finalize_list_summary_only(
         stats.bytes_total,
         top_prefixes(prefix_stats, 32),
         true,
+        0,
     );
     info!(
         "Data Map Task — list summary-only complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, bytes {}, elapsed {:.3}s, {:.0} objects/sec",
@@ -1466,6 +1474,7 @@ pub async fn data_map_task_diff_streaming(
             outcome.bytes_total,
             top_prefixes(&outcome.prefix_stats, 32),
             false,
+            1,
         );
         info!(
             "Data Map Task — diff streaming complete: rows {} (+{} -{} *{} ={} ignored {}), received objects {}, unique prefixes {}, elapsed {:.3}s, {:.0} objects/sec",

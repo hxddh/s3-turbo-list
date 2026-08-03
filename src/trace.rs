@@ -238,32 +238,38 @@ impl S3TraceWriter for NoopTraceWriter {
 
 /// Create a unified trace writer that combines file and/or stderr outputs.
 /// Returns a single [`Box<dyn S3TraceWriter>`] that fans events to all
-/// enabled outputs.  Panics if file creation fails.
-pub fn create_trace_writer(trace_compat: Option<&str>, debug_s3: bool) -> Box<dyn S3TraceWriter> {
-    create_trace_writer_opt(trace_compat, debug_s3).unwrap_or_else(|| Box::new(NoopTraceWriter))
+/// enabled outputs, or the error from creating the trace file.
+pub fn create_trace_writer(
+    trace_compat: Option<&str>,
+    debug_s3: bool,
+) -> Result<Box<dyn S3TraceWriter>, String> {
+    Ok(create_trace_writer_opt(trace_compat, debug_s3)?
+        .unwrap_or_else(|| Box::new(NoopTraceWriter)))
 }
 
+/// An unwritable `--trace-compat` path is an output failure the caller
+/// reports through the documented exit codes, not a panic.
 pub fn create_trace_writer_opt(
     trace_compat: Option<&str>,
     debug_s3: bool,
-) -> Option<Box<dyn S3TraceWriter>> {
+) -> Result<Option<Box<dyn S3TraceWriter>>, String> {
     let mut composite = CompositeTraceWriter::new();
 
     if let Some(path) = trace_compat {
-        composite.push(Box::new(
-            JsonlTraceWriter::new(path).expect("failed to create trace-compat file"),
-        ));
+        let writer = JsonlTraceWriter::new(path)
+            .map_err(|e| format!("Failed to create trace-compat file '{}': {}", path, e))?;
+        composite.push(Box::new(writer));
     }
 
     if debug_s3 {
         composite.push(Box::new(StderrTraceWriter));
     }
 
-    if composite.is_empty() {
+    Ok(if composite.is_empty() {
         None
     } else {
         Some(Box::new(composite))
-    }
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -371,21 +377,33 @@ mod tests {
     #[test]
     fn test_create_trace_writer_combinations() {
         // No tracing
-        let w = create_trace_writer(None, false);
+        let w = create_trace_writer(None, false).unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         // just should not panic
-        assert!(create_trace_writer_opt(None, false).is_none());
+        assert!(create_trace_writer_opt(None, false).unwrap().is_none());
 
         // File only
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.jsonl");
         let p_str = p.to_str().unwrap();
-        let w = create_trace_writer(Some(p_str), false);
+        let w = create_trace_writer(Some(p_str), false).unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         assert!(std::fs::read_to_string(p_str)
             .unwrap()
             .contains("\"operation\":\"X\""));
-        assert!(create_trace_writer_opt(Some(p_str), false).is_some());
+        assert!(create_trace_writer_opt(Some(p_str), false)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_create_trace_writer_unwritable_path_is_an_error_not_a_panic() {
+        let result = create_trace_writer_opt(Some("/nonexistent-dir/trace.jsonl"), false);
+        let err = match result {
+            Ok(_) => panic!("an unwritable trace path must surface as an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("trace-compat"), "{}", err);
     }
 
     #[test]
@@ -418,7 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.jsonl");
         let p_str = p.to_str().unwrap();
-        let w = create_trace_writer(Some(p_str), true);
+        let w = create_trace_writer(Some(p_str), true).unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         assert!(std::fs::read_to_string(p_str)
             .unwrap()

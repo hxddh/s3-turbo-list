@@ -12,21 +12,32 @@ enough segment boundaries to keep workers busy.
 Where boundaries come from, in precedence order:
 
 1. **Explicit `--hints-file`** — full control for repeated inventories.
-2. **Cached hints** at the conventional path
-   (`<region>_<bucket>_hints.toml`), written by startup discovery on a
-   previous run.
+2. **Cached hints** at the conventional path, written by startup discovery on
+   a previous run: `<region>_<bucket>_hints.toml` for a whole-bucket run, or
+   `<region>_<bucket>_<prefix-hash>_hints.toml` when `--prefix` is set.
+   Boundaries only partition the range a run lists, so a cache generated
+   under one prefix is never reused for another (it is ignored with a
+   warning if found at the whole-bucket path).
 3. **Startup structural discovery** (recursive list runs — the default;
-   hierarchical `--delimiter '/'` runs skip it) —
-   a bounded set of delimiter probes (one ListObjectsV2 page each, at most
-   3 levels deep) finds real `CommonPrefixes` boundaries at run start and
-   caches them at the conventional path.  Costs at most a second or two of
+   hierarchical `--delimiter '/'` runs skip it, and so does the cache
+   lookup) — a bounded set of delimiter probes (one ListObjectsV2 page each,
+   at most 3 levels deep) finds real `CommonPrefixes` boundaries at run start
+   and caches them at the conventional path.  Costs at most a second or two of
    startup; first runs list in parallel with no prior steps.
-4. **Single segment** — flat namespaces with no `/` structure, and runs
-   with `--no-auto-hints`, `--start-after`, or `--continuation-token`.
+4. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
+   namespace) and the listing spans more than one page, the key range is
+   partitioned up front by single-key `max-keys=1` probes, each cut costing
+   up to four probes.  The boundaries are real observed keys and are cached
+   like structural ones.  List mode targets one boundary per worker, since
+   runtime splitting still covers mid-run skew.
+5. **Single segment** — listings that fit in one page (nothing to partition,
+   and probing would cost more requests than the listing), and runs with
+   `--no-auto-hints`, `--start-after`, `--continuation-token`, or
+   `--delimiter`.
 
-`diff` partitions each side the same way (cached hints or startup discovery),
-and a flat side with no `CommonPrefixes` is partitioned up front by a single-key
-bisection so it lists in parallel too. Each side lists its segments
+`diff` partitions each side the same way (cached hints, startup discovery, or
+bisection); because diff has no runtime splitting to fall back on, its
+bisection targets at least eight boundaries. Each side lists its segments
 concurrently; the segment set stays static (no runtime splitting) so the merge
 can consume segments in key order.
 
@@ -38,9 +49,9 @@ range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
 candidate cuts are derived from the segment's cursor and validated with
 single-key probes, so the boundary is always a real observed key.  The reactor
 probes the busiest long-tail segments as soon as slots are idle (not on a fixed
-once-per-second tick) and fans out several at once, so a flat namespace — where
-this is the only fan-out mechanism — ramps in a few page round-trips rather than
-one segment per second.  Fan-out is **throughput-aware**: the reactor watches
+once-per-second tick) and fans out several at once, so a flat namespace whose
+startup bisection under-partitioned it ramps in a few page round-trips rather
+than one segment per second.  Fan-out is **throughput-aware**: the reactor watches
 run-wide page throughput and only keeps splitting while added concurrency is
 still raising it, so a single bucket at its request-rate ceiling (see below) is
 not oversubscribed past the point where more in-flight segments only add
@@ -73,7 +84,8 @@ beta/
 logs/
 ```
 
-**TOML** (written by startup discovery):
+**TOML** (written by startup discovery; `prefix` records the range the
+boundaries partition and is verified on load):
 
 ```toml
 bucket = "my-bucket"

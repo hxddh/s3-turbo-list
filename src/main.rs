@@ -467,6 +467,7 @@ fn main() {
             std::process::exit(agent::ExitCode::CliConfig.code());
         });
 
+    validate_addressing_style_command(&cli);
     cfg.apply_cli_overrides(
         cli.threads,
         cli.concurrency,
@@ -633,12 +634,20 @@ fn main() {
             cfg.output.log_file.clone().unwrap_or_else(|| {
                 format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"))
             });
-        let logfile = std::fs::OpenOptions::new()
+        let logfile = match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(logfile_s)
-            .expect("unable to open log file");
+            .open(&logfile_s)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                // An unwritable log path is an output failure, reported
+                // through the documented exit codes like every other one.
+                eprintln!("Failed to open log file '{}': {}", logfile_s, e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            }
+        };
         env_logger::Builder::new()
             .parse_filters(&loglevel)
             .target(env_logger::Target::Pipe(Box::new(logfile)))
@@ -821,8 +830,13 @@ fn main() {
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
         let trace_writer: Option<Arc<dyn S3TraceWriter>> =
-            trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3)
-                .map(Arc::from);
+            match trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3) {
+                Ok(writer) => writer.map(Arc::from),
+                Err(e) => {
+                    error!("{}", e);
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            };
 
         // ── Load or generate KeySpace hints ─────────────────
         let hints_disabled_for_diff = mode == RunMode::BiDir;
@@ -840,6 +854,8 @@ fn main() {
                 cli.hints_file.as_deref(),
                 opt_bucket,
                 opt_region,
+                &opt_prefix,
+                &cli.delimiter,
                 cli.no_auto_hints || hints_disabled_for_diff,
                 hints_disabled_for_diff,
             )
@@ -868,11 +884,12 @@ fn main() {
                 cfg.s3.force_path_style,
             );
             let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
-            let boundaries = auto_hints::discover_startup_boundaries(
+            let discovery = auto_hints::discover_startup_boundaries(
                 &probe_client,
                 opt_bucket,
                 &opt_prefix,
                 target_boundaries,
+                cfg.s3.operation_timeout_secs,
             )
             .await;
             // Flat namespace: no CommonPrefix structure, which previously
@@ -881,18 +898,32 @@ fn main() {
             // Bisect the key range with single-key probes instead — the same
             // partitioner diff sides use — so the first run starts at full
             // concurrency. The boundaries land in the same cache below.
-            let boundaries = if boundaries.is_empty() {
+            let boundaries = if !discovery.boundaries.is_empty() {
+                discovery.boundaries
+            } else if discovery.is_single_page_listing(cli.max_keys) {
+                // The discovery probe's page was not truncated and held no
+                // CommonPrefixes, and this run's page size returns those keys
+                // in one request too: the whole listing is a single page.
+                // Bisecting it would cost several probes per cut to partition
+                // work the single segment finishes in one request, and would
+                // cache boundaries that pin that shape for later runs.
+                info!(
+                    "Startup discovery found a single-page listing — using single-segment listing"
+                );
+                Vec::new()
+            } else {
                 info!("Startup discovery found no prefix structure — bisecting flat key space");
-                let flat_target = concurrency.clamp(8, 64);
+                // Runtime splitting still covers this run, so one boundary per
+                // worker is enough; spare boundaries would only cost probes.
+                let flat_target = concurrency.clamp(1, 64);
                 discover_flat_boundaries_via_client(
                     &probe_client,
                     opt_bucket,
                     &opt_prefix,
                     flat_target,
+                    cfg.s3.operation_timeout_secs,
                 )
                 .await
-            } else {
-                boundaries
             };
             if boundaries.is_empty() {
                 info!(
@@ -920,21 +951,14 @@ fn main() {
         let ks_list = ks_list;
         let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
 
-        // Discard a resume journal whose segment count does not match the
-        // current hints — completed indices would otherwise skip the wrong
-        // segments and silently drop keys.
-        let checkpoint_journal = checkpoint_journal.filter(|cj| {
-            if cj.total_segments == original_hints_count {
-                return true;
-            }
-            log::warn!(
-                "Checkpoint segment count {} does not match current hints ({}) — \
-                 discarding checkpoint and starting fresh",
-                cj.total_segments,
-                original_hints_count
-            );
-            false
-        });
+        // Discard a resume journal whose segment set does not match the
+        // current hints — completed indices are positional, so a mismatch
+        // would skip the wrong segments and silently drop keys.
+        let checkpoint_journal =
+            checkpoint_journal.filter(|cj| cj.verify_segments(&ks_list, original_hints_count));
+        // The checkpoint records progress against *this* boundary set; the
+        // fingerprint is what a later --resume verifies it against.
+        let current_identity = current_identity.with_boundaries(&ks_list);
 
         // Filter out completed segments when resuming.
         let hints = if let Some(ref cj) = checkpoint_journal {
@@ -1298,6 +1322,9 @@ fn main() {
     rt.shutdown_background();
 
     let metrics = g_state.metrics_snapshot();
+    // Parquet outputs this run wrote (base plus one per extra pooled writer);
+    // read before the snapshot is folded into the manifest.
+    let output_files = metrics.data_output_files;
     let interrupted = interrupted.load(Ordering::SeqCst);
     let exit_code = if interrupted {
         agent::ExitCode::Interrupted
@@ -1338,7 +1365,7 @@ fn main() {
         command: agent::redacted_command_args(),
         inputs: command_input_summary(&cli, &cfg),
         artifacts: if manifest_emitted {
-            agent::collect_artifacts(&manifest_outputs)
+            agent::collect_artifacts(&manifest_outputs, output_files)
         } else {
             Vec::new()
         },
@@ -1380,7 +1407,7 @@ fn main() {
     } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
         // stdout is reserved for TSV/NDJSON rows.
     } else if exit_code == agent::ExitCode::Success {
-        print_wrote_summary(&manifest.outputs);
+        print_wrote_summary(&manifest.outputs, output_files);
     }
     if exit_code != agent::ExitCode::Success {
         std::process::exit(exit_code.code());
@@ -1535,6 +1562,32 @@ fn validate_output_format_command(cli: &Cli) {
     }
 }
 
+/// An unparseable `--addressing-style` used to be dropped silently, leaving
+/// the run on whatever the config resolved to — a typo then looked like it
+/// had been applied.
+fn validate_addressing_style_command(cli: &Cli) {
+    let Some(style) = cli.addressing_style.as_deref() else {
+        return;
+    };
+    if style.parse::<config::AddressingStyle>().is_err() {
+        eprintln!(
+            "--addressing-style '{}' is not one of: path, virtual, auto",
+            style
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
+/// The prefix the run lists under, with the `/` "whole bucket" spelling
+/// normalized away — the same normalization the run itself applies.
+fn listing_prefix(cli: &Cli) -> String {
+    if cli.prefix == "/" {
+        String::new()
+    } else {
+        cli.prefix.clone()
+    }
+}
+
 fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
     let Some(token) = cli.continuation_token.as_deref() else {
         return;
@@ -1562,7 +1615,11 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if !cli.no_auto_hints {
-        let hints_path = agent::conventional_hints_path(bucket, region.as_deref());
+        let hints_path = agent::conventional_hints_path_for_prefix(
+            bucket,
+            region.as_deref(),
+            &listing_prefix(cli),
+        );
         if std::path::Path::new(&hints_path).exists() {
             eprintln!(
                 "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
@@ -1737,10 +1794,13 @@ fn ensure_output_dir(cli: &Cli) {
     }
 }
 
-fn print_wrote_summary(outputs: &agent::OutputPathSummary) {
+fn print_wrote_summary(outputs: &agent::OutputPathSummary, output_files: usize) {
     println!("Wrote:");
     if let Some(path) = &outputs.parquet_file {
         println!("  Parquet: {}", path);
+        for part in agent::parquet_part_paths(path, output_files) {
+            println!("  Parquet: {}", part);
+        }
     }
     if let Some(path) = &outputs.ks_file {
         println!("  KeySpace: {}", path);
@@ -2491,12 +2551,17 @@ fn build_plan_report(
         )
     });
     let hints = if inputs.mode == "diff" {
-        agent::diff_per_side_hints_plan(inputs.bucket.as_deref(), inputs.region.as_deref())
+        agent::diff_per_side_hints_plan(
+            inputs.bucket.as_deref(),
+            inputs.region.as_deref(),
+            &inputs.prefix,
+        )
     } else {
         agent::detect_hints_plan(
             cli.hints_file.as_deref(),
             inputs.bucket.as_deref(),
             inputs.region.as_deref(),
+            &inputs.prefix,
             cli.no_auto_hints,
         )
     };
@@ -2886,9 +2951,13 @@ async fn diff_side_boundaries(
         return Vec::new();
     }
 
-    let cache_path = agent::conventional_hints_path(bucket, region);
-    if let Ok(boundaries) = hints::parse_hints_file(&cache_path) {
-        return boundaries;
+    let cache_path = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
+    match hints::parse_conventional_hints_file(&cache_path, prefix) {
+        Ok(boundaries) => return boundaries,
+        Err(e) if std::path::Path::new(&cache_path).exists() => {
+            log::warn!("Ignoring conventional hints cache: {}", e);
+        }
+        Err(_) => {}
     }
 
     let client = core::build_s3_client(
@@ -2898,18 +2967,37 @@ async fn diff_side_boundaries(
         cfg.s3.force_path_style,
     );
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
-    let boundaries = auto_hints::discover_startup_boundaries(&client, bucket, prefix, target).await;
-    let boundaries = if boundaries.is_empty() {
+    let discovery = auto_hints::discover_startup_boundaries(
+        &client,
+        bucket,
+        prefix,
+        target,
+        cfg.s3.operation_timeout_secs,
+    )
+    .await;
+    let boundaries = if !discovery.boundaries.is_empty() {
+        discovery.boundaries
+    } else if discovery.is_single_page_listing(cli.max_keys) {
+        // Single-page side: nothing to partition, and the probes would cost
+        // more requests than the listing.
+        Vec::new()
+    } else {
         // Flat namespace: structural discovery found no CommonPrefixes, so the
         // side would otherwise list as one serial segment. Bisect the key range
         // with single-key probes so it lists in parallel. The target is smaller
         // than structural discovery's: each cut is a one-time up-front probe,
         // and only `max_concurrency` segments run at once, so spare boundaries
-        // beyond that would just cost probes without adding parallelism.
+        // beyond that would just cost probes without adding parallelism. Diff
+        // has no runtime splitting to fall back on, so it keeps a floor.
         let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-        discover_flat_boundaries_via_client(&client, bucket, prefix, flat_target).await
-    } else {
-        boundaries
+        discover_flat_boundaries_via_client(
+            &client,
+            bucket,
+            prefix,
+            flat_target,
+            cfg.s3.operation_timeout_secs,
+        )
+        .await
     };
     if !boundaries.is_empty() {
         if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
@@ -2927,6 +3015,7 @@ async fn discover_flat_boundaries_via_client(
     bucket: &str,
     prefix: &str,
     target: usize,
+    timeout_secs: u64,
 ) -> Vec<String> {
     let probe_bucket = bucket.to_string();
     let probe_prefix = prefix.to_string();
@@ -2943,7 +3032,18 @@ async fn discover_flat_boundaries_via_client(
             if let Some(sa) = start_after {
                 req = req.start_after(sa);
             }
-            let resp = req.send().await.map_err(|e| format!("{:?}", e))?;
+            // Same watchdog the runtime split probes use: startup runs before
+            // a single object is listed, so a stalled endpoint must not hang
+            // the run there.
+            let resp = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                req.send(),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| s3_turbo_list::error::concise_sdk_error(&e))?,
+                Err(_) => return Err("probe timed out".to_string()),
+            };
             Ok(resp
                 .contents()
                 .first()
@@ -2968,6 +3068,8 @@ fn load_hints(
     hints_file: Option<&str>,
     bucket: &str,
     region: Option<&str>,
+    prefix: &str,
+    delimiter: &str,
     no_auto_hints: bool,
     disabled_for_diff: bool,
 ) -> Vec<String> {
@@ -2998,18 +3100,33 @@ fn load_hints(
         return vec![];
     }
 
-    // 2. Try the startup-discovery cache at the conventional path.
-    let cache_filename = if let Some(r) = region {
-        agent::conventional_hints_path(bucket, Some(r))
-    } else {
-        agent::conventional_hints_path(bucket, None)
-    };
-
-    if let Ok(boundaries) = hints::parse_hints_file(&cache_filename) {
-        return boundaries;
+    // 2. A hierarchical run rolls every key under a CommonPrefix, and a page's
+    //    CommonPrefixes are not range-filtered: each cached segment would
+    //    re-list the same prefix set, multiplying requests and the reported
+    //    CommonPrefix count with no parallelism to show for it. Startup
+    //    discovery and the diff resolver already skip hints for these runs.
+    if !delimiter.is_empty() {
+        info!(
+            "--delimiter '{}' lists hierarchically: skipping the conventional hints cache and using single-segment listing",
+            delimiter
+        );
+        return vec![];
     }
 
-    // 3. No hints — the caller may attempt startup structural discovery
+    // 3. Try the startup-discovery cache at the conventional path.
+    let cache_filename = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
+
+    match hints::parse_conventional_hints_file(&cache_filename, prefix) {
+        Ok(boundaries) => return boundaries,
+        Err(e) if std::path::Path::new(&cache_filename).exists() => {
+            // Present but unusable (wrong prefix, malformed). Rediscovery
+            // below overwrites it with boundaries that fit this run.
+            log::warn!("Ignoring conventional hints cache: {}", e);
+        }
+        Err(_) => {}
+    }
+
+    // 4. No hints — the caller may attempt startup structural discovery
     //    before falling back to a single segment.
     info!(
         "No hints file or cached hints found for bucket '{}'",

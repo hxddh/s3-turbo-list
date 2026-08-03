@@ -20,6 +20,38 @@ pub const ERROR_INTERNAL_ERROR: u8 = 0x17;
 pub const ERROR_SERVICE_UNAVAILABLE: u8 = 0x18;
 pub const ERROR_UNKNOWN: u8 = 0xff;
 
+// ── SDK error formatting ───────────────────────────────────
+
+/// One-line summary of an SDK error: the S3 error code and message plus the
+/// HTTP status, rather than the `{:?}` dump of the whole error — which
+/// includes every response header and the raw body, and runs to kilobytes per
+/// failure. Startup discovery issues many probes, so a broken endpoint or a
+/// bad credential would otherwise flood the log.
+pub fn concise_sdk_error<E, R>(
+    err: &aws_smithy_runtime_api::client::result::SdkError<E, R>,
+) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_smithy_runtime_api::client::result::SdkError;
+
+    let kind = match err {
+        SdkError::ConstructionFailure(_) => "construction failure",
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(_) => "dispatch failure",
+        SdkError::ResponseError(_) => "response error",
+        SdkError::ServiceError(_) => "service error",
+        _ => "error",
+    };
+    match (err.code(), err.message()) {
+        (Some(code), Some(message)) => format!("{}: {}: {}", kind, code, message),
+        (Some(code), None) => format!("{}: {}", kind, code),
+        (None, Some(message)) => format!("{}: {}", kind, message),
+        (None, None) => kind.to_string(),
+    }
+}
+
 // ── FlatRuntimeError ──────────────────────────────────────
 
 /// Flat runtime error with errno classification, retryable-vs-fatal
