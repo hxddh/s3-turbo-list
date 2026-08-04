@@ -1249,8 +1249,21 @@ async fn merge_diff_streams(
     right: &mut DiffSideStream,
     writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     sink: &mut DiffRowSink,
+    aborted: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<(), String> {
     loop {
+        // A side that died mid-listing closes its channels, which is
+        // indistinguishable here from that side having ended: the merge would
+        // classify every remaining key of the *other* side as one-sided,
+        // producing a structurally valid diff that asserts something never
+        // observed. Stop instead — the caller discards the partial output.
+        if aborted() {
+            return Err(
+                "run aborted before both sides finished listing; a partial diff would \
+                 classify unread keys as one-sided"
+                    .to_string(),
+            );
+        }
         // A dropped receiver means the writer stopped on a write error. Bail
         // out here, per iteration, instead of waiting for the next flushed
         // batch to fail its send: rows only reach the writer every
@@ -1345,6 +1358,7 @@ impl DiffMergeOutcome {
 pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
     sides: DiffStreamSides,
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
+    aborted: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<DiffMergeOutcome, String> {
     let (writer_tx, mut writer_rx) =
         tokio::sync::mpsc::channel::<DiffWriteBatch>(DIFF_WRITE_PIPELINE_CAP);
@@ -1354,7 +1368,7 @@ pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
         let mut right = DiffSideStream::new(sides.right, "right");
         let mut sink = DiffRowSink::new();
 
-        merge_diff_streams(&mut left, &mut right, &writer_tx, &mut sink).await?;
+        merge_diff_streams(&mut left, &mut right, &writer_tx, &mut sink, &aborted).await?;
         sink.flush_all(&writer_tx).await?;
 
         let bytes_total = sink
@@ -1432,7 +1446,8 @@ pub async fn data_map_task_diff_streaming(
 
     let started_at = Instant::now();
     let mut output_ok = true;
-    let outcome = match run_diff_merge(sides, &mut parquet).await {
+    let abort_state = g_state.clone();
+    let outcome = match run_diff_merge(sides, &mut parquet, move || abort_state.is_quit()).await {
         Ok(outcome) => Some(outcome),
         Err(e) => {
             log::error!("Diff merge failed: {}", e);
@@ -1460,6 +1475,25 @@ pub async fn data_map_task_diff_streaming(
     }
     if !output_ok {
         g_state.inc_output_error();
+    }
+    if outcome.is_none() {
+        // The merge did not run to completion, so whatever reached the file
+        // describes part of one side against an unfinished other side. It
+        // parses, which is exactly what makes it dangerous — remove it rather
+        // than leave a valid-looking diff behind. (The KS file is only written
+        // for a completed merge, so there is nothing of this run's to remove
+        // there.)
+        match tokio::fs::remove_file(filename_output).await {
+            Ok(()) => log::error!(
+                "Removed incomplete diff output {} — a partial merge cannot describe both sides",
+                filename_output
+            ),
+            Err(e) => log::error!(
+                "Incomplete diff output {} could not be removed ({}); do not consume it",
+                filename_output,
+                e
+            ),
+        }
     }
 
     if let Some(outcome) = outcome {
