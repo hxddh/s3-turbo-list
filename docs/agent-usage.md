@@ -187,7 +187,15 @@ equality is reported as not applicable rather than a failure.
 
 With `--json`, the top-level `check` object gives agents stable pass/fail
 counts, artifact counts, and row/schema/exit-code status values without parsing
-human text.
+human text.  Its `parquet_schema_check` reports the worst status across every
+Parquet artifact, so a pooled run's part-files cannot hide behind the base
+file.
+
+Individual checks in `checks` are named `<check>:<kind>`.  When a run records
+several artifacts of one kind — a pooled list run writes one `parquet` entry
+per writer — the first keeps the bare name and the rest are suffixed with
+their index (`artifact_sha256:parquet#1`), so every check name in a report is
+unique and attributable to one file.
 
 Run manifest `warnings` use the same guardrail wording as dry-run plans so
 agents can compare preflight and completed runs consistently.
@@ -248,11 +256,12 @@ total across the set.
 Agents should branch on exit codes first, then read `run.json` if it exists.
 
 A non-zero exit means the output artifacts are not trustworthy, even when they
-exist and parse.  A run that failed mid-listing (exit 4) leaves a structurally
-valid Parquet file holding only the keys it got to, and in `diff` mode a side
-that failed is merged as if it had ended, so the remaining keys of the other
-side are classified as present-on-one-side.  Only treat outputs as complete on
-exit 0.
+exist and parse.  A `list` run that failed mid-listing (exit 4) leaves a
+structurally valid Parquet file holding only the keys it got to.  A `diff`
+whose side failed removes its output file instead, because a partial merge
+cannot describe both sides — an aborted diff leaves no Parquet and no KS file,
+so their absence next to a non-zero exit is expected.  Only treat outputs as
+complete on exit 0.
 
 ## S3 API trace
 

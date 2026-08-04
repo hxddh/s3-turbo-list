@@ -1930,3 +1930,77 @@ fn test_cli_accepts_known_addressing_styles() {
         assert_eq!(code, 0, "{}: stdout: {}\nstderr: {}", style, stdout, stderr);
     }
 }
+
+#[test]
+fn test_cli_manifest_summary_attributes_checks_per_part_file() {
+    // A pooled list run records one `parquet` artifact per writer. Their
+    // checks used to share a name, so a failing part was indistinguishable
+    // from a passing one in a report keyed by check name.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.parquet"), b"x").unwrap();
+    std::fs::write(dir.path().join("out.part1.parquet"), b"x").unwrap();
+    let manifest = dir.path().join("run.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "tool_version": "0.24.0",
+  "status": "success",
+  "exit_code": 0,
+  "inputs": {"output_format": "parquet"},
+  "outputs": {"parquet_file": "out.parquet", "ks_file": null, "hints_file": null, "trace_compat": null, "log_file": null},
+  "artifacts": [
+    {"kind": "parquet", "path": "out.parquet", "exists": true, "size_bytes": 1, "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"},
+    {"kind": "parquet", "path": "out.part1.parquet", "exists": true, "size_bytes": 999, "sha256": "deadbeef"}
+  ],
+  "metrics": {"received_objects": 2, "streamed_rows": 2, "unique_prefixes": 1, "parquet_rows": 2, "ks_entries": 0, "bytes_total": 2, "summary_only": false, "fatal_errors": 0, "output_errors": 0, "top_prefixes": []},
+  "warnings": []
+}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "manifest-summary",
+            manifest.to_str().unwrap(),
+            "--check",
+            "--json",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 6, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["check"]["ok"], false);
+
+    let names: Vec<&str> = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["name"].as_str().unwrap())
+        .collect();
+    // The first artifact keeps the bare kind so existing consumers still
+    // find it; the second is attributable to its own file.
+    assert!(names.contains(&"artifact_sha256:parquet"), "{:?}", names);
+    assert!(names.contains(&"artifact_sha256:parquet#1"), "{:?}", names);
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    let before = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        before,
+        sorted.len(),
+        "check names must be unique: {:?}",
+        names
+    );
+
+    let status_of = |name: &str| -> &str {
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .map(|check| check["status"].as_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(status_of("artifact_sha256:parquet"), "ok");
+    assert_eq!(status_of("artifact_sha256:parquet#1"), "fail");
+}
