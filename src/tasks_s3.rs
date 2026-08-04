@@ -463,12 +463,15 @@ async fn flat_reactor_task(
         }
 
         if set.is_empty() {
+            // Every segment task has joined, so every cloned sender is dropped
+            // and every `send` has completed — the batches are in the channel.
+            // Returning drops the last sender, and the data map receives all of
+            // them before `recv` reports the close, so there is nothing to wait
+            // for here. (This used to sleep a second before returning, which
+            // only delayed that close: the listing was over, the data map was
+            // parked, and the run paid the second at the very end.)
             ctx.complete();
             info!("Flat List S3 Task — {} — completed", ctx.s3_bucket_name);
-            tokio::time::sleep(Duration::from_secs(
-                core::DEFAULT_TASK_COMPLETE_QUIT_WAIT_SECS,
-            ))
-            .await;
             break;
         }
 

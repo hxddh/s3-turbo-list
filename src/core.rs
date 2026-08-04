@@ -15,7 +15,6 @@ use tokio::sync::Barrier;
 pub(crate) const MB: usize = 1_048_576;
 
 pub(crate) const DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS: u64 = 5;
-pub(crate) const DEFAULT_TASK_COMPLETE_QUIT_WAIT_SECS: u64 = 1;
 
 // ── ObjectProps: bit-flag state machine ────────────────────
 

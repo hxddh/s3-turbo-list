@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **The listing task no longer sleeps a second before returning.** Once every
+  segment task had joined it waited a fixed second and only then returned —
+  which is what drops the last channel sender, so the data map, already parked
+  with an empty queue, waited that second before it could finalize the output.
+  The wait synchronised nothing: a segment task that has joined has completed
+  its sends, and a closed channel still yields everything buffered before
+  `recv` reports the close (now pinned by a test). Measured on a 3000-key mock
+  listing: ~1.72s to ~0.73s end to end.
+
 ## [0.26.0] - 2026-08-04
 
 ### Performance
