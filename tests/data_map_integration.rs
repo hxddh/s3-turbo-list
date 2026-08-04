@@ -57,6 +57,7 @@ async fn merge(
             right: vec![rrx],
         },
         &mut parquet,
+        || false,
     )
     .await?;
     parquet.close().await.unwrap();
@@ -235,7 +236,7 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_diff_merge(DiffStreamSides { left, right }, &mut parquet),
+        run_diff_merge(DiffStreamSides { left, right }, &mut parquet, || false),
     )
     .await
     .expect("diff merge over many parallel segments must not hang")
@@ -413,6 +414,7 @@ async fn test_merge_stops_consuming_input_after_writer_failure() {
             right: vec![],
         },
         &mut parquet,
+        || false,
     )
     .await
     .unwrap_err();
@@ -429,4 +431,66 @@ async fn test_merge_stops_consuming_input_after_writer_failure() {
         sent,
         BATCHES
     );
+}
+
+// ── Aborted run ─────────────────────────────────────────────
+//
+// A side that dies mid-listing closes its channels, which looks exactly like
+// that side having ended: the merge would classify every remaining key of the
+// other side as one-sided, producing a structurally valid diff that asserts
+// something never observed. The abort signal stops it instead.
+#[tokio::test]
+async fn test_merge_aborts_when_the_run_is_failing() {
+    let (ltx, lrx) = tokio::sync::mpsc::channel(8);
+    let (_rtx, rrx) = tokio::sync::mpsc::channel::<Batch>(8);
+    // Left has keys; the right side's sender is dropped immediately, the way a
+    // fatally failed side closes its channels.
+    tokio::spawn(async move {
+        let _ = ltx
+            .send(vec![
+                left_obj("a.txt", 1, [0u8; 16]),
+                left_obj("b.txt", 1, [0u8; 16]),
+            ])
+            .await;
+    });
+
+    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), "unused.ks");
+    let err = run_diff_merge(
+        DiffStreamSides {
+            left: vec![lrx],
+            right: vec![rrx],
+        },
+        &mut parquet,
+        || true,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("aborted"), "{}", err);
+    parquet.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_merge_completes_when_not_aborted() {
+    // Same shape, abort predicate false: the right side is genuinely empty, so
+    // the left keys are legitimately left-only.
+    let (ltx, lrx) = tokio::sync::mpsc::channel(8);
+    let (rtx, rrx) = tokio::sync::mpsc::channel::<Batch>(8);
+    drop(rtx);
+    tokio::spawn(async move {
+        let _ = ltx.send(vec![left_obj("a.txt", 1, [0u8; 16])]).await;
+    });
+
+    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), "unused.ks");
+    let outcome = run_diff_merge(
+        DiffStreamSides {
+            left: vec![lrx],
+            right: vec![rrx],
+        },
+        &mut parquet,
+        || false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.plus, 1);
+    parquet.close().await.unwrap();
 }

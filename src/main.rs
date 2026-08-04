@@ -2280,7 +2280,7 @@ fn run_benchmark_local_diff(
                     &output_config.compression,
                     output_config.compression_level,
                 );
-                let outcome = data_map::run_diff_merge(sides, &mut parquet).await?;
+                let outcome = data_map::run_diff_merge(sides, &mut parquet, || false).await?;
                 parquet_rows = parquet.total_rows();
                 ks_entries = outcome.write_ks(&ks).await?;
                 parquet.close().await?;
@@ -2293,7 +2293,7 @@ fn run_benchmark_local_diff(
                     &output_config.compression,
                     output_config.compression_level,
                 );
-                let outcome = data_map::run_diff_merge(sides, &mut parquet).await?;
+                let outcome = data_map::run_diff_merge(sides, &mut parquet, || false).await?;
                 parquet_rows = parquet.total_rows();
                 Ok(outcome)
             };

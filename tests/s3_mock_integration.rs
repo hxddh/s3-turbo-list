@@ -3365,3 +3365,71 @@ fn local_mock_small_max_keys_still_partitions_untruncated_listing() {
         requests
     );
 }
+
+// ── Failed diff side leaves no artifact ─────────────────────
+//
+// A side that fails fatally closes its channels mid-listing, which the merge
+// cannot distinguish from that side having ended: every remaining key of the
+// other side would be classified one-sided, and the run would leave behind a
+// structurally valid Parquet asserting that the unread bucket does not have
+// them. Only the exit code said otherwise.
+#[test]
+fn local_mock_diff_with_failing_side_writes_no_diff_output() {
+    let server = MockS3Server::start(move |request, _sequence| {
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        if !request.path.contains("/left") {
+            return MockResponse::error(403, "AccessDenied", "injected fatal on the right side");
+        }
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let keys = ["a.txt", "b.txt", "c.txt"];
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| *k > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--target-region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_ne!(code, 0, "a failed side must fail the run");
+    assert!(
+        !parquet.exists(),
+        "a partial diff must not be left behind: stdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(!ks.exists(), "no KS file describes a diff that never ran");
+}

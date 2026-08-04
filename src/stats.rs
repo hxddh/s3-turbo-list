@@ -13,14 +13,9 @@ impl HttpStatusCodeTracker {
         }
     }
 
-    /// Increment the counter for a status code. Uses entry API to
-    /// prevent lost updates when two callers race on a first-seen code.
-    #[allow(dead_code)] // Phase 5: async variant retained for future async callers
-    pub async fn inc(&self, code: u16) {
-        self.inc_sync(code);
-    }
-
-    /// Synchronous increment — safe because DashMap entry API is lock-free.
+    /// Increment the counter for a status code — safe because the DashMap
+    /// entry API is lock-free, so two callers racing on a first-seen code
+    /// cannot lose an update.
     pub fn inc_sync(&self, code: u16) {
         self.map
             .entry(code)
@@ -58,9 +53,9 @@ mod tests {
     #[tokio::test]
     async fn test_single_code_inc_and_snapshot() {
         let tracker = HttpStatusCodeTracker::new();
-        tracker.inc(200).await;
-        tracker.inc(200).await;
-        tracker.inc(404).await;
+        tracker.inc_sync(200);
+        tracker.inc_sync(200);
+        tracker.inc_sync(404);
 
         let snap = tracker.snapshot();
         assert_eq!(snap, vec![(200, 2), (404, 1)]);
@@ -78,7 +73,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 b.wait(); // all tasks start together
                 for _ in 0..250 {
-                    t.inc(500).await;
+                    t.inc_sync(500);
                 }
             }));
         }

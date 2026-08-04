@@ -2,6 +2,7 @@ use crate::profiles;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -302,9 +303,37 @@ fn manifest_check_summary(
             .filter(|check| check.name.starts_with("artifact_exists:") && check.status == "fail")
             .count(),
         row_check: manifest_check_status(checks, "parquet_rows_match_streamed_rows"),
-        parquet_schema_check: manifest_check_status(checks, "artifact_parquet_schema:parquet"),
+        // One entry per Parquet artifact (a pooled run writes several), so the
+        // summary reports the worst of them rather than whichever came first.
+        parquet_schema_check: manifest_check_worst(checks, "artifact_parquet_schema:parquet"),
         exit_code_check: manifest_check_status(checks, "exit_code"),
     }
+}
+
+/// Worst status across `name` and its `name#N` siblings: `fail` beats `warn`
+/// beats `ok`, and `not_applicable` only when there is nothing to report.
+fn manifest_check_worst(checks: &[ManifestCheck], name: &str) -> String {
+    let matching = checks.iter().filter(|check| {
+        check.name == name
+            || check
+                .name
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('#'))
+    });
+    let mut worst: Option<String> = None;
+    for check in matching {
+        let status = normalize_check_status(&check.status);
+        let rank = |s: &str| match s {
+            "fail" => 3,
+            "warn" => 2,
+            "ok" => 1,
+            _ => 0,
+        };
+        if worst.as_deref().is_none_or(|w| rank(&status) > rank(w)) {
+            worst = Some(status);
+        }
+    }
+    worst.unwrap_or_else(|| "not_applicable".to_string())
 }
 
 fn manifest_check_status(checks: &[ManifestCheck], name: &str) -> String {
@@ -408,10 +437,25 @@ fn manifest_checks(
         });
     }
 
+    // Several artifacts can share a kind — a pooled list run records one
+    // `parquet` entry per writer. The first keeps the bare `:<kind>` check
+    // name so existing consumers still find it; the rest are suffixed with
+    // their index, so a failing part is attributable to its file instead of
+    // hiding behind a duplicate name.
+    let mut seen_kinds: HashMap<&str, usize> = HashMap::new();
     for artifact in artifacts {
+        let occurrence = seen_kinds
+            .entry(artifact.kind.as_str())
+            .and_modify(|count| *count += 1)
+            .or_insert(0);
+        let label = if *occurrence == 0 {
+            artifact.kind.clone()
+        } else {
+            format!("{}#{}", artifact.kind, occurrence)
+        };
         let current_exists = !artifact.path.is_empty() && Path::new(&artifact.path).exists();
         checks.push(ManifestCheck {
-            name: format!("artifact_exists:{}", artifact.kind),
+            name: format!("artifact_exists:{}", label),
             status: if current_exists { "ok" } else { "fail" }.to_string(),
             message: format!(
                 "{} recorded_exists={} current_exists={}",
@@ -426,7 +470,7 @@ fn manifest_checks(
         if let Some(recorded_size) = artifact.size_bytes {
             let current_size = std::fs::metadata(&artifact.path).ok().map(|m| m.len());
             checks.push(ManifestCheck {
-                name: format!("artifact_size:{}", artifact.kind),
+                name: format!("artifact_size:{}", label),
                 status: if current_size == Some(recorded_size) {
                     "ok"
                 } else {
@@ -447,7 +491,7 @@ fn manifest_checks(
         if let Some(recorded_sha256) = artifact.sha256.as_deref() {
             let current_sha256 = sha256_file(&artifact.path).ok();
             checks.push(ManifestCheck {
-                name: format!("artifact_sha256:{}", artifact.kind),
+                name: format!("artifact_sha256:{}", label),
                 status: if current_sha256.as_deref() == Some(recorded_sha256) {
                     "ok"
                 } else {
@@ -470,7 +514,7 @@ fn manifest_checks(
                 Ok(current) => {
                     if let Some(recorded_rows) = artifact.parquet_row_count {
                         checks.push(ManifestCheck {
-                            name: "artifact_parquet_rows:parquet".to_string(),
+                            name: format!("artifact_parquet_rows:{}", label),
                             status: if current.row_count == recorded_rows {
                                 "ok"
                             } else {
@@ -485,7 +529,7 @@ fn manifest_checks(
                     }
                     if !artifact.parquet_schema_fields.is_empty() {
                         checks.push(ManifestCheck {
-                            name: "artifact_parquet_schema:parquet".to_string(),
+                            name: format!("artifact_parquet_schema:{}", label),
                             status: if current.schema_fields == artifact.parquet_schema_fields {
                                 "ok"
                             } else {
@@ -502,7 +546,7 @@ fn manifest_checks(
                     }
                 }
                 Err(e) => checks.push(ManifestCheck {
-                    name: "artifact_parquet_metadata:parquet".to_string(),
+                    name: format!("artifact_parquet_metadata:{}", label),
                     status: "fail".to_string(),
                     message: format!("{} metadata read failed: {}", artifact.path, e),
                 }),

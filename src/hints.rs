@@ -73,12 +73,34 @@ pub fn parse_conventional_hints_file(path: &str, prefix: &str) -> Result<Vec<Str
             path, cached_prefix, prefix
         ));
     }
+    warn_if_stale(path, &cache.generated_at);
     info!(
         "Loaded {} key-space boundaries from TOML hints cache '{}'",
         cache.boundaries.len(),
         path
     );
     Ok(cache.boundaries)
+}
+
+/// Age past which a cache is worth a word.  Boundaries are cut points in a
+/// bucket that keeps changing — flat-namespace boundaries are literal object
+/// keys — so an old cache still partitions correctly but increasingly
+/// unevenly, and nothing else would ever say so.
+const HINTS_CACHE_STALE_DAYS: i64 = 30;
+
+fn warn_if_stale(path: &str, generated_at: &str) {
+    let Ok(generated) = chrono::DateTime::parse_from_rfc3339(generated_at) else {
+        return;
+    };
+    let age_days = (chrono::Utc::now() - generated.with_timezone(&chrono::Utc)).num_days();
+    if age_days >= HINTS_CACHE_STALE_DAYS {
+        log::warn!(
+            "Hints cache '{}' was generated {} days ago; segments may have drifted with the \
+             bucket — delete it to re-derive boundaries at startup",
+            path,
+            age_days
+        );
+    }
 }
 
 pub fn inspect_hints_file(
@@ -506,6 +528,34 @@ generated_at = "2026-01-01T00:00:00Z"
             vec!["a/", "b/"]
         );
         assert!(parse_conventional_hints_file(&path, "logs/").is_err());
+    }
+
+    #[test]
+    fn test_conventional_cache_stale_warning_does_not_reject() {
+        // Stale is a warning, never a rejection: an old cache still
+        // partitions the key space correctly, just less evenly.
+        let content = r#"bucket = "b"
+boundaries = ["a/", "b/"]
+generated_at = "2020-01-01T00:00:00Z"
+"#;
+        let (_dir, path) = write_tmp(content);
+        assert_eq!(
+            parse_conventional_hints_file(&path, "").unwrap(),
+            vec!["a/", "b/"]
+        );
+    }
+
+    #[test]
+    fn test_conventional_cache_unparseable_timestamp_is_not_fatal() {
+        let content = r#"bucket = "b"
+boundaries = ["a/"]
+generated_at = "not-a-timestamp"
+"#;
+        let (_dir, path) = write_tmp(content);
+        assert_eq!(
+            parse_conventional_hints_file(&path, "").unwrap(),
+            vec!["a/"]
+        );
     }
 
     #[test]

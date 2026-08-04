@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-04
+
+### Fixed
+- **A `diff` whose side failed mid-listing wrote a complete-looking diff.** A
+  side that fails fatally (or a Ctrl-C) closes its channels, which the merge
+  cannot distinguish from that side having ended: every remaining key of the
+  other side was classified one-sided, so the run left behind a structurally
+  valid Parquet asserting that the unread bucket does not contain them. Only
+  the non-zero exit code said otherwise. The merge now stops as soon as the
+  run is aborting, and the partial output file — which parses, and that is
+  exactly what makes it dangerous — is removed rather than left behind.
+- **`manifest-summary --check` gave every Parquet artifact the same check
+  names.** Since v0.24.0 a pooled list run records one `parquet` artifact per
+  writer, so `artifact_sha256:parquet` and its siblings appeared once per
+  part: the overall verdict and exit code were right, but a report keyed by
+  check name could not tell which file failed, and the `parquet_schema_check`
+  summary field reported whichever artifact came first. Checks after the
+  first of a kind are now suffixed (`artifact_sha256:parquet#1`), the first
+  keeps its existing name, and the summary field reports the worst status
+  across all of them.
+
+### Changed
+- **A conventional hints cache older than 30 days now logs a warning on
+  load.** Boundaries are cut points in a bucket that keeps changing — flat
+  namespace boundaries are literal object keys — so an old cache still
+  partitions correctly but increasingly unevenly, and nothing else would ever
+  say so. The cache is still used; deleting it re-derives boundaries at
+  startup.
+- Removed the unused async `HttpStatusCodeTracker::inc` wrapper; callers use
+  the lock-free `inc_sync` directly.
+
 ## [0.24.0] - 2026-08-03
 
 ### Fixed
