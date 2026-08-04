@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-08-04
+
 ### Performance
 - **The listing task no longer sleeps a second before returning.** Once every
   segment task had joined it waited a fixed second and only then returned —
