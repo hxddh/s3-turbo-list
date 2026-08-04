@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **A run no longer holds the process open for a heartbeat after it
+  finishes.** The monitor slept a full `DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS`
+  (5s) between checks and only tested the run's exit conditions at the top of
+  its loop, so every run paid a fixed tail of up to 5 seconds regardless of
+  size — three orders of magnitude more than the work itself on the
+  small-bucket path v0.24.0 had just reduced to two requests. The monitor now
+  polls at 100ms and still prints its heartbeat on the same 5s cadence: a
+  two-request listing went from ~5.1s to ~1.1s end to end, and the mock test
+  suite from ~51s to ~14s.
+
 ### Internal
 - **The local S3 mock now serves connections concurrently.** It handled every
   connection on a single accept loop, so a parallel listing was served

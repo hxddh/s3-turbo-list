@@ -1,11 +1,20 @@
 use crate::core::{MonContext, DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS};
 use log::info;
+use std::time::{Duration, Instant};
+
+/// How often the monitor re-checks the run's exit conditions.  The heartbeat
+/// itself still prints every `DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS`, but
+/// sleeping that long between checks held the process open for up to a full
+/// heartbeat after the listing had finished — a fixed tail that dwarfed the
+/// run itself on anything small.
+const MON_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn mon_task(ctx: MonContext) {
     ctx.start();
     ctx.g_state.wait_to_start().await;
 
     info!("Mon Task — started");
+    let mut last_heartbeat: Option<Instant> = None;
 
     loop {
         if ctx.is_quit() {
@@ -20,6 +29,15 @@ pub async fn mon_task(ctx: MonContext) {
             info!("Mon Task — all list tasks completed, exiting");
             return;
         }
+
+        // Poll fast, report on the heartbeat interval.
+        if last_heartbeat.is_some_and(|at| {
+            at.elapsed() < Duration::from_secs(DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS)
+        }) {
+            tokio::time::sleep(MON_POLL_INTERVAL).await;
+            continue;
+        }
+        last_heartbeat = Some(Instant::now());
 
         let tracker_stats = format!("{}", *ctx.get_tracker());
         if !tracker_stats.is_empty() {
@@ -38,9 +56,6 @@ pub async fn mon_task(ctx: MonContext) {
             );
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS,
-        ))
-        .await;
+        tokio::time::sleep(MON_POLL_INTERVAL).await;
     }
 }

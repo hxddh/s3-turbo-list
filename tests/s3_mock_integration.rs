@@ -3735,3 +3735,62 @@ fn local_mock_diff_serves_both_sides_concurrently() {
         server.max_in_flight()
     );
 }
+
+// The monitor used to sleep a whole heartbeat between checks, so a run held
+// the process open for up to that long after the listing had finished — a
+// fixed tail that dwarfed the work on anything small (a two-request listing
+// took ~5s). The heartbeat still prints on its own cadence; only the exit
+// check got faster.
+#[test]
+fn local_mock_small_run_exits_without_waiting_for_a_heartbeat() {
+    let keys = ["a.txt", "b.txt", "c.txt"];
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet).len(), keys.len());
+    // Generous: the run itself is milliseconds, and the heartbeat interval it
+    // must not wait for is 5s.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "a three-key listing took {:?} — the process is waiting on a timer, not on work",
+        elapsed
+    );
+}
