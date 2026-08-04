@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+- **The local S3 mock now serves connections concurrently.** It handled every
+  connection on a single accept loop, so a parallel listing was served
+  strictly serially: no test could distinguish a run that fans out from one
+  that does not (only request counts and query shapes were observable), and
+  handler-side latency could not model a slow endpoint or a hot key range.
+  Connections are now served on their own threads, `max_in_flight()` reports
+  the peak concurrency actually served, and a panic inside a handler — an
+  assertion, typically — is re-raised on the test thread instead of reaching
+  the client as a reset socket. New tests assert that a partitioned list run
+  and both diff sides genuinely overlap requests.
+
 ## [0.25.0] - 2026-08-04
 
 ### Fixed
