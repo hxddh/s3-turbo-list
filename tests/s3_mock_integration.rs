@@ -3794,3 +3794,98 @@ fn local_mock_small_run_exits_without_waiting_for_a_heartbeat() {
         elapsed
     );
 }
+
+// ── KS output is real CSV ───────────────────────────────────
+//
+// Object keys may contain quotes, commas and newlines, and all three reach
+// the KS prefix column. The writer used to interpolate them bare, so three
+// objects could produce four lines and a quote inside a key broke the row —
+// while the run exited 0 and the README called the file a two-column CSV.
+#[test]
+fn local_mock_ks_output_escapes_keys_as_csv() {
+    let keys = [
+        "comma,prefix/a.txt",
+        "multi\nline/b.txt",
+        "plain/c.txt",
+        "we\"ird/d.txt",
+    ];
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        dir.path().join("out.parquet").display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // Parse it the way a consumer would, with a real CSV reader.
+    let script = dir.path().join("read_ks.py");
+    std::fs::write(
+        &script,
+        r#"import csv, sys
+rows = list(csv.reader(open(sys.argv[1], newline="")))
+print(len(rows))
+for prefix, count in rows:
+    print(repr(prefix), count)
+"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(&ks)
+        .output()
+        .expect("python3 available for CSV round-trip");
+    let parsed = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut lines = parsed.lines();
+    assert_eq!(
+        lines.next(),
+        Some("4"),
+        "one CSV row per distinct prefix: {}",
+        parsed
+    );
+    let body: Vec<&str> = lines.collect();
+    assert!(
+        body.iter().any(|l| l.contains("we\"ird")),
+        "an embedded quote must survive a CSV round-trip: {:?}",
+        body
+    );
+    assert!(
+        body.iter().any(|l| l.contains("multi\\nline")),
+        "an embedded newline must stay inside its field: {:?}",
+        body
+    );
+    assert!(
+        body.iter().any(|l| l.contains("comma,prefix")),
+        "an embedded comma must stay inside its field: {:?}",
+        body
+    );
+}
