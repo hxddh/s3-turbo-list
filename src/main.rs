@@ -487,6 +487,7 @@ fn main() {
     cfg.normalize_addressing_style();
     apply_output_dir_defaults(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
+    validate_runtime_values(&cfg);
     validate_summary_only_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
@@ -1557,6 +1558,64 @@ fn validate_output_format_command(cli: &Cli) {
     if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
         eprintln!(
             "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
+/// Cheap shape check for an endpoint: a scheme this SDK can dispatch and a
+/// non-empty host. Deliberately not a full URL parse — custom deployments use
+/// shapes this tool has no business rejecting, so this only feeds a warning.
+fn endpoint_url_looks_usable(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    !host.is_empty()
+}
+
+/// Numeric knobs have no meaningful zero: a zero concurrency listed nothing
+/// and still exited 0 (the reactor's fill loop never ran), zero worker threads
+/// and a zero-capacity channel both panicked out of the documented exit codes,
+/// and a zero operation timeout fails every request. Reject them where every
+/// other configuration error is reported, with the offending value named.
+fn validate_runtime_values(cfg: &S3TurboConfig) {
+    let checks: [(&str, usize); 4] = [
+        (
+            "runtime.max_concurrency (-c/--concurrency)",
+            cfg.runtime.max_concurrency,
+        ),
+        (
+            "runtime.worker_threads (-T/--threads)",
+            cfg.runtime.worker_threads,
+        ),
+        ("channel.capacity", cfg.channel.capacity),
+        (
+            "s3.operation_timeout_secs",
+            cfg.s3.operation_timeout_secs as usize,
+        ),
+    ];
+    for (name, value) in checks {
+        if value == 0 {
+            eprintln!("{} must be at least 1 (got {})", name, value);
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+    }
+    if cfg.s3.connect_timeout_secs == 0 {
+        eprintln!(
+            "s3.connect_timeout_secs must be at least 1 (got {})",
+            cfg.s3.connect_timeout_secs
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if !s3_turbo_list::utils::is_supported_compression(&cfg.output.compression) {
+        eprintln!(
+            "output.compression '{}' is not supported; use one of: {}",
+            cfg.output.compression,
+            s3_turbo_list::utils::SUPPORTED_COMPRESSION.join(", ")
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
@@ -2685,6 +2744,31 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
             }
         }
         warnings.extend(provider_setup_guardrail_warnings(cli, cfg));
+        // A misspelled profile applies no preset at all — no endpoint
+        // template, no addressing recommendation — and the run proceeds as if
+        // none had been asked for. The plan already carries
+        // `profile_known: false`; say so where an operator will read it.
+        if let Some(name) = cfg.s3.profile.as_deref() {
+            if profiles::get_profile(name).is_none() {
+                warnings.push(format!(
+                    "--profile '{}' matches no endpoint compatibility preset ({}); no endpoint or addressing defaults were applied",
+                    name,
+                    profiles::all_profiles()
+                        .iter()
+                        .map(|profile| profile.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        if let Some(endpoint) = cfg.s3.endpoint_url.as_deref() {
+            if !endpoint_url_looks_usable(endpoint) {
+                warnings.push(format!(
+                    "--endpoint-url '{}' has no scheme and host; the run will fail when it dispatches its first request",
+                    endpoint
+                ));
+            }
+        }
     }
     if cli.summary_only
         && (cli.output_dir.is_some()

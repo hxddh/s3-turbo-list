@@ -266,6 +266,25 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
     }
 }
 
+/// Codec names the Parquet writer accepts. An unknown name used to fall back
+/// to gzip silently — a different codec from the documented default, chosen
+/// without the caller knowing, and reported as the user's own value in the
+/// dry-run plan.
+pub const SUPPORTED_COMPRESSION: &[&str] = &[
+    "uncompressed",
+    "snappy",
+    "gzip",
+    "lz4",
+    "lz4_raw",
+    "zstd",
+    "brotli",
+];
+
+pub fn is_supported_compression(name: &str) -> bool {
+    let normalized = name.trim().to_lowercase();
+    SUPPORTED_COMPRESSION.contains(&normalized.as_str())
+}
+
 fn parse_compression(name: &str, level: u32) -> Compression {
     let normalized = name.trim().to_lowercase();
     let spec = match normalized.as_str() {

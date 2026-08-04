@@ -2004,3 +2004,153 @@ fn test_cli_manifest_summary_attributes_checks_per_part_file() {
     assert_eq!(status_of("artifact_sha256:parquet"), "ok");
     assert_eq!(status_of("artifact_sha256:parquet#1"), "fail");
 }
+
+// ── Runtime value validation ────────────────────────────────
+//
+// A zero here used to be accepted: zero concurrency listed nothing and still
+// exited 0 (the reactor's fill loop never ran, so an agent reading the
+// manifest saw an empty bucket), while zero worker threads and a
+// zero-capacity channel panicked with exit 101, outside the documented
+// exit-code contract.
+#[test]
+fn test_cli_rejects_zero_valued_runtime_knobs() {
+    for (flag, value) in [("--concurrency", "0"), ("--threads", "0")] {
+        let (code, stdout, stderr) = run_cli(&[
+            "--dry-run",
+            flag,
+            value,
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ]);
+        assert_eq!(code, 2, "{}: stdout: {}\nstderr: {}", flag, stdout, stderr);
+        assert!(
+            stderr.contains("must be at least 1"),
+            "{} should name the bound: {}",
+            flag,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_cli_rejects_zero_valued_config_knobs() {
+    for (key, body) in [
+        ("channel.capacity", "[channel]\ncapacity = 0\n"),
+        (
+            "s3.operation_timeout_secs",
+            "[s3]\noperation_timeout_secs = 0\n",
+        ),
+        (
+            "s3.connect_timeout_secs",
+            "[s3]\nconnect_timeout_secs = 0\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("c.toml");
+        std::fs::write(&config, body).unwrap();
+        let (code, stdout, stderr) = run_cli(&[
+            "--config",
+            config.to_str().unwrap(),
+            "--dry-run",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ]);
+        assert_eq!(code, 2, "{}: stdout: {}\nstderr: {}", key, stdout, stderr);
+        assert!(
+            stderr.contains(key),
+            "error should name {}: {}",
+            key,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_cli_rejects_unknown_compression_instead_of_falling_back() {
+    // The old behaviour silently wrote gzip — a different codec from the
+    // documented default — while the dry-run plan still echoed the value the
+    // user typed.
+    let (code, stdout, stderr) = run_cli(&[
+        "--dry-run",
+        "--compression",
+        "zstdd",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        stderr.contains("zstd"),
+        "should list valid codecs: {}",
+        stderr
+    );
+
+    for codec in [
+        "uncompressed",
+        "snappy",
+        "gzip",
+        "lz4",
+        "lz4_raw",
+        "zstd",
+        "brotli",
+    ] {
+        let (code, _stdout, stderr) = run_cli(&[
+            "--dry-run",
+            "--compression",
+            codec,
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ]);
+        assert_eq!(code, 0, "{} must stay accepted: {}", codec, stderr);
+    }
+}
+
+#[test]
+fn test_cli_warns_about_unknown_profile_and_malformed_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = dir.path().join("plan.json");
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--plan-json",
+            plan.to_str().unwrap(),
+            "--profile",
+            "nosuchprofile",
+            "--endpoint-url",
+            "not-a-url",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let warnings = json["warnings"].as_array().unwrap();
+    let text: Vec<&str> = warnings.iter().filter_map(|w| w.as_str()).collect();
+    assert!(
+        text.iter().any(|w| w.contains("nosuchprofile")),
+        "an unknown profile applies no preset and must say so: {:?}",
+        text
+    );
+    assert!(
+        text.iter().any(|w| w.contains("not-a-url")),
+        "a malformed endpoint must be reported before the run: {:?}",
+        text
+    );
+}

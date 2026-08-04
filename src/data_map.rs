@@ -979,22 +979,63 @@ fn finalize_list_summary_only(
     );
 }
 
+/// Bytes of encoded KS rows buffered before a write, so a bucket with a
+/// million distinct prefixes costs a few hundred writes rather than one per
+/// row.
+const KS_WRITE_CHUNK_BYTES: usize = 256 * 1024;
+
 async fn write_ks_counts(path: &str, counts: &PrefixStats) -> Result<usize, String> {
-    let mut entries: Vec<(String, usize)> = counts
+    // Borrow the prefixes rather than cloning them: on a deep-hierarchy bucket
+    // the map already holds one String per distinct prefix, and copying the
+    // whole set again just to sort it doubled that for the length of the write.
+    let mut entries: Vec<(&str, usize)> = counts
         .iter()
-        .map(|(p, stats)| (p.clone(), stats.objects))
+        .map(|(prefix, stats)| (prefix.as_str(), stats.objects))
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     write_ks_entries(path, &entries).await
 }
 
-async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> Result<usize, String> {
+/// Append one RFC 4180 field: quoted, with embedded quotes doubled. Object
+/// keys may contain `"`, `,` and newlines — all legal S3 key bytes, all of
+/// which reach this column through the key's prefix, and none of which the
+/// previous bare `format!` escaped.
+fn push_csv_field(out: &mut Vec<u8>, value: &str) {
+    out.push(b'"');
+    for byte in value.as_bytes() {
+        if *byte == b'"' {
+            out.push(b'"');
+        }
+        out.push(*byte);
+    }
+    out.push(b'"');
+}
+
+async fn write_ks_entries(path: &str, entries: &[(&str, usize)]) -> Result<usize, String> {
     match tokio::fs::File::create(path).await {
         Ok(ks_file) => {
             let mut buf = tokio::io::BufWriter::new(ks_file);
+            // One reused encode buffer and one reused number buffer: the old
+            // per-row `format!` allocated once per distinct prefix, and wrote
+            // one await per row.
+            let mut chunk: Vec<u8> = Vec::with_capacity(KS_WRITE_CHUNK_BYTES + 1024);
+            let mut number = String::new();
             for (prefix, count) in entries {
-                let line = format!("\"{}\",\"{}\"\n", prefix, count);
-                if let Err(e) = buf.write_all(line.as_bytes()).await {
+                push_csv_field(&mut chunk, prefix);
+                chunk.push(b',');
+                number.clear();
+                let _ = std::fmt::Write::write_fmt(&mut number, format_args!("{}", count));
+                push_csv_field(&mut chunk, &number);
+                chunk.push(b'\n');
+                if chunk.len() >= KS_WRITE_CHUNK_BYTES {
+                    if let Err(e) = buf.write_all(&chunk).await {
+                        return Err(format!("Failed to write KS file {}: {}", path, e));
+                    }
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                if let Err(e) = buf.write_all(&chunk).await {
                     return Err(format!("Failed to write KS file {}: {}", path, e));
                 }
             }
@@ -1008,22 +1049,33 @@ async fn write_ks_entries(path: &str, entries: &[(String, usize)]) -> Result<usi
 }
 
 fn top_prefixes(prefix_stats: &PrefixStats, limit: usize) -> Vec<core::PrefixMetric> {
-    let mut entries: Vec<_> = prefix_stats
+    // Borrow and select rather than clone-and-sort: this runs once per run,
+    // but a deep-hierarchy bucket has one entry per distinct prefix, and
+    // cloning every key to fully sort them for the top 32 was the second
+    // largest cost in the run's accounting layer.
+    let mut entries: Vec<(&str, usize, u64)> = prefix_stats
         .iter()
-        .map(|(prefix, stats)| core::PrefixMetric {
-            prefix: prefix.clone(),
-            objects: stats.objects,
-            bytes: stats.bytes,
-        })
+        .map(|(prefix, stats)| (prefix.as_str(), stats.objects, stats.bytes))
         .collect();
-    entries.sort_by(|a, b| {
-        b.objects
-            .cmp(&a.objects)
-            .then_with(|| b.bytes.cmp(&a.bytes))
-            .then_with(|| a.prefix.cmp(&b.prefix))
-    });
-    entries.truncate(limit);
+    let rank = |a: &(&str, usize, u64), b: &(&str, usize, u64)| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(b.0))
+    };
+    let limit = limit.min(entries.len());
+    if limit < entries.len() {
+        entries.select_nth_unstable_by(limit, rank);
+        entries.truncate(limit);
+    }
+    entries.sort_unstable_by(rank);
     entries
+        .into_iter()
+        .map(|(prefix, objects, bytes)| core::PrefixMetric {
+            prefix: prefix.to_string(),
+            objects,
+            bytes,
+        })
+        .collect()
 }
 
 fn epoch_secs() -> u64 {

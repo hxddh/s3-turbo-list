@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-04
+
+### Fixed
+- **The KeySpace file is now valid CSV for every key.** Object keys may
+  contain `"`, `,` and newlines — all legal S3 bytes, all of which reach the
+  KS prefix column — and the writer interpolated them bare. Three objects
+  whose keys held a quote and a newline produced four lines, one of them
+  unparseable, while the run exited 0 and the README called the file a
+  two-column CSV. Fields are now quoted per RFC 4180 with embedded quotes
+  doubled. (The stdout TSV path has escaped for some time; only KS was
+  missed.)
+- **Zero-valued runtime knobs are rejected instead of misbehaving.**
+  `--concurrency 0` listed nothing and still exited 0 — the reactor's fill
+  loop never ran, so an agent reading the manifest saw an empty bucket.
+  `--threads 0` and `channel.capacity = 0` panicked with exit 101, outside
+  the documented exit codes. These, plus `s3.operation_timeout_secs` and
+  `s3.connect_timeout_secs`, now fail validation with exit 2 and name the
+  offending value.
+- **An unsupported `--compression` value is rejected rather than silently
+  swapped.** An unknown codec fell back to gzip — not the documented zstd
+  default — while the dry-run plan still echoed the value the user typed, so
+  the plan and the run disagreed about the output format.
+- **A misspelled `--profile` or a malformed `--endpoint-url` now warns.** An
+  unknown profile applies no preset at all (no endpoint template, no
+  addressing default) and the run proceeded as if none had been requested;
+  an endpoint without a scheme and host was accepted and failed only when the
+  first request dispatched. Both now surface in the dry-run plan and run
+  manifest warnings.
+
+### Performance
+- **The run's prefix accounting no longer copies and fully sorts every
+  prefix.** `top_prefixes` cloned every key and sorted the whole set to take
+  32, and the KS write cloned them again, sorted again, and allocated a
+  string per row. On a bucket with a million distinct prefixes (2M objects,
+  measured in isolation) that was 0.98s and 1.17s; borrowing the keys,
+  selecting the top-k rather than sorting, and encoding into a reused buffer
+  brings them to 0.50s and 0.61s. End to end on the local list-output
+  benchmark at that shape the run went from ~5.0-6.2s to ~2.9-3.6s across
+  samples, though that figure also carries the synthetic producer's own cost
+  at a million distinct prefixes, so the isolated numbers above are the ones
+  attributable to the tool. Buckets with few prefixes are unaffected.
+
+### Documentation
+- `docs/agent-usage.md` no longer promises `hints` "estimate summary
+  metadata"; that came from the sampled-scan feature removed some releases
+  ago. The plan's `status` field is now listed.
+- `docs/compat-probe.md` uses a test name the probe actually emits, and spells
+  out that `compatible` covers only the tests that ran — a bucket with fewer
+  than three objects skips the pagination check, so `compatible` there says
+  nothing about continuation-token behavior.
+- `guide large-bucket` no longer pins `-c 8`, which capped a large bucket at a
+  twelfth of the default concurrency and contradicted the tuning guide.
+
 ## [0.27.0] - 2026-08-04
 
 ### Performance

@@ -882,7 +882,9 @@ These commands do not contact S3-compatible cloud endpoints.
             r#"Large bucket:
   # Key-space partitioning is automatic: the first run probes the bucket
   # structure at startup, lists in parallel, and caches the boundaries.
-  s3-turbo-list --output-dir out --delimiter '' -c 8 -T 4 list --bucket my-bucket --region us-east-1
+  # The concurrency default (100) is an upper bound the run settles below on
+  # its own; pinning it lower here would cap a large bucket for no reason.
+  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
 "#
             .to_string(),
         ),

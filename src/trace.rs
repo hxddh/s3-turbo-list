@@ -398,7 +398,14 @@ mod tests {
 
     #[test]
     fn test_create_trace_writer_unwritable_path_is_an_error_not_a_panic() {
-        let result = create_trace_writer_opt(Some("/nonexistent-dir/trace.jsonl"), false);
+        // A path whose parent is a regular file can never be created, by any
+        // user — unlike a merely absent directory, which some other test or
+        // tool may have since created.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("trace.jsonl");
+        let result = create_trace_writer_opt(Some(path.to_str().unwrap()), false);
         let err = match result {
             Ok(_) => panic!("an unwritable trace path must surface as an error"),
             Err(e) => e,
