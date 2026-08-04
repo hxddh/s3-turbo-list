@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-04
+
 ### Performance
 - **A run no longer holds the process open for a heartbeat after it
   finishes.** The monitor slept a full `DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS`
