@@ -494,3 +494,35 @@ async fn test_merge_completes_when_not_aborted() {
     assert_eq!(outcome.plus, 1);
     parquet.close().await.unwrap();
 }
+
+// ── Channel close delivers before it reports ────────────────
+//
+// The listing task returns as soon as its segments have joined, which drops
+// the last sender. That is only safe because a closed channel still yields
+// everything already buffered before `recv` reports the close — otherwise
+// returning promptly would race the data map and drop batches. This pins the
+// property the listing shutdown path depends on.
+#[tokio::test]
+async fn test_dropping_the_sender_delivers_buffered_batches_first() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Batch>(64);
+    for i in 0..32 {
+        tx.send(vec![left_obj(&format!("key-{:03}", i), 1, [0u8; 16])])
+            .await
+            .unwrap();
+    }
+    // Every send has completed, exactly as it has when a segment task joins.
+    drop(tx);
+
+    let mut received = Vec::new();
+    while let Some(batch) = rx.recv().await {
+        received.extend(batch.into_iter().map(|(key, _)| key.as_str().to_string()));
+    }
+    assert_eq!(
+        received.len(),
+        32,
+        "buffered batches must survive the close"
+    );
+    assert_eq!(received.first().unwrap(), "key-000");
+    assert_eq!(received.last().unwrap(), "key-031");
+    assert!(rx.recv().await.is_none(), "close is reported once drained");
+}
