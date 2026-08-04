@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-04
+
 ### Fixed
 - **The KeySpace file is now valid CSV for every key.** Object keys may
   contain `"`, `,` and newlines — all legal S3 bytes, all of which reach the
