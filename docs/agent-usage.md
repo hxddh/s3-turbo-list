@@ -74,6 +74,7 @@ The plan JSON includes:
 
 - `schema_version`
 - `tool_version`
+- `status`
 - `command`
 - `network`
 - `inputs`
@@ -98,7 +99,7 @@ is only an endpoint compatibility preset means credentials still come from
 `AWS_PROFILE` or the standard AWS SDK credential chain.
 
 When a hints file is present, `hints` includes parse status, format, boundary
-count, warnings, and estimate summary metadata.  When `--resume` is set and a
+count, and warnings.  When `--resume` is set and a
 checkpoint file exists, `checkpoint` reports parse status, completed/total
 segments, and identity match details.
 

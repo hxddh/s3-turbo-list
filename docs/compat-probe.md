@@ -37,7 +37,7 @@ left to the probe so transport failures remain part of the diagnostic report.
 
 | Value | Meaning |
 |---|---|
-| `compatible` | No test reported `error`. |
+| `compatible` | No test reported `error`. Tests reported `skipped` were not exercised — a bucket with fewer than three objects skips the pagination check, so `compatible` on a near-empty bucket says nothing about continuation-token behavior. |
 | `partial` | Some tests reported `error`, while at least one did not. |
 | `incompatible` | Every test reported `error`. |
 
@@ -79,7 +79,7 @@ Minimal report shape:
       "request_id_2": "EXTENDED123"
     },
     {
-      "test": "ListObjectsV2 basic",
+      "test": "ListObjectsV2 (max-keys=1)",
       "status": "error",
       "latency_ms": 35,
       "http_status": 501,
