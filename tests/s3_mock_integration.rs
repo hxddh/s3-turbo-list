@@ -71,11 +71,36 @@ impl MockResponse {
     }
 }
 
+/// Concurrency the mock actually served, so a test can assert that segments
+/// overlapped rather than merely that the right requests were sent.
+#[derive(Default)]
+struct ServedConcurrency {
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl ServedConcurrency {
+    fn enter(&self) {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct MockS3Server {
     addr: std::net::SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    concurrency: Arc<ServedConcurrency>,
+    /// First panic raised inside a handler. Handlers run on connection
+    /// threads, where a panic would otherwise surface only as a connection
+    /// reset in the client — an assertion failure must not read as a network
+    /// error, so it is re-raised when the server is dropped.
+    handler_panic: Arc<Mutex<Option<String>>>,
 }
 
 impl MockS3Server {
@@ -91,21 +116,59 @@ impl MockS3Server {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handler = Arc::new(handler);
 
+        let concurrency = Arc::new(ServedConcurrency::default());
+        let handler_panic: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         let thread_requests = requests.clone();
         let thread_shutdown = shutdown.clone();
+        let thread_concurrency = Arc::clone(&concurrency);
+        let thread_panic = Arc::clone(&handler_panic);
+        // One thread per connection: the client opens a connection per request
+        // (responses close it), so serving them serially would make every
+        // parallel listing look sequential — no test could tell a run that
+        // fans out from one that does not, and handler-side latency could not
+        // model a slow range.
         let handle = thread::spawn(move || {
             let mut sequence = 0usize;
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         sequence += 1;
-                        handle_connection(stream, sequence, &thread_requests, handler.as_ref());
+                        let seq = sequence;
+                        let requests = Arc::clone(&thread_requests);
+                        let handler = Arc::clone(&handler);
+                        let concurrency = Arc::clone(&thread_concurrency);
+                        let panic_slot = Arc::clone(&thread_panic);
+                        workers.push(thread::spawn(move || {
+                            concurrency.enter();
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handle_connection(stream, seq, &requests, handler.as_ref())
+                                }));
+                            concurrency.leave();
+                            if let Err(payload) = result {
+                                let message = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                                let mut slot = panic_slot.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(message);
+                                }
+                            }
+                        }));
+                        workers.retain(|worker| !worker.is_finished());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break,
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
         });
 
@@ -114,7 +177,14 @@ impl MockS3Server {
             requests,
             shutdown,
             handle: Some(handle),
+            concurrency,
+            handler_panic,
         }
+    }
+
+    /// Highest number of requests the mock served at the same instant.
+    fn max_in_flight(&self) -> usize {
+        self.concurrency.max_in_flight.load(Ordering::SeqCst)
     }
 
     fn endpoint(&self) -> String {
@@ -132,6 +202,13 @@ impl Drop for MockS3Server {
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        // Re-raise a handler assertion on the test thread; on a connection
+        // thread it would have reached the client as a reset socket.
+        if !thread::panicking() {
+            if let Some(message) = self.handler_panic.lock().unwrap().take() {
+                panic!("mock handler panicked: {}", message);
+            }
         }
     }
 }
@@ -3432,4 +3509,288 @@ fn local_mock_diff_with_failing_side_writes_no_diff_output() {
         stderr
     );
     assert!(!ks.exists(), "no KS file describes a diff that never ran");
+}
+
+// ── Observable parallelism ──────────────────────────────────
+//
+// These are the tests the serial mock could not express: with per-request
+// latency and a mock that serves connections concurrently, a run that fans
+// out is distinguishable from one that does not — by the concurrency the
+// mock actually served, and by finishing well inside the serial bound.
+
+/// Mock for a flat namespace of `count` keys where every listing request
+/// costs `latency`. Bisection probes stay fast so startup is not the thing
+/// under measurement.
+fn slow_flat_namespace_server(count: usize, page: usize, latency: Duration) -> MockS3Server {
+    let keys: Vec<String> = (0..count).map(|i| format!("obj-{:06}", i)).collect();
+    MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Flat, and more pages to come, so the run pre-partitions.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("t")));
+        }
+        if max_keys == 1 {
+            let first: Vec<&str> = keys
+                .iter()
+                .find(|key| key.as_str() > start_after.as_str())
+                .map(|key| vec![key.as_str()])
+                .unwrap_or_default();
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
+        }
+        thread::sleep(latency);
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => keys.partition_point(|key| key.as_str() <= start_after.as_str()),
+        };
+        let page_keys: Vec<&str> = keys[start_idx..]
+            .iter()
+            .take(max_keys.min(page))
+            .map(String::as_str)
+            .collect();
+        let next = start_idx + page_keys.len();
+        let truncated = next < keys.len();
+        let token = format!("off-{}", next);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            page as i32,
+            &page_keys,
+            &[],
+            truncated,
+            truncated.then_some(token.as_str()),
+        ))
+    })
+}
+
+#[test]
+fn local_mock_list_serves_segments_concurrently() {
+    const KEYS: usize = 2000;
+    const PAGE: usize = 50;
+    const LATENCY_MS: u64 = 20;
+
+    // Same bucket and the same per-request latency twice: once partitioned,
+    // once as a single chain. The baseline uses --start-after with a key that
+    // sorts before every object, so nothing is skipped and both partitioning
+    // and runtime splitting are off. Both runs pay the same fixed process
+    // overhead, so the difference between them is the listing itself — which
+    // is what makes parallelism measurable at all.
+    fn run(extra: &[&str]) -> (std::time::Duration, usize, usize) {
+        let server = slow_flat_namespace_server(KEYS, PAGE, Duration::from_millis(LATENCY_MS));
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let parquet = dir.path().join("out.parquet");
+        let ks = dir.path().join("out.ks");
+        write_fast_config(&config);
+
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "--concurrency".into(),
+            "8".into(),
+            "--max-keys".into(),
+            PAGE.to_string(),
+            "--output-parquet-file".into(),
+            parquet.display().to_string(),
+            "--output-ks-file".into(),
+            ks.display().to_string(),
+        ];
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        args.extend([
+            "list".into(),
+            "--bucket".into(),
+            "mock-bucket".into(),
+            "--region".into(),
+            "us-east-1".into(),
+        ]);
+
+        let started = std::time::Instant::now();
+        let (code, stdout, stderr) = run_cli(&args, dir.path());
+        let elapsed = started.elapsed();
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        assert_eq!(parquet_keys(&parquet).len(), KEYS);
+        (elapsed, server.max_in_flight(), server.requests().len())
+    }
+
+    let (serial_elapsed, serial_peak, serial_requests) = run(&["--start-after", "obj-"]);
+    let (parallel_elapsed, parallel_peak, parallel_requests) = run(&[]);
+    assert!(serial_requests > 0 && parallel_requests > 0);
+
+    assert_eq!(
+        serial_peak, 1,
+        "a single-segment run has nothing to overlap"
+    );
+    assert!(
+        parallel_peak >= 2,
+        "partitioned listing must overlap requests, peak in-flight was {}",
+        parallel_peak
+    );
+    // Wall clock is deliberately not asserted here: a run shorter than the
+    // monitor's heartbeat window finishes inside it, so both runs measure the
+    // same fixed process time (~5s) whatever the listing cost. The served
+    // concurrency above is the signal that does not depend on that.
+    let _ = (serial_elapsed, parallel_elapsed);
+}
+
+#[test]
+fn local_mock_diff_serves_both_sides_concurrently() {
+    const KEYS: usize = 600;
+    const PAGE: usize = 50;
+    let keys: Vec<String> = (0..KEYS).map(|i| format!("obj-{:06}", i)).collect();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("t")));
+        }
+        if max_keys == 1 {
+            let first: Vec<&str> = keys
+                .iter()
+                .find(|key| key.as_str() > start_after.as_str())
+                .map(|key| vec![key.as_str()])
+                .unwrap_or_default();
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
+        }
+        thread::sleep(Duration::from_millis(20));
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => keys.partition_point(|key| key.as_str() <= start_after.as_str()),
+        };
+        let page_keys: Vec<&str> = keys[start_idx..]
+            .iter()
+            .take(max_keys.min(PAGE))
+            .map(String::as_str)
+            .collect();
+        let next = start_idx + page_keys.len();
+        let truncated = next < keys.len();
+        let token = format!("off-{}", next);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            PAGE as i32,
+            &page_keys,
+            &[],
+            truncated,
+            truncated.then_some(token.as_str()),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--max-keys".into(),
+        PAGE.to_string(),
+        "--output-parquet-file".into(),
+        dir.path().join("d.parquet").display().to_string(),
+        "--output-ks-file".into(),
+        dir.path().join("d.ks").display().to_string(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--target-region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        server.max_in_flight() >= 2,
+        "diff sides and their segments must overlap, peak in-flight was {}",
+        server.max_in_flight()
+    );
+}
+
+// The monitor used to sleep a whole heartbeat between checks, so a run held
+// the process open for up to that long after the listing had finished — a
+// fixed tail that dwarfed the work on anything small (a two-request listing
+// took ~5s). The heartbeat still prints on its own cadence; only the exit
+// check got faster.
+#[test]
+fn local_mock_small_run_exits_without_waiting_for_a_heartbeat() {
+    let keys = ["a.txt", "b.txt", "c.txt"];
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        let page: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key > start_after.as_str())
+            .collect();
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    let ks = dir.path().join("out.ks");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&parquet).len(), keys.len());
+    // Generous: the run itself is milliseconds, and the heartbeat interval it
+    // must not wait for is 5s.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "a three-key listing took {:?} — the process is waiting on a timer, not on work",
+        elapsed
+    );
 }
