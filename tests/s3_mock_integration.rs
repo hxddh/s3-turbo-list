@@ -3889,3 +3889,319 @@ for prefix, count in rows:
         body
     );
 }
+
+/// A ListObjectsV2 page whose single object carries a caller-supplied raw ETag,
+/// so a test can model what an S3-compatible endpoint actually put on the wire
+/// rather than what a well-behaved one would.
+fn list_bucket_xml_with_raw_etag(key: &str, raw_etag: &str, next_token: Option<&str>) -> String {
+    let next_token_xml = next_token
+        .map(|token| format!("<NextContinuationToken>{}</NextContinuationToken>", token))
+        .unwrap_or_default();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>mock-bucket</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>{}</IsTruncated>{}<Contents><Key>{}</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>{}</ETag><Size>10</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"#,
+        next_token.is_some(),
+        next_token_xml,
+        xml_escape(key),
+        xml_escape(raw_etag),
+    )
+}
+
+/// A malformed ETag must cost its object an ETag, never its segment.
+///
+/// Regression: `ObjectProps::from` sliced the raw ETag as `&x[1..33]`, which
+/// panics when byte 1 lands inside a multi-byte character. The panic killed the
+/// segment task, and the reactor logged the `JoinError` and carried on — so the
+/// segment's whole key range vanished from the output while the run reported
+/// `status: success` with `fatal_errors: 0`, and `manifest-summary --check`
+/// passed on the short file.
+#[test]
+fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
+    // 34 bytes, so it takes the single-part branch, but byte 1 is mid-character.
+    let bad_etag = format!("\u{65e5}{}", "a".repeat(31));
+    assert_eq!(bad_etag.len(), 34);
+
+    let server = MockS3Server::start(move |request, _sequence| {
+        match request.query.get("continuation-token").map(String::as_str) {
+            None => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
+                "a-good.txt",
+                "\"d41d8cd98f00b204e9800998ecf8427e\"",
+                Some("token-1"),
+            )),
+            Some("token-1") => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
+                "b-bad-etag.txt",
+                &bad_etag,
+                Some("token-2"),
+            )),
+            _ => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
+                "c-good.txt",
+                "\"d41d8cd98f00b204e9800998ecf8427e-3\"",
+                None,
+            )),
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("etag.parquet");
+    let ks = dir.path().join("etag.ks");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a malformed ETag must not panic a segment task: {}",
+        stderr
+    );
+    assert_eq!(
+        parquet_keys(&parquet),
+        vec!["a-good.txt", "b-bad-etag.txt", "c-good.txt"],
+        "the object with the malformed ETag — and the rest of its segment — must still be listed"
+    );
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["status"], "success");
+    assert_eq!(manifest_json["metrics"]["fatal_errors"], 0);
+}
+
+/// One key per page, resumable by either continuation token or `start-after`,
+/// with a caller-chosen set of pages that fail hard before they will serve.
+///
+/// `drops_per_page` is how many times a chosen page drops the connection before
+/// answering: the SDK retries internally, so a page has to fail at least
+/// `max_attempts` times in a row before the failure surfaces to the segment's
+/// own retry loop, which is the layer under test.
+fn paged_mock_with_failing_pages(
+    total_keys: usize,
+    failing: &'static [usize],
+    drops_per_page: usize,
+) -> (MockS3Server, Arc<Mutex<BTreeMap<usize, usize>>>) {
+    let attempts: Arc<Mutex<BTreeMap<usize, usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let handler_attempts = Arc::clone(&attempts);
+    let server = MockS3Server::start(move |request, _sequence| {
+        // A delimiter request is a split probe. Answering it with keys would
+        // hand the reactor a boundary and fan the run out into several
+        // segments, which would scramble both the page order and the retry
+        // budget under test; an empty result keeps this a single chain.
+        if request.query.contains_key("delimiter") {
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+
+        // Which key this request is asking for, however it was resumed.
+        let index = match (
+            request.query.get("continuation-token"),
+            request.query.get("start-after"),
+        ) {
+            (Some(token), _) => match token
+                .strip_prefix("tok-")
+                .and_then(|t| t.parse::<usize>().ok())
+            {
+                Some(i) => i + 1,
+                None => {
+                    return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None))
+                }
+            },
+            (None, Some(after)) if !after.is_empty() => {
+                match after
+                    .strip_prefix("key-")
+                    .and_then(|k| k.parse::<usize>().ok())
+                {
+                    Some(i) => i + 1,
+                    None => {
+                        return MockResponse::ok_xml(list_bucket_xml(
+                            "",
+                            1000,
+                            &[],
+                            &[],
+                            false,
+                            None,
+                        ))
+                    }
+                }
+            }
+            _ => 0,
+        };
+        if index >= total_keys {
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+
+        if failing.contains(&index) {
+            let mut seen = handler_attempts.lock().unwrap();
+            let count = seen.entry(index).or_insert(0);
+            *count += 1;
+            if *count <= drops_per_page {
+                return MockResponse::drop_connection();
+            }
+        }
+
+        let key = format!("key-{:02}", index);
+        let last = index + 1 >= total_keys;
+        let token = format!("tok-{:02}", index);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &[key.as_str()],
+            &[],
+            !last,
+            if last { None } else { Some(token.as_str()) },
+        ))
+    });
+    (server, attempts)
+}
+
+fn paged_run_args(
+    server: &MockS3Server,
+    config: &std::path::Path,
+    parquet: &std::path::Path,
+    ks: &std::path::Path,
+    manifest: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "--output-ks-file".into(),
+        ks.display().to_string(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        // One segment, listed in order: the budget under test is per-segment,
+        // and a fanned-out run would interleave pages from several of them.
+        "--no-auto-hints".into(),
+        "--concurrency".into(),
+        "1".into(),
+    ]
+}
+
+/// A segment that keeps advancing between hiccups must not run out of retries.
+///
+/// Regression: `max_attempts` was charged over the segment's whole lifetime and
+/// never refunded, so a healthy listing died once it had accumulated that many
+/// isolated transient failures — no matter how much ground it had covered in
+/// between. The failure rate scaled with how long a run was, which is exactly
+/// backwards for a tool whose job is big buckets.
+#[test]
+fn local_mock_retry_budget_is_refunded_by_progress() {
+    // `write_fast_config` sets max_attempts = 3, so four separate hiccups is
+    // more than a lifetime budget could absorb but each one is survivable on
+    // its own.
+    const FAILING: &[usize] = &[2, 4, 6, 8];
+    let (server, attempts) = paged_mock_with_failing_pages(10, FAILING, 3);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("refund.parquet");
+    let ks = dir.path().join("refund.ks");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = paged_run_args(&server, &config, &parquet, &ks, &manifest);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(
+        parquet_keys(&parquet),
+        (0..10)
+            .map(|i| format!("key-{:02}", i))
+            .collect::<Vec<String>>(),
+        "every page must be listed despite four separate hiccups"
+    );
+
+    // Each chosen page really did exhaust the SDK's own retries.
+    let seen = attempts.lock().unwrap().clone();
+    for index in FAILING {
+        assert!(
+            seen.get(index).copied().unwrap_or(0) > 3,
+            "page {} should have been retried past the SDK budget: {:?}",
+            index,
+            seen
+        );
+    }
+
+    // The segment's own retry loop is what resumed: it drops the continuation
+    // token and re-requests with `start-after`. A purely SDK-internal retry
+    // replays the tokened request instead, so this is the layer under test.
+    let requests = server.requests();
+    assert!(
+        requests.iter().any(|request| {
+            request
+                .query
+                .get("start-after")
+                .is_some_and(|k| k == "key-01")
+                && !request.query.contains_key("continuation-token")
+        }),
+        "expected a segment-level resume after the first hiccup: {:#?}",
+        requests
+    );
+}
+
+/// The refund must require real progress, or a stuck segment retries forever.
+///
+/// This is the guard on the fix above: a page that never succeeds leaves the
+/// resume point where it was, so the budget is charged normally and the run
+/// fails instead of spinning.
+#[test]
+fn local_mock_retry_budget_still_exhausts_without_progress() {
+    // Page 2 never answers, so every retry after the first resumes from the
+    // same key and buys no ground.
+    const FAILING: &[usize] = &[2];
+    let (server, _attempts) = paged_mock_with_failing_pages(10, FAILING, usize::MAX);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("stuck.parquet");
+    let ks = dir.path().join("stuck.ks");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = paged_run_args(&server, &config, &parquet, &ks, &manifest);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+
+    assert_ne!(
+        code, 0,
+        "a segment that cannot advance must fail the run: stdout: {}\nstderr: {}",
+        stdout, stderr
+    );
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["status"], "failed");
+    assert!(
+        manifest_json["metrics"]["fatal_errors"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "the run must record the failure: {}",
+        manifest_json
+    );
+}
