@@ -135,6 +135,31 @@ impl SegmentControl {
     }
 }
 
+/// What a segment task's `JoinError` means for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinFailure {
+    /// The run is already shutting down and aborted this task on purpose.
+    ShutdownCancel,
+    /// The task died on its own — its key range is missing from the output.
+    LostSegment,
+}
+
+/// Classify a segment task's join failure.
+///
+/// Only a cancellation raised *while the run is already quitting* is benign:
+/// that is `abort_all` reaping siblings after some other failure. Anything
+/// else means a segment stopped early, and the keys it owned are simply absent
+/// from the output — indistinguishable downstream from a range that was empty.
+/// Treating that as non-fatal is what let a panicking segment produce a short
+/// Parquet under `status: success` with `fatal_errors: 0`.
+pub(crate) fn classify_join_failure(is_cancelled: bool, run_is_quitting: bool) -> JoinFailure {
+    if is_cancelled && run_is_quitting {
+        JoinFailure::ShutdownCancel
+    } else {
+        JoinFailure::LostSegment
+    }
+}
+
 /// Ancestor directories of `cursor`, deepest first, ending at the listing
 /// prefix: `big/a/0005` → `["big/a/", "big/", <listing_prefix>]`.
 fn ancestor_dirs(cursor: &str, listing_prefix: &str) -> Vec<String> {
@@ -503,7 +528,19 @@ async fn flat_reactor_task(
                     }
                 }
                 Some(Err(e)) => {
-                    error!("Task join error: {:?}", e);
+                    match classify_join_failure(e.is_cancelled(), ctx.is_quit()) {
+                        JoinFailure::ShutdownCancel => {
+                            info!("Segment task cancelled during shutdown");
+                        }
+                        JoinFailure::LostSegment => {
+                            error!(
+                                "Flat List S3 Task — {} — segment task failed to join, its key range is missing from the output: {:?}",
+                                ctx.s3_bucket_name, e
+                            );
+                            ctx.g_state.inc_fatal_error();
+                            ctx.g_state.quit();
+                        }
+                    }
                 }
                 None => {}
             },
@@ -681,14 +718,35 @@ async fn flat_list_run_to_complete(
                 if ctx.is_quit() {
                     return false;
                 }
-                let next_retry_attempt = retry_attempt.saturating_add(1);
+                // `max_attempts` bounds *consecutive* failures, not the
+                // segment's lifetime. An attempt that listed part of its range
+                // before failing leaves the segment strictly further along, so
+                // it refunds the budget. Charging it instead made a run's
+                // failure rate scale with its length rather than with how sick
+                // the endpoint was: ten isolated hiccups, each retried
+                // successfully, killed a listing that was advancing the whole
+                // way — and long runs over big buckets accumulate ten of
+                // anything. Keying the refund on the resume point (rather than
+                // on a page count) keeps this monotonic: a refund is only ever
+                // granted for ground the segment will not cover again, so a
+                // segment that cannot advance still exhausts the budget instead
+                // of retrying forever.
+                let advanced = err.next_start() != start_after;
+                let next_retry_attempt = if advanced {
+                    0
+                } else {
+                    retry_attempt.saturating_add(1)
+                };
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
                     start_after = err.next_start_owned();
                     continuation_token = None;
                     retry_attempt = next_retry_attempt;
                     debug!(
-                        "Retrying from '{}' (attempt {}): {}",
-                        start_after, retry_attempt, err
+                        "Retrying from '{}' (attempt {}{}): {}",
+                        start_after,
+                        retry_attempt,
+                        if advanced { ", budget refunded" } else { "" },
+                        err
                     );
                     continue;
                 }
@@ -698,9 +756,10 @@ async fn flat_list_run_to_complete(
                 // still running: the data map finalized early and the
                 // siblings died on channel errors, inflating fatal_errors.)
                 error!(
-                    "Flat List S3 Task — {} — fatal after {} attempt(s): {}",
+                    "Flat List S3 Task — {} — fatal after {} consecutive failed attempt(s) at '{}': {}",
                     ctx.s3_bucket_name,
                     retry_attempt.saturating_add(1),
+                    start_after,
                     err
                 );
                 ctx.g_state.inc_fatal_error();
@@ -1447,6 +1506,48 @@ mod tests {
 }
 
 #[cfg(test)]
+mod join_failure_tests {
+    use super::*;
+
+    #[test]
+    fn test_panicked_segment_is_a_lost_segment() {
+        // A panic is never benign: the segment stopped mid-range and the keys
+        // it owned are absent from the output, which nothing downstream can
+        // distinguish from an empty range.
+        assert_eq!(
+            classify_join_failure(false, false),
+            JoinFailure::LostSegment
+        );
+    }
+
+    #[test]
+    fn test_panicked_segment_stays_fatal_even_while_quitting() {
+        // `is_quit()` alone must not excuse a join failure — the run may be
+        // quitting *because* of this very panic, and the segment's keys are
+        // missing either way.
+        assert_eq!(classify_join_failure(false, true), JoinFailure::LostSegment);
+    }
+
+    #[test]
+    fn test_cancellation_during_shutdown_is_benign() {
+        // `abort_all` reaping siblings after some other failure already quit
+        // the run: counting these would inflate fatal_errors on a clean stop.
+        assert_eq!(
+            classify_join_failure(true, true),
+            JoinFailure::ShutdownCancel
+        );
+    }
+
+    #[test]
+    fn test_cancellation_without_shutdown_is_a_lost_segment() {
+        // Nothing should cancel a segment while the run is healthy; if it
+        // happens, the range is still missing and the run must not claim
+        // success.
+        assert_eq!(classify_join_failure(true, false), JoinFailure::LostSegment);
+    }
+}
+
+#[cfg(test)]
 mod flat_cut_tests {
     use super::*;
 
@@ -1558,7 +1659,26 @@ pub async fn diff_list_side_task(
         }
         match set.join_next().await {
             Some(Ok(_completed)) => {}
-            Some(Err(e)) => error!("Diff segment join error: {:?}", e),
+            Some(Err(e)) => {
+                // Losing a segment is worse here than in list mode: the merge
+                // sees the missing keys as absent from this side and reports
+                // every one of them as a one-sided difference. Two identical
+                // buckets came out as a full-bucket delta, under
+                // `status: success`.
+                match classify_join_failure(e.is_cancelled(), ctx.is_quit()) {
+                    JoinFailure::ShutdownCancel => {
+                        info!("Diff segment task cancelled during shutdown");
+                    }
+                    JoinFailure::LostSegment => {
+                        error!(
+                            "Diff List S3 Task — {} — segment task failed to join, its key range is missing from this side of the comparison: {:?}",
+                            ctx.s3_bucket_name, e
+                        );
+                        ctx.g_state.inc_fatal_error();
+                        ctx.g_state.quit();
+                    }
+                }
+            }
             None => break,
         }
         if ctx.is_quit() {

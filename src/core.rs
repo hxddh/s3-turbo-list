@@ -290,15 +290,30 @@ impl ObjectProps {
 impl From<&aws_sdk_s3::types::Object> for ObjectProps {
     fn from(item: &aws_sdk_s3::types::Object) -> Self {
         let mut md5 = [0u8; 16];
+        // Index the ETag as bytes, never as `str`. The value is whatever the
+        // endpoint sent, and `&x[1..33]` panics when byte 1 lands inside a
+        // multi-byte character — a panicking segment task used to be swallowed
+        // by the reactor, so one malformed ETag silently dropped a whole key
+        // range from the output. Byte slicing also skips a UTF-8 boundary
+        // check that a 32-char hex span never needs.
         let (etag_md5, etag_parts) = item.e_tag().map_or((md5, 0), |x| {
-            if x.len() == 34 {
-                if hex::decode_to_slice(&x[1..33], &mut md5).is_ok() {
-                    return (md5, 0);
+            let raw = x.as_bytes();
+            if raw.len() == 34 {
+                if let Some(hex_span) = raw.get(1..33) {
+                    if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
+                        return (md5, 0);
+                    }
                 }
-            } else if x.len() >= 36 && x.as_bytes().get(33) == Some(&b'-') {
-                if hex::decode_to_slice(&x[1..33], &mut md5).is_ok() {
-                    if let Ok(parts) = &x[34..x.len() - 1].parse::<usize>() {
-                        return (md5, *parts as u32);
+            } else if raw.len() >= 36 && raw.get(33) == Some(&b'-') {
+                if let Some(hex_span) = raw.get(1..33) {
+                    if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
+                        if let Some(parts) = raw
+                            .get(34..raw.len() - 1)
+                            .and_then(|p| std::str::from_utf8(p).ok())
+                            .and_then(|p| p.parse::<u32>().ok())
+                        {
+                            return (md5, parts);
+                        }
                     }
                 }
             }
@@ -1185,6 +1200,82 @@ mod tests {
     fn test_object_props_list_output_excludes_diff_mode() {
         let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [1u8; 16]);
         assert!(!props.include_in_list_output());
+    }
+
+    /// Build the SDK object the listing path actually converts from, so these
+    /// exercise the real `From` impl rather than a re-implementation of it.
+    fn object_with_etag(etag: &str) -> aws_sdk_s3::types::Object {
+        aws_sdk_s3::types::Object::builder()
+            .key("k")
+            .size(1)
+            .e_tag(etag)
+            .build()
+    }
+
+    #[test]
+    fn test_etag_parses_single_part() {
+        let props = ObjectProps::from(&object_with_etag("\"d41d8cd98f00b204e9800998ecf8427e\""));
+        assert_eq!(props.etag_string(), "d41d8cd98f00b204e9800998ecf8427e");
+        assert!(!props.is_etag_not_avail());
+    }
+
+    #[test]
+    fn test_etag_parses_multipart() {
+        let props = ObjectProps::from(&object_with_etag("\"d41d8cd98f00b204e9800998ecf8427e-37\""));
+        assert_eq!(props.etag_string(), "d41d8cd98f00b204e9800998ecf8427e-37");
+        assert_eq!(props.etag_parts, 37);
+    }
+
+    #[test]
+    fn test_etag_parses_max_realistic_part_count() {
+        // S3 caps multipart uploads at 10000 parts.
+        let props = ObjectProps::from(&object_with_etag(
+            "\"d41d8cd98f00b204e9800998ecf8427e-10000\"",
+        ));
+        assert_eq!(props.etag_parts, 10_000);
+    }
+
+    #[test]
+    fn test_non_ascii_etag_does_not_panic() {
+        // Regression: `&x[1..33]` panicked when byte 1 landed inside a
+        // multi-byte character, and the panicking segment task used to be
+        // swallowed by the reactor — one malformed ETag from an S3-compatible
+        // endpoint silently dropped that segment's whole key range from the
+        // output. The value must simply fail to parse.
+        let etag = format!("\u{65e5}{}", "a".repeat(31)); // 34 bytes, byte 1 is mid-char
+        assert_eq!(etag.len(), 34);
+        let props = ObjectProps::from(&object_with_etag(&etag));
+        assert!(props.is_etag_not_avail());
+    }
+
+    #[test]
+    fn test_non_ascii_multipart_shaped_etag_does_not_panic() {
+        // Same hazard on the multipart branch: byte 33 is a valid `-`, so the
+        // length check passes, but the hex span and the part-count span are
+        // both cut on byte indices.
+        let etag = format!("\u{65e5}{}-\u{65e5}7\"", "a".repeat(30));
+        assert_eq!(etag.as_bytes()[33], b'-');
+        let props = ObjectProps::from(&object_with_etag(&etag));
+        assert!(props.is_etag_not_avail());
+    }
+
+    #[test]
+    fn test_unparseable_etags_are_reported_unavailable() {
+        // Unquoted, empty, short, and non-hex values all fall back to
+        // "unavailable", which `classify_pair` reports as a difference rather
+        // than silently calling two objects equal.
+        for etag in [
+            "d41d8cd98f00b204e9800998ecf8427e", // unquoted
+            "\"\"",
+            "\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"",  // non-hex
+            "\"d41d8cd98f00b204e9800998ecf8427e-\"", // empty part count
+        ] {
+            let props = ObjectProps::from(&object_with_etag(etag));
+            assert!(
+                props.is_etag_not_avail(),
+                "etag {etag:?} should be unavailable"
+            );
+        }
     }
 
     #[test]

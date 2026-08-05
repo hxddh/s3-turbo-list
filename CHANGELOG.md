@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-05
+
+### Fixed
+- **A segment task that dies no longer disappears quietly.** The reactor
+  logged the `JoinError` and carried on, so the key range that segment owned
+  was simply absent from the output while the run reported `status: success`
+  with `fatal_errors: 0` — and `manifest-summary --check` passed, because the
+  row counts it compares were both short by the same amount. A four-segment
+  listing of eight objects returned six. In diff mode the hole was worse than
+  missing rows: the merge saw the lost side's keys as absent and reported
+  every one as a one-sided difference, so two identical buckets came out as a
+  full-bucket delta — and when both sides lost a segment, as "no differences".
+  Only a cancellation raised while the run is already quitting is treated as
+  benign now; anything else fails the run.
+- **A malformed ETag costs its object an ETag, not its segment.** The hex span
+  was carved out with `&x[1..33]`, which panics when byte 1 lands inside a
+  multi-byte character. An S3-compatible endpoint returning a 34-byte
+  non-ASCII ETag took down the segment that was listing it — which, before the
+  fix above, meant that range vanished from a run that still exited 0. The
+  value is now indexed as bytes and an unparseable ETag falls back to
+  "unavailable", which diff already reports as a difference rather than
+  silently calling two objects equal.
+- **`s3.max_attempts` bounds consecutive failures, not a segment's lifetime.**
+  The counter was never reset, so it was a budget for *total* transient
+  failures: a listing that hiccuped and recovered ten times died at the tenth
+  however much ground it had covered in between. The odds of finishing fell
+  the longer a run went — backwards for a tool built for large buckets. An
+  attempt that advances the resume point now refunds the budget. The refund is
+  keyed on the resume point rather than a page count so it stays monotonic: a
+  segment that cannot advance still exhausts its retries instead of spinning
+  forever.
+
+### Changed
+- **Runs that used to report success while dropping a segment now fail.** This
+  is the intended effect of the first fix above, but it is a visible change
+  for any pipeline that was consuming short output without noticing. A failed
+  run exits non-zero and records the failure in the run manifest; `--resume`
+  picks up from the last checkpoint, which never recorded the lost segment as
+  complete.
+
 ## [0.28.0] - 2026-08-04
 
 ### Fixed

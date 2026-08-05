@@ -1,0 +1,211 @@
+{
+  "schema_version": "s3-turbo-list.agent.v1",
+  "tool_version": "0.28.0",
+  "status": "ok",
+  "benchmark": "list-output",
+  "network": "none: synthetic local data only",
+  "compression": "zstd",
+  "compression_level": 1,
+  "output_format": "parquet",
+  "objects": 2000000,
+  "batch_size": 1000,
+  "prefixes": 512,
+  "producers": 1,
+  "channel_capacity": 64,
+  "producer_send_wait_secs": 0.26836936,
+  "elapsed_secs": 0.812539547,
+  "objects_per_sec": 2461418.656340182,
+  "rows_per_sec": 2461418.656340182,
+  "parquet_bytes_per_object": 2.837813,
+  "ks_bytes_per_object": 0.005065,
+  "text_bytes_per_object": 0.0,
+  "output_bytes_per_object": 2.842878,
+  "parquet_mib_per_sec": 6.661458836941433,
+  "text_mib_per_sec": 0.0,
+  "output_mib_per_sec": 6.673348376177849,
+  "artifact_dir": null,
+  "parquet_file": "/tmp/s3-turbo-list-benchmark-23070-1785906216196592251/benchmark.parquet",
+  "parquet_bytes": 5675626,
+  "ks_file": "/tmp/s3-turbo-list-benchmark-23070-1785906216196592251/benchmark.ks",
+  "ks_bytes": 10130,
+  "text_file": null,
+  "text_bytes": 0,
+  "metrics": {
+    "fatal_errors": 0,
+    "output_errors": 0,
+    "stream_timeouts": 0,
+    "s3_client_timeouts": 0,
+    "s3_client_generic_errors": 0,
+    "received_batches": 2000,
+    "received_objects": 2000000,
+    "streamed_rows": 2000000,
+    "unique_prefixes": 512,
+    "parquet_rows": 2000000,
+    "ks_entries": 512,
+    "bytes_total": 6141304256,
+    "top_prefixes": [
+      {
+        "prefix": "prefix-127",
+        "objects": 3907,
+        "bytes": 11494461
+      },
+      {
+        "prefix": "prefix-126",
+        "objects": 3907,
+        "bytes": 11490554
+      },
+      {
+        "prefix": "prefix-125",
+        "objects": 3907,
+        "bytes": 11486647
+      },
+      {
+        "prefix": "prefix-124",
+        "objects": 3907,
+        "bytes": 11482740
+      },
+      {
+        "prefix": "prefix-123",
+        "objects": 3907,
+        "bytes": 11478833
+      },
+      {
+        "prefix": "prefix-122",
+        "objects": 3907,
+        "bytes": 11474926
+      },
+      {
+        "prefix": "prefix-121",
+        "objects": 3907,
+        "bytes": 11471019
+      },
+      {
+        "prefix": "prefix-120",
+        "objects": 3907,
+        "bytes": 11467112
+      },
+      {
+        "prefix": "prefix-119",
+        "objects": 3907,
+        "bytes": 11463205
+      },
+      {
+        "prefix": "prefix-118",
+        "objects": 3907,
+        "bytes": 11459298
+      },
+      {
+        "prefix": "prefix-117",
+        "objects": 3907,
+        "bytes": 11455391
+      },
+      {
+        "prefix": "prefix-116",
+        "objects": 3907,
+        "bytes": 11451484
+      },
+      {
+        "prefix": "prefix-115",
+        "objects": 3907,
+        "bytes": 11447577
+      },
+      {
+        "prefix": "prefix-114",
+        "objects": 3907,
+        "bytes": 11443670
+      },
+      {
+        "prefix": "prefix-113",
+        "objects": 3907,
+        "bytes": 11439763
+      },
+      {
+        "prefix": "prefix-112",
+        "objects": 3907,
+        "bytes": 11435856
+      },
+      {
+        "prefix": "prefix-111",
+        "objects": 3907,
+        "bytes": 11431949
+      },
+      {
+        "prefix": "prefix-110",
+        "objects": 3907,
+        "bytes": 11428042
+      },
+      {
+        "prefix": "prefix-109",
+        "objects": 3907,
+        "bytes": 11424135
+      },
+      {
+        "prefix": "prefix-108",
+        "objects": 3907,
+        "bytes": 11420228
+      },
+      {
+        "prefix": "prefix-107",
+        "objects": 3907,
+        "bytes": 11416321
+      },
+      {
+        "prefix": "prefix-106",
+        "objects": 3907,
+        "bytes": 11412414
+      },
+      {
+        "prefix": "prefix-105",
+        "objects": 3907,
+        "bytes": 11408507
+      },
+      {
+        "prefix": "prefix-104",
+        "objects": 3907,
+        "bytes": 11404600
+      },
+      {
+        "prefix": "prefix-103",
+        "objects": 3907,
+        "bytes": 11400693
+      },
+      {
+        "prefix": "prefix-102",
+        "objects": 3907,
+        "bytes": 11396786
+      },
+      {
+        "prefix": "prefix-101",
+        "objects": 3907,
+        "bytes": 11392879
+      },
+      {
+        "prefix": "prefix-100",
+        "objects": 3907,
+        "bytes": 11388972
+      },
+      {
+        "prefix": "prefix-99",
+        "objects": 3907,
+        "bytes": 11385065
+      },
+      {
+        "prefix": "prefix-98",
+        "objects": 3907,
+        "bytes": 11381158
+      },
+      {
+        "prefix": "prefix-97",
+        "objects": 3907,
+        "bytes": 11377251
+      },
+      {
+        "prefix": "prefix-96",
+        "objects": 3907,
+        "bytes": 11373344
+      }
+    ],
+    "summary_only": false
+  },
+  "artifacts_kept": false
+}
