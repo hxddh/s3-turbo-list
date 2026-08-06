@@ -22,6 +22,19 @@ pub struct CheckpointIdentity {
     pub addressing_style: Option<String>,
     #[serde(default)]
     pub mode: Option<String>, // "list" or "bidir"
+    /// The `--filter` expression, verbatim, or `None` when the run had no
+    /// filter.  It belongs here for the same reason `prefix` and `max_keys`
+    /// do: it decides which objects reach the output, so resuming under a
+    /// different one splices two populations into a single file that reads
+    /// as one coherent listing.
+    ///
+    /// A checkpoint written before this field existed also deserializes to
+    /// `None`, which is indistinguishable from "no filter". Resuming such a
+    /// checkpoint under a filter is caught (`None` vs `Some`); resuming a
+    /// filtered pre-upgrade checkpoint without one is not. That residual gap
+    /// closes as soon as a checkpoint is written by this version or later.
+    #[serde(default)]
+    pub filter: Option<String>,
     /// Fingerprint of the key-space boundary set the checkpoint's segment
     /// indices refer to.  Absent in checkpoints written before boundary
     /// verification existed.
@@ -40,6 +53,7 @@ impl CheckpointIdentity {
         profile: Option<&str>,
         addressing_style: Option<&str>,
         mode: Option<&str>,
+        filter: Option<&str>,
     ) -> Self {
         Self {
             bucket: bucket.to_string(),
@@ -50,6 +64,7 @@ impl CheckpointIdentity {
             profile: profile.map(|p| p.to_string()),
             addressing_style: addressing_style.map(|a| a.to_string()),
             mode: mode.map(|m| m.to_string()),
+            filter: filter.map(|f| f.to_string()),
             boundaries_digest: None,
         }
     }
@@ -90,6 +105,9 @@ impl CheckpointIdentity {
         }
         if self.mode != current.mode {
             mismatches.push("mode".into());
+        }
+        if self.filter != current.filter {
+            mismatches.push("filter".into());
         }
 
         mismatches
@@ -287,6 +305,7 @@ mod tests {
             profile,
             addressing_style,
             mode,
+            None,
         )
     }
 
@@ -312,6 +331,76 @@ mod tests {
         );
         let current = id.clone();
         assert!(id.diff(&current).is_empty());
+    }
+
+    fn make_identity_with_filter(filter: Option<&str>) -> CheckpointIdentity {
+        CheckpointIdentity::new(
+            "test-bucket",
+            Some("us-east-1"),
+            "",
+            Some("/"),
+            None,
+            None,
+            Some("path"),
+            Some("list"),
+            filter,
+        )
+    }
+
+    #[test]
+    fn test_identity_changed_filter_detected() {
+        // Resuming under a different filter would splice rows written under
+        // the old expression together with rows written under the new one.
+        let stored = make_identity_with_filter(Some("SOURCE.size > 1000"));
+        let current = make_identity_with_filter(Some("SOURCE.size > 2000"));
+        assert!(stored.diff(&current).contains(&"filter".to_string()));
+    }
+
+    #[test]
+    fn test_identity_filter_added_or_dropped_detected() {
+        let none = make_identity_with_filter(None);
+        let some = make_identity_with_filter(Some("SOURCE.size > 1000"));
+        assert!(none.diff(&some).contains(&"filter".to_string()));
+        assert!(some.diff(&none).contains(&"filter".to_string()));
+    }
+
+    #[test]
+    fn test_identity_same_filter_allows_resume() {
+        let stored = make_identity_with_filter(Some("SOURCE.size > 1000"));
+        let current = make_identity_with_filter(Some("SOURCE.size > 1000"));
+        assert!(stored.diff(&current).is_empty());
+    }
+
+    #[test]
+    fn test_load_and_verify_changed_filter_discards_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.toml");
+        let path_str = path.to_str().unwrap();
+
+        let journal = make_journal(make_identity_with_filter(Some("SOURCE.size > 1000")));
+        journal.save(path_str);
+
+        let current = make_identity_with_filter(Some("SOURCE.size > 2000"));
+        assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
+    }
+
+    #[test]
+    fn test_identity_without_filter_field_deserializes_to_none() {
+        // A checkpoint written before the field existed must still load —
+        // it just carries no filter, and is caught the moment the current
+        // run has one.
+        let toml_src = r#"
+bucket = "test-bucket"
+prefix = ""
+delimiter = "/"
+addressing_style = "path"
+mode = "list"
+"#;
+        let id: CheckpointIdentity = toml::from_str(toml_src).unwrap();
+        assert_eq!(id.filter, None);
+        assert!(id
+            .diff(&make_identity_with_filter(Some("SOURCE.size > 1000")))
+            .contains(&"filter".to_string()));
     }
 
     #[test]
@@ -356,7 +445,8 @@ mod tests {
 
     #[test]
     fn test_identity_legacy_detection() {
-        let legacy = CheckpointIdentity::new("bucket", None, "", None, None, None, None, None);
+        let legacy =
+            CheckpointIdentity::new("bucket", None, "", None, None, None, None, None, None);
         assert!(legacy.is_legacy());
 
         let modern = make_identity(Some("/"), None, None, None, None);

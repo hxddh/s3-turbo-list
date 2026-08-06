@@ -158,6 +158,25 @@ The `metrics` object includes data-map counters such as received batches,
 received objects, streamed rows, unique prefixes, Parquet rows, KS entries,
 total bytes, top prefixes, fatal listing errors, and output write errors.
 
+Two fields report endpoint pushback, so a run that was slow because it was
+being rate-limited can be told apart from one that was slow because the
+bucket is large:
+
+- `throttled_responses`: responses the endpoint rejected for rate
+  (`SlowDown`, `TooManyRequests`, `ThrottlingException`).  Keyed on the S3
+  error code, not the HTTP status, because 503 also carries plain
+  `ServiceUnavailable`.
+- `http_error_statuses`: the `{status, count}` histogram of error responses
+  the run saw, empty when there were none.
+
+Retries are not failures: a run can finish with `status: success`,
+`fatal_errors: 0` and a large `throttled_responses`.  That combination means
+the listing completed but the endpoint was the constraint.
+
+`inputs.filter` records the `--filter` expression the run applied, or `null`
+for no filter.  Two runs over one bucket under different filters produce
+different artifacts; this field is what tells their manifests apart.
+
 The manifest `command` array uses the same sensitive value redaction as dry-run
 plans.  Use `inputs`, `outputs`, and `config_source` for exact structured run
 details instead of trying to recover secret-adjacent values from `command`.

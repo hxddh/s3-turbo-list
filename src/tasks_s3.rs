@@ -1206,6 +1206,10 @@ fn handle_sdk_error(
             let retryable = errno < ERROR_NO_BUCKET;
             let fatal = errno >= ERROR_NO_BUCKET;
 
+            if errno == ERROR_SLOW_DOWN || errno == ERROR_TOO_MANY_REQUESTS {
+                ctx.g_state.inc_throttled();
+            }
+
             // Emit trace event.
             emit_trace_compat(
                 ctx,

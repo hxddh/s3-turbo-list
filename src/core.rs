@@ -265,6 +265,26 @@ impl ObjectProps {
         dir == OBJECT_PROPS_FLAG_DIR_LEFT || dir == OBJECT_PROPS_FLAG_DIR_RIGHT
     }
 
+    /// Diff-filter gate for a key present on only one side.
+    ///
+    /// One-sided rows used to bypass the filter entirely, so `--filter` only
+    /// ever narrowed the both-sides rows and the output still carried every
+    /// `+`/`-` row the user had asked to exclude. The present side binds to
+    /// `SOURCE`: for a one-sided row it is the only object there is, and a
+    /// filter that genuinely distinguishes the two sides must name `TARGET`,
+    /// which cannot be evaluated here at all.
+    ///
+    /// That unevaluable case keeps the row. `evaluate` returns `None` for it,
+    /// and only `Some(false)` excludes — the same convention
+    /// `include_in_list_output` uses, so a predicate that cannot be decided
+    /// never silently drops a difference.
+    pub fn include_one_sided(props: &ObjectProps) -> bool {
+        match OBJECT_FILTER.get() {
+            Some(filter) => filter.evaluate(props, None) != Some(false),
+            None => true,
+        }
+    }
+
     /// Streaming-diff classification of a key present on both sides.
     /// Returns `None` when the optional diff filter excludes the pair.
     /// Semantics mirror the legacy match state machine: size mismatch,
@@ -390,6 +410,12 @@ pub struct GlobalState {
     pub task_next_stream_timeout_count: Arc<AtomicUsize>,
     pub s3_client_timeout_count: Arc<AtomicUsize>,
     pub s3_client_generic_error_count: Arc<AtomicUsize>,
+    /// Responses the endpoint rejected for rate — `SlowDown`,
+    /// `TooManyRequests`, `ThrottlingException`.  Keyed on the S3 error code
+    /// rather than the HTTP status, because 503 also carries plain
+    /// `ServiceUnavailable` and conflating the two makes the number useless
+    /// for the question it exists to answer.
+    pub throttled_count: Arc<AtomicUsize>,
     pub fatal_error_count: Arc<AtomicUsize>,
     pub output_error_count: Arc<AtomicUsize>,
     pub data_received_batches: Arc<AtomicUsize>,
@@ -412,6 +438,14 @@ pub struct PrefixMetric {
     pub bytes: u64,
 }
 
+/// One entry of the error-response status histogram.  Only error responses
+/// reach the tracker, so an empty histogram means the run saw none.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HttpStatusMetric {
+    pub status: u16,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunMetricsSnapshot {
     pub fatal_errors: usize,
@@ -419,6 +453,13 @@ pub struct RunMetricsSnapshot {
     pub stream_timeouts: usize,
     pub s3_client_timeouts: usize,
     pub s3_client_generic_errors: usize,
+    /// Rate-limited responses, and the error-status histogram they came from.
+    /// A run that spent most of its wall clock being throttled and retried
+    /// used to be indistinguishable in the manifest from a clean one — the
+    /// numbers existed but only ever reached the heartbeat log, which needs
+    /// `--log` and is not machine-readable.
+    pub throttled_responses: usize,
+    pub http_error_statuses: Vec<HttpStatusMetric>,
     pub data_received_batches: usize,
     pub data_received_objects: usize,
     pub data_streamed_rows: usize,
@@ -443,6 +484,7 @@ impl GlobalState {
             task_next_stream_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_generic_error_count: Arc::new(AtomicUsize::new(0)),
+            throttled_count: Arc::new(AtomicUsize::new(0)),
             fatal_error_count: Arc::new(AtomicUsize::new(0)),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data_received_batches: Arc::new(AtomicUsize::new(0)),
@@ -482,6 +524,12 @@ impl GlobalState {
     }
     pub fn read_s3_client_generic_error(&self) -> usize {
         self.s3_client_generic_error_count.load(Ordering::Relaxed)
+    }
+    pub fn inc_throttled(&self) {
+        self.throttled_count.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn read_throttled(&self) -> usize {
+        self.throttled_count.load(Ordering::Relaxed)
     }
     pub fn inc_fatal_error(&self) {
         self.fatal_error_count.fetch_add(1, Ordering::Relaxed);
@@ -532,6 +580,13 @@ impl GlobalState {
             fatal_errors: self.read_fatal_error(),
             output_errors: self.read_output_error(),
             stream_timeouts: self.read_task_next_stream_timeout(),
+            throttled_responses: self.read_throttled(),
+            http_error_statuses: self
+                .tracker
+                .snapshot()
+                .into_iter()
+                .map(|(status, count)| HttpStatusMetric { status, count })
+                .collect(),
             s3_client_timeouts: self.read_s3_client_timeout(),
             s3_client_generic_errors: self.read_s3_client_generic_error(),
             data_received_batches: self.data_received_batches.load(Ordering::Relaxed),
@@ -1161,6 +1216,59 @@ mod tests {
             ObjectProps::classify_pair(&missing, &missing),
             Some(MatchResult::Astrisk)
         );
+    }
+
+    #[test]
+    fn test_metrics_snapshot_reports_throttling() {
+        let g = GlobalState::new(Arc::new(AtomicBool::new(false)), 1);
+        assert_eq!(g.metrics_snapshot().throttled_responses, 0);
+        assert!(g.metrics_snapshot().http_error_statuses.is_empty());
+
+        g.inc_throttled();
+        g.inc_throttled();
+        g.tracker.inc_sync(503);
+        g.tracker.inc_sync(503);
+        g.tracker.inc_sync(500);
+
+        let snap = g.metrics_snapshot();
+        assert_eq!(snap.throttled_responses, 2);
+        assert_eq!(
+            snap.http_error_statuses
+                .iter()
+                .map(|m| (m.status, m.count))
+                .collect::<Vec<_>>(),
+            vec![(500, 1), (503, 2)],
+            "the histogram is the raw evidence behind the throttle count"
+        );
+    }
+
+    #[test]
+    fn test_include_one_sided_without_filter_keeps_every_row() {
+        // No filter installed in this test binary — the gate must be inert.
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 1, [0xab; 16]);
+        assert!(ObjectProps::include_one_sided(&props));
+    }
+
+    #[test]
+    fn test_target_referencing_filter_cannot_decide_a_one_sided_row() {
+        // The contract that keeps `SOURCE.size != TARGET.size` from silently
+        // dropping every one-sided difference: with no target to bind, the
+        // expression evaluates to `None`, and `include_one_sided` excludes
+        // only on `Some(false)`.
+        let expr = crate::filter_expr::FilterExpr::compile("SOURCE.size != TARGET.size", true)
+            .expect("compiles in diff mode");
+        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
+        assert_eq!(expr.evaluate(&props, None), None);
+    }
+
+    #[test]
+    fn test_target_free_filter_decides_a_one_sided_row() {
+        let expr = crate::filter_expr::FilterExpr::compile("SOURCE.size > 1000", true)
+            .expect("compiles in diff mode");
+        let small = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 999, [0xab; 16]);
+        let big = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 1001, [0xab; 16]);
+        assert_eq!(expr.evaluate(&small, None), Some(false));
+        assert_eq!(expr.evaluate(&big, None), Some(true));
     }
 
     #[test]

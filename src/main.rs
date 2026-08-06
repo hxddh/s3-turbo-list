@@ -797,6 +797,7 @@ fn main() {
             } else {
                 "list"
             }),
+            cli.filter.as_deref(),
         );
 
         let checkpoint_journal = checkpoint_path_opt
@@ -1390,6 +1391,7 @@ fn main() {
                 } else {
                     "list"
                 }),
+                cli.filter.as_deref(),
             )),
         ),
         warnings: run_warnings.clone(),
@@ -2395,6 +2397,8 @@ fn run_benchmark_local_diff(
         stream_timeouts: 0,
         s3_client_timeouts: 0,
         s3_client_generic_errors: 0,
+        throttled_responses: 0,
+        http_error_statuses: Vec::new(),
         received_batches: outcome.received_batches,
         received_objects: outcome.received_objects,
         streamed_rows: outcome.rows,
@@ -2607,6 +2611,7 @@ fn build_plan_report(
             } else {
                 "list"
             }),
+            inputs.filter.as_deref(),
         )
     });
     let hints = if inputs.mode == "diff" {
@@ -2912,6 +2917,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         continuation_token: cli.continuation_token.clone(),
         profile: cfg.s3.profile.clone(),
         addressing_style: cfg.s3.addressing_style.to_string(),
+        filter: cli.filter.clone(),
     }
 }
 

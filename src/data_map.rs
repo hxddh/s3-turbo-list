@@ -1343,12 +1343,20 @@ async fn merge_diff_streams(
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
                 sink.record_key(&key, props.size());
-                sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
+                if core::ObjectProps::include_one_sided(&props) {
+                    sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
+                } else {
+                    sink.ignored += 1;
+                }
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
                 sink.record_key(&key, props.size());
-                sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
+                if core::ObjectProps::include_one_sided(&props) {
+                    sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
+                } else {
+                    sink.ignored += 1;
+                }
             }
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
