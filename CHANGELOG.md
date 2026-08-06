@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-06
+
 ### Fixed
 - **`--filter` now reaches every diff row, not just the paired ones.** The
   merge consulted the filter only for keys present on both sides; the `+`/`-`
