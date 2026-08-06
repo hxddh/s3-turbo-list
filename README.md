@@ -103,6 +103,17 @@ requests — use `--prefix` for that). The language is deliberately small:
 comparison and arithmetic, and `&&` `||` `!`. An invalid filter is rejected
 before any S3 request with exit code `2`.
 
+In diff, the filter applies to every row, including the one-sided `+`/`-`
+rows for keys present on only one side. Such a row binds the side that exists
+to `SOURCE`; a predicate naming `TARGET` cannot be evaluated for it and keeps
+the row, so `SOURCE.size != TARGET.size` still reports every one-sided
+difference. Rows the filter excludes are counted as `ignored`.
+
+The filter is part of a run's identity: `--resume` rejects a checkpoint
+written under a different `--filter` rather than splicing two differently
+filtered populations into one output file, and the run manifest records the
+expression under `inputs.filter`.
+
 ```bash
 s3-turbo-list --filter 'SOURCE.size > 1073741824' \
   list --region us-east-2 --bucket my-bucket

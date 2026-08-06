@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-06
+
+### Fixed
+- **`--filter` now reaches every diff row, not just the paired ones.** The
+  merge consulted the filter only for keys present on both sides; the `+`/`-`
+  rows for one-sided keys were pushed straight to the writer. A diff filtered
+  to `SOURCE.size > 1GB` still emitted every left-only and right-only object
+  whatever its size — and since differences between two buckets tend to
+  concentrate in exactly those one-sided keys, the filter was missing the bulk
+  of the output while appearing to work. The `ignored` counter hid it: it only
+  ever counted rejected pairs, so the number of excluded rows looked right.
+  One-sided rows now bind the side that exists to `SOURCE`. A predicate naming
+  `TARGET` cannot be evaluated for them and keeps the row, so
+  `SOURCE.size != TARGET.size` still reports every one-sided difference rather
+  than silently discarding the strongest kind of difference there is.
+- **`--resume` no longer accepts a checkpoint written under a different
+  `--filter`.** Checkpoint identity already guarded every other input that
+  decides what reaches the output — prefix, delimiter, max_keys, profile,
+  addressing style, mode — but not the filter. Resuming with the expression
+  changed spliced rows written under the old predicate together with rows
+  written under the new one, in one file that reads as a single coherent
+  listing. The filter joins the identity block; a mismatch discards the
+  checkpoint and starts fresh, as the other fields already did. Checkpoints
+  written before this release carry no filter, so resuming one *under* a
+  filter is caught, while resuming a filtered pre-upgrade checkpoint without
+  one is not — that gap closes with the first checkpoint this version writes.
+
+### Added
+- **The run manifest reports endpoint pushback.** `metrics.throttled_responses`
+  counts `SlowDown` / `TooManyRequests` / `ThrottlingException`, and
+  `metrics.http_error_statuses` carries the error-status histogram behind it.
+  The counts existed but only reached the heartbeat log, which needs `--log`
+  and is not machine-readable, so a run that spent most of its wall clock
+  being throttled and retried was indistinguishable in the manifest from a
+  clean one. The count keys on the S3 error code rather than the HTTP status,
+  because 503 also carries plain `ServiceUnavailable`. This matters more since
+  0.29.0 made the retry budget per-consecutive-failure: a run held up by
+  throttling is now likelier to finish, and finishing quietly is exactly the
+  case that needs a number attached.
+- `inputs.filter` in the run manifest records the `--filter` expression a run
+  applied. Two runs over one bucket under different filters produce different
+  artifacts; their manifests used to be identical.
+
 ## [0.29.0] - 2026-08-05
 
 ### Fixed

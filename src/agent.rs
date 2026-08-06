@@ -189,6 +189,10 @@ pub struct CommandInputSummary {
     pub continuation_token: Option<String>,
     pub profile: Option<String>,
     pub addressing_style: String,
+    /// The `--filter` expression this run applied, or `None` for no filter.
+    /// Two runs over one bucket under different filters produce different
+    /// artifacts; without this the manifests that describe them are identical.
+    pub filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -280,6 +284,12 @@ pub struct MetricsSummary {
     pub stream_timeouts: usize,
     pub s3_client_timeouts: usize,
     pub s3_client_generic_errors: usize,
+    /// Rate-limited responses (`SlowDown`, `TooManyRequests`,
+    /// `ThrottlingException`) and the full error-status histogram.  These
+    /// separate "slow because the bucket is large" from "slow because the
+    /// endpoint was pushing back" without reading the heartbeat log.
+    pub throttled_responses: usize,
+    pub http_error_statuses: Vec<crate::core::HttpStatusMetric>,
     pub received_batches: usize,
     pub received_objects: usize,
     pub streamed_rows: usize,
@@ -299,6 +309,8 @@ impl From<RunMetricsSnapshot> for MetricsSummary {
             stream_timeouts: metrics.stream_timeouts,
             s3_client_timeouts: metrics.s3_client_timeouts,
             s3_client_generic_errors: metrics.s3_client_generic_errors,
+            throttled_responses: metrics.throttled_responses,
+            http_error_statuses: metrics.http_error_statuses,
             received_batches: metrics.data_received_batches,
             received_objects: metrics.data_received_objects,
             streamed_rows: metrics.data_streamed_rows,
