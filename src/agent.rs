@@ -226,6 +226,14 @@ pub struct CheckpointPlan {
     pub completed_segments: Option<usize>,
     pub total_segments: Option<usize>,
     pub identity_fields: Vec<String>,
+    /// Segments this run skipped because a checkpoint recorded them complete.
+    /// `None` when the run did not resume; `Some(n)` with `n > 0` means the
+    /// artifacts describe only the rest of the key space, and the earlier
+    /// run's output is the other half. Read from what the run actually
+    /// loaded, not from the file on disk — a completed run removes its
+    /// checkpoint, so the disk state at manifest time says nothing about
+    /// whether this run resumed.
+    pub resumed_segments_skipped: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -569,7 +577,11 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
             "profile".to_string(),
             "addressing_style".to_string(),
             "mode".to_string(),
+            // Added to the identity in 0.30.0; this list is what the manifest
+            // reports as the verified set, and it was left behind.
+            "filter".to_string(),
         ],
+        resumed_segments_skipped: None,
     }
 }
 
@@ -577,8 +589,10 @@ pub fn checkpoint_plan(
     enabled: bool,
     path: Option<String>,
     current_identity: Option<&CheckpointIdentity>,
+    resumed_segments_skipped: Option<usize>,
 ) -> CheckpointPlan {
     let mut plan = default_checkpoint_plan(enabled, path.clone());
+    plan.resumed_segments_skipped = resumed_segments_skipped;
     let Some(path) = path else {
         return plan;
     };

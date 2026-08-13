@@ -16,7 +16,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use config::S3TurboConfig;
 use core::RunMode;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::Serialize;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -775,7 +775,10 @@ fn main() {
 
     let list_output_format = list_output_format(&cli).unwrap_or(ListOutputFormat::Parquet);
 
-    rt.block_on(async {
+    // The async block yields what the run learned about resuming: the manifest
+    // is built after it, and a completed run has already removed its
+    // checkpoint, so the file on disk can no longer answer this.
+    let resumed_segments_skipped: Option<usize> = rt.block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
         let checkpoint_path_opt = if cli.resume {
             Some(checkpoint::checkpoint_path(opt_bucket, opt_region))
@@ -804,12 +807,32 @@ fn main() {
             .as_deref()
             .and_then(|p| checkpoint::CheckpointJournal::load_and_verify(p, &current_identity));
 
+        // Segments this run will not list because the checkpoint records them
+        // complete. Captured here rather than re-read at manifest time: a run
+        // that finishes removes its checkpoint, so the file on disk at the end
+        // says nothing about whether this run resumed.
+        let mut resumed_segments_skipped: Option<usize> = None;
         if let Some(ref cj) = checkpoint_journal {
+            let skipped = cj.completed_indices.len();
+            resumed_segments_skipped = Some(skipped);
             info!(
                 "Resuming checkpoint: {} of {} segments completed",
-                cj.completed_indices.len(),
-                cj.total_segments
+                skipped, cj.total_segments
             );
+            if skipped > 0 {
+                // The output of a resumed run covers only the segments it
+                // listed. Saying so is the difference between "combine this
+                // with the interrupted run's output" and a file that silently
+                // omits whatever the earlier run already wrote — which is what
+                // happens when both runs are pointed at one output path.
+                run_warnings.push(format!(
+                    "Resuming from checkpoint: {} of {} segments are already recorded complete \
+                     and will not be listed again, so this run's output covers only the \
+                     remaining key space. Combine it with the output of the interrupted run; \
+                     writing both to the same path leaves only this run's half.",
+                    skipped, cj.total_segments
+                ));
+            }
         }
 
         let g_state = g_state.clone();
@@ -1283,10 +1306,33 @@ fn main() {
         if cli.resume {
             if let Some(ref cp_path) = checkpoint_path_opt {
                 let final_metrics = g_state.metrics_snapshot();
+                let run_was_interrupted = interrupted.load(Ordering::SeqCst);
                 if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
                     info!(
                         "Skipping final checkpoint save because run failed before producing reliable output"
                     );
+                } else if !run_was_interrupted {
+                    // The run listed its whole key space, so there is no resume
+                    // point left. Saving one anyway was not merely redundant:
+                    // runtime-split segments record no progress, so the journal
+                    // claimed only *some* segments were done, nothing removed
+                    // it, and the next ordinary `--resume` invocation skipped
+                    // the recorded segments and wrote an output covering only
+                    // the remainder — reported as success, because the manifest
+                    // honestly described its own short artifact.
+                    match std::fs::remove_file(cp_path) {
+                        Ok(()) => info!(
+                            "Run completed the whole key space — removed checkpoint {}",
+                            cp_path
+                        ),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => warn!(
+                            "Run completed but its checkpoint {} could not be removed ({}). \
+                             A later --resume would skip the segments it records; delete it \
+                             before resuming.",
+                            cp_path, e
+                        ),
+                    }
                 } else {
                     let completed = merged_completed_indices(
                         checkpoint_journal.as_ref(),
@@ -1319,6 +1365,7 @@ fn main() {
         }
 
         info!("All tasks completed.");
+        resumed_segments_skipped
     });
 
     rt.shutdown_background();
@@ -1393,6 +1440,7 @@ fn main() {
                 }),
                 cli.filter.as_deref(),
             )),
+            resumed_segments_skipped,
         ),
         warnings: run_warnings.clone(),
     };
@@ -2679,7 +2727,13 @@ fn build_plan_report(
         config_source,
         resolved_config: cfg.into(),
         hints,
-        checkpoint: agent::checkpoint_plan(cli.resume, checkpoint_path, current_identity.as_ref()),
+        // A dry run has not loaded a checkpoint, so nothing was skipped yet.
+        checkpoint: agent::checkpoint_plan(
+            cli.resume,
+            checkpoint_path,
+            current_identity.as_ref(),
+            None,
+        ),
         file_conflicts,
         warnings,
     }
