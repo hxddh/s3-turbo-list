@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-08-14
+
 ### Fixed
 - **A throttled run says it was throttled.** `operation_timeout_secs` served as
   three budgets at once — the SDK's per-attempt timeout, the SDK's whole-call
@@ -32,9 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more. The pause starts at `initial_backoff_secs`, doubles per consecutive
   failure and caps at 30s; an attempt that advances the segment refunds the
   budget and resets the pause, so a healthy listing that hiccups once does not
-  inherit a long delay. A sustained throttle now takes longer to give up than
-  it did — that is the point, but it is a visible change for anything timing a
-  failing run.
+  inherit a long delay.
 - **A completed run no longer leaves a resume point behind.** Runtime-split
   segments deliberately record no checkpoint progress, so a run that listed
   its whole key space still ended by saving a checkpoint claiming only some of
@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the caller's job; it is no longer a silent one.
 - `checkpoint.identity_fields` in the run manifest lists `filter`, which
   joined the checkpoint identity in 0.30.0 while this advertised list did not.
+
+### Changed
+- **A sustained throttle now takes about three minutes to give up, where it
+  took about fifty seconds.** Consecutive retries back off instead of
+  re-issuing immediately, so a run spends longer being told to slow down
+  before it fails. That is the point — a transient throttle that used to kill
+  a run now rides through — but it is a visible change for anything that times
+  a failing run or bounds how long one may take. `s3.max_attempts` and
+  `s3.initial_backoff_secs` control it.
 
 ## [0.30.0] - 2026-08-06
 
