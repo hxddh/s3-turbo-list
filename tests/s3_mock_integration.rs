@@ -4518,7 +4518,14 @@ fn recovering_throttle_server(throttle_count: usize) -> (MockS3Server, Arc<Mutex
         // Serving them normally keeps the measurement to the retry cadence of
         // the segment loop, which is what is under test.
         if request.query.get("max-keys").map(String::as_str) == Some("1") {
-            return MockResponse::ok_xml(list_bucket_xml("", 1, &["only-key.txt"], &[], false, None));
+            return MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1,
+                &["only-key.txt"],
+                &[],
+                false,
+                None,
+            ));
         }
         let now = std::time::Instant::now();
         {
