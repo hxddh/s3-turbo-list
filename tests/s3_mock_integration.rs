@@ -4489,3 +4489,163 @@ boundaries_digest = "{}"
         fields
     );
 }
+
+// ── Throttling must be visible and must be backed off ──────
+//
+// `operation_timeout_secs` served as three budgets at once: the SDK's
+// per-attempt timeout, the SDK's whole-operation budget (attempts plus
+// backoff), and the app's own per-page watchdog. With all three equal, the
+// SDK's retry sequence was always cut off before it could return the
+// `ServiceError` it was holding, so a bucket that was rate-limiting the run
+// surfaced as a stream timeout. The throttle counters increment where that
+// error is handled, so they stayed at zero — pointing an operator at "the
+// endpoint is hanging" while the endpoint was saying "slow down".
+
+/// Rate-limit the first `throttle_count` listing requests, then serve
+/// normally. A transient throttle is the case worth getting right: the run
+/// should ride it out, and should say that it happened.
+fn recovering_throttle_server(throttle_count: usize) -> (MockS3Server, Arc<Mutex<Vec<Duration>>>) {
+    let gaps: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let last = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let (g, sn, lt) = (Arc::clone(&gaps), Arc::clone(&seen), Arc::clone(&last));
+
+    let server = MockS3Server::start(move |request, _sequence| {
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
+        }
+        let now = std::time::Instant::now();
+        {
+            let mut last_at = lt.lock().unwrap();
+            if let Some(prev) = *last_at {
+                g.lock().unwrap().push(now.duration_since(prev));
+            }
+            *last_at = Some(now);
+        }
+        if sn.fetch_add(1, Ordering::SeqCst) < throttle_count {
+            return MockResponse::error(503, "SlowDown", "Please reduce your request rate.");
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["only-key.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    (server, gaps)
+}
+
+fn throttle_test_args(
+    dir: &std::path::Path,
+    config: &std::path::Path,
+    endpoint: String,
+    manifest: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--config".to_string(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        endpoint,
+        "--addressing-style".into(),
+        "path".into(),
+        "--output-parquet-file".into(),
+        dir.join("out.parquet").display().to_string(),
+    ];
+    if let Some(path) = manifest {
+        args.extend(vec![
+            "--run-manifest".to_string(),
+            path.display().to_string(),
+        ]);
+    }
+    args.extend(vec![
+        "list".to_string(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ]);
+    args
+}
+
+/// The shipped defaults. All three matter here: the retry budget is what makes
+/// the SDK's backoff sequence outlast the operation budget, and the two
+/// timeouts are the budgets it outlasts.
+fn write_default_config(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"[s3]
+max_attempts = 10
+initial_backoff_secs = 1
+connect_timeout_secs = 60
+operation_timeout_secs = 5
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_mock_throttling_is_reported_as_throttling() {
+    let (server, _gaps) = recovering_throttle_server(2);
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let manifest = dir.path().join("run.json");
+    write_default_config(&config);
+
+    let args = throttle_test_args(dir.path(), &config, server.endpoint(), Some(&manifest));
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(
+        code, 0,
+        "the endpoint recovered, so the run should too.\nstdout: {}\nstderr: {}",
+        stdout, stderr
+    );
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let metrics = &manifest_json["metrics"];
+
+    assert!(
+        metrics["throttled_responses"].as_u64().unwrap_or(0) >= 2,
+        "the endpoint sent two 503 SlowDown responses; the run must report \
+         them rather than counting only timeouts: {}",
+        metrics
+    );
+    let statuses: Vec<u64> = metrics["http_error_statuses"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["status"].as_u64()).collect())
+        .unwrap_or_default();
+    assert!(
+        statuses.contains(&503),
+        "the 503s must reach the status histogram: {}",
+        metrics
+    );
+}
+
+#[test]
+fn local_mock_throttling_backs_off_instead_of_hammering() {
+    // Re-issuing immediately is the wrong answer to `SlowDown`: the endpoint
+    // has just asked for less load, and an undelayed retry answers with more.
+    let (server, gaps) = recovering_throttle_server(2);
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_default_config(&config);
+
+    let args = throttle_test_args(dir.path(), &config, server.endpoint(), None);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let observed = gaps.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "expected retries after the throttled responses"
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|gap| *gap >= Duration::from_millis(500)),
+        "a retry followed a SlowDown with no pause; gaps between listing \
+         requests were {:?}",
+        observed
+    );
+}

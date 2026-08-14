@@ -106,8 +106,8 @@ pinning exact boundaries on repeated inventories.
 
 | Config key | Default | Notes |
 |---|---:|---|
-| `s3.max_attempts` | `10` | Retry budget per segment. |
-| `s3.initial_backoff_secs` | `1` | Initial SDK retry backoff. A single throttle (HTTP 503 SlowDown) costs ~1s of wall-clock instead of stalling the whole run; the SDK still grows the delay exponentially across `max_attempts`. |
+| `s3.max_attempts` | `10` | Retry budget per segment, counted in *consecutive* failures: an attempt that advances the segment's resume point refunds it. Retries are the segment loop's own; the SDK is configured for a single attempt per call so the error it holds reaches that loop instead of being cut off by a timeout. |
+| `s3.initial_backoff_secs` | `1` | Seed for the pause between consecutive retries of a segment, doubling per attempt and capped at 30s. `0` disables the pause. |
 | `s3.connect_timeout_secs` | `60` | Connection timeout. |
 | `s3.operation_timeout_secs` | `5` | Per-page ListObjectsV2 watchdog and SDK operation/read/attempt timeout. |
 | `runtime.worker_threads` | CPU cores | Tokio worker threads; CLI override: `-T`, `--threads`. |
@@ -142,9 +142,13 @@ Practical guidance:
 
 - Raise `--concurrency` until throughput stops improving, then stop; past
   that point you are only adding idle workers.
-- If you are throttled (HTTP 503 `SlowDown`), the low default
-  `initial_backoff_secs` keeps each retry cheap; lowering request pressure
-  (fewer concurrent segments) helps more than retrying harder.
+- If you are throttled (HTTP 503 `SlowDown`), the run reports it: the manifest
+  carries `metrics.throttled_responses` and the `metrics.http_error_statuses`
+  histogram behind it. Retries then back off, so the run rides out a transient
+  throttle instead of answering back-pressure with more requests. Sustained
+  throttling still ends the run once a segment burns its consecutive-failure
+  budget without advancing — lowering request pressure (fewer concurrent
+  segments) helps more than retrying harder.
 - The largest wins come from spreading load across prefixes, which segmented
   listing does automatically.
 
