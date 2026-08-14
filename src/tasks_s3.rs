@@ -46,6 +46,11 @@ const FANOUT_IMPROVE_RATIO: f64 = 1.05;
 /// Throughput sampling window for the fan-out governor.  The split tick runs
 /// at 200ms, far too jittery to read a trend from; rates are judged over ~1s.
 const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
+/// Largest exponent applied to `initial_backoff_secs` between consecutive
+/// retries of one segment.
+const RETRY_BACKOFF_MAX_SHIFT: u32 = 5;
+/// Ceiling on a single inter-retry pause.
+const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// Right half of a split, sent from the segment task to the reactor.
 #[derive(Debug, Clone)]
@@ -741,13 +746,28 @@ async fn flat_list_run_to_complete(
                     start_after = err.next_start_owned();
                     continuation_token = None;
                     retry_attempt = next_retry_attempt;
+                    // Space consecutive failures. Re-issuing immediately is
+                    // the wrong answer to `SlowDown` in particular: the
+                    // endpoint has just asked for less load, and an
+                    // undelayed retry answers with more of it. An attempt
+                    // that advanced resets the budget and starts the delay
+                    // over, so a healthy listing that hiccups once does not
+                    // inherit a long pause.
+                    let delay = retry_backoff(ctx.initial_backoff_secs, retry_attempt);
                     debug!(
-                        "Retrying from '{}' (attempt {}{}): {}",
+                        "Retrying from '{}' (attempt {}{}) after {:?}: {}",
                         start_after,
                         retry_attempt,
                         if advanced { ", budget refunded" } else { "" },
+                        delay,
                         err
                     );
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                        if ctx.is_quit() {
+                            return false;
+                        }
+                    }
                     continue;
                 }
                 // Fatal error: fail the whole run fast via the global quit
@@ -768,6 +788,24 @@ async fn flat_list_run_to_complete(
             }
         }
     }
+}
+
+/// Delay before the Nth consecutive retry of one segment: exponential from
+/// `initial_backoff_secs`, capped so a long-lived segment never parks for
+/// minutes. `attempt` is 1 for the first retry.
+///
+/// The cap matters more than the growth rate here. The budget counts
+/// *consecutive* failures and is refunded whenever the segment advances, so a
+/// segment only reaches the high attempts when it is making no progress at
+/// all — at which point waiting longer neither helps it nor hurts a run that
+/// is going to fail anyway, while unbounded growth would stall the reactor's
+/// view of a segment that is still nominally alive.
+fn retry_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
+    if attempt == 0 || initial_backoff_secs == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 1u64 << attempt.min(RETRY_BACKOFF_MAX_SHIFT);
+    Duration::from_secs(initial_backoff_secs.saturating_mul(factor)).min(RETRY_BACKOFF_CAP)
 }
 
 // ── Single ListObjectsV2 paginator call ────────────────────
@@ -1461,6 +1499,31 @@ mod tests {
 
         assert_eq!(select_split_targets(&controls, 2), vec![1]);
         assert!(select_split_targets(&controls, 1).is_empty());
+    }
+
+    #[test]
+    fn test_retry_backoff_grows_then_caps() {
+        // First retry waits the configured seed, then doubles.
+        assert_eq!(
+            retry_backoff(1, 0),
+            Duration::ZERO,
+            "no pause before the first attempt"
+        );
+        assert_eq!(retry_backoff(1, 1), Duration::from_secs(2));
+        assert_eq!(retry_backoff(1, 2), Duration::from_secs(4));
+        assert_eq!(retry_backoff(1, 3), Duration::from_secs(8));
+        // A segment that cannot advance must not park indefinitely.
+        assert_eq!(retry_backoff(1, 20), RETRY_BACKOFF_CAP);
+        assert!(retry_backoff(60, 4) <= RETRY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn test_retry_backoff_honours_a_zero_seed() {
+        // `initial_backoff_secs = 0` is how the test config asks for no pause;
+        // it must stay exactly that rather than becoming a one-second floor.
+        for attempt in 0..6 {
+            assert_eq!(retry_backoff(0, attempt), Duration::ZERO);
+        }
     }
 
     #[test]

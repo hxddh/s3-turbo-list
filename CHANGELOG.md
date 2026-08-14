@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A throttled run says it was throttled.** `operation_timeout_secs` served as
+  three budgets at once — the SDK's per-attempt timeout, the SDK's whole-call
+  budget including its own retries and backoff, and the app's per-page
+  watchdog. With all three equal, the SDK's retry sequence was always cut off
+  before it could return the `ServiceError` it held, so a bucket rate-limiting
+  the run surfaced as a stream timeout. The throttle counters increment where
+  that error is handled, so `metrics.throttled_responses` and
+  `metrics.http_error_statuses` — added in 0.30.0 for exactly this question —
+  reported zero and empty under the shipped defaults, sending an operator
+  after a hanging endpoint while the endpoint was saying "slow down". The SDK
+  now makes one attempt per call and the segment loop owns retries, so the
+  real error reaches the code that classifies and counts it.
+- **`SlowDown` no longer fails a run outright.** Retryability was decided by
+  `errno < ERROR_NO_BUCKET`, and `SlowDown`, `TooManyRequests`,
+  `InternalError` and `ServiceUnavailable` sit above that line — so the four
+  conditions S3 defines as temporary were classified with "bucket does not
+  exist". A listing large enough to be throttled could be killed by the
+  endpoint's own back-pressure signal. Retryability is now an explicit set.
+- **Retries pause between consecutive failures.** The segment loop re-issued
+  immediately, which is the wrong answer to `SlowDown` in particular: the
+  endpoint has just asked for less load and an undelayed retry answers with
+  more. The pause starts at `initial_backoff_secs`, doubles per consecutive
+  failure and caps at 30s; an attempt that advances the segment refunds the
+  budget and resets the pause, so a healthy listing that hiccups once does not
+  inherit a long delay. A sustained throttle now takes longer to give up than
+  it did — that is the point, but it is a visible change for anything timing a
+  failing run.
 - **A completed run no longer leaves a resume point behind.** Runtime-split
   segments deliberately record no checkpoint progress, so a run that listed
   its whole key space still ended by saving a checkpoint claiming only some of

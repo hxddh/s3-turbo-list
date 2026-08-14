@@ -3,8 +3,13 @@ use std::sync::Arc;
 
 // ── Error codes ────────────────────────────────────────────
 
-/// Errors below 0x10 are retryable (timeout, transient).
-/// Errors >= 0x10 are fatal (no bucket, access denied, permanent redirect).
+/// Codes below 0x10 are client-side transients (timeout, connection).
+/// Codes from 0x10 are server-reported conditions, and the range mixes two
+/// kinds: 0x10-0x14 are permanent (no bucket, access denied, permanent
+/// redirect, bad signature) while 0x15-0x18 are the endpoint asking for less
+/// load or reporting a temporary fault. Retryability is decided by
+/// [`is_retryable`], never by comparing against `ERROR_NO_BUCKET` — that
+/// comparison put `SlowDown` on the fatal side of the line.
 pub const ERROR_S3_NEXT_STREAM_TIMEOUT: u8 = 0x1;
 pub const ERROR_S3_CLIENT_GENERIC: u8 = 0x2;
 pub const ERROR_S3_CLIENT_CONNECTION_TIMEOUT: u8 = 0x3;
@@ -19,6 +24,37 @@ pub const ERROR_TOO_MANY_REQUESTS: u8 = 0x16;
 pub const ERROR_INTERNAL_ERROR: u8 = 0x17;
 pub const ERROR_SERVICE_UNAVAILABLE: u8 = 0x18;
 pub const ERROR_UNKNOWN: u8 = 0xff;
+
+/// Whether a segment should retry after this error rather than fail the run.
+///
+/// Client-side transients retry, and so do the four server conditions that S3
+/// defines as temporary: `SlowDown`, `TooManyRequests`/`ThrottlingException`,
+/// `InternalError`, and `ServiceUnavailable`. They sit above `ERROR_NO_BUCKET`
+/// numerically, so the old `errno < ERROR_NO_BUCKET` test classified a bucket
+/// asking for a lower request rate the same way it classified a bucket that
+/// does not exist — a listing large enough to be throttled could be killed by
+/// the endpoint's own back-pressure signal.
+///
+/// Everything else — missing bucket, denied access, permanent redirect, bad
+/// signature, malformed auth header, unrecognised codes — is permanent for
+/// this run: retrying re-sends a request that cannot start succeeding.
+pub fn is_retryable(errno: u8) -> bool {
+    errno < ERROR_NO_BUCKET
+        || matches!(
+            errno,
+            ERROR_SLOW_DOWN
+                | ERROR_TOO_MANY_REQUESTS
+                | ERROR_INTERNAL_ERROR
+                | ERROR_SERVICE_UNAVAILABLE
+        )
+}
+
+/// Whether this error is the endpoint refusing load, as opposed to failing.
+/// Retry pacing keys on this: back-pressure deserves a longer pause than a
+/// one-off internal error.
+pub fn is_throttle(errno: u8) -> bool {
+    matches!(errno, ERROR_SLOW_DOWN | ERROR_TOO_MANY_REQUESTS)
+}
 
 // ── SDK error formatting ───────────────────────────────────
 
@@ -99,7 +135,12 @@ impl FlatRuntimeError {
     /// Returns `true` if this error is transient and the operation should be retried.
     /// The caller owns the retry budget and must cap retry attempts.
     pub fn continue_on_error(&self) -> bool {
-        self.errno < ERROR_NO_BUCKET
+        is_retryable(self.errno)
+    }
+
+    /// Returns `true` when the endpoint asked for a lower request rate.
+    pub fn is_throttle(&self) -> bool {
+        is_throttle(self.errno)
     }
 
     /// Returns the HTTP status code, or 0 if not set.
@@ -267,6 +308,65 @@ mod tests {
         assert_eq!(err.request_id.as_deref(), Some("req-abc-123"));
         assert!(err.raw_body_excerpt.is_some());
         assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn test_transient_server_conditions_are_retryable() {
+        // These four are the endpoint asking for less load or reporting a
+        // temporary fault. They sit above ERROR_NO_BUCKET numerically, and the
+        // old `errno < ERROR_NO_BUCKET` test therefore treated a bucket saying
+        // "slow down" like a bucket that does not exist.
+        for errno in [
+            ERROR_SLOW_DOWN,
+            ERROR_TOO_MANY_REQUESTS,
+            ERROR_INTERNAL_ERROR,
+            ERROR_SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                is_retryable(errno),
+                "{} must be retryable",
+                errno_to_name(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn test_permanent_conditions_are_not_retryable() {
+        for errno in [
+            ERROR_NO_BUCKET,
+            ERROR_ACCESS_DENIED,
+            ERROR_PERMANENT_REDIRECT,
+            ERROR_SIGNATURE_DOES_NOT_MATCH,
+            ERROR_AUTH_HEADER_MALFORMED,
+            ERROR_UNKNOWN,
+        ] {
+            assert!(
+                !is_retryable(errno),
+                "{} must not be retried",
+                errno_to_name(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_transients_stay_retryable() {
+        for errno in [
+            ERROR_S3_NEXT_STREAM_TIMEOUT,
+            ERROR_S3_CLIENT_GENERIC,
+            ERROR_S3_CLIENT_CONNECTION_TIMEOUT,
+        ] {
+            assert!(is_retryable(errno));
+        }
+    }
+
+    #[test]
+    fn test_only_rate_signals_count_as_throttle() {
+        assert!(is_throttle(ERROR_SLOW_DOWN));
+        assert!(is_throttle(ERROR_TOO_MANY_REQUESTS));
+        // Retryable, but not back-pressure: pacing treats them differently.
+        assert!(!is_throttle(ERROR_INTERNAL_ERROR));
+        assert!(!is_throttle(ERROR_SERVICE_UNAVAILABLE));
+        assert!(!is_throttle(ERROR_S3_NEXT_STREAM_TIMEOUT));
     }
 
     #[test]

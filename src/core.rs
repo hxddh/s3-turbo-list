@@ -709,6 +709,10 @@ pub struct S3TaskContext {
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
     pub max_attempts: u32,
+    /// Seed for the pause between consecutive retries of one segment. Shared
+    /// with the SDK's own backoff setting; the app layer owns the retry that
+    /// actually paces a rate-limited endpoint.
+    pub initial_backoff_secs: u64,
     pub operation_timeout_secs: u64,
     /// CLI `--start-after` override — single-chain mode: hints and startup
     /// discovery are skipped when this is set, so exactly one segment exists
@@ -722,13 +726,19 @@ pub struct S3TaskContext {
 impl S3TaskContext {
     pub async fn load_sdk_config(s3_config: &S3Config) -> aws_config::SdkConfig {
         aws_config::from_env()
-            .retry_config(
-                aws_config::retry::RetryConfig::standard()
-                    .with_max_attempts(s3_config.max_attempts)
-                    .with_initial_backoff(std::time::Duration::from_secs(
-                        s3_config.initial_backoff_secs,
-                    )),
-            )
+            // One attempt per SDK call: the segment loop owns retries, and two
+            // retry layers stacked here did more than duplicate work.
+            // `operation_timeout` (the whole call) and `operation_attempt_timeout`
+            // (one try) are both `operation_timeout_secs`, and the app's own
+            // per-page watchdog is the same value again — so the SDK's retry
+            // sequence was always cut short before it could return the
+            // `ServiceError` it had. A rate-limited bucket therefore surfaced as
+            // a stream timeout: the throttle counters, which increment where
+            // that error is handled, stayed at zero while the run spent its
+            // whole budget being told to slow down. With a single attempt the
+            // real error reaches the segment loop, which classifies it, counts
+            // it, and backs off.
+            .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(1))
             .timeout_config(
                 aws_config::timeout::TimeoutConfigBuilder::new()
                     .connect_timeout(std::time::Duration::from_secs(
@@ -788,6 +798,7 @@ impl S3TaskContext {
             delimiter: delimiter.map(|d| d.to_string()),
             max_keys,
             max_attempts: s3_config.max_attempts.max(1),
+            initial_backoff_secs: s3_config.initial_backoff_secs,
             operation_timeout_secs: s3_config.operation_timeout_secs.max(1),
             start_after: start_after.map(|s| s.to_string()),
             continuation_token: continuation_token.map(|s| s.to_string()),
