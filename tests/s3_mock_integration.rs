@@ -1741,12 +1741,16 @@ boundaries_digest = "{}"
         Some("m/")
     );
 
-    let checkpoint_after = std::fs::read_to_string(&checkpoint).unwrap();
+    // This run finished the remaining segment, so both segments are now done
+    // and there is no resume point left. The checkpoint used to be rewritten
+    // here as `completed_indices = [0, 1]` and left on disk — which is the
+    // trap: the next `--resume` invocation would find every segment recorded
+    // complete and list nothing at all, while still reporting success.
     assert!(
-        checkpoint_after.contains("completed_indices = [\n    0,\n    1,\n]")
-            || checkpoint_after.contains("completed_indices = [0, 1]"),
-        "{}",
-        checkpoint_after
+        !checkpoint.exists(),
+        "a run that completed the remaining segments must leave no resume \
+         point, but the checkpoint survived: {}",
+        std::fs::read_to_string(&checkpoint).unwrap_or_default()
     );
 }
 
@@ -4203,5 +4207,285 @@ fn local_mock_retry_budget_still_exhausts_without_progress() {
             > 0,
         "the run must record the failure: {}",
         manifest_json
+    );
+}
+
+// ── Checkpoint lifecycle: a completed run must not leave a resume point ──
+//
+// Runtime-split segments deliberately record no checkpoint progress, so a run
+// that finishes cleanly still ends with a checkpoint claiming only some of its
+// segments are done.  Nothing removed that file, so the next ordinary
+// `--resume` invocation read it, skipped those segments, and wrote an output
+// covering only the remainder — success, no warning, and `manifest-summary
+// --check` passing, because the manifest honestly described its own short
+// artifact.  A nightly inventory was correct on its first run and quietly
+// short on every run after it.
+
+/// Keys skewed so bisection produces both tiny segments (which complete
+/// without splitting) and a dominant tail (which splits and loses credit).
+fn skewed_keys() -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..40 {
+        keys.push(format!("a-{:04}", i));
+    }
+    for i in 0..40 {
+        keys.push(format!("m-{:04}", i));
+    }
+    for i in 0..1920 {
+        keys.push(format!("z-{:06}", i));
+    }
+    keys.sort();
+    keys
+}
+
+/// A flat namespace whose root page is truncated, so the run does not take the
+/// single-page shortcut and instead bisects into several segments.
+fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
+    MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            let head: Vec<&str> = keys.iter().take(3).map(String::as_str).collect();
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &head, &[], true, Some("disc")));
+        }
+        if request.query.get("max-keys").map(String::as_str) == Some("1") {
+            let first: Vec<&str> = keys
+                .iter()
+                .find(|k| k.as_str() > start_after.as_str())
+                .map(|k| vec![k.as_str()])
+                .unwrap_or_default();
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = keys[start_idx.min(keys.len())..]
+            .iter()
+            .take(4)
+            .map(String::as_str)
+            .collect();
+        let truncated = start_idx + page.len() < keys.len() && !page.is_empty();
+        let token = truncated.then(|| format!("off-{}", start_idx + page.len()));
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            4,
+            &page,
+            &[],
+            truncated,
+            token.as_deref(),
+        ))
+    })
+}
+
+#[test]
+fn local_mock_successful_run_leaves_no_checkpoint() {
+    let keys = skewed_keys();
+    let server = multi_segment_flat_server(keys.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--resume".into(),
+        "--output-parquet-file".into(),
+        dir.path().join("out.parquet").display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(
+        parquet_keys(&dir.path().join("out.parquet")).len(),
+        keys.len()
+    );
+
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    assert!(
+        !checkpoint.exists(),
+        "a run that listed the whole key space has nothing to resume, but it \
+         left a checkpoint behind: {:?}",
+        checkpoint_completed_indices(&checkpoint)
+    );
+}
+
+#[test]
+fn local_mock_repeated_resume_runs_stay_complete() {
+    // The end-to-end shape of the bug: an unattended job that always passes
+    // --resume must produce the same complete listing every time.
+    let keys = skewed_keys();
+    let server = multi_segment_flat_server(keys.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--resume".into(),
+        "--output-parquet-file".into(),
+        dir.path().join("out.parquet").display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+
+    for run in 1..=3 {
+        let (code, stdout, stderr) = run_cli(&args, dir.path());
+        assert_eq!(
+            code, 0,
+            "run {} stdout: {}\nstderr: {}",
+            run, stdout, stderr
+        );
+        let listed = parquet_keys(&dir.path().join("out.parquet"));
+        assert_eq!(
+            listed.len(),
+            keys.len(),
+            "run {} produced a short listing ({} of {} keys) while reporting success",
+            run,
+            listed.len(),
+            keys.len()
+        );
+    }
+}
+
+#[test]
+fn local_mock_resumed_run_declares_its_partial_coverage() {
+    // A resumed run's artifacts cover only the segments it listed. Nothing
+    // said so, so pointing the interrupted run and the resumed run at one
+    // output path silently left only the resumed half — the earlier run's
+    // rows overwritten, the manifest reporting success over the remainder.
+    let server = MockS3Server::start(|request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["z-last.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let hints = dir.path().join("hints.toml");
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+    std::fs::write(
+        &hints,
+        "bucket = \"mock-bucket\"\nregion = \"us-east-1\"\nboundaries = [\"m/\"]\ngenerated_at = \"2026-05-17T00:00:00Z\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &checkpoint,
+        format!(
+            r#"bucket = "mock-bucket"
+prefix = ""
+total_segments = 2
+completed_indices = [0]
+last_updated = "2026-05-17T00:00:00Z"
+
+[identity]
+bucket = "mock-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = ""
+addressing_style = "path"
+mode = "list"
+boundaries_digest = "{}"
+"#,
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+        ),
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--resume".into(),
+        "--hints-file".into(),
+        hints.display().to_string(),
+        "--output-parquet-file".into(),
+        dir.path().join("resume.parquet").display().to_string(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        manifest_json["checkpoint"]["resumed_segments_skipped"].as_u64(),
+        Some(1),
+        "the manifest must record that this run skipped a segment: {}",
+        manifest_json
+    );
+
+    let warnings = manifest_json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|w| w.contains("only the remaining key space")),
+        "a resumed run must warn that its output is partial: {:?}",
+        warnings
+    );
+
+    // The identity list the manifest advertises must name every field that is
+    // actually compared, or an operator cannot tell what resume verified.
+    let fields: Vec<&str> = manifest_json["checkpoint"]["identity_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        fields.contains(&"filter"),
+        "identity_fields omits a field resume compares: {:?}",
+        fields
     );
 }

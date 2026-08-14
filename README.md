@@ -172,10 +172,20 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
 
 Progress is saved every 30 seconds and on graceful shutdown. The checkpoint
 identity covers bucket, region, prefix, delimiter, max-keys, addressing style,
-profile, mode, and the key-space boundary set itself (count and fingerprint) —
-completed segments are recorded by index, so a checkpoint is discarded with a
-warning unless the boundaries it was written against are the ones this run
-resolved.
+profile, mode, filter, and the key-space boundary set itself (count and
+fingerprint) — completed segments are recorded by index, so a checkpoint is
+discarded with a warning unless the boundaries it was written against are the
+ones this run resolved.
+
+A run that lists its whole key space removes the checkpoint on the way out:
+there is no resume point left, and leaving one behind meant the next
+`--resume` invocation skipped those segments and listed only the remainder.
+
+**A resumed run's output covers only the segments it listed.** The rest are in
+the output of the run that was interrupted — combine the two. Pointing both
+runs at the same `--output-parquet-file` leaves only the second run's half.
+A resumed run says so on stderr, and the run manifest records the count under
+`checkpoint.resumed_segments_skipped`.
 
 ## Providers
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A completed run no longer leaves a resume point behind.** Runtime-split
+  segments deliberately record no checkpoint progress, so a run that listed
+  its whole key space still ended by saving a checkpoint claiming only some of
+  its segments were done — and nothing ever removed that file. The next
+  ordinary `--resume` invocation read it, skipped those segments, and wrote an
+  output covering only the remainder: exit 0, `status: success`, no warning,
+  and `manifest-summary --check` passing, because the manifest honestly
+  described its own short artifact. No interruption was needed to reach this.
+  A nightly job that always passes `--resume` was correct on its first run and
+  quietly short on every run after it — reproducibly, since each later run
+  skipped the same segments. A run that completes its key space now removes
+  the checkpoint, because there is nothing left to resume.
+- **A resumed run says that its output is partial.** The artifacts of a resume
+  cover only the segments that run listed; the rest are in the output of the
+  run that was interrupted. Nothing stated this — not the manifest, not a
+  warning, not the docs — so pointing both runs at one `--output-parquet-file`
+  silently discarded the first run's rows. The run now warns on stderr and
+  records the count in the manifest under
+  `checkpoint.resumed_segments_skipped`. Note what this does not do: it does
+  not merge the two outputs or refuse to overwrite. Combining them is still
+  the caller's job; it is no longer a silent one.
+- `checkpoint.identity_fields` in the run manifest lists `filter`, which
+  joined the checkpoint identity in 0.30.0 while this advertised list did not.
+
 ## [0.30.0] - 2026-08-06
 
 ### Fixed
