@@ -4514,6 +4514,12 @@ fn recovering_throttle_server(throttle_count: usize) -> (MockS3Server, Arc<Mutex
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
         }
+        // Single-key probes are key-space partitioning, not listing attempts.
+        // Serving them normally keeps the measurement to the retry cadence of
+        // the segment loop, which is what is under test.
+        if request.query.get("max-keys").map(String::as_str) == Some("1") {
+            return MockResponse::ok_xml(list_bucket_xml("", 1, &["only-key.txt"], &[], false, None));
+        }
         let now = std::time::Instant::now();
         {
             let mut last_at = lt.lock().unwrap();
