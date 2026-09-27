@@ -38,7 +38,11 @@ that the command fell back to built-in defaults.
 `doctor --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
 endpoint compatibility profile status, local output parent directories, and
-explicitly marks network probing as skipped.  `doctor --simple` is intended for
+explicitly marks network probing as skipped.  An endpoint problem that stops
+every real run — a profile that requires an explicit endpoint URL, or an
+endpoint still containing template placeholders — is an `error` check, and
+`doctor` then exits `3`, the same code the real run would exit with.  Other
+`error` checks exit `2`.  `doctor --simple` is intended for
 compact human output; agents should prefer `--json`.
 
 `--dry-run` resolves command inputs, planned output paths, hints source,
@@ -85,6 +89,25 @@ The plan JSON includes:
 - `checkpoint`
 - `file_conflicts`
 - `warnings`
+
+`status` is `ok`, or `blocked` when a provider setup problem would stop the
+real run with exit code `3` (the reason is in `warnings`).  A blocked dry run
+still prints or writes the plan, then exits `3`, so the dry run predicts the
+run's exit class.
+
+`hints.source` for `list` says how the run will partition its key space:
+
+| Value | Meaning |
+|---|---|
+| `explicit` | `--hints-file` boundaries. |
+| `auto_cache` | Boundaries cached by an earlier run's startup discovery. |
+| `startup_discovery` | No cache yet: the run probes the bucket structure at startup, partitions from it, and caches the boundaries. |
+| `disabled_single_segment_fallback` | `--no-auto-hints`: one starting segment, fanned out by runtime splitting. |
+| `delimiter_single_segment` | A `--delimiter` run: one hierarchical segment, never split. |
+| `single_chain` | `--start-after` / `--continuation-token`: one sequential chain, never split. |
+
+Only the last two add the "single ListObjectsV2 chain" warning; the others
+partition the run, so `--concurrency` adds parallelism to them.
 
 Agents should treat `network` as authoritative for dry-run behavior.  Current
 dry-run reports `none: dry-run only resolves local configuration and planned
@@ -232,11 +255,18 @@ agents can compare preflight and completed runs consistently.
 Run manifests also include `config_source`, so a saved manifest is enough to
 see which TOML file and CLI overrides shaped the completed run.
 
-Endpoint compatibility profiles that require provider-specific endpoints warn
-in dry-run and `doctor` until an endpoint URL is configured.  Placeholder
-endpoints from starter configs, such as `<account-id>` or `<region>`, are also
-reported locally before a real run.  Real cloud-facing commands stop with exit
-code `3` when these deterministic provider setup problems are still present.
+Endpoint compatibility profiles that require provider-specific endpoints are
+reported by dry-run and `doctor` until an endpoint URL is configured.
+Placeholder endpoints from starter configs, such as `<account-id>` or
+`<region>`, are also reported locally before a real run.  These are
+deterministic provider setup problems: real cloud-facing commands stop with
+exit code `3`, and so do `doctor` and `--dry-run` (plan `status: blocked`).
+
+For `diff` with a region-templated profile (`bos`, `b2`, `oss`) and no explicit
+endpoint, each side uses the profile's endpoint for its own region: the target
+side lists against the `--target-region` endpoint, which the dry-run plan names
+in `warnings`.  An explicit `--endpoint-url` / `s3.endpoint_url` applies to
+both sides.
 
 Object filters are validated before any listing run.  Agents can use simple
 numeric predicates such as:

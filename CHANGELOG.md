@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Preflight predicts the run.** `doctor` reports an endpoint problem that
+  stops every real run (a profile requiring an explicit endpoint URL, or an
+  endpoint still containing template placeholders) as an `error` and exits 3;
+  it used to warn and exit 0. A `--dry-run` with such a problem prints its plan
+  with `status: "blocked"` and exits 3. `doctor --fix-suggestions` now prints
+  the endpoint fix, and no longer suggests `export AWS_PROFILE=default` when
+  credentials are already in the environment.
+- **Unknown config keys are rejected** (exit 2, naming the expected keys). A
+  typo such as `max_concurency` used to be ignored, leaving the default in
+  effect with no sign anything was wrong.
+- **`compat-probe` exits non-zero when the endpoint is `incompatible`**: 3 when
+  every failure is a setup error (access, bucket, signature, redirect), else 4.
+  `partial` still exits 0. It also resolves its endpoint and addressing style
+  like a listing run — including `s3.endpoint_url` / `addressing_style` from
+  the config file and profile — and honours `--trace-compat` and `--debug-s3`.
+- **The dry-run hints plan says how the run will partition.** A run with no
+  cached hints reports `hints.source: "startup_discovery"` (it was
+  `single_segment_fallback`, which the run never was), and the "single
+  ListObjectsV2 chain" warning is limited to runs that really are one chain:
+  `--start-after` / `--continuation-token` (`single_chain`) and `--delimiter`
+  (`delimiter_single_segment`).
+
+### Fixed
+- **`diff` with a region-templated profile (bos, b2, oss) listed the target
+  side against the source region's endpoint.** The preset was applied once,
+  from `--region`; with a different `--target-region` the target now uses its
+  own region's endpoint (named in the dry-run plan). An explicit endpoint still
+  applies to both sides.
+- **One failed split probe no longer stops a segment from ever splitting.** A
+  probe that timed out or was throttled was treated as "no boundary in this
+  range", so a long-tail segment that hit one transient error listed serially
+  to the end. A failed probe now retries after the segment advances, and only
+  three consecutive failures retire it.
+
 ## [0.32.0] - 2026-09-27
 
 ### Performance

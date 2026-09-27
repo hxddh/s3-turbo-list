@@ -166,6 +166,20 @@ pub fn endpoint_profile_guardrail_warnings(cfg: &S3TurboConfig) -> Vec<String> {
     warnings
 }
 
+/// The endpoint a region-templated profile (e.g. bos, b2, oss) derives for
+/// `region`, or `None` when the profile has a fixed endpoint or no template.
+/// A diff needs it per side: the preset is applied once, from the source
+/// region, and the target side must not inherit that region's host.
+pub fn region_endpoint(profile_name: &str, region: &str) -> Option<String> {
+    let profile = get_profile(profile_name)?;
+    if profile.default_endpoint_url.is_some() || region.is_empty() {
+        return None;
+    }
+    profile
+        .endpoint_template
+        .map(|template| template.replace("{region}", region))
+}
+
 pub fn endpoint_url_has_template_placeholder(endpoint: &str) -> bool {
     endpoint.contains('<') || endpoint.contains('>')
 }
@@ -225,6 +239,16 @@ pub fn apply_profile_preset(
 #[cfg(test)]
 mod profile_metadata_tests {
     use super::*;
+
+    #[test]
+    fn region_endpoint_follows_the_template_only() {
+        assert_eq!(
+            region_endpoint("bos", "gz").as_deref(),
+            Some("https://s3.gz.bcebos.com")
+        );
+        assert!(region_endpoint("aws", "us-east-1").is_none());
+        assert!(region_endpoint("no-such-profile", "gz").is_none());
+    }
 
     /// BOS has fixed its ListObjectsV2 compatibility (start_after +
     /// continuation-token). The profile must not carry the old

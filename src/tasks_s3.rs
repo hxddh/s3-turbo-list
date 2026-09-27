@@ -39,6 +39,11 @@ const SPLIT_MIN_PAGES: u32 = 5;
 const SPLIT_CHECK_INTERVAL_MS: u64 = 200;
 /// Maximum ancestor-directory probe rungs per split attempt.
 const SPLIT_PROBE_MAX_RUNGS: usize = 4;
+/// Consecutive failed split probes (errors or timeouts, not "no boundary")
+/// before a segment stops being probed.  A throttled or briefly unreachable
+/// endpoint says nothing about the range's structure, so one failure must not
+/// retire the segment; repeated failures stop the probes adding to the load.
+const SPLIT_PROBE_MAX_FAILURES: u32 = 3;
 /// Minimum throughput gain (ratio) for newly added concurrency to count as
 /// "helping".  Below this, the extra segments are oversubscribing a saturated
 /// provider and fan-out is capped at the last useful level.
@@ -74,6 +79,11 @@ pub(crate) struct SegmentControl {
     splitting: AtomicBool,
     /// No structural boundary exists in the remaining range; do not re-probe.
     unsplittable: AtomicBool,
+    /// Page count the segment must reach before its next probe.  Pushed ahead
+    /// after a failed probe, so retries back off with the segment's progress.
+    next_probe_page: AtomicU32,
+    /// Consecutive probes that failed (as opposed to finding no boundary).
+    probe_failures: AtomicU32,
     /// Segment gave part of its range away; checkpoint must not record it.
     was_split: AtomicBool,
 }
@@ -87,8 +97,24 @@ impl SegmentControl {
             pages: AtomicU32::new(0),
             splitting: AtomicBool::new(false),
             unsplittable: AtomicBool::new(false),
+            next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
+            probe_failures: AtomicU32::new(0),
             was_split: AtomicBool::new(false),
         }
+    }
+
+    /// A probe errored or timed out.  Retry later rather than retiring the
+    /// segment — until failures repeat, which is a reason to stop probing.
+    fn record_probe_failure(&self) {
+        let failures = self.probe_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= SPLIT_PROBE_MAX_FAILURES {
+            self.unsplittable.store(true, Ordering::Relaxed);
+        } else {
+            let pages = self.pages.load(Ordering::Relaxed);
+            self.next_probe_page
+                .store(pages.saturating_add(SPLIT_MIN_PAGES), Ordering::Relaxed);
+        }
+        self.splitting.store(false, Ordering::Relaxed);
     }
 
     fn current_end(&self) -> Option<String> {
@@ -112,7 +138,7 @@ impl SegmentControl {
     }
 
     fn is_split_candidate(&self) -> bool {
-        self.pages.load(Ordering::Relaxed) >= SPLIT_MIN_PAGES
+        self.pages.load(Ordering::Relaxed) >= self.next_probe_page.load(Ordering::Relaxed)
             && !self.splitting.load(Ordering::Relaxed)
             && !self.unsplittable.load(Ordering::Relaxed)
     }
@@ -184,6 +210,16 @@ fn ancestor_dirs(cursor: &str, listing_prefix: &str) -> Vec<String> {
     dirs
 }
 
+/// What a split probe learned about a segment's remaining range.
+enum SplitProbe {
+    /// A real boundary strictly inside the range.
+    Cut(String),
+    /// The probes completed and found no boundary to cut at.
+    NoBoundary,
+    /// A probe request errored or timed out: nothing was learned.
+    Failed,
+}
+
 /// One delimiter probe per ancestor rung; returns the middle CommonPrefix
 /// strictly inside `(cursor, end)`. When the range has no prefix structure,
 /// falls back to flat-range cuts derived from the cursor itself.
@@ -192,7 +228,7 @@ async fn probe_split_candidate(
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
-) -> Option<String> {
+) -> SplitProbe {
     for dir in ancestor_dirs(cursor, listing_prefix)
         .into_iter()
         .take(SPLIT_PROBE_MAX_RUNGS)
@@ -210,11 +246,11 @@ async fn probe_split_candidate(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 debug!("Split probe failed for prefix '{}': {:?}", dir, e);
-                return None;
+                return SplitProbe::Failed;
             }
             Err(_elapsed) => {
                 debug!("Split probe timed out for prefix '{}'", dir);
-                return None;
+                return SplitProbe::Failed;
             }
         };
         let mut candidates: Vec<String> = response
@@ -226,7 +262,7 @@ async fn probe_split_candidate(
             .collect();
         if !candidates.is_empty() {
             candidates.sort();
-            return Some(candidates.swap_remove(candidates.len() / 2));
+            return SplitProbe::Cut(candidates.swap_remove(candidates.len() / 2));
         }
     }
 
@@ -247,7 +283,7 @@ async fn probe_flat_cut(
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
-) -> Option<String> {
+) -> SplitProbe {
     for candidate in flat_cut_candidates(cursor, listing_prefix, end) {
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let send = ctx
@@ -262,20 +298,20 @@ async fn probe_flat_cut(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 debug!("Flat cut probe failed at '{}': {:?}", candidate, e);
-                return None;
+                return SplitProbe::Failed;
             }
             Err(_elapsed) => {
                 debug!("Flat cut probe timed out at '{}'", candidate);
-                return None;
+                return SplitProbe::Failed;
             }
         };
         if let Some(key) = response.contents().first().and_then(|o| o.key()) {
             if key > cursor && end.is_none_or(|e| key < e) {
-                return Some(key.to_string());
+                return SplitProbe::Cut(key.to_string());
             }
         }
     }
-    None
+    SplitProbe::NoBoundary
 }
 
 /// Candidate cuts for a flat range, mid-depth first (most balanced for
@@ -670,13 +706,21 @@ fn maybe_start_split_probes(
             }
             match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await
             {
-                Some(mid) => {
+                SplitProbe::Cut(mid) => {
                     debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
+                    control.probe_failures.store(0, Ordering::Relaxed);
                     *control.pending_split.lock().unwrap() = Some(mid);
                     // The segment task clears `splitting` when it accepts or
                     // rejects the proposal at its next page boundary.
                 }
-                None => {
+                SplitProbe::Failed => {
+                    debug!(
+                        "Split probe for segment {} failed; will retry after more pages",
+                        index
+                    );
+                    control.record_probe_failure();
+                }
+                SplitProbe::NoBoundary => {
                     debug!(
                         "Split probe for segment {}: no structural boundary in remaining range",
                         index
@@ -1430,6 +1474,34 @@ mod tests {
         assert_eq!(ancestor_dirs("logs/a/b", "logs/"), vec!["logs/a/", "logs/"]);
         assert_eq!(ancestor_dirs("toplevel", ""), vec![""]);
         assert_eq!(ancestor_dirs("a/b", "a/"), vec!["a/"]);
+    }
+
+    #[test]
+    fn test_failed_split_probe_backs_off_instead_of_retiring() {
+        let control = SegmentControl::new(None);
+        for _ in 0..SPLIT_MIN_PAGES {
+            control.record_page("k");
+        }
+        assert!(control.is_split_candidate());
+
+        // A transient probe failure defers the next probe; it does not mark
+        // the segment unsplittable.
+        control.splitting.store(true, Ordering::Relaxed);
+        control.record_probe_failure();
+        assert!(!control.unsplittable.load(Ordering::Relaxed));
+        assert!(!control.splitting.load(Ordering::Relaxed));
+        assert!(!control.is_split_candidate(), "must wait for more pages");
+        for _ in 0..SPLIT_MIN_PAGES {
+            control.record_page("k");
+        }
+        assert!(control.is_split_candidate());
+
+        // Repeated failures do retire it.
+        for _ in 1..SPLIT_PROBE_MAX_FAILURES {
+            control.record_probe_failure();
+        }
+        assert!(control.unsplittable.load(Ordering::Relaxed));
+        assert!(!control.is_split_candidate());
     }
 
     #[test]

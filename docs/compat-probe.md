@@ -16,8 +16,13 @@ s3-turbo-list compat-probe \
   --output compat-probe.json
 ```
 
-`compat-probe` reads the endpoint from the global `--endpoint-url` flag
-(or its subcommand-local `--endpoint` override).
+`compat-probe` resolves its endpoint the way a listing run does: the
+subcommand-local `--endpoint`, then the global `--endpoint-url`, then
+`s3.endpoint_url` from the config file or the profile preset.  The addressing
+style likewise defaults to the resolved config (global `--addressing-style`,
+config file, profile) unless the subcommand's `--addressing-style` is given.
+`--trace-compat` writes the probe's S3 trace to a JSONL file, and `--debug-s3`
+to stderr; with neither, the trace goes to stderr as before.
 Template placeholders such as `<account-id>` are rejected locally with provider
 setup exit code `3` before network setup.  Literal but unreachable endpoints are
 left to the probe so transport failures remain part of the diagnostic report.
@@ -40,6 +45,16 @@ left to the probe so transport failures remain part of the diagnostic report.
 | `compatible` | No test reported `error`. Tests reported `skipped` were not exercised — a bucket with fewer than three objects skips the pagination check, so `compatible` on a near-empty bucket says nothing about continuation-token behavior. |
 | `partial` | Some tests reported `error`, while at least one did not. |
 | `incompatible` | Every test reported `error`. |
+
+## Exit Codes
+
+| `overall_status` | Exit code |
+|---|---|
+| `compatible` | `0` |
+| `partial` | `0` — the report's `tests[]` names the failing operations; an endpoint that lacks only e.g. `encoding-type=url` can still be listed. |
+| `incompatible` | `3` when every failure is a setup error (`AccessDenied`, `NoSuchBucket`, bad signature, redirect, or a codeless 401/403/404 such as `HeadBucket`'s), otherwise `4`. |
+
+The report is written (stdout or `--output`) before a non-zero exit.
 
 ## Test Fields
 

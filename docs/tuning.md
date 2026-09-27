@@ -199,6 +199,10 @@ compression_level = 1
 capacity = 128
 ```
 
+Keys are checked: an unknown section or key (a typo such as
+`max_concurency`) fails config loading with exit code `2` and names the
+expected keys, instead of silently running on the default.
+
 CLI flags exist for common runtime controls such as `--threads`,
 `--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
 `--max-keys`, `--start-after`, and output file paths.

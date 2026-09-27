@@ -448,13 +448,46 @@ pub fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-pub fn detect_hints_plan(
-    explicit_hints_file: Option<&str>,
-    bucket: Option<&str>,
-    region: Option<&str>,
-    prefix: &str,
-    no_auto_hints: bool,
-) -> HintsPlan {
+/// How a list run will partition its key space, mirroring the run's own
+/// order of decisions (see the hints/discovery block in `main`).
+pub struct HintsPlanInputs<'a> {
+    pub explicit_hints_file: Option<&'a str>,
+    pub bucket: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub prefix: &'a str,
+    pub no_auto_hints: bool,
+    /// `--start-after` or `--continuation-token`: one sequential chain.
+    pub single_chain: bool,
+    /// A non-empty `--delimiter`: hierarchical, not partitioned.
+    pub delimited: bool,
+}
+
+pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
+    let HintsPlanInputs {
+        explicit_hints_file,
+        bucket,
+        region,
+        prefix,
+        no_auto_hints,
+        single_chain,
+        delimited,
+    } = inputs;
+    let plan_without_hints = |source: &str, warning: &str| HintsPlan {
+        source: source.to_string(),
+        path: None,
+        exists: false,
+        valid: None,
+        format: None,
+        boundary_count: None,
+        warnings: vec![warning.to_string()],
+    };
+    if single_chain {
+        return plan_without_hints(
+            "single_chain",
+            "--start-after / --continuation-token list one sequential ListObjectsV2 chain; \
+             hints, startup discovery and runtime splitting are skipped",
+        );
+    }
     if let Some(path) = explicit_hints_file {
         let report = inspect_hints_for_plan(path);
         return HintsPlan {
@@ -472,16 +505,20 @@ pub fn detect_hints_plan(
         };
     }
 
+    if delimited {
+        return plan_without_hints(
+            "delimiter_single_segment",
+            "a --delimiter run lists one hierarchical segment: CommonPrefixes are not \
+             range-bounded, so hints, startup discovery and runtime splitting are skipped",
+        );
+    }
+
     if no_auto_hints {
-        return HintsPlan {
-            source: "disabled_single_segment_fallback".to_string(),
-            path: None,
-            exists: false,
-            valid: None,
-            format: None,
-            boundary_count: None,
-            warnings: vec!["--no-auto-hints skips conventional hints cache loading".to_string()],
-        };
+        return plan_without_hints(
+            "disabled_single_segment_fallback",
+            "--no-auto-hints skips the hints cache and startup discovery; the run starts as \
+             one segment and relies on runtime splitting to fan out",
+        );
     }
 
     if let Some(bucket) = bucket {
@@ -489,10 +526,13 @@ pub fn detect_hints_plan(
         let exists = Path::new(&path).exists();
         let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
         return HintsPlan {
+            // No cache: the run probes the bucket's structure at startup and
+            // partitions from what it finds (then caches it here), so this is
+            // not a single-segment plan.
             source: if exists {
                 "auto_cache"
             } else {
-                "single_segment_fallback"
+                "startup_discovery"
             }
             .to_string(),
             path: Some(path),
@@ -894,10 +934,13 @@ pub fn doctor_report(
 
 fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
     if let Some(endpoint) = cfg.s3.endpoint_url.as_deref() {
+        // Both endpoint problems below stop every real list/diff run with
+        // exit 3, so doctor reports them as errors, not warnings: a preflight
+        // that says "ok" before a guaranteed setup failure is worse than none.
         if profiles::endpoint_url_has_template_placeholder(endpoint) {
             return DoctorCheck {
                 name: "endpoint_url".to_string(),
-                status: "warn".to_string(),
+                status: "error".to_string(),
                 message: format!(
                     "endpoint_url contains template placeholders and must be edited before a real run: {}",
                     endpoint
@@ -917,9 +960,21 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
             if profile.requires_explicit_endpoint {
                 return DoctorCheck {
                     name: "endpoint_url".to_string(),
-                    status: "warn".to_string(),
+                    status: "error".to_string(),
                     message: format!(
                         "profile '{}' requires --endpoint-url or s3.endpoint_url in config",
+                        profile.name
+                    ),
+                };
+            }
+            // doctor takes no --region, so a region-derived endpoint cannot
+            // be resolved here; the run supplies it.
+            if profile.endpoint_template.is_some() && profile.default_region.is_none() {
+                return DoctorCheck {
+                    name: "endpoint_url".to_string(),
+                    status: "warn".to_string(),
+                    message: format!(
+                        "profile '{}' derives its endpoint from the region; the run needs --region or --endpoint-url",
                         profile.name
                     ),
                 };
