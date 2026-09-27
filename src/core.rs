@@ -417,6 +417,8 @@ pub struct GlobalState {
     /// for the question it exists to answer.
     pub throttled_count: Arc<AtomicUsize>,
     pub fatal_error_count: Arc<AtomicUsize>,
+    /// The first listing error that ended the run: (errno, one-line summary).
+    pub first_fatal_error: Arc<Mutex<Option<(u8, String)>>>,
     pub output_error_count: Arc<AtomicUsize>,
     pub data_received_batches: Arc<AtomicUsize>,
     pub data_received_objects: Arc<AtomicUsize>,
@@ -486,6 +488,7 @@ impl GlobalState {
             s3_client_generic_error_count: Arc::new(AtomicUsize::new(0)),
             throttled_count: Arc::new(AtomicUsize::new(0)),
             fatal_error_count: Arc::new(AtomicUsize::new(0)),
+            first_fatal_error: Arc::new(Mutex::new(None)),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data_received_batches: Arc::new(AtomicUsize::new(0)),
             data_received_objects: Arc::new(AtomicUsize::new(0)),
@@ -533,6 +536,18 @@ impl GlobalState {
     }
     pub fn inc_fatal_error(&self) {
         self.fatal_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Count a fatal listing error and keep the first one's description, so a
+    /// failed run can say what failed instead of only that something did.
+    pub fn record_fatal_error(&self, errno: u8, summary: String) {
+        self.inc_fatal_error();
+        let mut first = self.first_fatal_error.lock().unwrap();
+        if first.is_none() {
+            *first = Some((errno, summary));
+        }
+    }
+    pub fn first_fatal_error(&self) -> Option<(u8, String)> {
+        self.first_fatal_error.lock().unwrap().clone()
     }
     pub fn read_fatal_error(&self) -> usize {
         self.fatal_error_count.load(Ordering::Relaxed)

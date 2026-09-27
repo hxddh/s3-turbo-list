@@ -4726,3 +4726,93 @@ fn local_mock_throttling_backs_off_instead_of_hammering() {
         observed
     );
 }
+
+#[test]
+fn local_mock_access_denied_is_a_setup_error_that_explains_itself() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(403, "AccessDenied", "Access Denied")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".to_string(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--summary-only".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    // Credentials/bucket problems are setup errors (3), not retryable network
+    // failures (4), and the reason reaches stderr and the manifest.
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("AccessDenied"), "stderr: {}", stderr);
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["exit_code"], 3);
+    assert!(
+        manifest_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("AccessDenied")),
+        "{}",
+        manifest_json["warnings"]
+    );
+}
+
+#[test]
+fn local_mock_missing_region_fails_fast_without_requests() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "InternalError", "should not be reached")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env("AWS_CONFIG_FILE", dir.path().join("no-aws-config"))
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            dir.path().join("no-aws-credentials"),
+        )
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--endpoint-url",
+            &server.endpoint(),
+            "--addressing-style",
+            "path",
+            "list",
+            "--bucket",
+            "mock-bucket",
+            "--summary-only",
+        ])
+        .output()
+        .expect("run s3-turbo-list");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr);
+    assert!(stderr.contains("--region"), "stderr: {}", stderr);
+    assert!(server.requests().is_empty());
+    assert!(started.elapsed() < Duration::from_secs(20));
+}

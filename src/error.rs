@@ -39,7 +39,7 @@ pub const ERROR_UNKNOWN: u8 = 0xff;
 /// signature, malformed auth header, unrecognised codes — is permanent for
 /// this run: retrying re-sends a request that cannot start succeeding.
 pub fn is_retryable(errno: u8) -> bool {
-    errno < ERROR_NO_BUCKET
+    (errno < ERROR_NO_BUCKET && errno != ERROR_S3_MISSING_REGION)
         || matches!(
             errno,
             ERROR_SLOW_DOWN
@@ -47,6 +47,21 @@ pub fn is_retryable(errno: u8) -> bool {
                 | ERROR_INTERNAL_ERROR
                 | ERROR_SERVICE_UNAVAILABLE
         )
+}
+
+/// Permanent errors that mean the run's setup is wrong — the bucket, the
+/// credentials, or the endpoint/region — rather than the network or the
+/// endpoint's health.  Retrying the whole run cannot fix these.
+pub fn is_setup_error(errno: u8) -> bool {
+    matches!(
+        errno,
+        ERROR_S3_MISSING_REGION
+            | ERROR_NO_BUCKET
+            | ERROR_ACCESS_DENIED
+            | ERROR_PERMANENT_REDIRECT
+            | ERROR_SIGNATURE_DOES_NOT_MATCH
+            | ERROR_AUTH_HEADER_MALFORMED
+    )
 }
 
 /// Whether this error is the endpoint refusing load, as opposed to failing.
@@ -126,6 +141,24 @@ impl FlatRuntimeError {
     /// skip real keys that sort before it (e.g. keys starting with `!`/`#`/`-`).
     pub fn next_start(&self) -> &str {
         &self.next_start
+    }
+
+    pub fn errno(&self) -> u8 {
+        self.errno
+    }
+
+    /// One line naming what failed, for the operator: the S3 error code (or
+    /// the classified name when the endpoint sent none), HTTP status, message.
+    pub fn summary(&self) -> String {
+        let code = self
+            .s3_error_code
+            .clone()
+            .unwrap_or_else(|| errno_to_name(self.errno).to_string());
+        if self.http_status_code != 0 {
+            format!("{} (HTTP {}): {}", code, self.http_status_code, self.errmsg)
+        } else {
+            format!("{}: {}", code, self.errmsg)
+        }
     }
 
     pub fn next_start_owned(&self) -> String {

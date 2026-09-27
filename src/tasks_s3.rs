@@ -804,7 +804,10 @@ async fn flat_list_run_to_complete(
                     start_after,
                     err
                 );
-                ctx.g_state.inc_fatal_error();
+                ctx.g_state.record_fatal_error(
+                    err.errno(),
+                    format!("bucket '{}': {}", ctx.s3_bucket_name, err.summary()),
+                );
                 ctx.g_state.quit();
                 return false;
             }

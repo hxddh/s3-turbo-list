@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Permanent auth and bucket errors exit 3, not 4.** `AccessDenied`,
+  `NoSuchBucket`, `SignatureDoesNotMatch`, `AuthorizationHeaderMalformed` and
+  `PermanentRedirect` are setup problems that re-running cannot fix; exit 4
+  ("network/retry exhaustion") told agents to retry them.
+- **A failed run says why.** Every non-zero exit prints one line on stderr
+  (status, exit code, reason, "outputs are partial"); a failed listing records
+  its first fatal error — S3 code, HTTP status, message — in the manifest's
+  `warnings`. Previously a failed run could end with empty stdout and stderr.
+- **SIGTERM is handled like Ctrl-C** (exit 7, manifest and checkpoint written).
+  It used to kill the process outright (exit 143, no manifest, an empty
+  Parquet file), which is what `timeout(1)` and agent harnesses send.
+- **No region fails fast with exit 3.** A run with no `--region`, no
+  `AWS_REGION` and no profile region spent its whole retry budget (about
+  three minutes) on a client error and then exited 4.
+- Rejected up front with exit 2: `--plan-json` without `--dry-run` (it used to
+  run a real scan and never write the plan), `--max-keys` below 1, and a
+  `--compression-level` outside the codec's range (it used to write gzip while
+  every report said e.g. zstd).
+
 ### Fixed
 - **A resumed run could checkpoint a split segment and lose its tail.** Split
   children took fresh indices from the count of segments *remaining*, which on
@@ -30,6 +50,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not range-bounded, so a split parent re-listed its child's prefixes.
 - A TOML `--hints-file` is sorted and de-duplicated like a plain one; an
   unsorted hand-edited file produced overlapping segments and duplicate rows.
+- **An interrupt no longer races the final checkpoint.** On Ctrl-C the output
+  task drained the listing channel but left it open while finalize ran, so a
+  segment finishing in that window sent its last batch into a channel no one
+  would read, reported itself complete, and was checkpointed; `--resume` then
+  skipped it. The channel is now closed before the final drain, so a late
+  batch fails its send and its segment stays unfinished.
+- **Diff Parquet output is in key order**, as documented. Rows were buffered
+  per DiffFlag and flushed flag by flag, so e.g. the `+` rows of a mostly-equal
+  diff landed in a clump after `=` rows with larger keys, and the Key column's
+  statistics could not prune.
+- **Filters with ordinary nesting compile.** The depth limit counted every
+  grammar rule, so `(((SOURCE.size > 1)))` was rejected as too deep. It now
+  counts parentheses and prefix operators (limit 32).
+- **Filters are type-checked statically.** Validation evaluated the filter
+  once against zeroed properties: `100 / SOURCE.size > 1` was rejected (a
+  division by zero in the probe), while `SOURCE.size > 0 && SOURCE.size`
+  was accepted (short-circuit) and then evaluated to nothing for every real
+  object, silently keeping all of them.
+- A stdout listing whose reader goes away (`| head`) records the rows it
+  streamed in the manifest instead of zero, and says the reader closed the
+  pipe instead of reporting a bare write error.
 
 ## [0.31.0] - 2026-08-14
 
