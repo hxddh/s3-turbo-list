@@ -901,9 +901,13 @@ fn test_cli_compat_probe_dry_run_warns_for_placeholder_endpoint() {
         "--bucket",
         "agent-test-bucket",
     ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // The plan is still printed, but the dry run fails the way the real run
+    // would: a placeholder endpoint is a provider setup error (exit 3).
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("Provider setup error:"), "{}", stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "blocked");
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -1009,9 +1013,10 @@ fn test_cli_dry_run_warns_for_profile_missing_or_placeholder_endpoint() {
         "--region",
         "auto",
     ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "blocked");
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -1040,8 +1045,9 @@ endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
         "--region",
         "auto",
     ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "blocked");
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -1065,11 +1071,13 @@ endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
 
     let (code, stdout, stderr) =
         run_cli(&["--config", config.to_str().unwrap(), "doctor", "--json"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // A placeholder endpoint stops every real run with exit 3; doctor says so.
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "error");
     assert!(json["checks"].as_array().unwrap().iter().any(|check| {
         check["name"] == "endpoint_url"
-            && check["status"] == "warn"
+            && check["status"] == "error"
             && check["message"]
                 .as_str()
                 .unwrap()
@@ -2181,4 +2189,139 @@ fn test_cli_rejects_invalid_values_before_any_work() {
     ]);
     assert_eq!(code, 2, "{}", stderr);
     assert!(stderr.contains("compression_level"), "{}", stderr);
+}
+
+#[test]
+fn test_cli_doctor_suggestions_respect_env_credentials() {
+    // Static keys in the environment already give the SDK credentials;
+    // suggesting `export AWS_PROFILE=default` would point it elsewhere.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    clear_aws_env(&mut cmd);
+    let output = cmd
+        .env("AWS_ACCESS_KEY_ID", "test-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+        .args([
+            "--profile",
+            "minio",
+            "doctor",
+            "--simple",
+            "--fix-suggestions",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{}", stdout);
+    assert!(!stdout.contains("NEXT export AWS_PROFILE"), "{}", stdout);
+    assert!(stdout.contains("NEXT pass --endpoint-url"), "{}", stdout);
+}
+
+#[test]
+fn test_cli_dry_run_hints_plan_matches_run_partitioning() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(&[&str], &str, bool); 4] = [
+        // No cached hints: startup discovery partitions the run.
+        (&[], "startup_discovery", false),
+        // Runtime splitting still fans the run out.
+        (
+            &["--no-auto-hints"],
+            "disabled_single_segment_fallback",
+            false,
+        ),
+        // These can never fan out, and only these say so.
+        (&["--delimiter", "/"], "delimiter_single_segment", true),
+        (&["--start-after", "k"], "single_chain", true),
+    ];
+    for (extra, source, single_chain_warning) in cases {
+        let mut args: Vec<&str> = extra.to_vec();
+        args.extend([
+            "--dry-run",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ]);
+        let (code, stdout, stderr) = run_cli_in_dir(&args, dir.path());
+        assert_eq!(code, 0, "{:?}: {}", extra, stderr);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["hints"]["source"], source, "{:?}", extra);
+        let warned = json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("single ListObjectsV2 chain"));
+        assert_eq!(
+            warned, single_chain_warning,
+            "{:?}: {}",
+            extra, json["warnings"]
+        );
+    }
+}
+
+#[test]
+fn test_cli_diff_target_uses_its_own_region_endpoint() {
+    let target_warning = |args: &[&str]| -> Option<String> {
+        let (code, stdout, stderr) = run_cli_without_aws_env(args);
+        assert_eq!(code, 0, "{:?}: {}", args, stderr);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .find(|w| w.contains("diff target side lists against"))
+            .map(str::to_string)
+    };
+    // Region-templated profile, different target region: the target gets its
+    // own region's host, not the source's.
+    let warning = target_warning(&[
+        "--profile",
+        "bos",
+        "--dry-run",
+        "diff",
+        "--bucket",
+        "a",
+        "--region",
+        "bj",
+        "--target-bucket",
+        "c",
+        "--target-region",
+        "gz",
+    ])
+    .expect("target endpoint should be reported");
+    assert!(warning.contains("https://s3.gz.bcebos.com"), "{}", warning);
+    // An explicit endpoint is the user's choice for both sides.
+    assert!(target_warning(&[
+        "--profile",
+        "bos",
+        "--endpoint-url",
+        "https://s3.bj.bcebos.com",
+        "--dry-run",
+        "diff",
+        "--bucket",
+        "a",
+        "--region",
+        "bj",
+        "--target-bucket",
+        "c",
+        "--target-region",
+        "gz",
+    ])
+    .is_none());
+    // Same region on both sides: nothing to derive.
+    assert!(target_warning(&[
+        "--profile",
+        "bos",
+        "--dry-run",
+        "diff",
+        "--bucket",
+        "a",
+        "--region",
+        "bj",
+        "--target-bucket",
+        "c",
+        "--target-region",
+        "bj",
+    ])
+    .is_none());
 }

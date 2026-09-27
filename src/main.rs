@@ -212,9 +212,10 @@ enum Commands {
         #[arg(long)]
         bucket: String,
 
-        /// Addressing style: path, virtual, or auto
-        #[arg(long, default_value = "auto")]
-        addressing_style: String,
+        /// Addressing style: path, virtual, or auto (defaults to the
+        /// resolved config: global flag, config file, then profile)
+        #[arg(long)]
+        addressing_style: Option<String>,
 
         /// Output JSON report file path (default: stdout)
         #[arg(short, long)]
@@ -483,8 +484,12 @@ fn main() {
         cli.compression.as_deref(),
         cli.compression_level,
     );
+    // Recorded before the preset fills it in: a diff derives the target
+    // side's endpoint from its own region only when the user gave none.
+    let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
     cfg.apply_profile_preset(command_region(&cli.cmd));
     cfg.normalize_addressing_style();
+    let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
     apply_output_dir_defaults(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
@@ -530,7 +535,17 @@ fn main() {
                 }
             }
             if report.status == "error" {
-                std::process::exit(agent::ExitCode::CliConfig.code());
+                // An endpoint/profile error is the same setup failure a real
+                // run exits 3 on; any other error is a local config problem.
+                let setup_error = report
+                    .checks
+                    .iter()
+                    .any(|check| check.name == "endpoint_url" && check.status == "error");
+                std::process::exit(if setup_error {
+                    agent::ExitCode::ProviderSetup.code()
+                } else {
+                    agent::ExitCode::CliConfig.code()
+                });
             }
             return;
         }
@@ -605,7 +620,12 @@ fn main() {
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
         }
-        let report = build_plan_report(&cli, &cfg, config_source.clone());
+        let report = build_plan_report(
+            &cli,
+            &cfg,
+            config_source.clone(),
+            diff_target_endpoint.as_deref(),
+        );
         if let Some(path) = cli.plan_json.as_deref() {
             if let Err(e) = agent::write_json_file(path, &report) {
                 eprintln!("Plan write error: {}", e);
@@ -614,6 +634,12 @@ fn main() {
         }
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
+        }
+        // The plan must predict the run: a setup problem the run would stop
+        // on with exit 3 fails the dry run the same way (plan still written).
+        if let Some(error) = provider_setup_guardrail_warnings(&cli, &cfg).first() {
+            eprintln!("Provider setup error: {}", error);
+            std::process::exit(agent::ExitCode::ProviderSetup.code());
         }
         return;
     }
@@ -685,20 +711,39 @@ fn main() {
             addressing_style,
             output,
         } => {
+            // Same resolution as a listing run: the probe must exercise the
+            // endpoint and addressing style the run would use, including
+            // values that come from the config file or the profile.
             let endpoint_url = endpoint_url
                 .as_deref()
                 .or(cli.endpoint.as_deref())
+                .or(cfg.s3.endpoint_url.as_deref())
                 .unwrap_or_else(|| {
                     eprintln!(
-                        "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint"
+                        "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
+                         or set s3.endpoint_url in the config"
                     );
                     std::process::exit(agent::ExitCode::CliConfig.code());
-                });
+                })
+                .to_string();
+            let addressing_style = match addressing_style.as_deref() {
+                Some(style) => match style.parse::<config::AddressingStyle>() {
+                    Ok(parsed) => parsed.to_string(),
+                    Err(_) => {
+                        eprintln!(
+                            "--addressing-style '{}' is not one of: path, virtual, auto",
+                            style
+                        );
+                        std::process::exit(agent::ExitCode::CliConfig.code());
+                    }
+                },
+                None => cfg.s3.addressing_style.to_string(),
+            };
             run_compat_probe(
-                endpoint_url,
+                &endpoint_url,
                 region,
                 bucket,
-                addressing_style,
+                &addressing_style,
                 output.as_deref(),
                 &cfg,
             );
@@ -1059,6 +1104,7 @@ fn main() {
                     let left = diff_side_boundaries(
                         opt_bucket,
                         opt_region,
+                        cfg.s3.endpoint_url.as_deref(),
                         &opt_prefix,
                         &cfg,
                         &cli,
@@ -1068,6 +1114,7 @@ fn main() {
                     let right = diff_side_boundaries(
                         target_bucket,
                         target_region,
+                        diff_target_endpoint.as_deref(),
                         &opt_prefix,
                         &cfg,
                         &cli,
@@ -1080,6 +1127,7 @@ fn main() {
                         diff_side_boundaries(
                             opt_bucket,
                             opt_region,
+                            cfg.s3.endpoint_url.as_deref(),
                             &opt_prefix,
                             &cfg,
                             &cli,
@@ -1088,6 +1136,7 @@ fn main() {
                         diff_side_boundaries(
                             target_bucket,
                             target_region,
+                            diff_target_endpoint.as_deref(),
                             &opt_prefix,
                             &cfg,
                             &cli,
@@ -1128,7 +1177,7 @@ fn main() {
             let right_ctx = core::S3TaskContext::new(
                 target_bucket,
                 target_region,
-                cfg.s3.endpoint_url.as_deref(),
+                diff_target_endpoint.as_deref(),
                 cfg.s3.force_path_style,
                 &sdk_config,
                 &s3_cfg,
@@ -1855,7 +1904,10 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
         }
         Commands::CompatProbe { endpoint_url, .. } => {
-            let effective = endpoint_url.as_deref().or(cli.endpoint.as_deref());
+            let effective = endpoint_url
+                .as_deref()
+                .or(cli.endpoint.as_deref())
+                .or(cfg.s3.endpoint_url.as_deref());
             if let Some(endpoint) = effective {
                 if profiles::endpoint_url_has_template_placeholder(endpoint) {
                     warnings.push(format!(
@@ -2062,8 +2114,20 @@ fn print_doctor_simple(report: &agent::DoctorReport, fix_suggestions: bool) {
 fn print_doctor_suggestions(report: &agent::DoctorReport) {
     for check in &report.checks {
         match check.name.as_str() {
-            "aws_profile" if check.status == "warn" => {
+            // Static keys, SSO/role variables and the like already give the
+            // SDK credentials; exporting a profile then points it elsewhere.
+            "aws_profile" if check.status == "warn" && !credential_environment_signal_present() => {
                 println!("NEXT export AWS_PROFILE=default");
+            }
+            "endpoint_url" if check.status == "error" => {
+                println!(
+                    "NEXT pass --endpoint-url <url>, or set s3.endpoint_url in {}",
+                    report
+                        .config_source
+                        .loaded_config
+                        .as_deref()
+                        .unwrap_or("s3-turbo-list.toml")
+                );
             }
             name if name.ends_with("_parent") && check.status == "error" => {
                 if let Some(path) = check
@@ -2688,6 +2752,7 @@ fn build_plan_report(
     cli: &Cli,
     cfg: &S3TurboConfig,
     config_source: agent::ConfigSourceSummary,
+    diff_target_endpoint: Option<&str>,
 ) -> agent::PlanReport {
     let (planned_ks, planned_parquet, planned_hints) = planned_output_paths(cli, cfg);
     let outputs =
@@ -2723,13 +2788,15 @@ fn build_plan_report(
             &inputs.prefix,
         )
     } else {
-        agent::detect_hints_plan(
-            cli.hints_file.as_deref(),
-            inputs.bucket.as_deref(),
-            inputs.region.as_deref(),
-            &inputs.prefix,
-            cli.no_auto_hints,
-        )
+        agent::detect_hints_plan(agent::HintsPlanInputs {
+            explicit_hints_file: cli.hints_file.as_deref(),
+            bucket: inputs.bucket.as_deref(),
+            region: inputs.region.as_deref(),
+            prefix: &inputs.prefix,
+            no_auto_hints: cli.no_auto_hints,
+            single_chain: cfg.s3.start_after.is_some() || cli.continuation_token.is_some(),
+            delimited: !cli.delimiter.is_empty(),
+        })
     };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = config_source.warnings.clone();
@@ -2740,14 +2807,26 @@ fn build_plan_report(
                 .to_string(),
         );
     }
+    if let Some(target_endpoint) =
+        diff_target_endpoint.filter(|target| Some(*target) != cfg.s3.endpoint_url.as_deref())
+    {
+        warnings.push(format!(
+            "diff target side lists against {} (the profile's endpoint for --target-region); \
+             the source side uses resolved_config.s3.endpoint_url",
+            target_endpoint
+        ));
+    }
+    // Only runs that can never fan out get this warning. A run without cached
+    // hints still partitions (startup discovery, then runtime splitting), and
+    // so does --no-auto-hints (runtime splitting alone).
     if inputs.mode == "list"
         && matches!(
             hints.source.as_str(),
-            "single_segment_fallback" | "disabled_single_segment_fallback"
+            "single_chain" | "delimiter_single_segment"
         )
     {
         warnings.push(
-            "list is planned as a single ListObjectsV2 chain; --concurrency only improves throughput when hints provide multiple key-space segments"
+            "list is planned as a single ListObjectsV2 chain; --concurrency does not add parallelism to it"
                 .to_string(),
         );
     }
@@ -2773,7 +2852,14 @@ fn build_plan_report(
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
-        status: "ok".to_string(),
+        // `blocked`: a provider setup problem that stops the real run with
+        // exit 3 (the reason is in `warnings`); the dry run exits 3 too.
+        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() {
+            "ok"
+        } else {
+            "blocked"
+        }
+        .to_string(),
         command: agent::redacted_command_args(),
         network: "none: dry-run only resolves local configuration and planned paths".to_string(),
         inputs,
@@ -3140,6 +3226,7 @@ fn diff_segment_channels(segments: usize) -> (Vec<SegmentBatchSender>, Vec<Segme
 async fn diff_side_boundaries(
     bucket: &str,
     region: Option<&str>,
+    endpoint: Option<&str>,
     prefix: &str,
     cfg: &S3TurboConfig,
     cli: &Cli,
@@ -3158,12 +3245,7 @@ async fn diff_side_boundaries(
         Err(_) => {}
     }
 
-    let client = core::build_s3_client(
-        sdk_config,
-        region,
-        cfg.s3.endpoint_url.as_deref(),
-        cfg.s3.force_path_style,
-    );
+    let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style);
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
     let discovery = auto_hints::discover_startup_boundaries(
         &client,
@@ -3254,6 +3336,34 @@ async fn discover_flat_boundaries_via_client(
 
 // The region supplied by the active subcommand, used for profile endpoint
 // templating before the full command dispatch.
+/// The endpoint the diff target side lists against. A region-templated
+/// profile's preset was applied from the source region; when the endpoint
+/// came from that template (not from the user) and the target has its own
+/// region, the target gets its own region's host instead of the source's.
+fn diff_target_endpoint(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+    endpoint_was_explicit: bool,
+) -> Option<String> {
+    if let Commands::Diff {
+        target_region: Some(target_region),
+        ..
+    } = &cli.cmd
+    {
+        if !endpoint_was_explicit {
+            if let Some(endpoint) = cfg
+                .s3
+                .profile
+                .as_deref()
+                .and_then(|profile| profiles::region_endpoint(profile, target_region))
+            {
+                return Some(endpoint);
+            }
+        }
+    }
+    cfg.s3.endpoint_url.clone()
+}
+
 fn command_region(cmd: &Commands) -> Option<&str> {
     match cmd {
         Commands::List { region, .. } | Commands::Diff { region, .. } => region.as_deref(),
@@ -3345,8 +3455,8 @@ fn run_compat_probe(
 ) {
     let rt = build_runtime_or_exit(2);
 
-    rt.block_on(async {
-        if let Err(e) = compat_probe::run_compat_probe(
+    let report = rt.block_on(async {
+        match compat_probe::run_compat_probe(
             endpoint_url,
             region,
             bucket,
@@ -3356,10 +3466,29 @@ fn run_compat_probe(
         )
         .await
         {
-            eprintln!("Compat-probe output error: {}", e);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("Compat-probe output error: {}", e);
+                std::process::exit(agent::ExitCode::OutputWrite.code());
+            }
         }
     });
+    // `partial` keeps exit 0: the report says which operations failed, and an
+    // endpoint that only lacks e.g. encoding-type=url can still be listed.
+    // `incompatible` — every operation failed — must not read as success.
+    if report.overall_status == "incompatible" {
+        let exit_code = if report.failures_are_setup_errors() {
+            agent::ExitCode::ProviderSetup
+        } else {
+            agent::ExitCode::NetworkRetryExhausted
+        };
+        eprintln!(
+            "s3-turbo-list: compat-probe found the endpoint incompatible (exit {}): every probe \
+             operation failed; see the report's tests[] for each error.",
+            exit_code.code()
+        );
+        std::process::exit(exit_code.code());
+    }
 }
 
 /// Render the hints-file validation section in human doctor output. Doctor

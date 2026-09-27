@@ -48,6 +48,7 @@ impl std::fmt::Display for AddressingStyle {
 // ── S3Config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3Config {
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
@@ -96,6 +97,7 @@ impl Default for S3Config {
 // ── RuntimeConfig ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
@@ -115,6 +117,7 @@ impl Default for RuntimeConfig {
 // ── OutputConfig ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     #[serde(default = "default_row_group_size")]
     pub row_group_size: usize,
@@ -146,6 +149,7 @@ impl Default for OutputConfig {
 // ── ChannelConfig ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     #[serde(default = "default_channel_capacity")]
     pub capacity: usize,
@@ -162,6 +166,7 @@ impl Default for ChannelConfig {
 // ── S3TurboConfig ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3TurboConfig {
     #[serde(default)]
     pub s3: S3Config,
@@ -526,6 +531,21 @@ max_concurrency = 50
         assert_eq!(config.s3.max_attempts, 5);
         assert_eq!(config.runtime.max_concurrency, 50);
         assert_eq!(config.s3.initial_backoff_secs, 1);
+    }
+
+    #[test]
+    fn test_unknown_config_keys_are_rejected() {
+        // A misspelled key used to be ignored, silently running on the default.
+        for bad in [
+            "[runtime]\nmax_concurency = 5\n",
+            "[s3]\nendpoint = \"http://127.0.0.1:9000\"\n",
+            "[outputs]\ncompression = \"zstd\"\n",
+        ] {
+            let err = toml::from_str::<S3TurboConfig>(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unknown field"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

@@ -1636,7 +1636,10 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
         report.display().to_string(),
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // Every operation failed, and not on a setup error: an incompatible
+    // endpoint must not exit 0 (it used to).
+    assert_eq!(code, 4, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("incompatible"), "stderr: {}", stderr);
 
     let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
     assert_eq!(report["overall_status"], "incompatible");
@@ -1661,6 +1664,57 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
         .as_object()
         .unwrap()
         .contains_key("error_message"));
+}
+
+#[test]
+fn local_mock_compat_probe_uses_config_endpoint_style_and_trace() {
+    // Endpoint and addressing style come only from the config file, as for a
+    // listing run; every request is denied, which is a setup error (exit 3).
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(403, "AccessDenied", "Access Denied")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let trace = dir.path().join("trace.jsonl");
+    std::fs::write(
+        &config,
+        format!(
+            "[s3]\nmax_attempts = 1\ninitial_backoff_secs = 0\nconnect_timeout_secs = 2\n\
+             operation_timeout_secs = 2\nendpoint_url = \"{}\"\naddressing_style = \"path\"\n",
+            server.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
+        "compat-probe".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["endpoint_url"], server.endpoint());
+    assert_eq!(report["addressing_style"], "path");
+    assert_eq!(report["overall_status"], "incompatible");
+    // Path style: the bucket is in the request path, not the host.
+    let requests = server.requests();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|r| r.path.starts_with("/mock-bucket")));
+    // --trace-compat is honoured.
+    let trace_lines = std::fs::read_to_string(&trace).unwrap();
+    assert!(
+        trace_lines.lines().count() >= requests.len(),
+        "{}",
+        trace_lines
+    );
 }
 
 #[test]

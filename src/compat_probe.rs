@@ -16,6 +16,23 @@ pub struct CompatProbeReport {
 }
 
 impl CompatProbeReport {
+    /// Whether every failed test failed on a setup problem — the bucket, the
+    /// credentials, or the endpoint/region — rather than on transport or the
+    /// endpoint's behaviour.  Drives the exit code of an incompatible probe.
+    pub fn failures_are_setup_errors(&self) -> bool {
+        let mut errors = self.tests.iter().filter(|t| t.status == "error").peekable();
+        errors.peek().is_some()
+            && errors.all(|t| match (t.s3_error_code.as_deref(), t.http_status) {
+                // HEAD responses carry no body, so HeadBucket's refusal has a
+                // status and no code: 401/403 is access, 404 is the bucket.
+                (None, Some(401 | 403 | 404)) => true,
+                (code, status) => crate::error::is_setup_error(crate::error::service_error_errno(
+                    code,
+                    status.unwrap_or(0),
+                )),
+            })
+    }
+
     fn overall_status_for(results: &[ProbeTestResult]) -> &'static str {
         let error_count = results.iter().filter(|r| r.status == "error").count();
         if error_count == 0 {
@@ -66,8 +83,12 @@ pub async fn run_compat_probe(
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
-) -> Result<(), String> {
-    let trace_writer: Box<dyn S3TraceWriter> = Box::new(StderrTraceWriter);
+) -> Result<CompatProbeReport, String> {
+    // --trace-compat / --debug-s3 as for a listing run; with neither, the
+    // probe keeps its historical default of tracing to stderr.
+    let trace_writer: Box<dyn S3TraceWriter> =
+        crate::trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3)?
+            .unwrap_or_else(|| Box::new(StderrTraceWriter));
 
     let loader = aws_config::from_env()
         .retry_config(
@@ -93,7 +114,7 @@ pub async fn run_compat_probe(
     let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
     s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
     s3_cfg = s3_cfg.endpoint_url(endpoint_url.to_owned());
-    if addressing_style == "path" {
+    if addressing_style == "path" || cfg.s3.force_path_style {
         s3_cfg = s3_cfg.force_path_style(true);
     }
     let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
@@ -255,7 +276,7 @@ pub async fn run_compat_probe(
     } else {
         println!("{}", json);
     }
-    Ok(())
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
