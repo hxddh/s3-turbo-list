@@ -191,7 +191,12 @@ pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
 }
 
 fn parse_as_toml(path: &str, content: &str) -> Result<Vec<String>, String> {
-    let cached = parse_toml_cache(path, content)?;
+    let mut cached = parse_toml_cache(path, content)?;
+    // Same normalization as the plain-text path: segments are built from
+    // consecutive boundaries, so an unsorted hand-edited list would yield an
+    // inverted segment and a tail that re-lists keys another segment emitted.
+    cached.boundaries.sort();
+    cached.boundaries.dedup();
     info!(
         "Loaded {} key-space boundaries from TOML hints cache '{}'",
         cached.boundaries.len(),
@@ -436,6 +441,15 @@ generated_at = "2026-01-01T00:00:00Z"
                 "logs/file+plus.log",
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_toml_hints_sorts_and_dedups() {
+        let content =
+            "bucket = \"b\"\ngenerated_at = \"x\"\nboundaries = [\"m/\", \"c/\", \"m/\"]\n";
+        let (_dir, path) = write_tmp(content);
+        let boundaries = parse_as_toml(&path, content).unwrap();
+        assert_eq!(boundaries, vec!["c/".to_string(), "m/".to_string()]);
     }
 
     #[test]

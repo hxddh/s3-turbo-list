@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A resumed run could checkpoint a split segment and lose its tail.** Split
+  children took fresh indices from the count of segments *remaining*, which on
+  a resume collides with the original index of a segment still running. The
+  child's control replaced its namesake's, the split parent then completed
+  looking unsplit and was checkpointed, and the next `--resume` skipped the
+  child's range. Children now take indices above every original segment's.
+- **A `--continuation-token` run no longer restarts at the top of the prefix
+  when its first page fails.** The retry dropped the token before any key had
+  been listed, so it re-emitted every key the token had skipped.
+- **Gateway 5xx and codeless 429 responses are retried.** Errors were
+  classified by S3 error code only, so a 502/503/504 from a proxy (HTML or
+  empty body) or a vendor-named throttle was `Unknown` and fatal. A missing or
+  unrecognised code now falls back on the HTTP status; 429 counts as
+  throttled.
+- **A throttle always backs off**, including right after an attempt that made
+  progress, which previously retried with no pause.
+- `--trace-compat` events marked `SlowDown`, `InternalError` and
+  `ServiceUnavailable` as fatal and non-retryable.
+- `--delimiter` runs no longer split segments at runtime; CommonPrefixes are
+  not range-bounded, so a split parent re-listed its child's prefixes.
+- A TOML `--hints-file` is sorted and de-duplicated like a plain one; an
+  unsorted hand-edited file produced overlapping segments and duplicate rows.
+
 ## [0.31.0] - 2026-08-14
 
 ### Fixed

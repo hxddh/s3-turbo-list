@@ -252,12 +252,53 @@ pub fn s3_error_code_to_errno(code: Option<&str>) -> u8 {
     }
 }
 
+/// Classify a service error by its S3 error code, falling back on the HTTP
+/// status when the code is missing or unrecognised.  A 502/503/504 from a
+/// load balancer or proxy in front of the endpoint carries an HTML or empty
+/// body — no S3 `Code` — and a vendor may name its throttle differently; by
+/// code alone both classified as `ERROR_UNKNOWN`, which is fatal, so one such
+/// response ended a run the status line said was temporary.
+pub fn service_error_errno(code: Option<&str>, http_status: u16) -> u8 {
+    match s3_error_code_to_errno(code) {
+        ERROR_UNKNOWN => match http_status {
+            429 => ERROR_TOO_MANY_REQUESTS,
+            503 => ERROR_SERVICE_UNAVAILABLE,
+            500 | 502 | 504 => ERROR_INTERNAL_ERROR,
+            _ => ERROR_UNKNOWN,
+        },
+        errno => errno,
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_service_error_errno_falls_back_on_http_status() {
+        // A recognised S3 code wins over the status.
+        assert_eq!(
+            service_error_errno(Some("NoSuchBucket"), 503),
+            ERROR_NO_BUCKET
+        );
+        // Codeless gateway errors and vendor throttles are transient.
+        assert_eq!(service_error_errno(None, 503), ERROR_SERVICE_UNAVAILABLE);
+        assert_eq!(service_error_errno(None, 502), ERROR_INTERNAL_ERROR);
+        assert_eq!(
+            service_error_errno(Some("Throttled"), 429),
+            ERROR_TOO_MANY_REQUESTS
+        );
+        assert!(is_throttle(service_error_errno(None, 429)));
+        for status in [500, 502, 503, 504] {
+            assert!(is_retryable(service_error_errno(None, status)));
+        }
+        // Anything else stays unknown and fatal.
+        assert_eq!(service_error_errno(Some("Weird"), 400), ERROR_UNKNOWN);
+        assert!(!is_retryable(service_error_errno(None, 403)));
+    }
 
     #[test]
     fn test_flat_error_retryable() {

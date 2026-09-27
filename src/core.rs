@@ -1041,6 +1041,20 @@ impl KeySpaceHints {
     pub fn total_count(&self) -> usize {
         self.done.len() + self.inflight.len() + self.inner.len()
     }
+
+    /// One past the highest segment index this set holds.  After a resume the
+    /// set holds only the unfinished segments, which keep their original
+    /// indices, so `total_count()` can be *below* an index still in flight —
+    /// anything minting fresh indices (runtime-split children) must start here.
+    pub fn index_end(&self) -> usize {
+        self.inner
+            .iter()
+            .map(|p| p.index)
+            .chain(self.inflight.keys().copied())
+            .chain(self.done.iter().map(|p| p.index))
+            .max()
+            .map_or(0, |max| max + 1)
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -1090,6 +1104,7 @@ mod tests {
         let boundaries = vec!["b/".to_string(), "d/".to_string()];
         let mut hints = KeySpaceHints::new_from(&boundaries);
         assert_eq!(hints.total_count(), 3); // ""→b/, b/→d/, d/→""
+        assert_eq!(hints.index_end(), 3);
 
         let p0 = hints.next().unwrap();
         assert_eq!(p0.start, "");
@@ -1117,6 +1132,18 @@ mod tests {
         assert_eq!(remaining.start, "m/");
         assert_eq!(remaining.end, None);
         assert!(hints.next().is_none());
+    }
+
+    #[test]
+    fn test_key_space_hints_index_end_covers_sparse_resume_set() {
+        // Resume with segment 0 done: one segment left, but its index is 10.
+        // Fresh (split-child) indices must not collide with it.
+        let boundaries: Vec<String> = (0..10).map(|i| format!("k{i:02}/")).collect();
+        let completed: Vec<usize> = (0..10).collect();
+        let hints = KeySpaceHints::new_uncompleted_from(&boundaries, &completed);
+        assert_eq!(hints.total_count(), 1);
+        assert_eq!(hints.index_end(), 11);
+        assert_eq!(KeySpaceHints::new_from(&[]).index_end(), 1);
     }
 
     #[test]

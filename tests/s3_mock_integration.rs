@@ -1351,6 +1351,70 @@ fn local_mock_list_stdout_formats_emit_no_blank_rows_for_empty_results() {
 }
 
 #[test]
+fn local_mock_token_retry_after_codeless_gateway_error_keeps_the_token() {
+    // First request: a 502 from a proxy in front of the endpoint — HTML body,
+    // no S3 error code. It must be retried (not fatal), and since no key was
+    // listed yet the retry must still carry the seed token: dropping it would
+    // restart at the top of the bucket and re-emit keys the token skipped.
+    let server = MockS3Server::start(|request, sequence| {
+        assert_eq!(
+            request.query.get("continuation-token").map(String::as_str),
+            Some("seed-token"),
+            "request {} lost the continuation token",
+            sequence
+        );
+        assert!(!request.query.contains_key("start-after"));
+        if sequence == 1 {
+            return MockResponse {
+                status: 502,
+                reason: "Bad Gateway",
+                body: "<html><body>502 Bad Gateway</body></html>".into(),
+                drop_connection: false,
+            };
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["logs/resumed.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--continuation-token".into(),
+        "seed-token".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "ndjson".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let keys: Vec<String> = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["k"].to_string())
+        .collect();
+    assert_eq!(keys, vec!["\"logs/resumed.txt\"".to_string()]);
+    assert_eq!(server.requests().len(), 2, "stderr: {}", stderr);
+}
+
+#[test]
 fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
     let server = MockS3Server::start(|request, _sequence| {
         assert_eq!(request.method, "GET");
