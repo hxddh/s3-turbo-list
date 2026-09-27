@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-27
+
 ### Performance
 - Parquet writes no longer build a dictionary for the near-unique `Key` and
   `ETag` columns (it always overflowed and fell back to plain encoding after
