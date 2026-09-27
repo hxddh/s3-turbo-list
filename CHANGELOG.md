@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- Parquet writes no longer build a dictionary for the near-unique `Key` and
+  `ETag` columns (it always overflowed and fell back to plain encoding after
+  hashing every value). On the local 2M-object benchmark: ~5-10% more
+  objects/s for gzip and zstd, and zstd files ~15% smaller.
+
 ### Changed
 - **Permanent auth and bucket errors exit 3, not 4.** `AccessDenied`,
   `NoSuchBucket`, `SignatureDoesNotMatch`, `AuthorizationHeaderMalformed` and

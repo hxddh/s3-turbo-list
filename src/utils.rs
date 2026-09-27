@@ -6,6 +6,7 @@ use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::schema::types::ColumnPath;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
@@ -103,6 +104,12 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             // near-unique Key/ETag strings costs encode CPU without buying
             // pruning. Chunk keeps coarse row-group pruning intact.
             .set_statistics_enabled(EnabledStatistics::Chunk)
+            // Key and ETag are near-unique per row: a dictionary never pays
+            // for itself, and building one means hashing every value until
+            // the dictionary page overflows and the writer falls back to
+            // plain anyway. Size, LastModified and DiffFlag keep it.
+            .set_column_dictionary_enabled(ColumnPath::from("Key"), false)
+            .set_column_dictionary_enabled(ColumnPath::from("ETag"), false)
             .set_compression(compression)
             .set_max_row_group_size(row_group_size.max(1))
             .build();
