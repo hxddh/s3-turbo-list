@@ -219,6 +219,12 @@ fn handle_connection(
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
     handler: &(dyn Fn(RecordedRequest, usize) -> MockResponse + Send + Sync),
 ) {
+    // The listener is non-blocking, and on macOS (BSD) an accepted socket
+    // inherits O_NONBLOCK. A read that raced ahead of the client's bytes then
+    // failed with WouldBlock and the connection was dropped unrecorded — the
+    // client saw a transport error the endpoint never sent (e.g. a startup
+    // discovery probe "failing", so the run fell back to bisection).
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let Some(request) = read_request(&mut stream) else {
         return;
