@@ -136,12 +136,25 @@ async fn route_batch(
 /// completion: batches of segments the checkpoint records as completed are
 /// already queued here, and dropping them would silently lose their objects
 /// (an interrupt followed by `--resume` skips those segments forever).
+/// Close the listing channel ahead of a final drain.  Draining with
+/// `try_recv` left the receiver open while finalize ran (seconds, for Parquet),
+/// so a segment finishing in that window could still *send* its last batch —
+/// successfully, into a channel no one would read again — and then report
+/// itself complete.  The final checkpoint recorded it and a later `--resume`
+/// skipped it: a silent hole.  Once closed, a late send fails, the segment sees
+/// the quit and reports itself incomplete, and `recv` still yields everything
+/// already buffered before returning `None`.
+fn close_and_drain_start(rx: &mut tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>) {
+    rx.close();
+}
+
 async fn drain_buffered_batches(
     rx: &mut tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
     senders: &[tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>],
     rr: &mut usize,
 ) -> bool {
-    while let Ok(batch) = rx.try_recv() {
+    close_and_drain_start(rx);
+    while let Some(batch) = rx.recv().await {
         if route_batch(senders, rr, batch).await.is_err() {
             return false;
         }
@@ -570,7 +583,8 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
         if ctx.is_quit() {
             // Count batches the channel already buffered so interrupt metrics
             // (and any checkpointed-completed segments) match received data.
-            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+            close_and_drain_start(&mut ctx.data_map_channel);
+            while let Some(batch) = ctx.data_map_channel.recv().await {
                 ingest_list_summary_batch(&mut prefix_stats, &mut stats, batch);
             }
             info!("Data Map Task — list summary-only force quit, finalizing");
@@ -578,7 +592,8 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
-            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+            close_and_drain_start(&mut ctx.data_map_channel);
+            while let Some(batch) = ctx.data_map_channel.recv().await {
                 ingest_list_summary_batch(&mut prefix_stats, &mut stats, batch);
             }
             info!("Data Map Task — list summary-only all list tasks done, finalizing");
@@ -647,6 +662,10 @@ pub async fn data_map_task_list_text_writer<W>(
                 )
                 .await
                 {
+                    // Record what was streamed before stopping: the manifest
+                    // otherwise reported zero rows for a run that wrote
+                    // millions before the reader went away (`| head`).
+                    record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -666,7 +685,8 @@ pub async fn data_map_task_list_text_writer<W>(
             // Write out batches the channel already buffered: they were
             // received before the interrupt and dropping them would silently
             // truncate the streamed rows.
-            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+            close_and_drain_start(&mut ctx.data_map_channel);
+            while let Some(batch) = ctx.data_map_channel.recv().await {
                 if !ingest_list_stdout_batch(
                     &mut writer,
                     format,
@@ -676,6 +696,10 @@ pub async fn data_map_task_list_text_writer<W>(
                 )
                 .await
                 {
+                    // Record what was streamed before stopping: the manifest
+                    // otherwise reported zero rows for a run that wrote
+                    // millions before the reader went away (`| head`).
+                    record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -687,7 +711,8 @@ pub async fn data_map_task_list_text_writer<W>(
             ctx.complete();
             return;
         } else if !ctx.all_list_tasks_is_running() {
-            while let Ok(batch) = ctx.data_map_channel.try_recv() {
+            close_and_drain_start(&mut ctx.data_map_channel);
+            while let Some(batch) = ctx.data_map_channel.recv().await {
                 if !ingest_list_stdout_batch(
                     &mut writer,
                     format,
@@ -697,6 +722,10 @@ pub async fn data_map_task_list_text_writer<W>(
                 )
                 .await
                 {
+                    // Record what was streamed before stopping: the manifest
+                    // otherwise reported zero rows for a run that wrote
+                    // millions before the reader went away (`| head`).
+                    record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -814,7 +843,14 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     folder.flush(prefix_stats);
     if !out.is_empty() {
         if let Err(e) = writer.write_all(&out).await {
-            log::error!("Stdout write error: {}", e);
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                log::error!(
+                    "Stdout closed by its reader (e.g. `| head`); stopping the listing. \
+                     The output is partial and the run is reported as failed."
+                );
+            } else {
+                log::error!("Stdout write error: {}", e);
+            }
             return false;
         }
     }
@@ -912,18 +948,11 @@ impl PrefixRunFolder {
     }
 }
 
-async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
+fn record_list_stdout_metrics(
     g_state: &core::GlobalState,
-    writer: &mut W,
     prefix_stats: &PrefixStats,
-    stats: ListStreamingStats,
-    started_at: Instant,
+    stats: &ListStreamingStats,
 ) {
-    if let Err(e) = writer.flush().await {
-        log::error!("Stdout flush error: {}", e);
-        g_state.inc_output_error();
-    }
-    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
     g_state.record_data_metrics(
         stats.received_batches,
         stats.received_objects,
@@ -936,6 +965,21 @@ async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
         false,
         0,
     );
+}
+
+async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
+    g_state: &core::GlobalState,
+    writer: &mut W,
+    prefix_stats: &PrefixStats,
+    stats: ListStreamingStats,
+    started_at: Instant,
+) {
+    if let Err(e) = writer.flush().await {
+        log::error!("Stdout flush error: {}", e);
+        g_state.inc_output_error();
+    }
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    record_list_stdout_metrics(g_state, prefix_stats, &stats);
     info!(
         "Data Map Task — list stdout complete: streamed rows {}, received batches {}, received objects {}, unique prefixes {}, bytes {}, elapsed {:.3}s, {:.0} objects/sec",
         stats.streamed_rows,
@@ -1194,10 +1238,12 @@ impl DiffSideStream {
     }
 }
 
-/// Buffered streaming row sink: rows accumulate per DiffFlag and flush as
-/// Parquet batches; per-prefix counts feed the KS file.
+/// Buffered streaming row sink: rows accumulate in merge (key) order, each
+/// with its DiffFlag, and flush as Parquet batches; per-prefix counts feed the
+/// KS file.  (Buffering per flag instead wrote each flag's rows in clumps, so
+/// a diff file was not in key order and its Key statistics could not prune.)
 struct DiffRowSink {
-    bufs: [Vec<(ObjectKey, ObjectProps)>; 4],
+    buf: Vec<(ObjectKey, ObjectProps, u8)>,
     prefix_stats: PrefixStats,
     rows: usize,
     plus: usize,
@@ -1214,12 +1260,12 @@ const DIFF_SINK_FLUSH_ROWS: usize = 8192;
 const DIFF_WRITE_PIPELINE_CAP: usize = 4;
 
 /// A flushed row batch on its way to the Parquet writer loop.
-type DiffWriteBatch = (Vec<(ObjectKey, ObjectProps)>, u8);
+type DiffWriteBatch = Vec<(ObjectKey, ObjectProps, u8)>;
 
 impl DiffRowSink {
     fn new() -> Self {
         Self {
-            bufs: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            buf: Vec::new(),
             prefix_stats: PrefixStats::new(),
             rows: 0,
             plus: 0,
@@ -1250,11 +1296,10 @@ impl DiffRowSink {
             _ => self.equal += 1,
         }
         self.rows += 1;
-        let buf = &mut self.bufs[flag as usize];
-        buf.push((key, props));
-        if buf.len() >= DIFF_SINK_FLUSH_ROWS {
-            let batch = std::mem::take(buf);
-            send_to_writer(writer_tx, batch, flag).await?;
+        self.buf.push((key, props, flag));
+        if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
+            let batch = std::mem::replace(&mut self.buf, Vec::with_capacity(DIFF_SINK_FLUSH_ROWS));
+            send_to_writer(writer_tx, batch).await?;
         }
         Ok(())
     }
@@ -1263,17 +1308,9 @@ impl DiffRowSink {
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     ) -> Result<(), String> {
-        for flag in [
-            OUTPUT_FLAG_PLUS,
-            OUTPUT_FLAG_MINUS,
-            OUTPUT_FLAG_ASTRISK,
-            OUTPUT_FLAG_EQUAL,
-        ] {
-            let buf = &mut self.bufs[flag as usize];
-            if !buf.is_empty() {
-                let batch = std::mem::take(buf);
-                send_to_writer(writer_tx, batch, flag).await?;
-            }
+        if !self.buf.is_empty() {
+            let batch = std::mem::take(&mut self.buf);
+            send_to_writer(writer_tx, batch).await?;
         }
         Ok(())
     }
@@ -1284,11 +1321,10 @@ impl DiffRowSink {
 /// `run_diff_merge` reports, this message only unblocks the merge.
 async fn send_to_writer(
     writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
-    batch: Vec<(ObjectKey, ObjectProps)>,
-    flag: u8,
+    batch: DiffWriteBatch,
 ) -> Result<(), String> {
     writer_tx
-        .send((batch, flag))
+        .send(batch)
         .await
         .map_err(|_| "diff Parquet writer stopped (write error)".to_string())
 }
@@ -1454,8 +1490,8 @@ pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
     // a write fails (dropping the receiver unblocks the merge, whose sends
     // then fail fast).
     let mut write_error: Option<String> = None;
-    while let Some((batch, flag)) = writer_rx.recv().await {
-        if let Err(e) = parquet.write_batch(batch, flag).await {
+    while let Some(batch) = writer_rx.recv().await {
+        if let Err(e) = parquet.write_flagged_rows(batch).await {
             write_error = Some(e);
             break;
         }

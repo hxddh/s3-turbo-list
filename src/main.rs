@@ -113,7 +113,7 @@ struct Cli {
     delimiter: String,
 
     /// Max keys per ListObjectsV2 page
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = clap::value_parser!(i32).range(1..))]
     max_keys: Option<i32>,
 
     /// Start listing after this key (single-chain: skips hints and
@@ -149,8 +149,8 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
-    /// Write dry-run plan JSON to this path
-    #[arg(long, global = true)]
+    /// Write dry-run plan JSON to this path (requires --dry-run)
+    #[arg(long, global = true, requires = "dry_run")]
     plan_json: Option<String>,
 
     /// Write final run manifest JSON to this path
@@ -841,6 +841,22 @@ fn main() {
         let channel_capacity = cfg.channel.capacity;
         let sdk_config = core::S3TaskContext::load_sdk_config(&cfg.s3).await;
 
+        // Without a region the SDK cannot sign a single request. Left to the
+        // listing, that surfaced as a retryable client error on every segment
+        // and the run spent its whole retry budget (minutes) before exiting as
+        // a network failure — the wrong exit class for a setup mistake.
+        let side_without_region =
+            opt_region.is_none() || opt_target_region.is_some_and(|r| r.is_none());
+        if side_without_region && sdk_config.region().is_none() {
+            eprintln!(
+                "No AWS region resolved{}: pass --region{} or set AWS_REGION \
+                 (or a region in the AWS profile).",
+                if opt_region.is_none() { "" } else { " for the diff target" },
+                if opt_region.is_none() { "" } else { " / --target-region" },
+            );
+            std::process::exit(agent::ExitCode::ProviderSetup.code());
+        }
+
         // List mode streams over one channel; diff builds per-segment
         // channels for each side further below.
         let (tx, rx) = if mode != RunMode::BiDir {
@@ -1375,15 +1391,26 @@ fn main() {
     // read before the snapshot is folded into the manifest.
     let output_files = metrics.data_output_files;
     let interrupted = interrupted.load(Ordering::SeqCst);
+    let first_fatal = g_state.first_fatal_error();
     let exit_code = if interrupted {
         agent::ExitCode::Interrupted
     } else if metrics.output_errors > 0 {
         agent::ExitCode::OutputWrite
+    } else if first_fatal
+        .as_ref()
+        .is_some_and(|(errno, _)| s3_turbo_list::error::is_setup_error(*errno))
+    {
+        // Wrong bucket, credentials, or region: re-running unchanged cannot
+        // succeed, so this must not read as a retryable network failure.
+        agent::ExitCode::ProviderSetup
     } else if metrics.fatal_errors > 0 {
         agent::ExitCode::NetworkRetryExhausted
     } else {
         agent::ExitCode::Success
     };
+    if let Some((_, summary)) = &first_fatal {
+        run_warnings.push(format!("Listing failed: {}", summary));
+    }
     let status = if exit_code == agent::ExitCode::Success {
         "success"
     } else if exit_code == agent::ExitCode::Interrupted {
@@ -1461,6 +1488,23 @@ fn main() {
         print_wrote_summary(&manifest.outputs, output_files);
     }
     if exit_code != agent::ExitCode::Success {
+        // One line on stderr for every non-success exit: without it a failed
+        // run could end with empty stdout and stderr (the reason only in the
+        // log file) while leaving partial artifacts behind.
+        let reason = match (&first_fatal, exit_code) {
+            (_, agent::ExitCode::Interrupted) => {
+                "interrupted; with --resume, a checkpoint may allow resuming".to_string()
+            }
+            (_, agent::ExitCode::OutputWrite) => "an output write failed".to_string(),
+            (Some((_, summary)), _) => summary.clone(),
+            (None, _) => "a listing segment failed".to_string(),
+        };
+        eprintln!(
+            "s3-turbo-list: run {} (exit {}): {}. Any outputs written are partial.",
+            status,
+            exit_code.code(),
+            reason
+        );
         std::process::exit(exit_code.code());
     }
 }
@@ -1666,6 +1710,16 @@ fn validate_runtime_values(cfg: &S3TurboConfig) {
             "output.compression '{}' is not supported; use one of: {}",
             cfg.output.compression,
             s3_turbo_list::utils::SUPPORTED_COMPRESSION.join(", ")
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+    if let Some(reason) = s3_turbo_list::utils::compression_setting_error(
+        &cfg.output.compression,
+        cfg.output.compression_level,
+    ) {
+        eprintln!(
+            "output.compression_level {} is not valid for '{}' (--compression-level): {}",
+            cfg.output.compression_level, cfg.output.compression, reason
         );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }

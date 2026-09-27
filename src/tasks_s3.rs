@@ -436,16 +436,24 @@ async fn flat_reactor_task(
 
     // Adaptive splitting only applies to plain list runs: diff uses a fixed,
     // key-ordered segment set per side (the merge needs it static), and
-    // --start-after / --continuation-token are single-chain modes.
+    // --start-after / --continuation-token are single-chain modes. A
+    // --delimiter run is excluded for the reason hints are: a page's
+    // CommonPrefixes are not range-bounded, so a split parent would keep
+    // paging past its cut, re-listing the child's prefixes.
     let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && ctx.start_after.is_none()
-        && ctx.continuation_token.is_none();
+        && ctx.continuation_token.is_none()
+        && ctx.delimiter.as_deref().unwrap_or("").is_empty();
 
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
     let mut set = tokio::task::JoinSet::new();
     let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
     let mut pending_children: Vec<SplitRange> = Vec::new();
-    let mut next_child_index = hints.total_count();
+    // Children need indices no original segment uses: on a resume the set is
+    // sparse, and a reused index would let a child's control replace its
+    // namesake's in `controls` — then the split parent completes looking
+    // unsplit and gets checkpointed while the child's range is still unlisted.
+    let mut next_child_index = hints.index_end();
     let mut split_count = 0usize;
     let mut retired_pages = 0u64;
     let mut gov = FanOutGovernor::new(flat_concurrency);
@@ -743,8 +751,14 @@ async fn flat_list_run_to_complete(
                     retry_attempt.saturating_add(1)
                 };
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
-                    start_after = err.next_start_owned();
-                    continuation_token = None;
+                    // A token-mode attempt that failed before recording any
+                    // key has no key to resume after: dropping the token then
+                    // would restart the listing at the top of the prefix and
+                    // re-emit everything the token had already skipped.
+                    if continuation_token.is_none() || !err.next_start().is_empty() {
+                        start_after = err.next_start_owned();
+                        continuation_token = None;
+                    }
                     retry_attempt = next_retry_attempt;
                     // Space consecutive failures. Re-issuing immediately is
                     // the wrong answer to `SlowDown` in particular: the
@@ -753,7 +767,15 @@ async fn flat_list_run_to_complete(
                     // that advanced resets the budget and starts the delay
                     // over, so a healthy listing that hiccups once does not
                     // inherit a long pause.
-                    let delay = retry_backoff(ctx.initial_backoff_secs, retry_attempt);
+                    // A throttle always pauses, even right after progress:
+                    // an endpoint that lets one page through and then says
+                    // `SlowDown` would otherwise be re-hit at once, forever.
+                    let backoff_step = if err.is_throttle() {
+                        retry_attempt.max(1)
+                    } else {
+                        retry_attempt
+                    };
+                    let delay = retry_backoff(ctx.initial_backoff_secs, backoff_step);
                     debug!(
                         "Retrying from '{}' (attempt {}{}) after {:?}: {}",
                         start_after,
@@ -782,7 +804,10 @@ async fn flat_list_run_to_complete(
                     start_after,
                     err
                 );
-                ctx.g_state.inc_fatal_error();
+                ctx.g_state.record_fatal_error(
+                    err.errno(),
+                    format!("bucket '{}': {}", ctx.s3_bucket_name, err.summary()),
+                );
                 ctx.g_state.quit();
                 return false;
             }
@@ -1230,7 +1255,7 @@ fn handle_sdk_error(
             let s3_err = service_err.err();
             let s3_code = s3_err.meta().code().map(|c| c.to_string());
             let s3_msg = s3_err.meta().message().map(|m| m.to_string());
-            let errno = s3_error_code_to_errno(s3_code.as_deref());
+            let errno = service_error_errno(s3_code.as_deref(), http_code);
 
             // Extract request ID from response headers (if available).
             let request_id = raw.headers().get("x-amz-request-id").map(|v| v.to_string());
@@ -1241,10 +1266,10 @@ fn handle_sdk_error(
                 String::from_utf8_lossy(&b[..end]).into_owned()
             });
 
-            let retryable = errno < ERROR_NO_BUCKET;
-            let fatal = errno >= ERROR_NO_BUCKET;
+            let retryable = is_retryable(errno);
+            let fatal = !retryable;
 
-            if errno == ERROR_SLOW_DOWN || errno == ERROR_TOO_MANY_REQUESTS {
+            if is_throttle(errno) {
                 ctx.g_state.inc_throttled();
             }
 
@@ -1311,7 +1336,7 @@ fn handle_sdk_error(
                 ERROR_S3_CLIENT_GENERIC
             };
 
-            let retryable = errno < ERROR_NO_BUCKET;
+            let retryable = is_retryable(errno);
 
             emit_trace_compat(
                 ctx,

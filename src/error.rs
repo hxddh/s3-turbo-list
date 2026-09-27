@@ -39,7 +39,7 @@ pub const ERROR_UNKNOWN: u8 = 0xff;
 /// signature, malformed auth header, unrecognised codes — is permanent for
 /// this run: retrying re-sends a request that cannot start succeeding.
 pub fn is_retryable(errno: u8) -> bool {
-    errno < ERROR_NO_BUCKET
+    (errno < ERROR_NO_BUCKET && errno != ERROR_S3_MISSING_REGION)
         || matches!(
             errno,
             ERROR_SLOW_DOWN
@@ -47,6 +47,21 @@ pub fn is_retryable(errno: u8) -> bool {
                 | ERROR_INTERNAL_ERROR
                 | ERROR_SERVICE_UNAVAILABLE
         )
+}
+
+/// Permanent errors that mean the run's setup is wrong — the bucket, the
+/// credentials, or the endpoint/region — rather than the network or the
+/// endpoint's health.  Retrying the whole run cannot fix these.
+pub fn is_setup_error(errno: u8) -> bool {
+    matches!(
+        errno,
+        ERROR_S3_MISSING_REGION
+            | ERROR_NO_BUCKET
+            | ERROR_ACCESS_DENIED
+            | ERROR_PERMANENT_REDIRECT
+            | ERROR_SIGNATURE_DOES_NOT_MATCH
+            | ERROR_AUTH_HEADER_MALFORMED
+    )
 }
 
 /// Whether this error is the endpoint refusing load, as opposed to failing.
@@ -126,6 +141,24 @@ impl FlatRuntimeError {
     /// skip real keys that sort before it (e.g. keys starting with `!`/`#`/`-`).
     pub fn next_start(&self) -> &str {
         &self.next_start
+    }
+
+    pub fn errno(&self) -> u8 {
+        self.errno
+    }
+
+    /// One line naming what failed, for the operator: the S3 error code (or
+    /// the classified name when the endpoint sent none), HTTP status, message.
+    pub fn summary(&self) -> String {
+        let code = self
+            .s3_error_code
+            .clone()
+            .unwrap_or_else(|| errno_to_name(self.errno).to_string());
+        if self.http_status_code != 0 {
+            format!("{} (HTTP {}): {}", code, self.http_status_code, self.errmsg)
+        } else {
+            format!("{}: {}", code, self.errmsg)
+        }
     }
 
     pub fn next_start_owned(&self) -> String {
@@ -252,12 +285,53 @@ pub fn s3_error_code_to_errno(code: Option<&str>) -> u8 {
     }
 }
 
+/// Classify a service error by its S3 error code, falling back on the HTTP
+/// status when the code is missing or unrecognised.  A 502/503/504 from a
+/// load balancer or proxy in front of the endpoint carries an HTML or empty
+/// body — no S3 `Code` — and a vendor may name its throttle differently; by
+/// code alone both classified as `ERROR_UNKNOWN`, which is fatal, so one such
+/// response ended a run the status line said was temporary.
+pub fn service_error_errno(code: Option<&str>, http_status: u16) -> u8 {
+    match s3_error_code_to_errno(code) {
+        ERROR_UNKNOWN => match http_status {
+            429 => ERROR_TOO_MANY_REQUESTS,
+            503 => ERROR_SERVICE_UNAVAILABLE,
+            500 | 502 | 504 => ERROR_INTERNAL_ERROR,
+            _ => ERROR_UNKNOWN,
+        },
+        errno => errno,
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_service_error_errno_falls_back_on_http_status() {
+        // A recognised S3 code wins over the status.
+        assert_eq!(
+            service_error_errno(Some("NoSuchBucket"), 503),
+            ERROR_NO_BUCKET
+        );
+        // Codeless gateway errors and vendor throttles are transient.
+        assert_eq!(service_error_errno(None, 503), ERROR_SERVICE_UNAVAILABLE);
+        assert_eq!(service_error_errno(None, 502), ERROR_INTERNAL_ERROR);
+        assert_eq!(
+            service_error_errno(Some("Throttled"), 429),
+            ERROR_TOO_MANY_REQUESTS
+        );
+        assert!(is_throttle(service_error_errno(None, 429)));
+        for status in [500, 502, 503, 504] {
+            assert!(is_retryable(service_error_errno(None, status)));
+        }
+        // Anything else stays unknown and fatal.
+        assert_eq!(service_error_errno(Some("Weird"), 400), ERROR_UNKNOWN);
+        assert!(!is_retryable(service_error_errno(None, 403)));
+    }
 
     #[test]
     fn test_flat_error_retryable() {

@@ -9,7 +9,10 @@
 
 use crate::core::ObjectProps;
 
-const MAX_EXPR_DEPTH: usize = 24;
+/// Maximum nesting the user can write: parenthesized groups plus chained
+/// prefix operators (`!`, `-`, `+`).  Counted per user-visible level — not per
+/// grammar rule, which let only three levels of parentheses through.
+const MAX_EXPR_DEPTH: usize = 32;
 
 // ── AST ────────────────────────────────────────────────────
 
@@ -82,16 +85,14 @@ impl FilterExpr {
         if uses_target && !allow_target {
             return Err("variable \"TARGET\" is only available in diff mode".to_string());
         }
-        let compiled = Self { root, uses_target };
-
-        // Evaluate against default props to catch type errors (e.g. a
-        // numeric-valued expression, or `!` applied to a number) up front.
-        let probe = ObjectProps::default();
-        let target_probe = if uses_target { Some(&probe) } else { None };
-        match eval(&compiled.root, &probe, target_probe) {
-            Some(Value::Bool(_)) => Ok(compiled),
-            Some(_) => Err("filter expression must evaluate to a boolean".to_string()),
-            None => Err("filter expression failed to evaluate".to_string()),
+        // Type-check the whole tree up front.  (Evaluating once against
+        // zeroed props did this before, and was wrong both ways: a division by
+        // a property failed on the zero divisor, and a short-circuit skipped
+        // the unevaluated branch — `SOURCE.size > 0 && SOURCE.size` compiled,
+        // then evaluated to nothing for every real object.)
+        match type_of(&root)? {
+            Ty::Bool => Ok(Self { root, uses_target }),
+            Ty::Num => Err("filter expression must evaluate to a boolean".to_string()),
         }
     }
 
@@ -104,6 +105,63 @@ impl FilterExpr {
         match eval(&self.root, source, target)? {
             Value::Bool(b) => Some(b),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ty {
+    Bool,
+    Num,
+}
+
+fn type_of(node: &Node) -> Result<Ty, String> {
+    let expect = |want: Ty, got: Ty, what: &str| {
+        if want == got {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} needs a {} operand in filter expression",
+                what,
+                if want == Ty::Bool {
+                    "boolean"
+                } else {
+                    "numeric"
+                }
+            ))
+        }
+    };
+    match node {
+        Node::Bool(_) => Ok(Ty::Bool),
+        Node::Int(_) | Node::Float(_) | Node::Prop(..) => Ok(Ty::Num),
+        Node::Unary(op, inner) => {
+            let t = type_of(inner)?;
+            match op {
+                UnOp::Not => expect(Ty::Bool, t, "'!'").map(|_| Ty::Bool),
+                UnOp::Neg | UnOp::Plus => expect(Ty::Num, t, "unary sign").map(|_| Ty::Num),
+            }
+        }
+        Node::Binary(op, lhs, rhs) => {
+            let (l, r) = (type_of(lhs)?, type_of(rhs)?);
+            match op {
+                BinOp::And | BinOp::Or => {
+                    expect(Ty::Bool, l, "'&&'/'||'")?;
+                    expect(Ty::Bool, r, "'&&'/'||'")?;
+                    Ok(Ty::Bool)
+                }
+                // Mixed-kind equality is `false`, not an error (see eval).
+                BinOp::Eq | BinOp::Ne => Ok(Ty::Bool),
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    expect(Ty::Num, l, "comparison")?;
+                    expect(Ty::Num, r, "comparison")?;
+                    Ok(Ty::Bool)
+                }
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    expect(Ty::Num, l, "arithmetic")?;
+                    expect(Ty::Num, r, "arithmetic")?;
+                    Ok(Ty::Num)
+                }
+            }
         }
     }
 }
@@ -269,29 +327,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_or(&mut self) -> Result<Node, String> {
-        self.enter()?;
         let mut node = self.parse_and()?;
         while self.eat_op("||") {
             let rhs = self.parse_and()?;
             node = Node::Binary(BinOp::Or, Box::new(node), Box::new(rhs));
         }
-        self.leave();
         Ok(node)
     }
 
     fn parse_and(&mut self) -> Result<Node, String> {
-        self.enter()?;
         let mut node = self.parse_cmp()?;
         while self.eat_op("&&") {
             let rhs = self.parse_cmp()?;
             node = Node::Binary(BinOp::And, Box::new(node), Box::new(rhs));
         }
-        self.leave();
         Ok(node)
     }
 
     fn parse_cmp(&mut self) -> Result<Node, String> {
-        self.enter()?;
         let mut node = self.parse_add()?;
         loop {
             let op = if self.eat_op(">=") {
@@ -312,12 +365,10 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_add()?;
             node = Node::Binary(op, Box::new(node), Box::new(rhs));
         }
-        self.leave();
         Ok(node)
     }
 
     fn parse_add(&mut self) -> Result<Node, String> {
-        self.enter()?;
         let mut node = self.parse_mul()?;
         loop {
             let op = if self.eat_op("+") {
@@ -330,12 +381,10 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_mul()?;
             node = Node::Binary(op, Box::new(node), Box::new(rhs));
         }
-        self.leave();
         Ok(node)
     }
 
     fn parse_mul(&mut self) -> Result<Node, String> {
-        self.enter()?;
         let mut node = self.parse_unary()?;
         loop {
             let op = if self.eat_op("*") {
@@ -350,36 +399,37 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_unary()?;
             node = Node::Binary(op, Box::new(node), Box::new(rhs));
         }
-        self.leave();
         Ok(node)
     }
 
     fn parse_unary(&mut self) -> Result<Node, String> {
-        self.enter()?;
         self.skip_ws();
-        let node = if self.eat_op("!") {
-            // Reject `!=` mis-parse: eat_op("!") already skipped one byte;
-            // a following `=` would have matched eat_op("!=") in parse_cmp,
-            // so reaching here with `!` is genuine negation.
-            Node::Unary(UnOp::Not, Box::new(self.parse_unary()?))
+        // Reject `!=` mis-parse: eat_op("!") already skipped one byte; a
+        // following `=` would have matched eat_op("!=") in parse_cmp, so
+        // reaching here with `!` is genuine negation.
+        let op = if self.eat_op("!") {
+            UnOp::Not
         } else if self.eat_op("-") {
-            Node::Unary(UnOp::Neg, Box::new(self.parse_unary()?))
+            UnOp::Neg
         } else if self.eat_op("+") {
-            Node::Unary(UnOp::Plus, Box::new(self.parse_unary()?))
+            UnOp::Plus
         } else {
-            self.parse_primary()?
+            return self.parse_primary();
         };
+        self.enter()?;
+        let inner = self.parse_unary()?;
         self.leave();
-        Ok(node)
+        Ok(Node::Unary(op, Box::new(inner)))
     }
 
     fn parse_primary(&mut self) -> Result<Node, String> {
-        self.enter()?;
         self.skip_ws();
         let node = match self.input.get(self.pos) {
             Some(b'(') => {
                 self.pos += 1;
+                self.enter()?;
                 let inner = self.parse_or()?;
+                self.leave();
                 self.skip_ws();
                 if !self.eat_byte(b')') {
                     return Err("missing closing parenthesis in filter expression".to_string());
@@ -401,7 +451,6 @@ impl<'a> Parser<'a> {
             }
             None => return Err("unexpected end of filter expression".to_string()),
         };
-        self.leave();
         Ok(node)
     }
 
@@ -697,6 +746,34 @@ mod tests {
         assert!(FilterExpr::compile("SOURCE size > 1", false).is_err());
         assert!(FilterExpr::compile("SOURCE.size & 1", false).is_err());
         assert!(FilterExpr::compile("SOURCE.size = 1", false).is_err());
+    }
+
+    #[test]
+    fn test_ordinary_nesting_is_accepted() {
+        let p = props(3, 10);
+        assert_eq!(eval_list("(((SOURCE.size > 1)))", &p), Some(true));
+        assert_eq!(
+            eval_list(
+                "!(SOURCE.size > 1 && (SOURCE.last_modified > 0 || (SOURCE.size < 5)))",
+                &p
+            ),
+            Some(false)
+        );
+        let deep = format!("{}SOURCE.size > 1{}", "(".repeat(20), ")".repeat(20));
+        assert_eq!(eval_list(&deep, &p), Some(true));
+    }
+
+    #[test]
+    fn test_static_type_check() {
+        // Division by a property compiles (the old zero-probe rejected it).
+        let p = props(50, 0);
+        assert_eq!(eval_list("100 / SOURCE.size > 1", &p), Some(true));
+        // A numeric branch hidden behind a short-circuit is rejected.
+        assert!(FilterExpr::compile("SOURCE.size > 0 && SOURCE.size", false).is_err());
+        assert!(FilterExpr::compile("SOURCE.size < 0 || SOURCE.size", false).is_err());
+        assert!(FilterExpr::compile("!SOURCE.size", false).is_err());
+        assert!(FilterExpr::compile("(SOURCE.size > 1) + 1 > 0", false).is_err());
+        assert!(FilterExpr::compile("SOURCE.size + 1", false).is_err());
     }
 
     #[test]

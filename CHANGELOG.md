@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-27
+
+### Performance
+- Parquet writes no longer build a dictionary for the near-unique `Key` and
+  `ETag` columns (it always overflowed and fell back to plain encoding after
+  hashing every value). On the local 2M-object benchmark: ~5-10% more
+  objects/s for gzip and zstd, and zstd files ~15% smaller.
+
+### Changed
+- **Permanent auth and bucket errors exit 3, not 4.** `AccessDenied`,
+  `NoSuchBucket`, `SignatureDoesNotMatch`, `AuthorizationHeaderMalformed` and
+  `PermanentRedirect` are setup problems that re-running cannot fix; exit 4
+  ("network/retry exhaustion") told agents to retry them.
+- **A failed run says why.** Every non-zero exit prints one line on stderr
+  (status, exit code, reason, "outputs are partial"); a failed listing records
+  its first fatal error — S3 code, HTTP status, message — in the manifest's
+  `warnings`. Previously a failed run could end with empty stdout and stderr.
+- **SIGTERM is handled like Ctrl-C** (exit 7, manifest and checkpoint written).
+  It used to kill the process outright (exit 143, no manifest, an empty
+  Parquet file), which is what `timeout(1)` and agent harnesses send.
+- **No region fails fast with exit 3.** A run with no `--region`, no
+  `AWS_REGION` and no profile region spent its whole retry budget (about
+  three minutes) on a client error and then exited 4.
+- Rejected up front with exit 2: `--plan-json` without `--dry-run` (it used to
+  run a real scan and never write the plan), `--max-keys` below 1, and a
+  `--compression-level` outside the codec's range (it used to write gzip while
+  every report said e.g. zstd).
+
+### Fixed
+- **A resumed run could checkpoint a split segment and lose its tail.** Split
+  children took fresh indices from the count of segments *remaining*, which on
+  a resume collides with the original index of a segment still running. The
+  child's control replaced its namesake's, the split parent then completed
+  looking unsplit and was checkpointed, and the next `--resume` skipped the
+  child's range. Children now take indices above every original segment's.
+- **A `--continuation-token` run no longer restarts at the top of the prefix
+  when its first page fails.** The retry dropped the token before any key had
+  been listed, so it re-emitted every key the token had skipped.
+- **Gateway 5xx and codeless 429 responses are retried.** Errors were
+  classified by S3 error code only, so a 502/503/504 from a proxy (HTML or
+  empty body) or a vendor-named throttle was `Unknown` and fatal. A missing or
+  unrecognised code now falls back on the HTTP status; 429 counts as
+  throttled.
+- **A throttle always backs off**, including right after an attempt that made
+  progress, which previously retried with no pause.
+- `--trace-compat` events marked `SlowDown`, `InternalError` and
+  `ServiceUnavailable` as fatal and non-retryable.
+- `--delimiter` runs no longer split segments at runtime; CommonPrefixes are
+  not range-bounded, so a split parent re-listed its child's prefixes.
+- A TOML `--hints-file` is sorted and de-duplicated like a plain one; an
+  unsorted hand-edited file produced overlapping segments and duplicate rows.
+- **An interrupt no longer races the final checkpoint.** On Ctrl-C the output
+  task drained the listing channel but left it open while finalize ran, so a
+  segment finishing in that window sent its last batch into a channel no one
+  would read, reported itself complete, and was checkpointed; `--resume` then
+  skipped it. The channel is now closed before the final drain, so a late
+  batch fails its send and its segment stays unfinished.
+- **Diff Parquet output is in key order**, as documented. Rows were buffered
+  per DiffFlag and flushed flag by flag, so e.g. the `+` rows of a mostly-equal
+  diff landed in a clump after `=` rows with larger keys, and the Key column's
+  statistics could not prune.
+- **Filters with ordinary nesting compile.** The depth limit counted every
+  grammar rule, so `(((SOURCE.size > 1)))` was rejected as too deep. It now
+  counts parentheses and prefix operators (limit 32).
+- **Filters are type-checked statically.** Validation evaluated the filter
+  once against zeroed properties: `100 / SOURCE.size > 1` was rejected (a
+  division by zero in the probe), while `SOURCE.size > 0 && SOURCE.size`
+  was accepted (short-circuit) and then evaluated to nothing for every real
+  object, silently keeping all of them.
+- A stdout listing whose reader goes away (`| head`) records the rows it
+  streamed in the manifest instead of zero, and says the reader closed the
+  pipe instead of reporting a bare write error.
+
 ## [0.31.0] - 2026-08-14
 
 ### Fixed

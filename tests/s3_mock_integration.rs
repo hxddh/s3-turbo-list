@@ -219,6 +219,12 @@ fn handle_connection(
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
     handler: &(dyn Fn(RecordedRequest, usize) -> MockResponse + Send + Sync),
 ) {
+    // The listener is non-blocking, and on macOS (BSD) an accepted socket
+    // inherits O_NONBLOCK. A read that raced ahead of the client's bytes then
+    // failed with WouldBlock and the connection was dropped unrecorded — the
+    // client saw a transport error the endpoint never sent (e.g. a startup
+    // discovery probe "failing", so the run fell back to bisection).
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let Some(request) = read_request(&mut stream) else {
         return;
@@ -1348,6 +1354,70 @@ fn local_mock_list_stdout_formats_emit_no_blank_rows_for_empty_results() {
         assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
         assert!(stdout.is_empty(), "{format} should not emit blank rows");
     }
+}
+
+#[test]
+fn local_mock_token_retry_after_codeless_gateway_error_keeps_the_token() {
+    // First request: a 502 from a proxy in front of the endpoint — HTML body,
+    // no S3 error code. It must be retried (not fatal), and since no key was
+    // listed yet the retry must still carry the seed token: dropping it would
+    // restart at the top of the bucket and re-emit keys the token skipped.
+    let server = MockS3Server::start(|request, sequence| {
+        assert_eq!(
+            request.query.get("continuation-token").map(String::as_str),
+            Some("seed-token"),
+            "request {} lost the continuation token",
+            sequence
+        );
+        assert!(!request.query.contains_key("start-after"));
+        if sequence == 1 {
+            return MockResponse {
+                status: 502,
+                reason: "Bad Gateway",
+                body: "<html><body>502 Bad Gateway</body></html>".into(),
+                drop_connection: false,
+            };
+        }
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["logs/resumed.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--continuation-token".into(),
+        "seed-token".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--output-format".into(),
+        "ndjson".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let keys: Vec<String> = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["k"].to_string())
+        .collect();
+    assert_eq!(keys, vec!["\"logs/resumed.txt\"".to_string()]);
+    assert_eq!(server.requests().len(), 2, "stderr: {}", stderr);
 }
 
 #[test]
@@ -4661,4 +4731,94 @@ fn local_mock_throttling_backs_off_instead_of_hammering() {
          requests were {:?}",
         observed
     );
+}
+
+#[test]
+fn local_mock_access_denied_is_a_setup_error_that_explains_itself() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(403, "AccessDenied", "Access Denied")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let manifest = dir.path().join("run.json");
+    write_fast_config(&config);
+
+    let args = vec![
+        "--config".to_string(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--run-manifest".into(),
+        manifest.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--summary-only".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    // Credentials/bucket problems are setup errors (3), not retryable network
+    // failures (4), and the reason reaches stderr and the manifest.
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("AccessDenied"), "stderr: {}", stderr);
+    let manifest_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["exit_code"], 3);
+    assert!(
+        manifest_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("AccessDenied")),
+        "{}",
+        manifest_json["warnings"]
+    );
+}
+
+#[test]
+fn local_mock_missing_region_fails_fast_without_requests() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(500, "InternalError", "should not be reached")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env("AWS_CONFIG_FILE", dir.path().join("no-aws-config"))
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            dir.path().join("no-aws-credentials"),
+        )
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--endpoint-url",
+            &server.endpoint(),
+            "--addressing-style",
+            "path",
+            "list",
+            "--bucket",
+            "mock-bucket",
+            "--summary-only",
+        ])
+        .output()
+        .expect("run s3-turbo-list");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr);
+    assert!(stderr.contains("--region"), "stderr: {}", stderr);
+    assert!(server.requests().is_empty());
+    assert!(started.elapsed() < Duration::from_secs(20));
 }

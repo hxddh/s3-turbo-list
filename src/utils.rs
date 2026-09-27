@@ -6,6 +6,7 @@ use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::schema::types::ColumnPath;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
@@ -103,6 +104,12 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             // near-unique Key/ETag strings costs encode CPU without buying
             // pruning. Chunk keeps coarse row-group pruning intact.
             .set_statistics_enabled(EnabledStatistics::Chunk)
+            // Key and ETag are near-unique per row: a dictionary never pays
+            // for itself, and building one means hashing every value until
+            // the dictionary page overflows and the writer falls back to
+            // plain anyway. Size, LastModified and DiffFlag keep it.
+            .set_column_dictionary_enabled(ColumnPath::from("Key"), false)
+            .set_column_dictionary_enabled(ColumnPath::from("ETag"), false)
             .set_compression(compression)
             .set_max_row_group_size(row_group_size.max(1))
             .build();
@@ -133,73 +140,28 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
                 .unwrap_or(0)
     }
 
-    pub async fn write_batch(
+    /// Write rows that each carry their own DiffFlag as one record batch.
+    /// Diff rows arrive in merged key order; keeping the flag per row (rather
+    /// than one batch per flag) is what keeps the file in that order.
+    pub async fn write_flagged_rows(
         &mut self,
-        v: Vec<(ObjectKey, ObjectProps)>,
-        diff_flag: u8,
+        rows: Vec<(ObjectKey, ObjectProps, u8)>,
     ) -> Result<(), String> {
-        self.write_batch_filtered(v, diff_flag, |_, _| true).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut batch = ListParquetBatch::with_capacity(rows.len());
+        for (key, props, flag) in &rows {
+            batch.append(key, props, *flag);
+        }
+        let count = batch.rows;
+        let record_batch = batch.finish(Arc::clone(&self.schema_ref))?;
+        self.writer
+            .write(&record_batch)
+            .await
+            .map_err(|e| format!("Parquet write error: {}", e))?;
+        self.total_rows += count;
         Ok(())
-    }
-
-    pub async fn write_batch_filtered<F>(
-        &mut self,
-        v: Vec<(ObjectKey, ObjectProps)>,
-        diff_flag: u8,
-        mut include: F,
-    ) -> Result<usize, String>
-    where
-        F: FnMut(&ObjectKey, &ObjectProps) -> bool,
-    {
-        if v.is_empty() {
-            return Ok(0);
-        }
-
-        let mut key_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(40));
-        let mut size_builder = UInt64Builder::with_capacity(v.len());
-        let mut last_modified_builder = UInt64Builder::with_capacity(v.len());
-        let mut etag_builder = StringBuilder::with_capacity(v.len(), v.len().saturating_mul(36));
-        let mut diff_flag_builder = UInt8Builder::with_capacity(v.len());
-        let mut etag_buf = [0u8; 43];
-        let mut count = 0usize;
-
-        for (key, props) in &v {
-            if !include(key, props) {
-                continue;
-            }
-
-            key_builder.append_value(key.as_str());
-            size_builder.append_value(props.size());
-            last_modified_builder.append_value(props.last_modified());
-            let etag = props.write_etag_to_buffer(&mut etag_buf);
-            etag_builder.append_value(etag);
-            diff_flag_builder.append_value(diff_flag);
-            count += 1;
-        }
-
-        if count == 0 {
-            return Ok(0);
-        }
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(key_builder.finish()) as ArrayRef,
-            Arc::new(size_builder.finish()) as ArrayRef,
-            Arc::new(last_modified_builder.finish()) as ArrayRef,
-            Arc::new(etag_builder.finish()) as ArrayRef,
-            Arc::new(diff_flag_builder.finish()) as ArrayRef,
-        ];
-
-        match RecordBatch::try_new(Arc::clone(&self.schema_ref), columns) {
-            Ok(batch) => {
-                self.writer
-                    .write(&batch)
-                    .await
-                    .map_err(|e| format!("Parquet write error: {}", e))?;
-                self.total_rows += count;
-            }
-            Err(e) => return Err(format!("RecordBatch error: {}", e)),
-        }
-        Ok(count)
     }
 
     pub async fn write_list_batch_filtered<F>(
@@ -285,6 +247,19 @@ pub fn is_supported_compression(name: &str) -> bool {
     SUPPORTED_COMPRESSION.contains(&normalized.as_str())
 }
 
+/// Why this codec/level pair cannot be written as configured, if it cannot.
+/// `parse_compression` falls back to gzip on a bad level, so without this
+/// check `zstd` at level 99 wrote gzip while every report said zstd.
+pub fn compression_setting_error(name: &str, level: u32) -> Option<String> {
+    let normalized = name.trim().to_lowercase();
+    if !matches!(normalized.as_str(), "gzip" | "zstd" | "brotli") {
+        return None;
+    }
+    Compression::from_str(&format!("{}({})", normalized, level))
+        .err()
+        .map(|e| e.to_string())
+}
+
 fn parse_compression(name: &str, level: u32) -> Compression {
     let normalized = name.trim().to_lowercase();
     let spec = match normalized.as_str() {
@@ -310,7 +285,7 @@ fn parse_compression(name: &str, level: u32) -> Compression {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_compression;
+    use super::{compression_setting_error, parse_compression};
     use parquet::basic::Compression;
 
     #[test]
@@ -324,6 +299,16 @@ mod tests {
             parse_compression("snappy", 6),
             Compression::SNAPPY
         ));
+    }
+
+    #[test]
+    fn test_compression_setting_error_rejects_out_of_range_levels() {
+        assert!(compression_setting_error("zstd", 3).is_none());
+        assert!(compression_setting_error("zstd", 99).is_some());
+        assert!(compression_setting_error("gzip", 11).is_some());
+        assert!(compression_setting_error("brotli", 12).is_some());
+        // Level is ignored by codecs that take none.
+        assert!(compression_setting_error("snappy", 99).is_none());
     }
 
     #[test]

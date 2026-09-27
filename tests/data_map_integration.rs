@@ -84,7 +84,13 @@ async fn merge(
             rows.push((keys.value(i).to_string(), flags.value(i)));
         }
     }
-    rows.sort();
+    // The file itself must be in merged key order (not re-sorted here): readers
+    // merge-join it and prune on the Key column's statistics.
+    assert!(
+        rows.windows(2).all(|w| w[0].0 <= w[1].0),
+        "diff Parquet rows are not in key order: {:?}",
+        rows
+    );
     Ok((outcome, rows))
 }
 

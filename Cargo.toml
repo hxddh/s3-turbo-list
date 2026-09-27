@@ -1,7 +1,7 @@
 # Releases are driven by this version field: see docs/release-checklist.md.
 [package]
 name = "s3-turbo-list"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2021"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.91.1"
@@ -25,7 +25,7 @@ arrow-array = "54"
 arrow-schema = "54"
 parquet = { version = "54", features = ["async"] }
 futures = "0.3"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 chrono = "0.4"
 hex = "0.4"
 sha2 = "0.10"

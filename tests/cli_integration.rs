@@ -2154,3 +2154,31 @@ fn test_cli_warns_about_unknown_profile_and_malformed_endpoint() {
         text
     );
 }
+
+#[test]
+fn test_cli_rejects_invalid_values_before_any_work() {
+    // --plan-json only makes sense with --dry-run; without it a real scan ran
+    // and the plan was never written.
+    let (code, _, stderr) = run_cli(&["--plan-json", "plan.json", "list", "--bucket", "b"]);
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("--dry-run"), "{}", stderr);
+
+    let (code, _, stderr) = run_cli(&["--max-keys", "0", "--dry-run", "list", "--bucket", "b"]);
+    assert_eq!(code, 2, "{}", stderr);
+
+    // An out-of-range level used to fall back to gzip while reports said zstd.
+    let (code, _, stderr) = run_cli(&[
+        "--compression",
+        "zstd",
+        "--compression-level",
+        "99",
+        "--dry-run",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("compression_level"), "{}", stderr);
+}

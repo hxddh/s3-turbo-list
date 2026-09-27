@@ -277,13 +277,18 @@ total across the set.
 | 0 | Success |
 | 1 | Unexpected internal error |
 | 2 | CLI/config/filter validation error |
-| 3 | Auth/profile/region/provider setup error detected before the scan |
-| 4 | Network timeout, retry exhaustion, or tracked fatal listing error |
+| 3 | Auth/profile/region/provider setup error — detected before the scan (e.g. no region resolved), or returned by the endpoint as a permanent error (`AccessDenied`, `NoSuchBucket`, `SignatureDoesNotMatch`, `AuthorizationHeaderMalformed`, `PermanentRedirect`). Re-running unchanged will not help. |
+| 4 | Network timeout, retry exhaustion, or other fatal listing error |
 | 5 | Output filesystem, manifest, Parquet, or KS write error |
 | 6 | Data validation, schema, or checksum error |
 | 7 | Interrupted; checkpoint may be available |
 
 Agents should branch on exit codes first, then read `run.json` if it exists.
+Every non-zero exit also prints one `s3-turbo-list: run <status> (exit N): <reason>`
+line on stderr, and a failed listing records its first fatal error (S3 error
+code, HTTP status, message) in the manifest's `warnings`.  SIGTERM (as sent by
+`timeout(1)` and most harnesses) is handled like Ctrl-C: exit 7, with the
+manifest and any checkpoint written.
 
 A non-zero exit means the output artifacts are not trustworthy, even when they
 exist and parse.  A `list` run that failed mid-listing (exit 4) leaves a
