@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-27
+
 ### Changed
 - **Preflight predicts the run.** `doctor` reports an endpoint problem that
   stops every real run (a profile requiring an explicit endpoint URL, or an
