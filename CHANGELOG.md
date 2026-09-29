@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-29
+
 ### Changed
 - **A missing `--config` file is an error** (exit 2). An explicitly named
   config that did not exist was silently ignored, so the run fell back to
