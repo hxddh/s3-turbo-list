@@ -426,43 +426,6 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
-pub fn conventional_hints_path(bucket: &str, region: Option<&str>) -> String {
-    let bucket = sanitize_path_component(bucket);
-    match region {
-        Some(r) => format!("{}_{}_hints.toml", sanitize_path_component(r), bucket),
-        None => format!("{}_hints.toml", bucket),
-    }
-}
-
-/// Conventional hints cache path for a run listing under `prefix`.
-///
-/// Boundaries only partition the range the run actually lists, so a cache
-/// generated under one prefix is useless (and badly skewed) for another:
-/// every boundary sorts outside the other prefix's range, leaving one segment
-/// with all the keys and the rest issuing empty requests. Prefixed runs
-/// therefore get their own cache file. A whole-bucket run keeps the plain
-/// path, so existing caches stay valid.
-pub fn conventional_hints_path_for_prefix(
-    bucket: &str,
-    region: Option<&str>,
-    prefix: &str,
-) -> String {
-    if prefix.is_empty() {
-        return conventional_hints_path(bucket, region);
-    }
-    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
-    let bucket = sanitize_path_component(bucket);
-    match region {
-        Some(r) => format!(
-            "{}_{}_{}_hints.toml",
-            sanitize_path_component(r),
-            bucket,
-            &digest[..8]
-        ),
-        None => format!("{}_{}_hints.toml", bucket, &digest[..8]),
-    }
-}
-
 pub fn sanitize_path_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -485,9 +448,8 @@ pub fn sanitize_path_component(value: &str) -> String {
 /// order of decisions (see the hints/discovery block in `main`).
 pub struct HintsPlanInputs<'a> {
     pub explicit_hints_file: Option<&'a str>,
-    pub bucket: Option<&'a str>,
-    pub region: Option<&'a str>,
-    pub prefix: &'a str,
+    /// A run command with a bucket (not a local tool).
+    pub listing: bool,
     pub no_auto_hints: bool,
     /// `--start-after` or `--continuation-token`: one sequential chain.
     pub single_chain: bool,
@@ -498,9 +460,7 @@ pub struct HintsPlanInputs<'a> {
 pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     let HintsPlanInputs {
         explicit_hints_file,
-        bucket,
-        region,
-        prefix,
+        listing,
         no_auto_hints,
         single_chain,
         delimited,
@@ -549,40 +509,19 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     if no_auto_hints {
         return plan_without_hints(
             "disabled_single_segment_fallback",
-            "--no-auto-hints skips the hints cache and startup discovery; the run starts as \
-             one segment and relies on runtime splitting to fan out",
+            "--no-auto-hints skips startup discovery; the run starts as one segment and \
+             relies on runtime splitting to fan out",
         );
     }
 
-    if let Some(bucket) = bucket {
-        let path = conventional_hints_path_for_prefix(bucket, region, prefix);
-        let exists = Path::new(&path).exists();
-        let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
-        return HintsPlan {
-            // No cache: the run probes the bucket's structure at startup and
-            // partitions from what it finds (then caches it here), so this is
-            // not a single-segment plan.
-            source: if exists {
-                "auto_cache"
-            } else {
-                "startup_discovery"
-            }
-            .to_string(),
-            path: Some(path),
-            exists,
-            valid: report.as_ref().map(|r| r.valid),
-            format: report
-                .as_ref()
-                .map(|r| format!("{:?}", r.format).to_lowercase()),
-            boundary_count: report.as_ref().map(|r| r.boundary_count),
-            warnings: report.map(|r| r.warnings).unwrap_or_else(|| {
-                vec![
-                    "no cached hints; flat list runs probe bucket structure at startup \
-                     and cache the discovered boundaries here"
-                        .to_string(),
-                ]
-            }),
-        };
+    if listing {
+        // The run probes the bucket's structure at startup (every run: there
+        // is no cache) and partitions from what it finds.
+        return plan_without_hints(
+            "startup_discovery",
+            "startup discovery partitions the key space from the bucket's structure \
+             (a few delimiter or single-key probes); runtime splitting covers skew",
+        );
     }
 
     HintsPlan {
@@ -596,32 +535,17 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     }
 }
 
-pub fn diff_per_side_hints_plan(
-    bucket: Option<&str>,
-    region: Option<&str>,
-    prefix: &str,
-) -> HintsPlan {
-    let path = bucket.map(|bucket| conventional_hints_path_for_prefix(bucket, region, prefix));
-    let exists = path
-        .as_deref()
-        .map(|path| Path::new(path).exists())
-        .unwrap_or(false);
-    let report = path
-        .as_deref()
-        .filter(|_| exists)
-        .and_then(inspect_hints_for_plan);
-
+pub fn diff_per_side_hints_plan() -> HintsPlan {
     HintsPlan {
         source: "diff_per_side_automatic".to_string(),
-        path,
-        exists,
-        valid: report.as_ref().map(|r| r.valid),
-        format: report
-            .as_ref()
-            .map(|r| format!("{:?}", r.format).to_lowercase()),
-        boundary_count: report.as_ref().map(|r| r.boundary_count),
+        path: None,
+        exists: false,
+        valid: None,
+        format: None,
+        boundary_count: None,
         warnings: vec![
-            "diff partitions each side automatically (cached hints or startup discovery); explicit --hints-file and --resume remain unsupported for diff"
+            "diff partitions each side with startup discovery; --hints-file and --resume \
+             are list-only"
                 .to_string(),
         ],
     }
@@ -1227,7 +1151,7 @@ mod tests {
         assert_eq!(url, "http://127.0.0.1:9000/my-bucket");
     }
 
-    use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
+    use super::redact_command_args;
 
     fn parquet_outputs(base: &str) -> super::OutputPathSummary {
         super::OutputPathSummary {
@@ -1313,36 +1237,6 @@ mod tests {
             "out.part{}.parquet",
             super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
         )));
-    }
-
-    #[test]
-    fn hints_cache_path_is_scoped_to_the_listing_prefix() {
-        // A whole-bucket run keeps the historical path, so caches written by
-        // earlier versions stay valid.
-        assert_eq!(
-            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), ""),
-            conventional_hints_path("my-bucket", Some("us-east-1"))
-        );
-        // Prefixed runs get their own file: boundaries under one prefix sort
-        // outside every other prefix's range.
-        let logs = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/");
-        let data = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "data/");
-        assert_ne!(
-            logs,
-            conventional_hints_path("my-bucket", Some("us-east-1"))
-        );
-        assert_ne!(logs, data);
-        assert!(logs.starts_with("us-east-1_my-bucket_"), "{}", logs);
-        assert!(logs.ends_with("_hints.toml"), "{}", logs);
-        // Stable across calls, and defined without a region too.
-        assert_eq!(
-            logs,
-            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/")
-        );
-        assert_ne!(
-            conventional_hints_path_for_prefix("my-bucket", None, "logs/"),
-            conventional_hints_path("my-bucket", None)
-        );
     }
 
     #[test]

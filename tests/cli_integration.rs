@@ -1473,21 +1473,20 @@ estimate_mode = "full"
 }
 
 #[test]
-fn test_cli_dry_run_list_still_reports_conventional_hints_cache() {
+fn test_cli_dry_run_ignores_a_leftover_hints_cache() {
+    // Runs no longer read or write a hints cache in the working directory:
+    // a file an older version left there is not an input.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("us-east-1_test-bucket_hints.toml"),
-        r#"bucket = "test-bucket"
-region = "us-east-1"
-total_objects = 30
-boundaries = ["m/"]
-generated_at = "2026-05-18T00:00:00Z"
-scan_mode = "full"
-estimate_mode = "full"
-"#,
-    )
-    .unwrap();
-
+    for name in [
+        "us-east-1_test-bucket_hints.toml",
+        "us-east-1_left_hints.toml",
+    ] {
+        std::fs::write(
+            dir.path().join(name),
+            "bucket = \"x\"\nboundaries = [\"m/\"]\ngenerated_at = \"2026-05-18T00:00:00Z\"\n",
+        )
+        .unwrap();
+    }
     let (code, stdout, stderr) = run_cli_in_dir(
         &[
             "--agent",
@@ -1502,26 +1501,8 @@ estimate_mode = "full"
     );
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["hints"]["source"], "auto_cache");
-    assert_eq!(json["hints"]["exists"], true);
-    assert_eq!(json["hints"]["boundary_count"], 1);
-}
-
-#[test]
-fn test_cli_dry_run_diff_ignores_conventional_hints_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("us-east-1_left_hints.toml"),
-        r#"bucket = "left"
-region = "us-east-1"
-total_objects = 30
-boundaries = ["m/"]
-generated_at = "2026-05-18T00:00:00Z"
-scan_mode = "full"
-estimate_mode = "full"
-"#,
-    )
-    .unwrap();
+    assert_eq!(json["hints"]["source"], "startup_discovery");
+    assert_eq!(json["hints"]["path"], serde_json::Value::Null);
 
     let (code, stdout, stderr) = run_cli_in_dir(
         &[
@@ -1540,26 +1521,7 @@ estimate_mode = "full"
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["hints"]["source"], "diff_per_side_automatic");
-    assert_eq!(json["hints"]["exists"], true);
-    assert_eq!(json["hints"]["boundary_count"], 1);
-    assert!(
-        json["hints"]["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| {
-                warning
-                    .as_str()
-                    .unwrap()
-                    .contains("partitions each side automatically")
-            })
-    );
-    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning
-            .as_str()
-            .unwrap()
-            .contains("partitions each side automatically")
-    }));
+    assert_eq!(json["hints"]["exists"], false);
 }
 
 #[test]

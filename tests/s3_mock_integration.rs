@@ -793,10 +793,9 @@ fn local_mock_list_startup_discovery_splits_segments() {
     assert_eq!(probes.len(), 4, "{:#?}", probes);
     assert_eq!(lists.len(), 4, "{:#?}", lists);
 
-    // Discovered boundaries are cached for future runs (incl. --resume).
-    let cache = dir.path().join("us-east-1_mock-bucket_hints.toml");
-    let cache_content = std::fs::read_to_string(&cache).unwrap();
-    assert!(cache_content.contains("a/x/"), "{}", cache_content);
+    // Nothing is cached in the working directory: the next run discovers
+    // again.
+    assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }
 
 #[test]
@@ -2410,13 +2409,13 @@ estimate_mode = "full"
 
 #[test]
 fn local_mock_diff_lists_sides_in_parallel_segments() {
-    // diff partitions each side automatically. The left side has a cached
-    // hints boundary ("m/") and lists two segments; the right side has no
-    // cache and a flat namespace, so structural discovery finds nothing and
-    // the flat-cut bisection (max-keys=1 probes) partitions it instead — so it
-    // also lists in parallel rather than as one serial segment. The merge must
-    // classify across both sides' segment boundaries with every key exactly
-    // once.
+    // diff partitions each side automatically. The left side's startup
+    // discovery finds one CommonPrefix ("m/") and lists two segments; the
+    // right side is a flat namespace, so structural discovery finds nothing
+    // and the flat-cut bisection (max-keys=1 probes) partitions it instead —
+    // so it also lists in parallel rather than as one serial segment. The
+    // merge must classify across both sides' segment boundaries with every
+    // key exactly once.
     let left_keys = ["a.txt", "left-only.txt", "z-extra.txt"];
     let right_keys = ["a.txt", "right-only.txt", "z-extra.txt"];
 
@@ -2429,6 +2428,12 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
             return MockResponse::error(500, "UnexpectedBucket", &request.path);
         };
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            let prefix = request.query.get("prefix").cloned().unwrap_or_default();
+            if request.path.contains("/left") {
+                // Left-side startup discovery: one top-level prefix.
+                let cps: &[&str] = if prefix.is_empty() { &["m/"] } else { &[] };
+                return MockResponse::ok_xml(list_bucket_xml(&prefix, 1000, &[], cps, false, None));
+            }
             // Right-side startup discovery: flat namespace, no structure, and
             // more pages to come — a side worth partitioning.
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("token")));
@@ -2451,19 +2456,6 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     let parquet = dir.path().join("diff.parquet");
     let ks = dir.path().join("diff.ks");
     write_fast_config(&config);
-    // Cached hints partition the left side at "m/".
-    std::fs::write(
-        dir.path().join("us-east-1_left_hints.toml"),
-        r#"bucket = "left"
-region = "us-east-1"
-total_objects = 3
-boundaries = ["m/"]
-generated_at = "2026-05-18T00:00:00Z"
-scan_mode = "full"
-estimate_mode = "full"
-"#,
-    )
-    .unwrap();
 
     let args = vec![
         "--config".into(),
@@ -3136,10 +3128,8 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
         "expected multiple parallel segments from startup pre-partitioning, got starts {:?}",
         segment_starts
     );
-    // Boundaries were cached for future runs (and --resume).
-    let cache = std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml"))
-        .expect("startup hints cache written");
-    assert!(cache.contains("boundaries"), "{}", cache);
+    // Nothing is cached in the working directory.
+    assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }
 
 // ── Resume boundary verification ────────────────────────────
@@ -3325,118 +3315,6 @@ generated_at = "2026-05-17T00:00:00Z"
         1,
         "expected a single hierarchical listing request, got {:?}",
         server.requests()
-    );
-}
-
-// A cache generated under one prefix describes boundaries that all sort
-// outside another prefix's range: reusing it leaves one segment holding every
-// key while the rest issue empty requests. Prefixed runs get their own cache
-// file, and a stale cross-prefix cache at the whole-bucket path is ignored.
-#[test]
-fn local_mock_prefixed_run_does_not_reuse_whole_bucket_cache() {
-    let keys = ["logs/a.txt", "logs/b.txt", "logs/c.txt"];
-    let server = MockS3Server::start(move |request, _sequence| {
-        if request.query.get("delimiter").map(String::as_str) == Some("/") {
-            // Structural discovery under logs/: no deeper structure, more
-            // pages to come, so the run partitions and caches boundaries.
-            return MockResponse::ok_xml(list_bucket_xml(
-                "logs/",
-                1000,
-                &[],
-                &[],
-                true,
-                Some("token"),
-            ));
-        }
-        let start_after = request
-            .query
-            .get("start-after")
-            .cloned()
-            .unwrap_or_default();
-        let max_keys = request.query.get("max-keys").map(String::as_str);
-        let page: Vec<&str> = keys
-            .iter()
-            .copied()
-            .filter(|k| *k > start_after.as_str())
-            .take(if max_keys == Some("1") { 1 } else { keys.len() })
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml(
-            "logs/",
-            if max_keys == Some("1") { 1 } else { 1000 },
-            &page,
-            &[],
-            false,
-            None,
-        ))
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
-    write_fast_config(&config);
-    // Whole-bucket boundaries from an earlier unprefixed run: every one of
-    // them sorts before "logs/", so all three keys would land in one segment.
-    std::fs::write(
-        dir.path().join("us-east-1_mock-bucket_hints.toml"),
-        r#"bucket = "mock-bucket"
-region = "us-east-1"
-boundaries = ["aaa/", "bbb/", "ccc/"]
-generated_at = "2026-05-17T00:00:00Z"
-"#,
-    )
-    .unwrap();
-
-    let args = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "--prefix".into(),
-        "logs/".into(),
-        "--output-parquet-file".into(),
-        parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let mut listed = parquet_keys(&parquet);
-    listed.sort();
-    assert_eq!(
-        listed,
-        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
-    );
-
-    // The whole-bucket cache was left untouched, and this run cached its own
-    // boundaries under a prefix-scoped path.
-    let whole_bucket =
-        std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml")).unwrap();
-    assert!(
-        whole_bucket.contains("aaa/"),
-        "the whole-bucket cache must not be overwritten by a prefixed run: {}",
-        whole_bucket
-    );
-    let prefixed: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
-            (name.ends_with("_hints.toml") && name != "us-east-1_mock-bucket_hints.toml")
-                .then_some(name)
-        })
-        .collect();
-    assert_eq!(
-        prefixed.len(),
-        1,
-        "expected exactly one prefix-scoped hints cache, got {:?}",
-        prefixed
     );
 }
 

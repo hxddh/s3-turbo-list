@@ -1414,35 +1414,25 @@ fn main() {
         let trace_writer: Option<Arc<dyn S3TraceWriter>> =
             match trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref()) {
                 Ok(writer) => writer.map(Arc::from),
-                Err(e) => {
-                    error!("{}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
-                }
+                // Through the standard failure epilogue: this exit used to
+                // print nothing (the reason went only to the log file).
+                Err(e) => exit_before_run(agent::ExitCode::OutputWrite, e),
             };
 
         // ── Load or generate KeySpace hints ─────────────────
-        let hints_disabled_for_diff = mode == RunMode::BiDir;
         // --start-after is single-chain: hint segments would each override
-        // their start with the CLI key and list overlapping ranges, so the
-        // cached-hints load is skipped just like startup discovery below.
-        // (--hints-file plus --start-after is rejected at CLI validation.)
+        // their start with the CLI key and list overlapping ranges, so
+        // startup discovery is skipped. (--hints-file plus --start-after is
+        // rejected at CLI validation.)
         let ks_list: Vec<String> = if resume_ranges.is_some() {
             Vec::new()
         } else if cfg.s3.start_after.is_some() {
             info!(
-                "--start-after is single-chain: skipping cached hints and listing as one segment"
+                "--start-after is single-chain: listing as one segment"
             );
             Vec::new()
         } else {
-            load_hints(
-                cli.hints_file.as_deref(),
-                opt_bucket,
-                opt_region,
-                &opt_prefix,
-                &cli.delimiter,
-                cli.no_auto_hints || hints_disabled_for_diff,
-                hints_disabled_for_diff,
-            )
+            load_hints(cli.hints_file.as_deref())
         };
         // ── Startup structural discovery ─────────────────────
         // When no hints exist for a flat (delimiter='') list run, probe the
@@ -1521,7 +1511,7 @@ fn main() {
             let interrupted_discovery = discovered.is_none();
             let boundaries = discovered.unwrap_or_default();
             if interrupted_discovery {
-                info!("Interrupted during startup discovery; no boundaries cached");
+                info!("Interrupted during startup discovery");
             } else if boundaries.is_empty() {
                 info!(
                     "Startup discovery found no cuttable key space — using single-segment listing"
@@ -1531,17 +1521,6 @@ fn main() {
                     "Startup discovery found {} key-space boundaries",
                     boundaries.len()
                 );
-                match auto_hints::write_startup_hints_cache(
-                    opt_bucket,
-                    opt_region,
-                    &opt_prefix,
-                    &boundaries,
-                ) {
-                    Ok(path) => info!("Startup hints cached to {} for future runs", path),
-                    Err(e) => {
-                        log::warn!("{} — resume runs may not see identical segments", e)
-                    }
-                }
                 ks_list = boundaries;
             }
         }
@@ -2089,23 +2068,12 @@ fn main() {
         "failed"
     };
 
-    // The hints cache is an output of this run only when this run wrote it
-    // (startup discovery on a list run); a cache merely read is an input.
-    let run_started_system = std::time::SystemTime::now() - run_timer.elapsed();
-    let hints_written = (mode == RunMode::List)
-        .then(|| agent::conventional_hints_path_for_prefix(opt_bucket, opt_region, &opt_prefix))
-        .filter(|path| {
-            std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| modified >= run_started_system)
-        });
     let manifest_outputs = runtime_output_summary(
         &cli,
         &cfg,
         list_writes_artifacts(&cli).then_some(filename_ks.as_str()),
         list_writes_artifacts(&cli).then_some(filename_output.as_str()),
-    )
-    .with_hints(hints_written);
+    );
     // Artifact summaries re-read every output in full (SHA256, Parquet footer,
     // line counts) — minutes of tail latency on a multi-GB listing. Only pay
     // that when a manifest is actually emitted; the human "Wrote:" summary
@@ -2510,9 +2478,9 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
             "--continuation-token cannot be empty".to_string(),
         );
     }
-    let Commands::List { region, bucket, .. } = &cli.cmd else {
+    if !matches!(cli.cmd, Commands::List { .. }) {
         return;
-    };
+    }
     if cli.resume {
         exit_before_run(
             agent::ExitCode::CliConfig,
@@ -2532,29 +2500,11 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
                 .to_string(),
         );
     }
-    if !cli.no_auto_hints {
-        let hints_path = agent::conventional_hints_path_for_prefix(
-            bucket,
-            region.as_deref(),
-            &listing_prefix(cli),
-        );
-        if std::path::Path::new(&hints_path).exists() {
-            exit_before_run(
-                agent::ExitCode::CliConfig,
-                format!(
-                    "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
-                    hints_path
-                ),
-            );
-        }
-    }
 }
 
 /// `--start-after` is a single-chain mode: with multiple hint segments, every
 /// segment would override its start with the CLI key and list overlapping
-/// ranges, duplicating output rows. Reject explicit multi-segment inputs; the
-/// conventional hints cache is skipped at load time (with a log line) instead
-/// of erroring, because startup discovery writes it automatically on first run.
+/// ranges, duplicating output rows. Reject explicit multi-segment inputs.
 /// A `--delimiter` listing is one hierarchical segment: CommonPrefixes are not
 /// bounded by a segment's key range, so boundaries from `--hints-file` made
 /// neighbouring segments drop or repeat folder rows. Runtime splitting and the
@@ -3057,10 +3007,9 @@ fn build_plan_report(
     config_source: agent::ConfigSourceSummary,
     diff_target_endpoint: Option<&str>,
 ) -> agent::PlanReport {
-    let (planned_ks, planned_parquet, planned_hints) = planned_output_paths(cli, cfg);
+    let (planned_ks, planned_parquet, _) = planned_output_paths(cli, cfg);
     let outputs =
-        runtime_output_summary(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref())
-            .with_hints(planned_hints);
+        runtime_output_summary(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref());
     let inputs = command_input_summary(cli, cfg);
     let checkpoint_path = inputs
         .bucket
@@ -3113,18 +3062,12 @@ fn build_plan_report(
                         .to_string(),
                 ],
             },
-            None => agent::diff_per_side_hints_plan(
-                inputs.bucket.as_deref(),
-                inputs.region.as_deref(),
-                &inputs.prefix,
-            ),
+            None => agent::diff_per_side_hints_plan(),
         }
     } else {
         agent::detect_hints_plan(agent::HintsPlanInputs {
             explicit_hints_file: cli.hints_file.as_deref(),
-            bucket: inputs.bucket.as_deref(),
-            region: inputs.region.as_deref(),
-            prefix: &inputs.prefix,
+            listing: inputs.bucket.is_some(),
             no_auto_hints: cli.no_auto_hints,
             single_chain: cfg.s3.start_after.is_some() || cli.continuation_token.is_some(),
             delimited: !cli.delimiter.is_empty(),
@@ -3413,17 +3356,6 @@ fn print_runtime_warnings(warnings: &[String]) {
     }
 }
 
-trait OutputPathSummaryExt {
-    fn with_hints(self, hints_file: Option<String>) -> Self;
-}
-
-impl OutputPathSummaryExt for agent::OutputPathSummary {
-    fn with_hints(mut self, hints_file: Option<String>) -> Self {
-        self.hints_file = hints_file;
-        self
-    }
-}
-
 fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputSummary {
     let prefix = if cli.prefix == "/" {
         String::new()
@@ -3615,11 +3547,8 @@ async fn quit_requested(g_state: &core::GlobalState) {
     }
 }
 
-/// Key-space boundaries for one diff side: cached hints when present,
-/// otherwise startup structural discovery (cached for future runs). The
-/// same automatic sources as list mode; explicit --hints-file remains
-/// rejected for diff. Empty means single-segment, the pre-parallel
-/// behavior.
+/// Key-space boundaries for one diff side from startup discovery, as in
+/// list mode (diff takes no --hints-file). Empty means one segment.
 async fn diff_side_boundaries(
     bucket: &str,
     region: Option<&str>,
@@ -3632,15 +3561,6 @@ async fn diff_side_boundaries(
 ) -> Vec<String> {
     if cli.no_auto_hints || !cli.delimiter.is_empty() || cfg.s3.start_after.is_some() {
         return Vec::new();
-    }
-
-    let cache_path = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
-    match hints::parse_conventional_hints_file(&cache_path, prefix) {
-        Ok(boundaries) => return boundaries,
-        Err(e) if std::path::Path::new(&cache_path).exists() => {
-            log::warn!("Ignoring conventional hints cache: {}", e);
-        }
-        Err(_) => {}
     }
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style());
@@ -3683,15 +3603,7 @@ async fn diff_side_boundaries(
         } => Some(boundaries),
         _ = quit_requested(g_state) => None,
     };
-    let Some(boundaries) = discovered else {
-        return Vec::new();
-    };
-    if !boundaries.is_empty()
-        && let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries)
-    {
-        log::warn!("{}", e);
-    }
-    boundaries
+    discovered.unwrap_or_default()
 }
 
 /// Bisect a flat key range into boundaries via single-key ListObjectsV2
@@ -3776,75 +3688,20 @@ fn command_region(cmd: &Commands) -> Option<&str> {
     }
 }
 
-fn load_hints(
-    hints_file: Option<&str>,
-    bucket: &str,
-    region: Option<&str>,
-    prefix: &str,
-    delimiter: &str,
-    no_auto_hints: bool,
-    disabled_for_diff: bool,
-) -> Vec<String> {
-    // 1. Explicit --hints-file takes absolute precedence.
-    if let Some(path) = hints_file {
-        match hints::parse_hints_file(path) {
-            Ok(boundaries) => {
-                return boundaries;
-            }
-            Err(e) => {
-                error!("Failed to load hints file '{}': {}", path, e);
-                error!("Aborting to avoid sending malformed S3 requests.");
-                std::process::exit(agent::ExitCode::CliConfig.code());
-            }
-        }
-    }
-
-    if no_auto_hints {
-        if disabled_for_diff {
-            info!(
-                "diff partitions each side independently; per-side hints/discovery are resolved later."
-            );
-        } else {
-            info!(
-                "--no-auto-hints set. Skipping conventional hints cache lookup and using single-segment fallback."
-            );
-        }
-        return vec![];
-    }
-
-    // 2. A hierarchical run rolls every key under a CommonPrefix, and a page's
-    //    CommonPrefixes are not range-filtered: each cached segment would
-    //    re-list the same prefix set, multiplying requests and the reported
-    //    CommonPrefix count with no parallelism to show for it. Startup
-    //    discovery and the diff resolver already skip hints for these runs.
-    if !delimiter.is_empty() {
-        info!(
-            "--delimiter '{}' lists hierarchically: skipping the conventional hints cache and using single-segment listing",
-            delimiter
-        );
-        return vec![];
-    }
-
-    // 3. Try the startup-discovery cache at the conventional path.
-    let cache_filename = agent::conventional_hints_path_for_prefix(bucket, region, prefix);
-
-    match hints::parse_conventional_hints_file(&cache_filename, prefix) {
-        Ok(boundaries) => return boundaries,
-        Err(e) if std::path::Path::new(&cache_filename).exists() => {
-            // Present but unusable (wrong prefix, malformed). Rediscovery
-            // below overwrites it with boundaries that fit this run.
-            log::warn!("Ignoring conventional hints cache: {}", e);
-        }
-        Err(_) => {}
-    }
-
-    // 4. No hints — the caller may attempt startup structural discovery
-    //    before falling back to a single segment.
-    info!(
-        "No hints file or cached hints found for bucket '{}'",
-        bucket
-    );
-    vec![]
+/// Boundaries from an explicit --hints-file; empty otherwise (the run then
+/// uses startup discovery, or lists one segment when it is disabled).
+fn load_hints(hints_file: Option<&str>) -> Vec<String> {
+    let Some(path) = hints_file else {
+        return Vec::new();
+    };
+    hints::parse_hints_file(path).unwrap_or_else(|e| {
+        // Through the standard failure epilogue: this exit used to print
+        // nothing on stderr (only the log file had it) and no --agent JSON.
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            format!("Hints file error: failed to load '{}': {}", path, e),
+        )
+    })
 }
 
 // ── Compat-probe ───────────────────────────────────────────

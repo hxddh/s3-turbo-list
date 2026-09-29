@@ -269,29 +269,6 @@ where
     None
 }
 
-/// Persist startup-discovered boundaries to the conventional hints cache
-/// so subsequent runs (and --resume) load identical segments.
-pub fn write_startup_hints_cache(
-    bucket: &str,
-    region: Option<&str>,
-    prefix: &str,
-    boundaries: &[String],
-) -> Result<String, String> {
-    let cache = HintsCache {
-        bucket: bucket.to_string(),
-        region: region.map(|r| r.to_string()),
-        prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
-        boundaries: boundaries.to_vec(),
-        generated_at: chrono::Local::now().to_rfc3339(),
-    };
-    let path = crate::agent::conventional_hints_path_for_prefix(bucket, region, prefix);
-    let toml_str = toml::to_string_pretty(&cache)
-        .map_err(|e| format!("failed to serialize hints cache: {}", e))?;
-    std::fs::write(&path, &toml_str)
-        .map_err(|e| format!("failed to write hints cache '{}': {}", path, e))?;
-    Ok(path)
-}
-
 // ── Tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -569,17 +546,5 @@ estimate_mode = "structural"
         .await;
         assert!(discovery.boundaries.is_empty());
         assert!(discovery.root_page_truncated);
-    }
-
-    #[test]
-    fn test_startup_hints_cache_round_trip() {
-        // conventional_hints_path is cwd-relative; use a unique bucket name
-        // and remove the file afterwards.
-        let bucket = format!("startup-hints-test-{}", std::process::id());
-        let boundaries = vec!["a/".to_string(), "b/".to_string()];
-        let path = write_startup_hints_cache(&bucket, Some("us-east-1"), "", &boundaries).unwrap();
-        let loaded = crate::hints::parse_hints_file(&path);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(loaded.unwrap(), boundaries);
     }
 }
