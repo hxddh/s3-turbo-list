@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-09-29
+
 ### Performance
 - **ListObjectsV2 pages are parsed directly.** About 80% of listing CPU was
   the AWS SDK deserializing each page's `<Contents>` (plus a second pass it
