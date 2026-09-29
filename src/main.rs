@@ -3444,7 +3444,11 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         delimiter: cli.delimiter.clone(),
         max_keys: cli.max_keys,
         start_after: cfg.s3.start_after.clone(),
-        continuation_token: cli.continuation_token.clone(),
+        // Redacted like the command line it came from.
+        continuation_token: cli
+            .continuation_token
+            .as_ref()
+            .map(|_| "<redacted>".to_string()),
         profile: cfg.s3.profile.clone(),
         addressing_style: cfg.s3.addressing_style.to_string(),
         filter: cli.filter.clone(),

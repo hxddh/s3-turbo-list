@@ -143,7 +143,7 @@ pub struct ObjectProps {
     #[serde(skip)]
     pub(crate) status: u8,
     #[serde(skip)]
-    #[allow(dead_code)] // Phase 5: alignment padding for cache-line behaviour
+    #[allow(dead_code)] // explicit padding: keeps the layout of this hot struct fixed
     pub(crate) pad: u16,
     #[serde(skip)]
     pub(crate) etag_parts: u32,
