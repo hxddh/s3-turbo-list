@@ -20,6 +20,12 @@ aws-sdk-s3 = "1"
 aws-smithy-runtime = { version = "1", features = ["client"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-async = "1"
+# ListObjectsV2 fast path (src/list_page.rs): wraps the response body
+# (`SdkBody::from_body_1_x`) and scans it with memchr.
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+http-body = "1"
+bytes = "1"
+memchr = "2"
 arrow = "60"
 arrow-array = "60"
 arrow-schema = "60"
