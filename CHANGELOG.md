@@ -26,6 +26,23 @@ release, with a deprecation warning, unless noted.
   and a side starts at most 16 segments ahead of the one being merged.
   With 20 ms latency: 3.75 s → 0.67 s. Buffered memory no longer grows with
   the segment count: a 3M-object diff peaks at 100 MB instead of 390 MB.
+- **Flat-namespace cuts land in the middle of the key range.** Startup
+  bisection and runtime flat splitting derived cut candidates by bumping one
+  character of the range's start key at a few depths. For keys with a long
+  constant suffix (`obj-000000123.snappy.parquet`) every bump fell inside the
+  suffix, so each cut landed on the key right after the start: a 200k-key
+  bucket was "partitioned" at `obj-000000001` … `obj-000000063` plus one
+  segment holding everything else, and runtime split proposals landed about a
+  page ahead of the cursor and were always rejected. Candidates now come from
+  the first position where the range's start and its upper end (the next
+  boundary, or an estimated highest key found with concurrent probe rounds for
+  the open-ended last range) differ, reading a digit run there as a number and
+  other characters over the alphabet the keys use, truncated right after that
+  position. Boundaries are still real observed keys with unchanged semantics,
+  and output is unchanged. On a local 200k-key mock at 20 ms per request:
+  list 8.7 s → 0.6 s, diff 8.7 s → 0.8 s, with runtime splitting alone
+  4.5 s → 1.3 s (15 splits instead of 0). See
+  `docs/validation-results/flat-cut-midpoint-bisection-20260929.md`.
 
 ### Changed
 - **Options belong to their commands.** Only `--config`, `--provider`,

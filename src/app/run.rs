@@ -671,6 +671,7 @@ pub(crate) fn run() {
                     "Startup discovery found {} key-space boundaries",
                     boundaries.len()
                 );
+                log::debug!("Startup boundaries: {}", boundaries.join("\t"));
                 ks_list = boundaries;
             }
         }

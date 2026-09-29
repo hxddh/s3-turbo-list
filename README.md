@@ -158,7 +158,8 @@ from, in precedence order:
 Segments also **split at runtime**: when one segment turns out to hold most of
 the data, the run probes its remaining range and fans it across idle workers —
 using `CommonPrefixes` boundaries where the range has structure, and
-cursor-derived single-key probes where it is flat. Fan-out is throughput-aware:
+single-key probes near the middle of the remaining keys where it is flat.
+Fan-out is throughput-aware:
 it stops adding segments once a bucket is at its request-rate ceiling, so
 `--concurrency` acts as an upper bound rather than a target. Hints formats,
 boundary semantics, and tuning knobs (including validating a hints file with

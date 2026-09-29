@@ -26,10 +26,17 @@ Where boundaries come from, in precedence order:
    startup; first runs list in parallel with no prior steps.
 4. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
    namespace) and the listing spans more than one page, the key range is
-   partitioned up front by single-key `max-keys=1` probes, each cut costing
-   up to four probes.  The boundaries are real observed keys and are cached
-   like structural ones.  List mode targets one boundary per worker, since
-   runtime splitting still covers mid-run skew.
+   partitioned up front by single-key `max-keys=1` probes.  Each cut aims at
+   the middle of its range: the candidate comes from the first position where
+   the range's low key and its upper end differ (a digit run there is read as
+   a number, other characters over the alphabet the keys use), truncated
+   right after it, so long constant suffixes such as
+   `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
+   estimates the namespace's highest key with a few concurrent probe rounds;
+   after that each cut is usually one probe, and every bisection level probes
+   its ranges concurrently.  The boundaries are real observed keys and are
+   cached like structural ones.  List mode targets one boundary per worker,
+   since runtime splitting still covers mid-run skew.
 5. **Single segment** — listings that fit in one page (nothing to partition,
    and probing would cost more requests than the listing), and runs with
    `--no-auto-hints`, `--start-after`, `--continuation-token`, or
@@ -45,9 +52,11 @@ Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits
 cooperatively — the right half becomes a new parallel child segment,
 recursively.  Split points come from a delimiter probe when the remaining
-range has `CommonPrefixes` structure; for flat ranges (no `/` structure),
-candidate cuts are derived from the segment's cursor and validated with
-single-key probes, so the boundary is always a real observed key.  The reactor
+range has `CommonPrefixes` structure; for flat ranges (no `/` structure), the
+cut is placed near the middle of the range between the segment's cursor and
+its end (or the listing's estimated highest key, for the last segment) the
+same way startup bisection places it, and validated with single-key probes, so
+the boundary is always a real observed key.  The reactor
 probes the busiest long-tail segments as soon as slots are idle (not on a fixed
 once-per-second tick) and fans out several at once, so a flat namespace whose
 startup bisection under-partitioned it ramps in a few page round-trips rather

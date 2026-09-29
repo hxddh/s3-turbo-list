@@ -234,12 +234,13 @@ enum SplitProbe {
 
 /// One delimiter probe per ancestor rung; returns the middle CommonPrefix
 /// strictly inside `(cursor, end)`. When the range has no prefix structure,
-/// falls back to flat-range cuts derived from the cursor itself.
+/// falls back to a flat-range cut near the middle of the remaining keys.
 async fn probe_split_candidate(
     ctx: &S3TaskContext,
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
+    flat_high: &FlatHigh,
 ) -> SplitProbe {
     for dir in ancestor_dirs(cursor, listing_prefix)
         .into_iter()
@@ -284,25 +285,29 @@ async fn probe_split_candidate(
         }
     }
 
-    probe_flat_cut(ctx, listing_prefix, cursor, end).await
+    probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high).await
 }
 
-/// Flat-range split: no CommonPrefix structure exists, so derive candidate
-/// cuts from the cursor — a real key inside the live region — by truncating
-/// it at several depths and bumping one character (which keeps every
-/// candidate strictly above the cursor while sharing its key-space shape;
-/// for numeric tails a mid-depth bump lands near a power-of-ten boundary).
-/// Each candidate costs one max_keys=1 request; the first real key returned
-/// inside `(cursor, end)` becomes the cut, so the boundary is always an
-/// observed key, never a synthetic guess. Unbalanced cuts are fine: children
-/// are themselves splittable, so fan-out continues recursively.
+/// Near-maximal real key of the listing, shared by a run's split probes: an
+/// open-ended segment (the last one) needs an upper end to cut toward, and
+/// estimating it costs several probe rounds, so the estimate is kept.
+type FlatHigh = Arc<Mutex<Option<String>>>;
+
+/// Flat-range split: no CommonPrefix structure exists, so cut near the middle
+/// of the segment's remaining keys with max_keys=1 probes (see `flat_cut`):
+/// a candidate between the cursor and the segment's upper end — its end
+/// bound, or the listing's estimated high key when it is open-ended — whose
+/// probe returns the real key that becomes the cut. The boundary is always an
+/// observed key, never a synthetic guess, and children are themselves
+/// splittable, so fan-out continues recursively.
 async fn probe_flat_cut(
     ctx: &S3TaskContext,
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
+    flat_high: &FlatHigh,
 ) -> SplitProbe {
-    for candidate in flat_cut_candidates(cursor, listing_prefix, end) {
+    let probe = |candidate: String| async move {
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let send = ctx
             .s3_client
@@ -312,60 +317,37 @@ async fn probe_flat_cut(
             .start_after(&candidate)
             .max_keys(1)
             .send();
-        let response = match timeout_at(Instant::now() + timeout_dur, send).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                debug!("Flat cut probe failed at '{}': {:?}", candidate, e);
-                return SplitProbe::Failed;
+        match timeout_at(Instant::now() + timeout_dur, send).await {
+            Ok(Ok(r)) => Ok(r
+                .contents()
+                .first()
+                .and_then(|o| o.key())
+                .map(str::to_string)),
+            Ok(Err(e)) => Err(format!("probe at '{}' failed: {:?}", candidate, e)),
+            Err(_elapsed) => Err(format!("probe at '{}' timed out", candidate)),
+        }
+    };
+    let known_high = flat_high.lock().unwrap().clone();
+    match crate::flat_cut::find_flat_cut(listing_prefix, cursor, end, known_high.as_deref(), &probe)
+        .await
+    {
+        Ok(found) => {
+            if let Some(high) = found.high {
+                let mut shared = flat_high.lock().unwrap();
+                if shared.as_ref().is_none_or(|k| high > *k) {
+                    *shared = Some(high);
+                }
             }
-            Err(_elapsed) => {
-                debug!("Flat cut probe timed out at '{}'", candidate);
-                return SplitProbe::Failed;
-            }
-        };
-        if let Some(key) = response.contents().first().and_then(|o| o.key()) {
-            if key > cursor && end.is_none_or(|e| key < e) {
-                return SplitProbe::Cut(key.to_string());
+            match found.cut {
+                Some(key) => SplitProbe::Cut(key),
+                None => SplitProbe::NoBoundary,
             }
         }
-    }
-    SplitProbe::NoBoundary
-}
-
-/// Candidate cuts for a flat range, mid-depth first (most balanced for
-/// structured tails), then deeper (closer to the cursor, higher hit rate).
-pub(crate) fn flat_cut_candidates(
-    cursor: &str,
-    listing_prefix: &str,
-    end: Option<&str>,
-) -> Vec<String> {
-    let tail_start = listing_prefix.len().min(cursor.len());
-    let tail_len = cursor.len() - tail_start;
-    if tail_len == 0 {
-        return Vec::new();
-    }
-
-    let bytes = cursor.as_bytes();
-    let mut candidates: Vec<String> = Vec::new();
-    // Tail depths to bump at: 1/2 first (most balanced), then deeper
-    // (3/4, 7/8 — closer to the cursor, higher hit rate), then 1/4.
-    for (numerator, denominator) in [(1usize, 2usize), (3, 4), (7, 8), (1, 4)] {
-        let pos = tail_start + (tail_len * numerator / denominator).min(tail_len - 1);
-        // Only bump printable ASCII at a char boundary; skip otherwise.
-        let byte = bytes[pos];
-        if !cursor.is_char_boundary(pos) || !(0x20..0x7e).contains(&byte) {
-            continue;
-        }
-        let mut candidate = cursor[..pos].to_string();
-        candidate.push((byte + 1) as char);
-        if candidate.as_str() > cursor
-            && end.is_none_or(|e| candidate.as_str() < e)
-            && !candidates.contains(&candidate)
-        {
-            candidates.push(candidate);
+        Err(e) => {
+            debug!("Flat cut {}", e);
+            SplitProbe::Failed
         }
     }
-    candidates
 }
 
 // ── Throughput-aware fan-out governor ──────────────────────
@@ -513,6 +495,7 @@ async fn flat_reactor_task(
     // unsplit and gets checkpointed while the child's range is still unlisted.
     let mut next_child_index = hints.index_end();
     let mut split_count = 0usize;
+    let flat_high: FlatHigh = Arc::new(Mutex::new(None));
     let mut retired_pages = 0u64;
     let mut gov = FanOutGovernor::new(flat_concurrency);
     let mut last_ts = epoch_secs();
@@ -675,7 +658,14 @@ async fn flat_reactor_task(
                     && hints.is_empty()
                 {
                     let idle = cap - set.len();
-                    maybe_start_split_probes(ctx, start_prefix, &controls, idle, &mut probes);
+                    maybe_start_split_probes(
+                        ctx,
+                        start_prefix,
+                        &controls,
+                        idle,
+                        &flat_high,
+                        &mut probes,
+                    );
                 }
             },
         }
@@ -810,6 +800,7 @@ fn maybe_start_split_probes(
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
+    flat_high: &FlatHigh,
     probes: &mut tokio::task::JoinSet<()>,
 ) {
     for index in select_split_targets(controls, idle_capacity) {
@@ -817,13 +808,21 @@ fn maybe_start_split_probes(
         control.splitting.store(true, Ordering::Relaxed);
         let probe_ctx = ctx.clone();
         let listing_prefix = start_prefix.to_string();
+        let flat_high = Arc::clone(flat_high);
         probes.spawn(async move {
             let (cursor, end) = control.snapshot();
             if cursor.is_empty() {
                 control.splitting.store(false, Ordering::Relaxed);
                 return;
             }
-            match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await
+            match probe_split_candidate(
+                &probe_ctx,
+                &listing_prefix,
+                &cursor,
+                end.as_deref(),
+                &flat_high,
+            )
+            .await
             {
                 SplitProbe::Cut(mid) => {
                     debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
@@ -1954,49 +1953,39 @@ mod join_failure_tests {
 
 #[cfg(test)]
 mod flat_cut_tests {
-    use super::*;
+    use crate::flat_cut::flat_cut_candidate;
 
     #[test]
     fn test_flat_cut_candidates_numeric_tail() {
-        // cursor tail "obj-0014" (8 chars): 1/2-depth bump first.
-        let candidates = flat_cut_candidates("obj-0014", "", None);
-        assert!(!candidates.is_empty());
-        // Every candidate is strictly above the cursor.
-        for c in &candidates {
-            assert!(c.as_str() > "obj-0014", "{}", c);
-        }
-        // The mid-depth bump comes first: "obj-0014"[..4] + '1' = "obj-1".
-        assert_eq!(candidates[0], "obj-1");
+        // Numeric tail: the cut lands at the numeric midpoint of the range,
+        // strictly above the cursor.
+        let candidate = flat_cut_candidate("obj-0014", "", "obj-0214").unwrap();
+        assert!(candidate.as_str() > "obj-0014", "{}", candidate);
+        assert_eq!(candidate, "obj-0114");
     }
 
     #[test]
     fn test_flat_cut_candidates_respect_end_bound() {
-        let candidates = flat_cut_candidates("prefix-3/object-000123", "", Some("prefix-3/p"));
-        for c in &candidates {
-            assert!(c.as_str() > "prefix-3/object-000123", "{}", c);
-            assert!(c.as_str() < "prefix-3/p", "{}", c);
-        }
+        let c = flat_cut_candidate("prefix-3/object-000123", "", "prefix-3/p").unwrap();
+        assert!(c.as_str() > "prefix-3/object-000123", "{}", c);
+        assert!(c.as_str() < "prefix-3/p", "{}", c);
     }
 
     #[test]
     fn test_flat_cut_candidates_listing_prefix_scopes_tail() {
-        // Bumps happen inside the tail after the listing prefix, so every
+        // The cut lies between two keys under the listing prefix, so the
         // candidate stays under the listing prefix scope.
-        let candidates = flat_cut_candidates("logs/2026/abcdef", "logs/", None);
-        assert!(!candidates.is_empty());
-        for c in &candidates {
-            assert!(c.starts_with("logs/"), "{}", c);
-        }
+        let c = flat_cut_candidate("logs/2026/abcdef", "logs/", "logs/2027/zz").unwrap();
+        assert!(c.starts_with("logs/"), "{}", c);
     }
 
     #[test]
     fn test_flat_cut_candidates_empty_or_non_ascii_tail() {
-        assert!(flat_cut_candidates("", "", None).is_empty());
-        // Multibyte tail positions are skipped rather than corrupting keys.
-        let candidates = flat_cut_candidates("中文键", "", None);
-        for c in &candidates {
-            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
-        }
+        assert!(flat_cut_candidate("", "", "").is_none());
+        // Multibyte keys yield valid UTF-8 candidates, never split characters.
+        let c = flat_cut_candidate("中文键", "", "中文键键").unwrap();
+        assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        assert!(c.as_str() > "中文键" && c.as_str() < "中文键键", "{}", c);
     }
 }
 
