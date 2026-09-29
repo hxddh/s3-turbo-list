@@ -1225,6 +1225,11 @@ async fn flat_list(
                         .unwrap_or_default()
                         .into_iter()
                         .filter_map(|cp| cp.prefix)
+                        // A chain restarted at a CommonPrefix (retry, resume)
+                        // sends start-after=<prefix>; the keys under it sort
+                        // after it and roll up into the same prefix, so the
+                        // server returns it again. It was emitted already.
+                        .filter(|cp| cp.as_str() > start_after)
                         .filter(|cp| {
                             !is_ended && until.as_deref().is_none_or(|end| cp.as_str() <= end)
                         })
@@ -2047,6 +2052,13 @@ pub async fn diff_list_side_task(
     let mut next_pair = hints.next();
     loop {
         while set.len() < concurrency {
+            // After Ctrl-C (possibly during startup discovery) start nothing
+            // new: the merge aborts, and a fresh request would only delay
+            // the exit by up to its timeout.
+            if ctx.is_quit() {
+                next_pair = None;
+                break;
+            }
             let Some(pair) = next_pair.take() else { break };
             if let Some(head) = &merge_head {
                 if pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS {

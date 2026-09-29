@@ -226,7 +226,10 @@ fn test_checkpoint_identity_includes_endpoint() {
         prefix: String::new(),
         last_updated: "now".into(),
         identity: Some(id(Some("http://x:9000"))),
-        remaining: Some(Vec::new()),
+        remaining: Some(vec![checkpoint::ResumeRange {
+            start_after: "k".into(),
+            end: None,
+        }]),
         listed_ranges: None,
     };
     journal.save(path_str).unwrap();

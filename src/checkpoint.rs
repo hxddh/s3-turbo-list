@@ -221,6 +221,16 @@ impl CheckpointJournal {
             );
             return None;
         };
+        // 0.36 saved one of these when Ctrl-C arrived after the listing had
+        // finished; resuming from it lists nothing and reports success.
+        if remaining.is_empty() {
+            warn!(
+                "Checkpoint {} has no key ranges left (the listing it records had \
+                 finished) — discarding checkpoint and starting fresh",
+                path
+            );
+            return None;
+        }
         info!(
             "Checkpoint {} identity verified — {} key range(s) left to list",
             path,
@@ -378,5 +388,17 @@ mod tests {
         );
         std::fs::write(&path, old).unwrap();
         assert!(CheckpointJournal::load_and_verify(path.to_str().unwrap(), &identity()).is_none());
+    }
+
+    #[test]
+    fn test_checkpoint_with_no_ranges_left_is_discarded() {
+        // Resuming from it would list nothing and report success.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.toml");
+        let path_str = path.to_str().unwrap();
+        let mut finished = journal(identity());
+        finished.remaining = Some(Vec::new());
+        finished.save(path_str).unwrap();
+        assert!(CheckpointJournal::load_and_verify(path_str, &identity()).is_none());
     }
 }

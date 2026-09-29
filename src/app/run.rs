@@ -452,7 +452,13 @@ pub(crate) fn run() {
     // The async block yields what the run learned about resuming: the manifest
     // is built after it, and a completed run has already removed its
     // checkpoint, so the file on disk can no longer answer this.
-    let (resumed_segments_skipped, checkpoint_note): (Option<usize>, Option<String>) = rt
+    // `listing_finished`: Ctrl-C arrived after the last range was listed,
+    // so the outputs are complete and the run reports success.
+    let (resumed_segments_skipped, checkpoint_note, listing_finished): (
+        Option<usize>,
+        Option<String>,
+        bool,
+    ) = rt
         .block_on(async {
         // ── Checkpoint ───────────────────────────────────────
         // Every list run that can resume saves a checkpoint when it is
@@ -1000,6 +1006,7 @@ pub(crate) fn run() {
         // What the exit line should say about resuming; `None` for runs
         // that cannot resume (diff, --start-after, --continuation-token).
         let mut checkpoint_note: Option<String> = None;
+        let mut listing_finished = false;
         if let Some(ref cp_path) = checkpoint_path_opt {
             let final_metrics = g_state.metrics_snapshot();
             let run_was_interrupted = interrupted.load(Ordering::SeqCst);
@@ -1056,10 +1063,8 @@ pub(crate) fn run() {
                     // the next --resume write an empty output and succeed.
                     Some(progress) if progress.remaining.is_empty() => {
                         let _ = std::fs::remove_file(cp_path);
-                        checkpoint_note = Some(
-                            "the listing had already finished; no checkpoint is needed"
-                                .to_string(),
-                        );
+                        info!("Interrupted after the listing had finished; outputs are complete");
+                        listing_finished = true;
                     }
                     Some(progress) => {
                         let listed_before = checkpoint_journal
@@ -1115,7 +1120,7 @@ pub(crate) fn run() {
         }
 
         info!("All tasks completed.");
-        (resumed_segments_skipped, checkpoint_note)
+        (resumed_segments_skipped, checkpoint_note, listing_finished)
     });
 
     rt.shutdown_background();
@@ -1124,7 +1129,7 @@ pub(crate) fn run() {
     // Parquet outputs this run wrote (base plus one per extra pooled writer);
     // read before the snapshot is folded into the manifest.
     let output_files = metrics.data_output_files;
-    let interrupted = interrupted.load(Ordering::SeqCst);
+    let interrupted = interrupted.load(Ordering::SeqCst) && !listing_finished;
     let first_fatal = g_state.first_fatal_error();
     let exit_code = if interrupted {
         agent::ExitCode::Interrupted

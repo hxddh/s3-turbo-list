@@ -1036,67 +1036,8 @@ pub struct KeySpaceHints {
     done: Vec<KeySpacePair>,
 }
 
-/// Defence-in-depth: log a warning for every boundary that looks like leaked
-/// TOML syntax.  The hints loader should already reject these, but this guard
-/// catches any path that reaches `new_from` with raw TOML still present.
-fn warn_on_suspicious_boundaries(hints: &[String]) {
-    for (i, b) in hints.iter().enumerate() {
-        // Leading whitespace that isn't a legitimate key character.
-        if b.starts_with(' ') || b.starts_with('\t') {
-            log::warn!(
-                "KeySpaceHints boundary {} has leading whitespace: '{}'. \
-                 This will be sent verbatim as an S3 start_after value and may \
-                 cause request failures.",
-                i,
-                b
-            );
-        }
-        // Trailing comma — classic TOML array entry leakage.
-        if b.ends_with(',') {
-            log::warn!(
-                "KeySpaceHints boundary {} ends with a comma: '{}'. \
-                 This looks like leaked TOML array syntax.",
-                i,
-                b
-            );
-        }
-        // Surrounded by quotes — another TOML leakage pattern.
-        if (b.starts_with('"') && b.ends_with('"')) || (b.starts_with('\'') && b.ends_with('\'')) {
-            log::warn!(
-                "KeySpaceHints boundary {} is quoted: '{}'. \
-                 This looks like leaked TOML string syntax.",
-                i,
-                b
-            );
-        }
-        // TOML array-open or array-close.
-        if b == "[" || b == "]" {
-            log::warn!(
-                "KeySpaceHints boundary {} is a TOML bracket: '{}'. \
-                 This will produce invalid S3 start_after values.",
-                i,
-                b
-            );
-        }
-        // TOML key = value assignment.
-        if b.contains('=') {
-            log::warn!(
-                "KeySpaceHints boundary {} contains '=': '{}'. \
-                 This looks like a TOML assignment line, not an object key.",
-                i,
-                b
-            );
-        }
-    }
-}
-
 impl KeySpaceHints {
     pub fn new_from(hints: &[String]) -> Self {
-        // Defensive validation: warn on any boundary that looks like leaked TOML
-        // syntax.  The hints loader should already have rejected these, but this
-        // guard catches any path that bypasses the loader.
-        warn_on_suspicious_boundaries(hints);
-
         let v = Self::pairs_from_boundaries(hints);
         Self {
             inner: v,
@@ -1125,8 +1066,6 @@ impl KeySpaceHints {
     }
 
     pub fn new_uncompleted_from(hints: &[String], completed_indices: &[usize]) -> Self {
-        warn_on_suspicious_boundaries(hints);
-
         let completed: HashSet<usize> = completed_indices.iter().copied().collect();
         let v = Self::pairs_from_boundaries(hints)
             .into_iter()

@@ -5741,3 +5741,121 @@ fn local_mock_uncreatable_output_fails_before_any_request() {
         .unwrap_or_default();
     assert!(leftovers.is_empty(), "{:?}", leftovers);
 }
+
+// ── Delimiter runs restarted at a CommonPrefix ───────────────
+//
+// A ListObjectsV2 emulator with prefix, delimiter, start-after,
+// continuation-token and max-keys semantics: a start-after that names a
+// CommonPrefix returns that prefix again, because the keys under it sort
+// after it and roll up into it.
+fn emulated_list(keys: &[String], q: &BTreeMap<String, String>) -> String {
+    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let delim = q.get("delimiter").cloned().unwrap_or_default();
+    let max: usize = q
+        .get("max-keys")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(1000);
+    let after = q
+        .get("continuation-token")
+        .cloned()
+        .or_else(|| q.get("start-after").cloned())
+        .unwrap_or_default();
+    let mut entries: Vec<(String, bool)> = Vec::new(); // (name, is_prefix)
+    for k in keys
+        .iter()
+        .filter(|k| k.starts_with(&prefix) && k.as_str() > after.as_str())
+    {
+        let rest = &k[prefix.len()..];
+        let entry = match (!delim.is_empty()).then(|| rest.find(&delim)).flatten() {
+            Some(i) => (format!("{}{}", prefix, &rest[..i + delim.len()]), true),
+            None => (k.clone(), false),
+        };
+        if entries.last().is_some_and(|last| last.0 == entry.0) {
+            continue;
+        }
+        // A continuation token naming a prefix resumes past the whole prefix.
+        if q.contains_key("continuation-token") && entry.1 && entry.0 == after {
+            continue;
+        }
+        entries.push(entry);
+        if entries.len() > max {
+            break;
+        }
+    }
+    let truncated = entries.len() > max;
+    entries.truncate(max);
+    let contents: Vec<&str> = entries
+        .iter()
+        .filter(|e| !e.1)
+        .map(|e| e.0.as_str())
+        .collect();
+    let prefixes: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.1)
+        .map(|e| e.0.as_str())
+        .collect();
+    let token = truncated.then(|| entries.last().unwrap().0.clone());
+    list_bucket_xml(
+        &prefix,
+        max as i32,
+        &contents,
+        &prefixes,
+        truncated,
+        token.as_deref(),
+    )
+}
+
+#[test]
+fn local_mock_delimiter_retry_after_common_prefix_emits_each_folder_once() {
+    // Two entries per page, so the first page ends on the CommonPrefix b/.
+    let keys: Vec<String> = ["a/1", "a/2", "b/1", "b/2", "c/1", "d.txt", "e.txt"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_once = failed.clone();
+    let server = MockS3Server::start(move |request, _| {
+        // Fail the first continuation request once: the retry restarts the
+        // chain with start-after=b/.
+        if request.query.contains_key("continuation-token")
+            && !failed_once.swap(true, Ordering::SeqCst)
+        {
+            return MockResponse::error(500, "InternalError", "boom");
+        }
+        MockResponse::ok_xml(emulated_list(&keys, &request.query))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "list".into(),
+        "--bucket".into(),
+        "b".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--delimiter".into(),
+        "/".into(),
+        "--max-keys".into(),
+        "2".into(),
+        "--output-format".into(),
+        "tsv".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(
+        failed.load(Ordering::SeqCst),
+        "the retry path was not exercised"
+    );
+    let rows: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(rows, ["a/", "b/", "c/", "d.txt", "e.txt"], "{}", stdout);
+}
