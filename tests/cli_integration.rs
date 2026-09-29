@@ -697,9 +697,11 @@ fn test_cli_default_paths_sanitize_bucket_and_region_components() {
 }
 
 #[test]
-fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
+fn test_cli_provider_preset_needs_no_credentials_profile_warning() {
+    // --provider cannot be mistaken for a credentials profile, so the plan no
+    // longer carries the AWS_PROFILE explanation --profile needed.
     let (code, stdout, stderr) = run_cli_without_aws_env(&[
-        "--profile",
+        "--provider",
         "bos",
         "--agent",
         "--dry-run",
@@ -710,15 +712,16 @@ fn test_cli_dry_run_warns_when_endpoint_profile_may_be_credentials_profile() {
         "bj",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let warnings = json["warnings"].as_array().unwrap();
-    assert!(warnings.iter().any(|warning| {
-        warning
-            .as_str()
+    assert!(
+        json["warnings"]
+            .as_array()
             .unwrap()
-            .contains("--profile 'bos' is an endpoint compatibility preset only")
-    }));
+            .iter()
+            .all(|w| !w.as_str().unwrap().contains("AWS_PROFILE")),
+        "{}",
+        json["warnings"]
+    );
 }
 
 #[test]

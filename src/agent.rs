@@ -1091,7 +1091,7 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
     DoctorCheck {
         name: "endpoint_url".to_string(),
         status: "ok".to_string(),
-        message: "no explicit endpoint URL required by the selected profile".to_string(),
+        message: "no explicit endpoint URL required by the provider preset".to_string(),
     }
 }
 

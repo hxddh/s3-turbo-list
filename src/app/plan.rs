@@ -300,36 +300,7 @@ pub(crate) fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<
         cli.cmd,
         Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
     ) {
-        if let Some(profile) = cfg
-            .s3
-            .profile
-            .as_deref()
-            .filter(|name| profiles::is_endpoint_preset_name(name))
-            && !credential_environment_signal_present()
-        {
-            warnings.push(format!(
-                    "--profile '{}' is an endpoint compatibility preset only; credentials still come from AWS_PROFILE or the AWS SDK default credential chain. If '{}' is also your credentials profile name, set AWS_PROFILE={}.",
-                    profile, profile, profile
-                ));
-        }
         warnings.extend(provider_setup_guardrail_warnings(cli, cfg));
-        // A misspelled profile applies no preset at all — no endpoint
-        // template, no addressing recommendation — and the run proceeds as if
-        // none had been asked for. The plan already carries
-        // `profile_known: false`; say so where an operator will read it.
-        if let Some(name) = cfg.s3.profile.as_deref()
-            && profiles::get_profile(name).is_none()
-        {
-            warnings.push(format!(
-                    "--profile '{}' matches no endpoint compatibility preset ({}); no endpoint or addressing defaults were applied",
-                    name,
-                    profiles::all_profiles()
-                        .iter()
-                        .map(|profile| profile.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-        }
         if let Some(endpoint) = cfg.s3.endpoint_url.as_deref()
             && !endpoint_url_looks_usable(endpoint)
         {
@@ -373,28 +344,6 @@ pub(crate) fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<
         );
     }
     warnings
-}
-
-pub(crate) fn credential_environment_signal_present() -> bool {
-    [
-        "AWS_PROFILE",
-        "AWS_DEFAULT_PROFILE",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_ROLE_ARN",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-    ]
-    .iter()
-    .any(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-    })
 }
 
 pub(crate) fn print_runtime_warnings(warnings: &[String]) {

@@ -818,35 +818,56 @@ Provider quickstarts: s3-turbo-list guide <{}>
 }
 
 fn render_quickstart(provider: &str) -> String {
-    let (setup, command) = match provider {
+    // (credentials, provider options, list options). compat-probe takes the
+    // same endpoint options as the listing, so its line reuses them.
+    let (setup, endpoint, list) = match provider {
         "minio" => (
             "export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin",
-            "s3-turbo-list --provider minio --endpoint-url http://127.0.0.1:9000 list --bucket my-bucket --region us-east-1 --output-dir out",
+            "--provider minio --endpoint-url http://127.0.0.1:9000",
+            "--bucket my-bucket --region us-east-1",
         ),
         "r2" => (
             "export AWS_PROFILE=my-r2-credentials",
-            "s3-turbo-list --provider r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com list --bucket my-bucket --output-dir out",
+            "--provider r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com",
+            "--bucket my-bucket",
         ),
         "bos" => (
             "export AWS_PROFILE=my-bos-credentials",
-            "s3-turbo-list --provider bos list --bucket my-bucket --region bj --output-dir out",
+            "--provider bos",
+            "--bucket my-bucket --region bj",
         ),
         "b2" => (
             "export AWS_PROFILE=my-b2-credentials",
-            "s3-turbo-list --provider b2 list --bucket my-bucket --region us-west-004 --output-dir out",
+            "--provider b2",
+            "--bucket my-bucket --region us-west-004",
         ),
         "oss" => (
             "export AWS_PROFILE=my-oss-credentials",
-            "s3-turbo-list --provider oss list --bucket my-bucket --region oss-cn-beijing --output-dir out",
+            "--provider oss",
+            "--bucket my-bucket --region oss-cn-beijing",
         ),
         _ => (
             "export AWS_PROFILE=default",
-            "s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out",
+            "",
+            "--bucket my-bucket --region us-east-1",
         ),
     };
+    let global = if endpoint.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", endpoint)
+    };
+    let probe = if endpoint.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  s3-turbo-list {}compat-probe {}   # check the endpoint first\n",
+            global, list
+        )
+    };
     format!(
-        "{} quickstart:\n  {}\n  s3-turbo-list compat-probe --bucket my-bucket  # non-AWS: check the endpoint first\n  {}\n",
-        provider, setup, command
+        "{} quickstart:\n  {}\n{}  s3-turbo-list {}list {} --output-dir out\n",
+        provider, setup, probe, global, list
     )
 }
 

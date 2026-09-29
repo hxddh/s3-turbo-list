@@ -108,9 +108,10 @@ pub(crate) fn run() {
     // fills in its default region when none is given — and the request must
     // then be signed for that region, not the ambient AWS_REGION (it was:
     // `--provider bos` alone signed for us-east-1 against the bj host).
-    if !endpoint_was_explicit
-        && let Some(profile) = cfg.s3.profile.as_deref().and_then(profiles::get_profile)
-        && profile.endpoint_template.is_some()
+    // A provider whose region is not tied to the endpoint (r2: "auto") gets
+    // its default whenever --region is omitted.
+    if let Some(profile) = cfg.s3.profile.as_deref().and_then(profiles::get_profile)
+        && (profile.endpoint_template.is_none() || !endpoint_was_explicit)
         && let Some(default_region) = profile.default_region
     {
         fill_default_region(&mut cli.cmd, default_region);

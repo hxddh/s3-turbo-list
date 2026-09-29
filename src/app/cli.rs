@@ -724,7 +724,17 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
 pub(crate) fn parse_cli() -> Cli {
     let argv = hoist_command_flags(std::env::args_os().collect());
     match CliArgs::try_parse_from(&argv) {
-        Ok(args) => Cli::from_args(args),
+        Ok(args) => {
+            let mut cli = Cli::from_args(args);
+            // clap does not say which spelling matched the hidden alias.
+            if argv.iter().any(|arg| {
+                arg.to_str()
+                    .is_some_and(|a| a == "--profile" || a.starts_with("--profile="))
+            }) {
+                cli.deprecated.push("--profile (use --provider)");
+            }
+            cli
+        }
         Err(e) => {
             use clap::error::ErrorKind;
             let has = |flag: &str| argv.iter().any(|arg| arg == flag);
@@ -736,7 +746,6 @@ pub(crate) fn parse_cli() -> Cli {
             );
             // `doctor --json` promises JSON on stdout for every config error.
             if usage_error && has("doctor") && has("--json") {
-                let _ = e.print();
                 let _ = DOCTOR_JSON.set(true);
                 let rendered = e.to_string();
                 let first = rendered.lines().next().unwrap_or_default();

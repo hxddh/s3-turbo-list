@@ -23,7 +23,7 @@ locally (no S3 access).
 | `aws` | AWS S3 | SDK-derived from the region | virtual | — | validated baseline |
 | `minio` | MinIO | deployment-specific: pass `--endpoint-url` | path | — | validated |
 | `bos` | Baidu BOS S3-compatible API | `https://s3.{region}.bcebos.com` | virtual | `bj` | validated |
-| `r2` | Cloudflare R2 | account-specific: pass `--endpoint-url` | path | pass `--region auto` | documented preset |
+| `r2` | Cloudflare R2 | account-specific: pass `--endpoint-url` | path | `auto` | documented preset |
 | `b2` | Backblaze B2 S3-compatible API | `https://s3.{region}.backblazeb2.com` | path | — | documented preset |
 | `oss` | Alibaba Cloud OSS S3-compatible API | `https://{region}.aliyuncs.com` | virtual | — | documented preset |
 
@@ -31,8 +31,8 @@ Presets with a `{region}` endpoint derive the endpoint from `--region`, so
 everyday commands need no `--endpoint-url`.  When `--region` is omitted,
 `bos` uses its default region `bj` (endpoint and signing) rather than the
 ambient `AWS_REGION`; `oss` and `b2` have no default region and need
-`--region` (or an explicit endpoint).  R2 signs for region `auto`: pass
-`--region auto`.
+`--region` (or an explicit endpoint).  `r2` signs for region `auto` unless
+`--region` says otherwise.
 
 ```bash
 s3-turbo-list --provider oss list --bucket my-bucket --region oss-cn-beijing --output-dir out
@@ -43,7 +43,7 @@ s3-turbo-list --provider b2 list --bucket my-b2-bucket --region us-west-004 --ou
 s3-turbo-list --provider minio --endpoint-url http://localhost:9000 \
   list --bucket my-bucket --region us-east-1 --output-dir out
 s3-turbo-list --provider r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com \
-  list --bucket my-bucket --region auto --output-dir out
+  list --bucket my-bucket --output-dir out
 ```
 
 The provider and endpoint options are global, so they may also follow the

@@ -559,7 +559,7 @@ fn diagnostic_for(
         Some("InvalidAccessKeyId") | Some("AccessDenied") => {
             return (
                 "access_denied",
-                "Check credentials, bucket permissions, and whether the selected profile is valid for this endpoint",
+                "Check credentials, bucket permissions, and whether the provider preset fits this endpoint",
             );
         }
         Some("NoSuchBucket") => {

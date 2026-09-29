@@ -52,8 +52,9 @@ release, with a deprecation warning, unless noted.
   Options written before the command name — the old documented spelling,
   `s3-turbo-list --output-dir out list …` — are still accepted.
 - **`--profile` is now `--provider`** (config key `provider`); the old
-  spelling is a hidden alias. Manifests report
-  `resolved_config.s3.provider`.
+  spelling is a hidden alias that warns. Dry-run plans and `doctor --json`
+  report `resolved_config.s3.provider`, and the plan no longer explains
+  AWS_PROFILE vs `--profile`.
 - **Interrupted list runs always save a checkpoint**; `--resume` only
   reads it. A run had to be started with `--resume` to be resumable. With
   `--output-dir` the checkpoint is written there.
@@ -77,9 +78,11 @@ release, with a deprecation warning, unless noted.
   normal "no config file" and "AWS_PROFILE unset" states.
 - `guide` prints the overview and the six provider pages; the recipes are
   gone.
-- A provider whose endpoint comes from the region (bos, oss, b2) signs for
-  its default region when `--region` is omitted, not the ambient
-  `AWS_REGION`.
+- A provider preset with a default region applies it when `--region` is
+  omitted: `bos` (bj; its endpoint derives from it, and requests used to be
+  signed for the ambient `AWS_REGION` instead) and `r2` (auto; the run used
+  to fail with "no AWS region resolved"). `oss` and `b2` still need
+  `--region`.
 - An explicit `--addressing-style` (including `auto`) wins over the
   provider preset.
 
@@ -91,8 +94,9 @@ release, with a deprecation warning, unless noted.
   from the outputs), the config key `force_path_style` (`addressing_style
   = "path"`). `-T/--threads`, `--max-keys`, `--no-auto-hints` and
   `--compression-level` are hidden from `--help` but stay supported.
-- Manifest fields `resolved_config.s3.{profile, force_path_style,
-  debug_s3}` and `checkpoint.{completed_segments, total_segments}`.
+- Plan and `doctor --json` fields `resolved_config.s3.{profile,
+  force_path_style, debug_s3}`, and plan/manifest fields
+  `checkpoint.{completed_segments, total_segments}` (always null now).
 
 ### Removed
 - `init-config` (a stub names the replacement: the config example in
