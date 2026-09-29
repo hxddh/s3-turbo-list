@@ -937,7 +937,7 @@ fn test_cli_dry_run_continuation_token_is_single_chain_list() {
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["inputs"]["continuation_token"], "token-123");
+    assert_eq!(json["inputs"]["continuation_token"], "<redacted>");
     assert!(
         json["command"]
             .as_array()
