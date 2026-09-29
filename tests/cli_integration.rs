@@ -2291,15 +2291,17 @@ fn test_dry_run_plans_prefix_distinct_names_log_file_and_slash_warning() {
         path.rsplit_once('_').unwrap().0.to_string()
     };
     assert_ne!(name(&a), name(&b));
-    // --log is named up front, inside --output-dir, and reported.
+    // --log is named after the outputs, beside them, and reported; the
+    // KeySpace file follows an explicit Parquet path.
     let logged = plan_for(&["--log", "--output-dir", "out"]);
-    assert!(
-        logged["outputs"]["log_file"]
-            .as_str()
-            .is_some_and(|p| p.starts_with("out/turbo_list_")),
-        "{}",
-        logged["outputs"]
-    );
+    let parquet = logged["outputs"]["parquet_file"].as_str().unwrap();
+    let base = parquet.strip_suffix(".parquet").unwrap();
+    assert!(base.starts_with("out/"), "{}", logged["outputs"]);
+    assert_eq!(logged["outputs"]["log_file"], format!("{}.log", base));
+    assert_eq!(logged["outputs"]["ks_file"], format!("{}.ks", base));
+    let explicit = plan_for(&["--log", "--output-parquet-file", "x/run.parquet"]);
+    assert_eq!(explicit["outputs"]["ks_file"], "x/run.ks");
+    assert_eq!(explicit["outputs"]["log_file"], "x/run.log");
     // A leading '/' matches no ordinary key; the plan says so.
     let slashed = plan_for(&["--prefix", "/dir1/"]);
     assert!(
@@ -2362,4 +2364,15 @@ fn test_doctor_json_reports_an_unreadable_hints_file_as_json() {
     let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(report["status"], "error");
     assert_eq!(report["checks"][0]["name"], "hints");
+}
+
+#[test]
+fn test_doctor_json_reports_usage_errors_as_json() {
+    // An option doctor does not take is a usage error; stdout still carries
+    // doctor's JSON shape.
+    let (code, stdout, stderr) = run_cli(&["doctor", "--json", "--summary-only"]);
+    assert_eq!(code, 2, "stderr: {}", stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["checks"][0]["name"], "cli");
 }

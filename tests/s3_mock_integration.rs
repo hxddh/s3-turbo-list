@@ -5505,3 +5505,108 @@ fn local_mock_truncated_page_that_never_advances_fails_the_run() {
     // One advancing attempt, then max_attempts (3) that make no progress.
     assert_eq!(requests_served.load(Ordering::SeqCst), 4);
 }
+
+// Runs started at the same moment over the same bucket used to pick the same
+// auto-generated name (the `_N` check ran long before the files were
+// created) and all reported success over one set of files; `--log` files were
+// never suffixed at all, so earlier manifests then failed `--check`.
+#[test]
+fn local_mock_concurrent_runs_get_distinct_outputs_and_logs() {
+    let server = MockS3Server::start(|request, _sequence| {
+        let prefix = request.query.get("prefix").cloned().unwrap_or_default();
+        MockResponse::ok_xml(list_bucket_xml(
+            &prefix,
+            1000,
+            &["a", "b"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-dir",
+        "out",
+        "--log",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let runs: Vec<_> = (0..4)
+        .map(|_| {
+            let args = args.clone();
+            let cwd = dir.path().to_path_buf();
+            thread::spawn(move || run_cli(&args, &cwd))
+        })
+        .collect();
+    for run in runs {
+        let (code, stdout, stderr) = run.join().unwrap();
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    }
+    let names = |ext: &str| {
+        std::fs::read_dir(dir.path().join("out"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(ext))
+            .count()
+    };
+    assert_eq!(names(".parquet"), 4);
+    assert_eq!(names(".ks"), 4);
+    assert_eq!(names(".log"), 4);
+}
+
+// An output the run cannot create used to surface only after the whole
+// listing (and its requests) had been paid for.
+#[test]
+fn local_mock_uncreatable_output_fails_before_any_request() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &["a"], &[], false, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let manifest_dir = dir.path().join("manifest-is-a-dir");
+    std::fs::create_dir(&manifest_dir).unwrap();
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-dir",
+        "out",
+        "--run-manifest",
+        manifest_dir.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, _stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 5, "stderr: {}", stderr);
+    assert!(stderr.contains("is a directory"), "{}", stderr);
+    assert!(server.requests().is_empty(), "{:#?}", server.requests());
+    // The name it reserved is released again: no empty output left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("out"))
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{:?}", leftovers);
+}

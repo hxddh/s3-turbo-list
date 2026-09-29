@@ -756,6 +756,8 @@ fn exit_config_error(message: &str) -> ! {
 /// Set once the command is a real `list` / `diff` / `compat-probe` run (not a
 /// dry run): its pre-run failures report like failed runs.
 static RUN_COMMAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// The output file `pick_output_stem` created to claim its name.
+static RESERVED_OUTPUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// `--agent` on such a run: stdout carries a JSON result even when the run
 /// stops before listing.
 static AGENT_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -767,12 +769,18 @@ static AGENT_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// failures (a bad filter, no region, an uncreatable output) used to give
 /// neither.
 fn exit_before_run(code: agent::ExitCode, message: String) -> ! {
+    // `doctor --json` keeps stdout machine-readable on every config error
+    // (validators shared with the run used to exit with stdout empty).
+    if code == agent::ExitCode::CliConfig && DOCTOR_JSON.get().copied().unwrap_or(false) {
+        exit_doctor_check_error("config_parse", &message);
+    }
     eprintln!("{}", message);
     run_failure_epilogue(code, &message);
     std::process::exit(code.code())
 }
 
 fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
+    release_reserved_output();
     if !RUN_COMMAND.get().copied().unwrap_or(false) {
         return;
     }
@@ -831,8 +839,23 @@ fn parse_cli() -> Cli {
         Ok(args) => Cli::from_args(args),
         Err(e) => {
             use clap::error::ErrorKind;
-            let agent = argv.iter().any(|arg| arg == "--agent");
-            if agent && !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+            let has = |flag: &str| argv.iter().any(|arg| arg == flag);
+            let usage_error = !matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            // `doctor --json` promises JSON on stdout for every config error.
+            if usage_error && has("doctor") && has("--json") {
+                let _ = e.print();
+                let _ = DOCTOR_JSON.set(true);
+                let rendered = e.to_string();
+                let first = rendered.lines().next().unwrap_or_default();
+                exit_doctor_check_error("cli", first.trim_start_matches("error: "));
+            }
+            let agent = has("--agent");
+            if agent && usage_error {
                 let _ = e.print();
                 let _ = RUN_COMMAND.set(true);
                 let _ = AGENT_RUN.set(true);
@@ -965,9 +988,7 @@ fn main() {
     let cli = cli;
     cfg.apply_profile_preset(command_region(&cli.cmd));
     let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
-    apply_output_dir_defaults(&cli, &mut cfg);
-    apply_log_file_default(&cli, &mut cfg);
-    apply_summary_only_output_defaults(&cli, &mut cfg);
+    resolve_output_paths(&cli, &mut cfg);
     validate_runtime_values(&cfg);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
@@ -1093,6 +1114,24 @@ fn main() {
 
     validate_provider_setup_or_exit(&cli, &cfg);
     create_output_parents(&cli, &cfg);
+    // The dry run's output check, before any request: an output the run
+    // cannot create (a directory, an unwritable path) used to surface only
+    // after the whole listing had been paid for.
+    let planned = runtime_output_summary(
+        &cli,
+        &cfg,
+        cfg.output.ks_file.as_deref(),
+        cfg.output.parquet_file.as_deref(),
+    );
+    if let Some(problem) = planned_output_problems(&planned, &cli).first() {
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!(
+                "Output error: {}",
+                problem.trim_end_matches("; the run would exit 5")
+            ),
+        );
+    }
 
     let mut run_warnings = config_source_warnings;
     run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
@@ -1210,24 +1249,10 @@ fn main() {
     // ── Phase 3: orchestration wiring ───────────────────────
     let g_tasks_count = if mode == RunMode::BiDir { 4 } else { 3 }; // list + data_map + mon (+right list)
 
-    let output_stem = output_stem(
-        opt_region,
-        opt_bucket,
-        opt_target_region.flatten(),
-        opt_target_bucket,
-        &opt_prefix,
-        None,
-    );
-    let filename_ks = cfg
-        .output
-        .ks_file
-        .clone()
-        .unwrap_or_else(|| format!("{}.ks", output_stem));
-    let filename_output = cfg
-        .output
-        .parquet_file
-        .clone()
-        .unwrap_or_else(|| format!("{}.parquet", output_stem));
+    // Resolved up front (`resolve_output_paths`); empty for runs that write
+    // no files.
+    let filename_ks = cfg.output.ks_file.clone().unwrap_or_default();
+    let filename_output = cfg.output.parquet_file.clone().unwrap_or_default();
     let writes_artifacts = list_writes_artifacts(&cli);
     validate_distinct_output_paths(
         &cli,
@@ -2032,7 +2057,7 @@ fn main() {
             ));
         }
     }
-    let manifest = agent::RunManifest {
+    let mut manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
         status: status.to_string(),
@@ -2075,13 +2100,31 @@ fn main() {
         warnings: manifest_warnings,
     };
 
+    // A manifest that cannot be written fails the run (exit 5) — but the
+    // listing is done: --agent still gets the manifest on stdout, marked
+    // failed, and the exit line says what is missing. It used to take the
+    // pre-run path: "Nothing was listed", and no manifest at all.
     if let Some(path) = cli.run_manifest.as_deref()
         && let Err(e) = agent::write_json_file(path, &manifest)
     {
-        exit_before_run(
-            agent::ExitCode::OutputWrite,
-            format!("Manifest write error: {}", e),
-        );
+        manifest
+            .warnings
+            .push(format!("manifest write error: {}", e));
+        if exit_code == agent::ExitCode::Success {
+            let code = agent::ExitCode::OutputWrite;
+            manifest.status = "failed".to_string();
+            manifest.exit_code = code.code();
+            if cli.agent {
+                println!("{}", agent::to_pretty_json(&manifest));
+            }
+            eprintln!(
+                "s3-turbo-list: run failed (exit {}): manifest write error: {}. The listing \
+                 completed and its outputs are complete; only the manifest is missing.",
+                code.code(),
+                e
+            );
+            std::process::exit(code.code());
+        }
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
@@ -2099,7 +2142,7 @@ fn main() {
         let reason = match (&first_fatal, exit_code) {
             (_, agent::ExitCode::Interrupted) => match &checkpoint_note {
                 Some(note) => format!("interrupted; {}", note),
-                None => "interrupted (run with --resume to make a run resumable)".to_string(),
+                None => "interrupted".to_string(),
             },
             (_, agent::ExitCode::OutputWrite) => first_output_error
                 .clone()
@@ -2241,49 +2284,27 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
     }
 }
 
-/// `--log` without `--output-log-file`: name the log file up front — inside
-/// `--output-dir` when one is given — so the plan, the manifest's `outputs`
-/// and its artifacts report it like every other output. It used to be named
-/// only when logging started, always in the working directory, and neither
-/// the plan nor the manifest knew it existed.
-fn apply_log_file_default(cli: &Cli, cfg: &mut S3TurboConfig) {
-    if !cli.log
-        || cfg.output.log_file.is_some()
-        || !matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
-    {
-        return;
-    }
-    let name = format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"));
-    cfg.output.log_file = Some(match cli.output_dir.as_deref() {
-        Some(dir) => format!("{}/{}", dir, name),
-        None => name,
-    });
-}
-
-fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
-    let Some(output_dir) = cli.output_dir.as_deref() else {
-        return;
-    };
-    if !list_writes_artifacts(cli) {
-        return;
-    }
-
-    match &cli.cmd {
+/// Every file a run writes, resolved once — for the plan, the run and the
+/// manifest alike:
+///
+/// - Parquet: `--output-parquet-file`, else `<dir>/<stem>.parquet` with the
+///   auto-named stem (`--output-dir`, else the working directory).
+/// - KeySpace: beside the Parquet file as `<name>.ks` (the deprecated
+///   `--output-ks-file` still wins). It used to land in the working
+///   directory under a timestamp whenever only the Parquet path was given.
+/// - Log (`--log`): beside the outputs as `<name>.log`, uniquely named with
+///   them (every run in one second used to share, and truncate, one
+///   `turbo_list_<ts>.log`, so earlier manifests failed `--check`).
+///
+/// An auto-named stem that is taken gets a `_N` suffix, and a real run
+/// reserves it by creating its first file exclusively, so runs started at
+/// the same moment cannot pick the same name (they all did, and all
+/// reported success over one set of files).
+fn resolve_output_paths(cli: &Cli, cfg: &mut S3TurboConfig) {
+    let artifacts = list_writes_artifacts(cli);
+    let (region, bucket, target_region, target_bucket, stem_suffix) = match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let stem = output_stem(
-                region.as_deref(),
-                bucket,
-                None,
-                None,
-                &listing_prefix(cli),
-                Some(output_dir),
-            );
-            if cfg.output.parquet_file.is_none() {
-                cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
-            }
-            if cfg.output.ks_file.is_none() {
-                cfg.output.ks_file = Some(format!("{}/{}.ks", output_dir, stem));
-            }
+            (region.as_deref(), bucket.as_str(), None, None, "")
         }
         Commands::Diff {
             region,
@@ -2291,30 +2312,134 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
             target_region,
             target_bucket,
             ..
-        } => {
-            let stem = output_stem(
-                region.as_deref(),
-                bucket,
-                target_region.as_deref(),
-                Some(target_bucket.as_str()),
-                &listing_prefix(cli),
-                Some(output_dir),
-            );
-            if cfg.output.parquet_file.is_none() {
-                cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
-            }
-            if cfg.output.ks_file.is_none() {
-                cfg.output.ks_file = Some(format!("{}/{}.ks", output_dir, stem));
-            }
+        } => (
+            region.as_deref(),
+            bucket.as_str(),
+            target_region.as_deref(),
+            Some(target_bucket.as_str()),
+            "",
+        ),
+        Commands::CompatProbe { region, bucket, .. } => (
+            region.as_deref(),
+            bucket.as_str(),
+            None,
+            None,
+            "_compat-probe",
+        ),
+        _ => return,
+    };
+    if !artifacts {
+        cfg.output.parquet_file = None;
+        cfg.output.ks_file = None;
+    }
+    let wants_log = cli.log && cfg.output.log_file.is_none();
+    // Explicit Parquet path: KS and log follow its name, nothing is reserved.
+    if let Some(parquet) = cfg.output.parquet_file.clone() {
+        let base = parquet.strip_suffix(".parquet").unwrap_or(&parquet);
+        cfg.output
+            .ks_file
+            .get_or_insert_with(|| format!("{}.ks", base));
+        if wants_log {
+            cfg.output.log_file = Some(format!("{}.log", base));
         }
-        _ => {}
+        return;
+    }
+    if !artifacts && !wants_log {
+        return;
+    }
+    let base = format!(
+        "{}{}",
+        output_stem_with_timestamp(
+            region,
+            bucket,
+            target_region,
+            target_bucket,
+            &listing_prefix(cli),
+            &Local::now().format("%Y%m%d%H%M%S").to_string(),
+        ),
+        stem_suffix
+    );
+    let mut extensions: Vec<&str> = Vec::new();
+    if artifacts {
+        extensions.extend([".parquet", ".ks"]);
+    }
+    if wants_log {
+        extensions.push(".log");
+    }
+    let path_of = |name: String| match cli.output_dir.as_deref() {
+        Some(dir) => format!("{}/{}", dir, name),
+        None => name,
+    };
+    let stem = pick_output_stem(&base, &extensions, &path_of, !cli.dry_run);
+    if artifacts {
+        cfg.output.parquet_file = Some(path_of(format!("{}.parquet", stem)));
+        cfg.output
+            .ks_file
+            .get_or_insert_with(|| path_of(format!("{}.ks", stem)));
+    }
+    if wants_log {
+        cfg.output.log_file = Some(path_of(format!("{}.log", stem)));
     }
 }
 
-fn apply_summary_only_output_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
-    if cli.summary_only {
-        cfg.output.parquet_file = None;
-        cfg.output.ks_file = None;
+/// The first of `base`, `base_1`, `base_2`, … none of whose files exist.
+/// With `reserve`, the stem is claimed by creating its first file with
+/// `create_new`, which only one process can win; the file is removed again
+/// if the run stops before writing it (`exit_before_run`).
+fn pick_output_stem(
+    base: &str,
+    extensions: &[&str],
+    path_of: &dyn Fn(String) -> String,
+    reserve: bool,
+) -> String {
+    for n in 0.. {
+        let stem = if n == 0 {
+            base.to_string()
+        } else {
+            format!("{}_{}", base, n)
+        };
+        let paths: Vec<String> = extensions
+            .iter()
+            .map(|ext| path_of(format!("{}{}", stem, ext)))
+            .collect();
+        if paths.iter().any(|path| std::path::Path::new(path).exists()) {
+            continue;
+        }
+        if !reserve {
+            return stem;
+        }
+        let anchor = &paths[0];
+        if let Some(parent) = std::path::Path::new(anchor)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            // A parent that cannot be created is reported by the run's own
+            // output checks; the name is still the right one.
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(anchor)
+        {
+            Ok(_) => {
+                let _ = RESERVED_OUTPUT.set(anchor.clone());
+                return stem;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return stem,
+        }
+    }
+    unreachable!("an unused suffix exists")
+}
+
+/// Drop the empty file `pick_output_stem` reserved, when the run stops
+/// before writing it.
+fn release_reserved_output() {
+    if let Some(path) = RESERVED_OUTPUT.get()
+        && std::fs::metadata(path).is_ok_and(|m| m.len() == 0)
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -2602,56 +2727,20 @@ fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
     }
 }
 
+/// Whether the run writes Parquet and KeySpace files: list in parquet
+/// format, and diff. (compat-probe writes only its report and log.)
 fn list_writes_artifacts(cli: &Cli) -> bool {
-    if cli.summary_only {
-        return false;
+    match &cli.cmd {
+        Commands::List { output_format, .. } => {
+            !cli.summary_only && output_format.writes_artifacts()
+        }
+        Commands::Diff { .. } => true,
+        _ => false,
     }
-    list_output_format(cli)
-        .map(ListOutputFormat::writes_artifacts)
-        .unwrap_or(true)
 }
 
-/// Auto-generated output stem for this run, unique in `dir` (the output
-/// directory, or the working directory): a stem whose `.parquet` or `.ks`
-/// already exists gets a `_N` suffix instead of overwriting another run's
-/// files — two runs started in the same second used to share one name, and
-/// the second silently replaced the first's artifacts while both reported
-/// success.
-fn output_stem(
-    region: Option<&str>,
-    bucket: &str,
-    target_region: Option<&str>,
-    target_bucket: Option<&str>,
-    prefix: &str,
-    dir: Option<&str>,
-) -> String {
-    let now = Local::now().format("%Y%m%d%H%M%S");
-    let stem = output_stem_with_timestamp(
-        region,
-        bucket,
-        target_region,
-        target_bucket,
-        prefix,
-        &now.to_string(),
-    );
-    let taken = |candidate: &str| {
-        [".parquet", ".ks"].iter().any(|ext| {
-            let name = format!("{}{}", candidate, ext);
-            match dir {
-                Some(dir) => std::path::Path::new(dir).join(name).exists(),
-                None => std::path::Path::new(&name).exists(),
-            }
-        })
-    };
-    if !taken(&stem) {
-        return stem;
-    }
-    (1..)
-        .map(|n| format!("{}_{}", stem, n))
-        .find(|candidate| !taken(candidate))
-        .expect("an unused suffix exists")
-}
-
+/// The auto-generated output name for a run at `timestamp` (uniqueness is
+/// `pick_output_stem`'s job).
 fn output_stem_with_timestamp(
     region: Option<&str>,
     bucket: &str,
@@ -3378,15 +3467,10 @@ fn runtime_output_summary(
         };
     }
 
-    let hints_file = None;
-    let compat_output = match &cli.cmd {
-        Commands::CompatProbe { output, .. } => output.clone(),
-        _ => None,
-    };
     agent::OutputPathSummary {
-        parquet_file: parquet_file.map(str::to_string).or(compat_output),
+        parquet_file: parquet_file.map(str::to_string),
         ks_file: ks_file.map(str::to_string),
-        hints_file,
+        hints_file: None,
         trace_compat: cfg.s3.trace_compat.clone(),
         log_file: cfg.output.log_file.clone(),
     }
@@ -3399,59 +3483,11 @@ fn planned_output_paths(
     if !list_writes_artifacts(cli) {
         return (None, None, None);
     }
-
-    let now = Local::now().format("%Y%m%d%H%M%S").to_string();
-    match &cli.cmd {
-        Commands::List { region, bucket, .. } => {
-            let stem = output_stem_with_timestamp(
-                region.as_deref(),
-                bucket,
-                None,
-                None,
-                &listing_prefix(cli),
-                &now,
-            );
-            let ks = cfg
-                .output
-                .ks_file
-                .clone()
-                .unwrap_or_else(|| format!("{}.ks", stem));
-            let parquet = cfg
-                .output
-                .parquet_file
-                .clone()
-                .unwrap_or_else(|| format!("{}.parquet", stem));
-            (Some(ks), Some(parquet), None)
-        }
-        Commands::Diff {
-            region,
-            bucket,
-            target_region,
-            target_bucket,
-            ..
-        } => {
-            let stem = output_stem_with_timestamp(
-                region.as_deref(),
-                bucket,
-                target_region.as_deref(),
-                Some(target_bucket),
-                &listing_prefix(cli),
-                &now,
-            );
-            let ks = cfg
-                .output
-                .ks_file
-                .clone()
-                .unwrap_or_else(|| format!("{}.ks", stem));
-            let parquet = cfg
-                .output
-                .parquet_file
-                .clone()
-                .unwrap_or_else(|| format!("{}.parquet", stem));
-            (Some(ks), Some(parquet), None)
-        }
-        _ => (None, None, None),
-    }
+    (
+        cfg.output.ks_file.clone(),
+        cfg.output.parquet_file.clone(),
+        None,
+    )
 }
 
 // ── Unified hints loader ───────────────────────────────────
