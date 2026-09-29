@@ -1,7 +1,7 @@
 # Releases are driven by this version field: see docs/releasing.md.
 [package]
 name = "s3-turbo-list"
-version = "0.37.0"
+version = "0.38.0"
 edition = "2024"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.94.1"

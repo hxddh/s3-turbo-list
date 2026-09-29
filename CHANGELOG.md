@@ -5,7 +5,14 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.38.0] - 2026-09-29
+
+This release removes the spellings 0.37 deprecated, puts a warning on the
+remaining old ones (removed in 0.39), makes `--agent` output and the JSON
+contract consistent, and fixes three wrong-result edge cases (a finished
+checkpoint, repeated folder rows after a retry, and Ctrl-C after the
+listing finished). Buckets with one large flat directory under a single
+prefix now list and diff in parallel from the start.
 
 ### Performance
 - **Large flat directories under a single prefix are partitioned at
