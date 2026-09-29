@@ -124,7 +124,8 @@ expression under `inputs.filter`.
 s3-turbo-list --filter 'SOURCE.size > 1073741824' \
   list --region us-east-2 --bucket my-bucket
 s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
-  diff --bucket left-bucket --target-bucket right-bucket
+  diff --bucket left-bucket --region us-east-1 \
+  --target-bucket right-bucket --target-region us-east-1
 ```
 
 ## Performance
@@ -208,7 +209,7 @@ defaults for common providers — they never touch credentials. Use
 `AWS_PROFILE` for credentials; `--profile` selects an *endpoint* preset only.
 
 ```bash
-s3-turbo-list guide oss              # quickstart + endpoint-compatibility facts
+s3-turbo-list guide oss              # endpoint-compatibility facts
 
 # Region-derived endpoints need no --endpoint-url:
 s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket

@@ -852,19 +852,24 @@ pub fn doctor_report(
         status: "ok".to_string(),
         message: "resolved configuration is valid TOML/CLI state".to_string(),
     });
-    checks.push(DoctorCheck {
-        name: "config_file".to_string(),
-        status: if Path::new("./s3-turbo-list.toml").exists() {
-            "ok"
-        } else {
-            "warn"
-        }
-        .to_string(),
-        message: if Path::new("./s3-turbo-list.toml").exists() {
-            "local s3-turbo-list.toml exists".to_string()
-        } else {
-            "local s3-turbo-list.toml not found; run init-config if you want a starter config"
-                .to_string()
+    // Report the config the command actually loaded (explicit --config,
+    // workspace or home), not just whether ./s3-turbo-list.toml exists.
+    checks.push(match config_source.loaded_config.as_deref() {
+        Some(path) => DoctorCheck {
+            name: "config_file".to_string(),
+            status: "ok".to_string(),
+            message: format!(
+                "loaded {} config {}",
+                config_source.loaded_config_kind, path
+            ),
+        },
+        None => DoctorCheck {
+            name: "config_file".to_string(),
+            status: "warn".to_string(),
+            message: "no config file loaded (searched ./s3-turbo-list.toml and \
+                      ~/.s3-turbo-list.toml); built-in defaults apply — run init-config \
+                      for a starter config"
+                .to_string(),
         },
     });
     checks.push(DoctorCheck {

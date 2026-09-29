@@ -689,30 +689,21 @@ worker_threads = 4
 }
 
 #[test]
-fn test_cli_doctor_warns_for_missing_explicit_config_no_cloud() {
+fn test_cli_doctor_rejects_missing_explicit_config_no_cloud() {
+    // A missing explicit --config is an error (it used to fall back to
+    // defaults, i.e. real AWS). doctor --json still prints JSON.
     let config_path = "/tmp/s3-turbo-list-missing-test-config.toml";
     let _ = std::fs::remove_file(config_path);
 
     let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor", "--json"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["config_source"]["explicit_config"], config_path);
-    assert_eq!(
-        json["config_source"]["loaded_config"],
-        serde_json::Value::Null
-    );
-    assert_eq!(json["config_source"]["loaded_config_kind"], "none");
-    assert!(json["config_source"]["warnings"]
-        .as_array()
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["checks"][0]["name"], "config_parse");
+    assert!(json["checks"][0]["message"]
+        .as_str()
         .unwrap()
-        .iter()
-        .any(|warning| warning.as_str().unwrap().contains("was not found")));
-
-    let (code, stdout, stderr) = run_cli(&["--config", config_path, "doctor"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("config:       -"));
-    assert!(stdout.contains("warning:"));
-    assert!(stdout.contains("was not found"));
+        .contains("was not found"));
 }
 
 #[test]
@@ -769,7 +760,7 @@ fn test_cli_dry_run_plan_json_list_no_cloud() {
 }
 
 #[test]
-fn test_cli_dry_run_plan_warns_for_missing_explicit_config_no_cloud() {
+fn test_cli_dry_run_rejects_missing_explicit_config_no_cloud() {
     let dir = tempfile::tempdir().unwrap();
     let missing_config = dir.path().join("missing.toml");
 
@@ -784,17 +775,8 @@ fn test_cli_dry_run_plan_warns_for_missing_explicit_config_no_cloud() {
         "--region",
         "us-east-1",
     ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        json["config_source"]["explicit_config"],
-        missing_config.to_str().unwrap()
-    );
-    assert!(json["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| { warning.as_str().unwrap().contains("explicit config file") }));
+    assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("was not found"), "{}", stderr);
 }
 
 #[test]
@@ -2125,16 +2107,31 @@ fn test_cli_rejects_unknown_compression_instead_of_falling_back() {
 }
 
 #[test]
-fn test_cli_warns_about_unknown_profile_and_malformed_endpoint() {
+fn test_cli_rejects_unknown_profile_and_warns_malformed_endpoint() {
     let dir = tempfile::tempdir().unwrap();
+    // An unknown profile applies no preset (the run would go to AWS): exit 2.
+    let (code, _, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--profile",
+            "nosuchprofile",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("nosuchprofile"), "{}", stderr);
+
     let plan = dir.path().join("plan.json");
     let (code, stdout, stderr) = run_cli_in_dir(
         &[
             "--dry-run",
             "--plan-json",
             plan.to_str().unwrap(),
-            "--profile",
-            "nosuchprofile",
             "--endpoint-url",
             "not-a-url",
             "list",
@@ -2146,20 +2143,16 @@ fn test_cli_warns_about_unknown_profile_and_malformed_endpoint() {
         dir.path(),
     );
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
     let warnings = json["warnings"].as_array().unwrap();
-    let text: Vec<&str> = warnings.iter().filter_map(|w| w.as_str()).collect();
     assert!(
-        text.iter().any(|w| w.contains("nosuchprofile")),
-        "an unknown profile applies no preset and must say so: {:?}",
-        text
-    );
-    assert!(
-        text.iter().any(|w| w.contains("not-a-url")),
+        warnings
+            .iter()
+            .filter_map(|w| w.as_str())
+            .any(|w| w.contains("not-a-url")),
         "a malformed endpoint must be reported before the run: {:?}",
-        text
+        warnings
     );
 }
 
@@ -2381,4 +2374,85 @@ fn test_cli_rejects_outputs_sharing_a_path() {
         "{}",
         stdout
     );
+}
+
+#[test]
+fn test_cli_preflight_matches_run_for_probe_hints_and_local_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    // compat-probe without any endpoint is a setup error (3), like list.
+    let (code, _, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "compat-probe",
+            "--region",
+            "us-east-1",
+            "--bucket",
+            "b",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 3, "{}", stderr);
+    // ...and listing-only flags are rejected instead of ignored.
+    let (code, _, stderr) = run_cli_in_dir(
+        &[
+            "--endpoint-url",
+            "http://127.0.0.1:1",
+            "--filter",
+            "SOURCE.size > 1",
+            "compat-probe",
+            "--region",
+            "us-east-1",
+            "--bucket",
+            "b",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("--filter"), "{}", stderr);
+
+    // A hints file the run cannot load fails the dry run with exit 2.
+    let (code, _, stderr) = run_cli_in_dir(
+        &[
+            "--hints-file",
+            "nope.txt",
+            "--dry-run",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "r",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 2, "{}", stderr);
+
+    // init-config refuses --dry-run rather than writing the file anyway.
+    let (code, _, _) = run_cli_in_dir(
+        &["--dry-run", "init-config", "--output", "x.toml"],
+        dir.path(),
+    );
+    assert_eq!(code, 2);
+    assert!(!dir.path().join("x.toml").exists());
+
+    // manifest-summary names a plan for what it is, in JSON when asked.
+    let (code, _, _) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--plan-json",
+            "plan.json",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "r",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    let (code, stdout, _) =
+        run_cli_in_dir(&["manifest-summary", "plan.json", "--json"], dir.path());
+    assert_eq!(code, 2);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "error");
+    assert!(json["error"].as_str().unwrap().contains("dry-run plan"));
 }

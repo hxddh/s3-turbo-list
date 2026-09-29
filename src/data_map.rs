@@ -220,7 +220,7 @@ async fn list_output_worker(
     let output_file = match tokio::fs::File::create(&part_path).await {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to create output file {}: {}", part_path, e);
+            g_state.note_output_error(format!("cannot create output file {}: {}", part_path, e));
             g_state.inc_output_error();
             return ListWorkerResult {
                 prefix_stats,
@@ -247,7 +247,7 @@ async fn list_output_worker(
             ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch).await;
         busy_nanos.fetch_add(work_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = result {
-            log::error!("{}", e);
+            g_state.note_output_error(format!("{}: {}", part_path, e));
             output_ok = false;
             g_state.inc_output_error();
             break;
@@ -257,7 +257,7 @@ async fn list_output_worker(
     // Capture the row count before close() consumes the writer.
     let parquet_rows = parquet.total_rows();
     if let Err(e) = parquet.close().await {
-        log::error!("{}", e);
+        g_state.note_output_error(format!("{}: {}", part_path, e));
         output_ok = false;
         g_state.inc_output_error();
     }
@@ -507,7 +507,7 @@ async fn coordinator_finalize(
     let ks_entries = match write_ks_counts(filename_ks, &merged_prefix_stats).await {
         Ok(count) => count,
         Err(e) => {
-            log::error!("{}", e);
+            g_state.note_output_error(format!("{}: {}", filename_ks, e));
             output_ok = false;
             0
         }
@@ -666,6 +666,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -700,6 +705,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -726,6 +736,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -975,7 +990,7 @@ async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
     started_at: Instant,
 ) {
     if let Err(e) = writer.flush().await {
-        log::error!("Stdout flush error: {}", e);
+        g_state.note_output_error(format!("stdout flush failed: {}", e));
         g_state.inc_output_error();
     }
     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
@@ -1530,7 +1545,10 @@ pub async fn data_map_task_diff_streaming(
     let output_file = match tokio::fs::File::create(filename_output).await {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to create output file {}: {}", filename_output, e);
+            g_state.note_output_error(format!(
+                "cannot create output file {}: {}",
+                filename_output, e
+            ));
             g_state.inc_output_error();
             g_state.data_map_task_complete();
             g_state.quit();
@@ -1572,7 +1590,7 @@ pub async fn data_map_task_diff_streaming(
         0
     };
     if let Err(e) = parquet.close().await {
-        log::error!("{}", e);
+        g_state.note_output_error(format!("{}: {}", filename_output, e));
         output_ok = false;
     }
     if !output_ok {

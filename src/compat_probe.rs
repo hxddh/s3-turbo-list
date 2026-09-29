@@ -80,6 +80,7 @@ pub async fn run_compat_probe(
     endpoint_url: &str,
     region: &str,
     bucket: &str,
+    prefix: &str,
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
@@ -138,6 +139,7 @@ pub async fn run_compat_probe(
             client
                 .list_objects_v2()
                 .bucket(bucket)
+                .prefix(prefix)
                 .max_keys(1)
                 .send()
                 .await
@@ -158,7 +160,7 @@ pub async fn run_compat_probe(
             client
                 .list_objects_v2()
                 .bucket(bucket)
-                .prefix("")
+                .prefix(prefix)
                 .max_keys(1)
                 .send()
                 .await
@@ -179,6 +181,7 @@ pub async fn run_compat_probe(
             client
                 .list_objects_v2()
                 .bucket(bucket)
+                .prefix(prefix)
                 .delimiter("/")
                 .max_keys(1)
                 .send()
@@ -200,6 +203,7 @@ pub async fn run_compat_probe(
             client
                 .list_objects_v2()
                 .bucket(bucket)
+                .prefix(prefix)
                 .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .max_keys(1)
                 .send()
@@ -225,6 +229,7 @@ pub async fn run_compat_probe(
             let resp = client
                 .list_objects_v2()
                 .bucket(bucket)
+                .prefix(prefix)
                 .max_keys(3)
                 .send()
                 .await?;
@@ -250,6 +255,7 @@ pub async fn run_compat_probe(
             endpoint_url,
             region,
             bucket,
+            prefix,
             addressing_style,
             trace_writer.as_ref(),
             res,
@@ -272,7 +278,8 @@ pub async fn run_compat_probe(
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     if let Some(out_path) = output {
         std::fs::write(out_path, &json).map_err(|e| e.to_string())?;
-        println!("Compat-probe report written to {}", out_path);
+        // stdout is for the report itself; this note is for humans.
+        eprintln!("Compat-probe report written to {}", out_path);
     } else {
         println!("{}", json);
     }
@@ -285,6 +292,7 @@ async fn pagination_probe_result(
     endpoint_url: &str,
     region: &str,
     bucket: &str,
+    prefix: &str,
     addressing_style: &str,
     trace_writer: &dyn S3TraceWriter,
     res: Result<
@@ -331,6 +339,7 @@ async fn pagination_probe_result(
                     endpoint_url,
                     region,
                     bucket,
+                    prefix,
                     addressing_style,
                     trace_writer,
                     evt,
@@ -364,6 +373,7 @@ async fn pagination_second_page_result(
     endpoint_url: &str,
     region: &str,
     bucket: &str,
+    prefix: &str,
     addressing_style: &str,
     trace_writer: &dyn S3TraceWriter,
     evt: &S3CompatEvent,
@@ -381,6 +391,7 @@ async fn pagination_second_page_result(
                         client
                             .list_objects_v2()
                             .bucket(bucket)
+                            .prefix(prefix)
                             .max_keys(3)
                             .continuation_token(token_for_request)
                             .send()

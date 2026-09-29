@@ -253,9 +253,10 @@ enum Commands {
     },
 
     /// Print guidance without contacting S3: an overview when no topic is
-    /// given, a provider quickstart (aws/minio/r2/bos), or a named recipe
+    /// given, a provider quickstart (aws/minio/r2/bos) or profile facts
+    /// (b2/oss), or a named recipe
     Guide {
-        /// Topic: a provider (aws/minio/r2/bos), a recipe name (e.g.
+        /// Topic: a provider (aws/minio/r2/bos/b2/oss), a recipe name (e.g.
         /// large-bucket, filter, release-check), or `index` to list recipes
         topic: Option<String>,
     },
@@ -422,8 +423,40 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
 
 // ── Main ───────────────────────────────────────────────────
 
+/// Set when the command is `doctor --json` (or doctor under `--agent`), so the
+/// early config-validation exits still print a JSON report on stdout: an agent
+/// that asked for JSON must not get an empty stdout on the very failures
+/// doctor exists to diagnose.
+static DOCTOR_JSON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Exit 2 on a config/CLI validation error, in doctor's JSON shape when
+/// doctor's JSON output was requested.
+fn exit_config_error(message: &str) -> ! {
+    eprintln!("{}", message);
+    if DOCTOR_JSON.get().copied().unwrap_or(false) {
+        println!(
+            "{}",
+            agent::to_pretty_json(&serde_json::json!({
+                "schema_version": agent::AGENT_SCHEMA_VERSION,
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "status": "error",
+                "checks": [{
+                    "name": "config_parse",
+                    "status": "error",
+                    "message": message,
+                }],
+            }))
+        );
+    }
+    std::process::exit(agent::ExitCode::CliConfig.code());
+}
+
 fn main() {
     let cli = Cli::parse();
+    let _ = DOCTOR_JSON.set(
+        matches!(cli.cmd, Commands::Doctor { json: true, .. })
+            || (cli.agent && matches!(cli.cmd, Commands::Doctor { .. })),
+    );
 
     match &cli.cmd {
         Commands::Completions { shell } => {
@@ -448,6 +481,12 @@ fn main() {
             overwrite,
             json,
         } => {
+            if cli.dry_run {
+                // init-config only writes a local file; a "dry run" that
+                // wrote it anyway (as it did) is worse than a clear refusal.
+                eprintln!("init-config does not support --dry-run: it contacts nothing and only writes '{}'", output);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
         }
@@ -460,10 +499,7 @@ fn main() {
 
     // Load config.
     let (mut cfg, config_load) = S3TurboConfig::load_with_summary(cli.config.as_deref())
-        .unwrap_or_else(|e| {
-            eprintln!("Config error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        });
+        .unwrap_or_else(|e| exit_config_error(&format!("Config error: {}", e)));
 
     validate_addressing_style_command(&cli);
     cfg.apply_cli_overrides(
@@ -483,6 +519,23 @@ fn main() {
     );
     // Recorded before the preset fills it in: a diff derives the target
     // side's endpoint from its own region only when the user gave none.
+    // A misspelled profile (`mino`) applied no preset at all — no endpoint,
+    // no addressing style — and the run went to AWS. Like an unknown config
+    // key, it is a configuration error.
+    if let Some(name) = cfg.s3.profile.as_deref() {
+        if profiles::get_profile(name).is_none() {
+            exit_config_error(&format!(
+                "--profile '{}' is not an endpoint compatibility preset; use one of: {} \
+                 (credentials profiles go in AWS_PROFILE)",
+                name,
+                profiles::all_profiles()
+                    .iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
     cfg.apply_profile_preset(command_region(&cli.cmd));
     cfg.normalize_addressing_style();
@@ -491,6 +544,7 @@ fn main() {
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
     validate_summary_only_command(&cli);
+    validate_compat_probe_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
@@ -513,7 +567,28 @@ fn main() {
                     std::process::exit(agent::ExitCode::CliConfig.code());
                 })
             });
-            let report = agent::doctor_report(&cfg, config_source.clone(), hints);
+            let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
+            // A filter that would fail the real run (exit 2) fails doctor too.
+            if let Some(filter_expr) = cli.filter.as_deref() {
+                let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
+                    .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
+                {
+                    Ok(_) => agent::DoctorCheck {
+                        name: "filter".to_string(),
+                        status: "ok".to_string(),
+                        message: format!("filter compiles: {}", filter_expr),
+                    },
+                    Err(e) => agent::DoctorCheck {
+                        name: "filter".to_string(),
+                        status: "error".to_string(),
+                        message: format!("filter does not compile: {}", e),
+                    },
+                };
+                if check.status == "error" {
+                    report.status = "error".to_string();
+                }
+                report.checks.push(check);
+            }
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -639,6 +714,14 @@ fn main() {
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
         }
+        // An explicit hints file the run cannot load stops it with exit 2;
+        // so does the plan (still written above).
+        if let Some(path) = cli.hints_file.as_deref() {
+            if let Err(e) = hints::parse_hints_file(path) {
+                eprintln!("Hints file error: {}", e);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+        }
         // The plan must predict the run: a setup problem the run would stop
         // on with exit 3 fails the dry run the same way (plan still written).
         if let Some(error) = provider_setup_guardrail_warnings(&cli, &cfg).first() {
@@ -649,6 +732,7 @@ fn main() {
     }
 
     validate_provider_setup_or_exit(&cli, &cfg);
+    create_output_parents(&cli, &cfg);
 
     let mut run_warnings = config_source_warnings;
     run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
@@ -747,6 +831,7 @@ fn main() {
                 &endpoint_url,
                 region,
                 bucket,
+                &listing_prefix(&cli),
                 &addressing_style,
                 output.as_deref(),
                 &cfg,
@@ -1473,6 +1558,10 @@ fn main() {
     if let Some((_, summary)) = &first_fatal {
         run_warnings.push(format!("Listing failed: {}", summary));
     }
+    let first_output_error = g_state.first_output_error();
+    if let Some(message) = &first_output_error {
+        run_warnings.push(format!("Output failed: {}", message));
+    }
     let status = if exit_code == agent::ExitCode::Success {
         "success"
     } else if exit_code == agent::ExitCode::Interrupted {
@@ -1587,7 +1676,10 @@ fn main() {
             (_, agent::ExitCode::Interrupted) => {
                 "interrupted; with --resume, a checkpoint may allow resuming".to_string()
             }
-            (_, agent::ExitCode::OutputWrite) => "an output write failed".to_string(),
+            (_, agent::ExitCode::OutputWrite) => first_output_error
+                .clone()
+                .map(|message| format!("output failed: {}", message))
+                .unwrap_or_else(|| "an output write failed".to_string()),
             (Some((_, summary)), _) => summary.clone(),
             (None, _) => "a listing segment failed".to_string(),
         };
@@ -1643,9 +1735,26 @@ fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: b
         }
         Err(e) => {
             eprintln!("Init config failed: {}", e);
+            if json {
+                print_json_error(&e);
+            }
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
+}
+
+/// The `--json` shape of a command that failed before producing its report:
+/// stdout stays machine-readable instead of empty.
+fn print_json_error(message: &str) {
+    println!(
+        "{}",
+        agent::to_pretty_json(&serde_json::json!({
+            "schema_version": agent::AGENT_SCHEMA_VERSION,
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "status": "error",
+            "error": message,
+        }))
+    );
 }
 
 fn run_guide(topic: Option<&str>) {
@@ -1673,6 +1782,9 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
         }
         Err(e) => {
             eprintln!("Manifest summary failed: {}", e);
+            if json {
+                print_json_error(&e);
+            }
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -1723,6 +1835,40 @@ fn apply_summary_only_output_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     if cli.summary_only {
         cfg.output.parquet_file = None;
         cfg.output.ks_file = None;
+    }
+}
+
+/// compat-probe runs a fixed set of probe requests and writes only its
+/// report: listing/output flags would be accepted and silently ignored.
+fn validate_compat_probe_command(cli: &Cli) {
+    if !matches!(cli.cmd, Commands::CompatProbe { .. }) {
+        return;
+    }
+    let ignored: Vec<&str> = [
+        ("--filter", cli.filter.is_some()),
+        ("--hints-file", cli.hints_file.is_some()),
+        ("--output-parquet-file", cli.output_parquet_file.is_some()),
+        ("--output-ks-file", cli.output_ks_file.is_some()),
+        ("--output-dir", cli.output_dir.is_some()),
+        ("--compression", cli.compression.is_some()),
+        ("--compression-level", cli.compression_level.is_some()),
+        ("--resume", cli.resume),
+        ("--no-auto-hints", cli.no_auto_hints),
+        ("--delimiter", !cli.delimiter.is_empty()),
+        ("--max-keys", cli.max_keys.is_some()),
+        ("--start-after", cli.start_after.is_some()),
+        ("--continuation-token", cli.continuation_token.is_some()),
+        ("--run-manifest", cli.run_manifest.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, set)| set.then_some(flag))
+    .collect();
+    if !ignored.is_empty() {
+        exit_config_error(&format!(
+            "compat-probe does not use {}: it runs a fixed set of probe requests and writes \
+             only its report (--output / stdout)",
+            ignored.join(", ")
+        ));
     }
 }
 
@@ -1786,34 +1932,30 @@ fn validate_runtime_values(cfg: &S3TurboConfig) {
     ];
     for (name, value) in checks {
         if value == 0 {
-            eprintln!("{} must be at least 1 (got {})", name, value);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_config_error(&format!("{} must be at least 1 (got {})", name, value));
         }
     }
     if cfg.s3.connect_timeout_secs == 0 {
-        eprintln!(
+        exit_config_error(&format!(
             "s3.connect_timeout_secs must be at least 1 (got {})",
             cfg.s3.connect_timeout_secs
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
     if !s3_turbo_list::utils::is_supported_compression(&cfg.output.compression) {
-        eprintln!(
+        exit_config_error(&format!(
             "output.compression '{}' is not supported; use one of: {}",
             cfg.output.compression,
             s3_turbo_list::utils::SUPPORTED_COMPRESSION.join(", ")
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
     if let Some(reason) = s3_turbo_list::utils::compression_setting_error(
         &cfg.output.compression,
         cfg.output.compression_level,
     ) {
-        eprintln!(
+        exit_config_error(&format!(
             "output.compression_level {} is not valid for '{}' (--compression-level): {}",
             cfg.output.compression_level, cfg.output.compression, reason
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
 }
 
@@ -1825,11 +1967,10 @@ fn validate_addressing_style_command(cli: &Cli) {
         return;
     };
     if style.parse::<config::AddressingStyle>().is_err() {
-        eprintln!(
+        exit_config_error(&format!(
             "--addressing-style '{}' is not one of: path, virtual, auto",
             style
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
 }
 
@@ -1940,17 +2081,77 @@ fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
     }
 }
 
+/// Whether a region resolves without the network: `AWS_REGION`,
+/// `AWS_DEFAULT_REGION`, or the AWS config file's profile. (The SDK's full
+/// chain also asks EC2 instance metadata, which a preflight cannot.)
+fn offline_region_resolves() -> bool {
+    let env_set = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
+    if env_set("AWS_REGION") || env_set("AWS_DEFAULT_REGION") {
+        return true;
+    }
+    use aws_config::meta::region::ProvideRegion;
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .ok()
+        .and_then(|rt| rt.block_on(aws_config::profile::ProfileFileRegionProvider::new().region()))
+        .is_some()
+}
+
+fn imds_disabled() -> bool {
+    std::env::var("AWS_EC2_METADATA_DISABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// The sides of a list/diff command that name no region of their own.
+fn sides_without_region(cli: &Cli) -> Vec<&'static str> {
+    match &cli.cmd {
+        Commands::List { region: None, .. } => vec!["--region"],
+        Commands::Diff {
+            region,
+            target_region,
+            ..
+        } => {
+            let mut sides = Vec::new();
+            if region.is_none() {
+                sides.push("--region");
+            }
+            if target_region.is_none() {
+                sides.push("--target-region");
+            }
+            sides
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     match &cli.cmd {
         Commands::List { .. } | Commands::Diff { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
+            // With instance metadata disabled the SDK has no other region
+            // source, so this is exactly the run's own "No AWS region
+            // resolved" failure, reported before any work.
+            let missing = sides_without_region(cli);
+            if !missing.is_empty() && imds_disabled() && !offline_region_resolves() {
+                warnings.push(format!(
+                    "no AWS region resolved for {}: pass it, or set AWS_REGION (or a region in \
+                     the AWS config profile)",
+                    missing.join(" / ")
+                ));
+            }
         }
         Commands::CompatProbe { endpoint_url, .. } => {
             let effective = endpoint_url
                 .as_deref()
                 .or(cli.endpoint.as_deref())
                 .or(cfg.s3.endpoint_url.as_deref());
+            if effective.is_none() {
+                warnings.push(
+                    "compat-probe needs an endpoint: pass --endpoint-url (or --endpoint), or set \
+                     s3.endpoint_url in the config"
+                        .to_string(),
+                );
+            }
             if let Some(endpoint) = effective {
                 if profiles::endpoint_url_has_template_placeholder(endpoint) {
                     warnings.push(format!(
@@ -2121,6 +2322,43 @@ fn validate_distinct_output_paths(
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
         seen.push((k, label, path));
+    }
+}
+
+/// Create the parent directories of explicit output paths, as `--output-dir`
+/// already does for its own. A missing parent used to surface only once the
+/// listing was done (exit 5, reason only in the log) — after the S3 requests
+/// had been paid for.
+fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
+    if !matches!(
+        cli.cmd,
+        Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
+    ) {
+        return;
+    }
+    let paths = [
+        cfg.output.parquet_file.as_deref(),
+        cfg.output.ks_file.as_deref(),
+        cfg.output.log_file.as_deref(),
+        cfg.s3.trace_compat.as_deref(),
+        cli.run_manifest.as_deref(),
+    ];
+    for path in paths.into_iter().flatten() {
+        let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        else {
+            continue;
+        };
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "Output error: cannot create directory '{}' for '{}': {}",
+                parent.display(),
+                path,
+                e
+            );
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
     }
 }
 
@@ -2919,11 +3157,37 @@ fn build_plan_report(
         .with_endpoint(cfg.s3.endpoint_url.as_deref())
     });
     let hints = if inputs.mode == "diff" {
-        agent::diff_per_side_hints_plan(
-            inputs.bucket.as_deref(),
-            inputs.region.as_deref(),
-            &inputs.prefix,
-        )
+        // Mirror diff_side_boundaries: these options leave each side as one
+        // serial segment (diff never splits at runtime).
+        let single = if cfg.s3.start_after.is_some() {
+            Some("single_chain")
+        } else if !cli.delimiter.is_empty() {
+            Some("delimiter_single_segment")
+        } else if cli.no_auto_hints {
+            Some("disabled_single_segment_fallback")
+        } else {
+            None
+        };
+        match single {
+            Some(source) => agent::HintsPlan {
+                source: source.to_string(),
+                path: None,
+                exists: false,
+                valid: None,
+                format: None,
+                boundary_count: None,
+                warnings: vec![
+                    "diff lists each side as one serial segment with these options; diff \
+                     does not split segments at runtime"
+                        .to_string(),
+                ],
+            },
+            None => agent::diff_per_side_hints_plan(
+                inputs.bucket.as_deref(),
+                inputs.region.as_deref(),
+                &inputs.prefix,
+            ),
+        }
     } else {
         agent::detect_hints_plan(agent::HintsPlanInputs {
             explicit_hints_file: cli.hints_file.as_deref(),
@@ -2937,6 +3201,14 @@ fn build_plan_report(
     };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = config_source.warnings.clone();
+    let missing_region = sides_without_region(cli);
+    if !missing_region.is_empty() && !imds_disabled() && !offline_region_resolves() {
+        warnings.push(format!(
+            "no region for {} from the command line, AWS_REGION or the AWS config profile; \
+             the run fails with exit 3 unless EC2 instance metadata supplies one",
+            missing_region.join(" / ")
+        ));
+    }
     if let (Commands::List { .. }, Some(parquet)) = (&cli.cmd, outputs.parquet_file.as_deref()) {
         let stale = stale_parquet_parts(parquet);
         if !stale.is_empty() {
@@ -2968,12 +3240,12 @@ fn build_plan_report(
     // Only runs that can never fan out get this warning. A run without cached
     // hints still partitions (startup discovery, then runtime splitting), and
     // so does --no-auto-hints (runtime splitting alone).
-    if inputs.mode == "list"
-        && matches!(
-            hints.source.as_str(),
-            "single_chain" | "delimiter_single_segment"
-        )
-    {
+    let never_fans_out = matches!(
+        hints.source.as_str(),
+        "single_chain" | "delimiter_single_segment"
+    ) || (inputs.mode == "diff"
+        && hints.source == "disabled_single_segment_fallback");
+    if never_fans_out {
         warnings.push(
             "list is planned as a single ListObjectsV2 chain; --concurrency does not add parallelism to it"
                 .to_string(),
@@ -3598,6 +3870,7 @@ fn run_compat_probe(
     endpoint_url: &str,
     region: &str,
     bucket: &str,
+    prefix: &str,
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
@@ -3609,6 +3882,7 @@ fn run_compat_probe(
             endpoint_url,
             region,
             bucket,
+            prefix,
             addressing_style,
             output,
             cfg,

@@ -3372,6 +3372,7 @@ fn run_expecting_output_write_failure(extra: &[&str]) {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     write_fast_config(&config);
+    std::fs::write(dir.path().join("blocker"), b"a regular file").unwrap();
 
     let mut args: Vec<String> = vec![
         "--config".into(),
@@ -3403,12 +3404,14 @@ fn run_expecting_output_write_failure(extra: &[&str]) {
 
 #[test]
 fn local_mock_unwritable_trace_path_exits_output_write() {
-    run_expecting_output_write_failure(&["--trace-compat", "/nonexistent-dir/trace.jsonl"]);
+    // A path under a regular file cannot be created, even as root (missing
+    // parent directories alone are now created, as --output-dir does).
+    run_expecting_output_write_failure(&["--trace-compat", "blocker/trace.jsonl"]);
 }
 
 #[test]
 fn local_mock_unwritable_log_path_exits_output_write() {
-    run_expecting_output_write_failure(&["--output-log-file", "/nonexistent-dir/run.log"]);
+    run_expecting_output_write_failure(&["--output-log-file", "blocker/run.log"]);
 }
 
 // A listing that fits in one page has nothing to partition: bisecting it

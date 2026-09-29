@@ -263,7 +263,7 @@ impl S3TurboConfig {
         };
         let mut loaded_config = None;
         let mut loaded_config_kind = "none".to_string();
-        let mut warnings = Vec::new();
+        let warnings = Vec::new();
 
         for (path, kind) in &search_paths {
             if path.exists() {
@@ -279,9 +279,13 @@ impl S3TurboConfig {
             }
         }
 
+        // An explicit --config is a strict opt-in. Falling back to built-in
+        // defaults when it is missing used to list the same-named bucket on
+        // real AWS with ambient credentials instead of the intended endpoint.
         if let (Some(explicit), None) = (cli_config_path, loaded_config.as_ref()) {
-            warnings.push(format!(
-                "explicit config file '{}' was not found; using built-in defaults",
+            return Err(format!(
+                "config file '{}' was not found (pass an existing file to --config, or omit it \
+                 to use ./s3-turbo-list.toml or ~/.s3-turbo-list.toml when present)",
                 explicit
             ));
         }

@@ -32,8 +32,12 @@ includes `config_source`, which reports the explicit `--config` path when
 present, the config file actually loaded, the searched paths, the source kind
 (`explicit`, `workspace`, `home`, or `none`), and global CLI config overrides
 such as `compression` or `endpoint_url`.
-When an explicit `--config` path is missing, `config_source.warnings` reports
-that the command fell back to built-in defaults.
+An explicit `--config` path that does not exist is an error (exit `2`), for
+every command that loads config — including `doctor` and `--dry-run`.  It used
+to fall back to built-in defaults, which would list the same-named bucket on
+AWS instead of the configured endpoint.  `doctor --json` prints its JSON
+report (with a `config_parse` `error` check) on every config error, so stdout
+is never empty.
 
 `doctor --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
@@ -137,7 +141,9 @@ than the checkpoint file: a run that lists its whole key space removes the
 checkpoint before exiting, so the file on disk cannot answer the question.
 
 For large buckets, agents should prefer the simple high-throughput path:
-run `list` directly with `-c 8 -T 4` as a conservative starting point.
+run `list` directly with the default concurrency: it is an upper bound the run
+settles below on its own, so pinning `-c` lower only caps a large bucket.
+Lower it only when the endpoint throttles (`metrics.throttled_responses`).
 Key-space partitioning is automatic — startup discovery probes the bucket
 structure and caches boundaries on the first run, and runtime splitting fans
 out long-tail segments — so no separate hints-generation step is needed.

@@ -423,6 +423,8 @@ pub struct GlobalState {
     pub fatal_error_count: Arc<AtomicUsize>,
     /// The first listing error that ended the run: (errno, one-line summary).
     pub first_fatal_error: Arc<Mutex<Option<(u8, String)>>>,
+    /// The first output failure's description, for the manifest and stderr.
+    pub first_output_error: Arc<Mutex<Option<String>>>,
     pub output_error_count: Arc<AtomicUsize>,
     pub data_received_batches: Arc<AtomicUsize>,
     pub data_received_objects: Arc<AtomicUsize>,
@@ -493,6 +495,7 @@ impl GlobalState {
             throttled_count: Arc::new(AtomicUsize::new(0)),
             fatal_error_count: Arc::new(AtomicUsize::new(0)),
             first_fatal_error: Arc::new(Mutex::new(None)),
+            first_output_error: Arc::new(Mutex::new(None)),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data_received_batches: Arc::new(AtomicUsize::new(0)),
             data_received_objects: Arc::new(AtomicUsize::new(0)),
@@ -549,6 +552,18 @@ impl GlobalState {
         if first.is_none() {
             *first = Some((errno, summary));
         }
+    }
+    /// Log an output failure and keep the first one's description. Does not
+    /// count it: callers already decide when a failure is an output error.
+    pub fn note_output_error(&self, message: String) {
+        log::error!("{}", message);
+        let mut first = self.first_output_error.lock().unwrap();
+        if first.is_none() {
+            *first = Some(message);
+        }
+    }
+    pub fn first_output_error(&self) -> Option<String> {
+        self.first_output_error.lock().unwrap().clone()
     }
     pub fn first_fatal_error(&self) -> Option<(u8, String)> {
         self.first_fatal_error.lock().unwrap().clone()
