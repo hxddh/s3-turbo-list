@@ -498,14 +498,14 @@ fn parquet_diff_flags(path: &std::path::Path) -> Vec<u8> {
     flags
 }
 
-fn checkpoint_completed_indices(path: &std::path::Path) -> Option<Vec<u64>> {
+/// The `start_after` of each range a checkpoint left to list.
+fn checkpoint_remaining_starts(path: &std::path::Path) -> Option<Vec<String>> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = toml::from_str(&content).ok()?;
-    value.get("completed_indices")?.as_array().map(|items| {
+    value.get("remaining")?.as_array().map(|items| {
         items
             .iter()
-            .filter_map(toml::Value::as_integer)
-            .map(|v| v as u64)
+            .filter_map(|item| item.get("start_after")?.as_str().map(str::to_string))
             .collect()
     })
 }
@@ -793,10 +793,9 @@ fn local_mock_list_startup_discovery_splits_segments() {
     assert_eq!(probes.len(), 4, "{:#?}", probes);
     assert_eq!(lists.len(), 4, "{:#?}", lists);
 
-    // Discovered boundaries are cached for future runs (incl. --resume).
-    let cache = dir.path().join("us-east-1_mock-bucket_hints.toml");
-    let cache_content = std::fs::read_to_string(&cache).unwrap();
-    assert!(cache_content.contains("a/x/"), "{}", cache_content);
+    // Nothing is cached in the working directory: the next run discovers
+    // again.
+    assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }
 
 #[test]
@@ -1579,7 +1578,7 @@ fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
             .iter()
             .any(|value| value == "endpoint_url")
     );
-    assert_eq!(manifest_json["inputs"]["continuation_token"], "seed-token");
+    assert_eq!(manifest_json["inputs"]["continuation_token"], "<redacted>");
     assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
 }
 
@@ -1661,10 +1660,13 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 
     let requests = server.requests();
     assert!(requests.iter().any(|request| request.method == "HEAD"));
-    assert!(requests.iter().any(|request| {
-        request.method == "GET"
-            && request.query.get("encoding-type").map(String::as_str) == Some("url")
-    }));
+    // The probe sends only requests a listing run sends (it used to try
+    // encoding-type=url, which the list engine never uses).
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.query.contains_key("encoding-type"))
+    );
     assert!(requests.iter().any(|request| {
         request.query.get("continuation-token").map(String::as_str) == Some("probe-page-2")
     }));
@@ -1881,9 +1883,8 @@ estimate_mode = "full"
         format!(
             r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-17T00:00:00Z"
+remaining = [{{ start_after = "m/" }}]
 
 [identity]
 bucket = "mock-bucket"
@@ -1892,10 +1893,8 @@ prefix = ""
 delimiter = ""
 addressing_style = "path"
 mode = "list"
-boundaries_digest = "{}"
 endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
             server.endpoint()
         ),
     )
@@ -1981,9 +1980,8 @@ estimate_mode = "full"
         &checkpoint,
         r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-24T00:00:00Z"
+remaining = [{ start_after = "m/" }]
 
 [identity]
 bucket = "mock-bucket"
@@ -2018,7 +2016,10 @@ mode = "list"
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(checkpoint_completed_indices(&checkpoint), Some(vec![0]));
+    assert_eq!(
+        checkpoint_remaining_starts(&checkpoint),
+        Some(vec!["m/".to_string()])
+    );
 
     let requests = server.requests();
     assert!(
@@ -2407,13 +2408,13 @@ estimate_mode = "full"
 
 #[test]
 fn local_mock_diff_lists_sides_in_parallel_segments() {
-    // diff partitions each side automatically. The left side has a cached
-    // hints boundary ("m/") and lists two segments; the right side has no
-    // cache and a flat namespace, so structural discovery finds nothing and
-    // the flat-cut bisection (max-keys=1 probes) partitions it instead — so it
-    // also lists in parallel rather than as one serial segment. The merge must
-    // classify across both sides' segment boundaries with every key exactly
-    // once.
+    // diff partitions each side automatically. The left side's startup
+    // discovery finds one CommonPrefix ("m/") and lists two segments; the
+    // right side is a flat namespace, so structural discovery finds nothing
+    // and the flat-cut bisection (max-keys=1 probes) partitions it instead —
+    // so it also lists in parallel rather than as one serial segment. The
+    // merge must classify across both sides' segment boundaries with every
+    // key exactly once.
     let left_keys = ["a.txt", "left-only.txt", "z-extra.txt"];
     let right_keys = ["a.txt", "right-only.txt", "z-extra.txt"];
 
@@ -2426,6 +2427,12 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
             return MockResponse::error(500, "UnexpectedBucket", &request.path);
         };
         if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            let prefix = request.query.get("prefix").cloned().unwrap_or_default();
+            if request.path.contains("/left") {
+                // Left-side startup discovery: one top-level prefix.
+                let cps: &[&str] = if prefix.is_empty() { &["m/"] } else { &[] };
+                return MockResponse::ok_xml(list_bucket_xml(&prefix, 1000, &[], cps, false, None));
+            }
             // Right-side startup discovery: flat namespace, no structure, and
             // more pages to come — a side worth partitioning.
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("token")));
@@ -2448,19 +2455,6 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     let parquet = dir.path().join("diff.parquet");
     let ks = dir.path().join("diff.ks");
     write_fast_config(&config);
-    // Cached hints partition the left side at "m/".
-    std::fs::write(
-        dir.path().join("us-east-1_left_hints.toml"),
-        r#"bucket = "left"
-region = "us-east-1"
-total_objects = 3
-boundaries = ["m/"]
-generated_at = "2026-05-18T00:00:00Z"
-scan_mode = "full"
-estimate_mode = "full"
-"#,
-    )
-    .unwrap();
 
     let args = vec![
         "--config".into(),
@@ -3133,80 +3127,69 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
         "expected multiple parallel segments from startup pre-partitioning, got starts {:?}",
         segment_starts
     );
-    // Boundaries were cached for future runs (and --resume).
-    let cache = std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml"))
-        .expect("startup hints cache written");
-    assert!(cache.contains("boundaries"), "{}", cache);
+    // Nothing is cached in the working directory.
+    assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
 }
 
-// ── Resume boundary verification ────────────────────────────
-//
-// Completed segment indices are positional. A checkpoint carried over to a
-// different boundary set with the same segment count (the normal outcome of
-// re-deriving flat-namespace boundaries against a bucket that took writes)
-// used to be accepted, marking ranges complete that were never listed — the
-// run then exited 0 with those keys silently missing from the output.
+// Flat keys sharing a long constant suffix after a numeric run
+// (`obj-000000123.snappy.parquet`) used to defeat bisection: every candidate
+// bumped a character inside the suffix, so each cut landed on the key right
+// after the range start and the run listed one giant tail segment. Cuts must
+// now land near the middle of each range, giving balanced segments.
 #[test]
-fn local_mock_resume_rejects_same_count_different_boundaries() {
-    let keys = ["a-first.txt", "n-middle.txt", "z-last.txt"];
+fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
+    const KEYS: usize = 4000;
+    const PAGE: usize = 250;
+    let keys: Vec<String> = (0..KEYS)
+        .map(|i| format!("obj-{:09}.snappy.parquet", i))
+        .collect();
+
+    let all_keys = keys.clone();
     let server = MockS3Server::start(move |request, _sequence| {
         let start_after = request
             .query
             .get("start-after")
             .cloned()
             .unwrap_or_default();
-        let page: Vec<&str> = keys
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Structural discovery: flat, and more pages to come.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("t")));
+        }
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PAGE)
+            .min(PAGE);
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => all_keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = all_keys[start_idx..]
             .iter()
-            .copied()
-            .filter(|k| *k > start_after.as_str())
+            .take(max_keys)
+            .map(String::as_str)
             .collect();
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+        let next = start_idx + page.len();
+        let truncated = next < all_keys.len() && max_keys > 1;
+        let token = format!("off-{}", next);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            max_keys as i32,
+            &page,
+            &[],
+            truncated,
+            truncated.then_some(token.as_str()),
+        ))
     });
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    let hints = dir.path().join("hints.toml");
-    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
-    let parquet = dir.path().join("resume.parquet");
-    let ks = dir.path().join("resume.ks");
+    let parquet = dir.path().join("out.parquet");
     write_fast_config(&config);
-    // This run partitions at "n/" ...
-    std::fs::write(
-        &hints,
-        r#"bucket = "mock-bucket"
-region = "us-east-1"
-boundaries = ["n/"]
-generated_at = "2026-05-17T00:00:00Z"
-"#,
-    )
-    .unwrap();
-    // ... but the checkpoint recorded segment 0 complete against "m/": same
-    // two segments, different ranges.
-    std::fs::write(
-        &checkpoint,
-        format!(
-            r#"bucket = "mock-bucket"
-prefix = ""
-total_segments = 2
-completed_indices = [0]
-last_updated = "2026-05-17T00:00:00Z"
-
-[identity]
-bucket = "mock-bucket"
-region = "us-east-1"
-prefix = ""
-delimiter = ""
-addressing_style = "path"
-mode = "list"
-boundaries_digest = "{}"
-endpoint_url = "{}"
-"#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
-            server.endpoint()
-        ),
-    )
-    .unwrap();
-
     let args = vec![
         "--config".into(),
         config.display().to_string(),
@@ -3214,34 +3197,69 @@ endpoint_url = "{}"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
-        "--resume".into(),
-        "--hints-file".into(),
-        hints.display().to_string(),
+        "--concurrency".into(),
+        "8".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
         "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
         "us-east-1".into(),
     ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3_turbo_list=debug")]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(
-        stderr.contains("discarding checkpoint and starting fresh"),
-        "expected the mismatched checkpoint to be discarded: {}",
-        stderr
-    );
 
-    // Nothing was skipped: the whole key space is in the output.
     let mut listed = parquet_keys(&parquet);
     listed.sort();
-    assert_eq!(
-        listed,
-        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
+    assert_eq!(listed, keys);
+
+    // One boundary per worker, every one a real key, strictly ascending.
+    let boundaries: Vec<String> = stderr
+        .lines()
+        .find_map(|line| line.split_once("Startup boundaries: ").map(|(_, b)| b))
+        .expect("startup boundaries logged")
+        .split('\t')
+        .map(str::to_string)
+        .collect();
+    assert_eq!(boundaries.len(), 8, "{:?}", boundaries);
+    let mut positions: Vec<usize> = boundaries
+        .iter()
+        .map(|b| keys.binary_search(b).expect("boundary is a real key"))
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "{:?}",
+        boundaries
     );
+    // Balanced: no segment holds more than ~2.5x its even share.
+    positions.push(KEYS - 1);
+    let mut prev = 0usize;
+    let largest = positions
+        .iter()
+        .map(|&p| {
+            let size = p - prev;
+            prev = p;
+            size
+        })
+        .max()
+        .unwrap();
+    let ideal = KEYS / (boundaries.len() + 1);
+    assert!(
+        largest <= ideal * 5 / 2,
+        "largest segment {} keys (ideal {}): {:?}",
+        largest,
+        ideal,
+        boundaries
+    );
+    // The cut search stays cheap: a bounded number of single-key probes.
+    let probes = server
+        .requests()
+        .iter()
+        .filter(|r| r.query.get("max-keys").map(String::as_str) == Some("1"))
+        .count();
+    assert!(probes <= 120, "{} bisection probes", probes);
 }
 
 // ── Conventional hints cache scoping ────────────────────────
@@ -3322,118 +3340,6 @@ generated_at = "2026-05-17T00:00:00Z"
         1,
         "expected a single hierarchical listing request, got {:?}",
         server.requests()
-    );
-}
-
-// A cache generated under one prefix describes boundaries that all sort
-// outside another prefix's range: reusing it leaves one segment holding every
-// key while the rest issue empty requests. Prefixed runs get their own cache
-// file, and a stale cross-prefix cache at the whole-bucket path is ignored.
-#[test]
-fn local_mock_prefixed_run_does_not_reuse_whole_bucket_cache() {
-    let keys = ["logs/a.txt", "logs/b.txt", "logs/c.txt"];
-    let server = MockS3Server::start(move |request, _sequence| {
-        if request.query.get("delimiter").map(String::as_str) == Some("/") {
-            // Structural discovery under logs/: no deeper structure, more
-            // pages to come, so the run partitions and caches boundaries.
-            return MockResponse::ok_xml(list_bucket_xml(
-                "logs/",
-                1000,
-                &[],
-                &[],
-                true,
-                Some("token"),
-            ));
-        }
-        let start_after = request
-            .query
-            .get("start-after")
-            .cloned()
-            .unwrap_or_default();
-        let max_keys = request.query.get("max-keys").map(String::as_str);
-        let page: Vec<&str> = keys
-            .iter()
-            .copied()
-            .filter(|k| *k > start_after.as_str())
-            .take(if max_keys == Some("1") { 1 } else { keys.len() })
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml(
-            "logs/",
-            if max_keys == Some("1") { 1 } else { 1000 },
-            &page,
-            &[],
-            false,
-            None,
-        ))
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
-    write_fast_config(&config);
-    // Whole-bucket boundaries from an earlier unprefixed run: every one of
-    // them sorts before "logs/", so all three keys would land in one segment.
-    std::fs::write(
-        dir.path().join("us-east-1_mock-bucket_hints.toml"),
-        r#"bucket = "mock-bucket"
-region = "us-east-1"
-boundaries = ["aaa/", "bbb/", "ccc/"]
-generated_at = "2026-05-17T00:00:00Z"
-"#,
-    )
-    .unwrap();
-
-    let args = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "--prefix".into(),
-        "logs/".into(),
-        "--output-parquet-file".into(),
-        parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let mut listed = parquet_keys(&parquet);
-    listed.sort();
-    assert_eq!(
-        listed,
-        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
-    );
-
-    // The whole-bucket cache was left untouched, and this run cached its own
-    // boundaries under a prefix-scoped path.
-    let whole_bucket =
-        std::fs::read_to_string(dir.path().join("us-east-1_mock-bucket_hints.toml")).unwrap();
-    assert!(
-        whole_bucket.contains("aaa/"),
-        "the whole-bucket cache must not be overwritten by a prefixed run: {}",
-        whole_bucket
-    );
-    let prefixed: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
-            (name.ends_with("_hints.toml") && name != "us-east-1_mock-bucket_hints.toml")
-                .then_some(name)
-        })
-        .collect();
-    assert_eq!(
-        prefixed.len(),
-        1,
-        "expected exactly one prefix-scoped hints cache, got {:?}",
-        prefixed
     );
 }
 
@@ -4534,7 +4440,7 @@ fn local_mock_successful_run_leaves_no_checkpoint() {
         !checkpoint.exists(),
         "a run that listed the whole key space has nothing to resume, but it \
          left a checkpoint behind: {:?}",
-        checkpoint_completed_indices(&checkpoint)
+        checkpoint_remaining_starts(&checkpoint)
     );
 }
 
@@ -4623,9 +4529,9 @@ fn local_mock_resumed_run_declares_its_partial_coverage() {
         format!(
             r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-17T00:00:00Z"
+remaining = [{{ start_after = "m/" }}]
+listed_ranges = 1
 
 [identity]
 bucket = "mock-bucket"
@@ -4634,10 +4540,8 @@ prefix = ""
 delimiter = ""
 addressing_style = "path"
 mode = "list"
-boundaries_digest = "{}"
 endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
             server.endpoint()
         ),
     )
@@ -4680,7 +4584,7 @@ endpoint_url = "{}"
         warnings
             .iter()
             .filter_map(Value::as_str)
-            .any(|w| w.contains("only the remaining key space")),
+            .any(|w| w.contains("only the rest of the key space")),
         "a resumed run must warn that its output is partial: {:?}",
         warnings
     );
@@ -5281,7 +5185,6 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
         &server.endpoint(),
         "--addressing-style",
         "path",
-        "--resume",
         "--max-keys",
         "50",
         "-c",
@@ -5339,6 +5242,10 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
         "the first run must be interrupted mid-listing"
     );
 
+    // The first run was not started with --resume: an interrupted run saves
+    // its checkpoint regardless, and the next run opts into reading it.
+    let mut args = args;
+    args.insert(6, "--resume".to_string());
     let (code, second_rows, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stderr: {}", stderr);
     // The partial-output warning reaches stderr, not only the manifest.
@@ -5728,4 +5635,109 @@ fn local_mock_truncated_page_that_never_advances_fails_the_run() {
     assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     // One advancing attempt, then max_attempts (3) that make no progress.
     assert_eq!(requests_served.load(Ordering::SeqCst), 4);
+}
+
+// Runs started at the same moment over the same bucket used to pick the same
+// auto-generated name (the `_N` check ran long before the files were
+// created) and all reported success over one set of files; `--log` files were
+// never suffixed at all, so earlier manifests then failed `--check`.
+#[test]
+fn local_mock_concurrent_runs_get_distinct_outputs_and_logs() {
+    let server = MockS3Server::start(|request, _sequence| {
+        let prefix = request.query.get("prefix").cloned().unwrap_or_default();
+        MockResponse::ok_xml(list_bucket_xml(
+            &prefix,
+            1000,
+            &["a", "b"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-dir",
+        "out",
+        "--log",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let runs: Vec<_> = (0..4)
+        .map(|_| {
+            let args = args.clone();
+            let cwd = dir.path().to_path_buf();
+            thread::spawn(move || run_cli(&args, &cwd))
+        })
+        .collect();
+    for run in runs {
+        let (code, stdout, stderr) = run.join().unwrap();
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    }
+    let names = |ext: &str| {
+        std::fs::read_dir(dir.path().join("out"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(ext))
+            .count()
+    };
+    assert_eq!(names(".parquet"), 4);
+    assert_eq!(names(".ks"), 4);
+    assert_eq!(names(".log"), 4);
+}
+
+// An output the run cannot create used to surface only after the whole
+// listing (and its requests) had been paid for.
+#[test]
+fn local_mock_uncreatable_output_fails_before_any_request() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &["a"], &[], false, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let manifest_dir = dir.path().join("manifest-is-a-dir");
+    std::fs::create_dir(&manifest_dir).unwrap();
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-dir",
+        "out",
+        "--run-manifest",
+        manifest_dir.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, _stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 5, "stderr: {}", stderr);
+    assert!(stderr.contains("is a directory"), "{}", stderr);
+    assert!(server.requests().is_empty(), "{:#?}", server.requests());
+    // The name it reserved is released again: no empty output left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("out"))
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{:?}", leftovers);
 }

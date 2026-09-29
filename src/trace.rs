@@ -249,6 +249,17 @@ pub fn create_trace_writer(
 
 /// An unwritable `--trace-compat` path is an output failure the caller
 /// reports through the documented exit codes, not a panic.
+/// The trace writer for a `--trace-compat` target: a JSONL file, or `-`
+/// for stderr.
+pub fn trace_writer_for_target(
+    target: Option<&str>,
+) -> Result<Option<Box<dyn S3TraceWriter>>, String> {
+    match target {
+        Some("-") => create_trace_writer_opt(None, true),
+        other => create_trace_writer_opt(other, false),
+    }
+}
+
 pub fn create_trace_writer_opt(
     trace_compat: Option<&str>,
     debug_s3: bool,

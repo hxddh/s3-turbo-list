@@ -78,7 +78,7 @@ pub struct ProbeTestResult {
 
 pub async fn run_compat_probe(
     endpoint_url: &str,
-    region: &str,
+    region: Option<&str>,
     bucket: &str,
     prefix: &str,
     addressing_style: &str,
@@ -88,7 +88,7 @@ pub async fn run_compat_probe(
     // --trace-compat / --debug-s3 as for a listing run; with neither, the
     // probe keeps its historical default of tracing to stderr.
     let trace_writer: Box<dyn S3TraceWriter> =
-        crate::trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3)?
+        crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())?
             .unwrap_or_else(|| Box::new(StderrTraceWriter));
 
     let loader = aws_config::from_env()
@@ -113,9 +113,20 @@ pub async fn run_compat_probe(
         );
     let config = loader.load().await;
     let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
+    // Without --region the probe signs for the region the SDK resolves
+    // (AWS_REGION, the AWS config file), as a listing run does.
+    let region = match region {
+        Some(region) => region.to_string(),
+        None => config.region().map(|r| r.to_string()).ok_or_else(|| {
+            "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
+                 for a region)"
+                .to_string()
+        })?,
+    };
+    let region = region.as_str();
     s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
     s3_cfg = s3_cfg.endpoint_url(endpoint_url.to_owned());
-    if addressing_style == "path" || cfg.s3.force_path_style {
+    if addressing_style == "path" || cfg.s3.force_path_style() {
         s3_cfg = s3_cfg.force_path_style(true);
     }
     let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
@@ -161,27 +172,6 @@ pub async fn run_compat_probe(
                 .list_objects_v2()
                 .bucket(bucket)
                 .prefix(prefix)
-                .max_keys(1)
-                .send()
-                .await
-        },
-        "ListObjectsV2 with prefix",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
-        trace_writer.as_ref(),
-        None,
-    )
-    .await;
-    results.push(probe_result_from("ListObjectsV2 with prefix", res, evt));
-
-    let (res, evt) = timed_s3_call(
-        || async {
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
                 .delimiter("/")
                 .max_keys(1)
                 .send()
@@ -197,32 +187,6 @@ pub async fn run_compat_probe(
     )
     .await;
     results.push(probe_result_from("ListObjectsV2 with delimiter", res, evt));
-
-    let (res, evt) = timed_s3_call(
-        || async {
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
-                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
-                .max_keys(1)
-                .send()
-                .await
-        },
-        "ListObjectsV2 (encoding-type=url)",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
-        trace_writer.as_ref(),
-        None,
-    )
-    .await;
-    results.push(probe_result_from(
-        "ListObjectsV2 (encoding-type=url)",
-        res,
-        evt,
-    ));
 
     let (res, mut evt) = timed_s3_call(
         || async {
@@ -595,7 +559,7 @@ fn diagnostic_for(
         Some("InvalidAccessKeyId") | Some("AccessDenied") => {
             return (
                 "access_denied",
-                "Check credentials, bucket permissions, and whether the selected profile is valid for this endpoint",
+                "Check credentials, bucket permissions, and whether the provider preset fits this endpoint",
             );
         }
         Some("NoSuchBucket") => {

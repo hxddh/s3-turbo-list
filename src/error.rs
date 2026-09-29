@@ -176,14 +176,8 @@ impl FlatRuntimeError {
         is_throttle(self.errno)
     }
 
-    /// Returns the HTTP status code, or 0 if not set.
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
-    pub fn http_status_code(&self) -> u16 {
-        self.http_status_code
-    }
-
     /// Attach an HTTP status code for diagnostics.
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
+    #[cfg(test)]
     pub fn with_http_status_code(mut self, code: u16) -> Self {
         self.http_status_code = code;
         self
@@ -211,14 +205,8 @@ impl FlatRuntimeError {
         self
     }
 
-    /// Returns `true` if this error is retryable (errno < 0x10).
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
-    pub fn is_retryable(&self) -> bool {
-        self.continue_on_error()
-    }
-
     /// Returns `true` if this error is fatal (errno >= 0x10).
-    #[allow(dead_code)] // Phase 5: used in log/trace formatting
+    #[cfg(test)]
     pub fn is_fatal(&self) -> bool {
         !self.continue_on_error()
     }
@@ -249,7 +237,6 @@ impl std::error::Error for FlatRuntimeError {}
 // ── Error code → name mapping ─────────────────────────────
 
 /// Return a human-readable S3 error classification for logging/trace.
-#[allow(dead_code)] // Phase 5: used in log/trace formatting
 pub fn errno_to_name(errno: u8) -> &'static str {
     match errno {
         ERROR_S3_NEXT_STREAM_TIMEOUT => "StreamTimeout",
@@ -349,7 +336,7 @@ mod tests {
         // Generic low error codes (not stream timeout) should be retryable.
         let err = FlatRuntimeError::new(ERROR_S3_CLIENT_GENERIC, "generic".into(), "key-42".into());
         assert!(err.continue_on_error());
-        assert!(err.is_retryable());
+        assert!(err.continue_on_error());
         assert!(!err.is_fatal());
     }
 
@@ -365,7 +352,7 @@ mod tests {
             err.continue_on_error(),
             "stream timeout should be retryable within the caller's retry budget"
         );
-        assert!(err.is_retryable());
+        assert!(err.continue_on_error());
         assert!(!err.is_fatal());
     }
 
@@ -388,7 +375,7 @@ mod tests {
                 tracker,
             );
 
-        assert_eq!(err.http_status_code(), 403);
+        assert_eq!(err.http_status_code, 403);
         assert_eq!(err.s3_error_code.as_deref(), Some("AccessDenied"));
         assert_eq!(err.request_id.as_deref(), Some("req-abc-123"));
         assert!(err.raw_body_excerpt.is_some());

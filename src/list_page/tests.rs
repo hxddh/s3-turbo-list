@@ -361,7 +361,7 @@ fn etag_rules_match_object_props_from() {
             .build();
         let expected = ObjectProps::from(&object);
         assert_eq!(
-            parse_etag(etag.as_bytes()),
+            parse_etag(&etag),
             (expected.etag_md5, expected.etag_parts),
             "{etag}"
         );

@@ -33,7 +33,7 @@ use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::primitives::{DateTime, DateTimeFormat, SdkBody};
 use aws_smithy_runtime_api::box_error::BoxError;
 use bytes::Bytes;
-use memchr::{memchr, memmem};
+use memchr::{memchr, memchr2, memmem};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -209,8 +209,8 @@ pub(crate) fn epoch_secs_to_u64(secs: i64) -> u64 {
 
 /// ETag text (entity-unescaped) → `(etag_md5, etag_parts)` by the same rules
 /// as `ObjectProps::from(&Object)`.
-fn parse_etag(raw: &[u8]) -> ([u8; 16], u32) {
-    std::str::from_utf8(raw).map_or(([0u8; 16], 0), crate::core::parse_etag_bytes)
+fn parse_etag(raw: &str) -> ([u8; 16], u32) {
+    crate::core::parse_etag_bytes(raw)
 }
 
 /// Whole epoch seconds of an RFC 3339 timestamp, as the SDK parses
@@ -371,12 +371,23 @@ fn all_xml_space(b: &[u8]) -> bool {
 /// other than tab/LF/CR, and U+FFFE / U+FFFF.  (Character *references* to
 /// controls are fine and handled by `unescape_into`.)
 fn has_forbidden_chars(b: &[u8]) -> bool {
+    // One pass finds both the forbidden controls and whether the page has
+    // any non-ASCII byte at all; U+FFFE / U+FFFF (EF BF BE/BF) can only occur
+    // in a non-ASCII page, so an ASCII page skips that second scan.
+    let mut high = 0u8;
     let controls = b.chunks(64).any(|chunk| {
-        chunk.iter().fold(false, |found, &c| {
-            found | (c < 0x20 && c != b'\t' && c != b'\n' && c != b'\r')
-        })
+        let (found, hi) = chunk.iter().fold((false, 0u8), |(found, hi), &c| {
+            (
+                found | (c < 0x20 && c != b'\t' && c != b'\n' && c != b'\r'),
+                hi | c,
+            )
+        });
+        high |= hi;
+        found
     });
-    controls || memmem::find_iter(b, b"\xEF\xBF").any(|i| matches!(b.get(i + 2), Some(0xBE | 0xBF)))
+    controls
+        || (high >= 0x80
+            && memmem::find_iter(b, b"\xEF\xBF").any(|i| matches!(b.get(i + 2), Some(0xBE | 0xBF))))
 }
 
 // ── Tags ───────────────────────────────────────────────────
@@ -387,21 +398,44 @@ fn has_forbidden_chars(b: &[u8]) -> bool {
 #[inline]
 fn name_end(b: &[u8], start: usize) -> Option<usize> {
     let first = *b.get(start)?;
-    if !(first.is_ascii_alphabetic() || first == b'_') {
+    if NAME_CLASS[first as usize] != NAME_START {
         return None;
     }
     let mut i = start + 1;
     while let Some(&c) = b.get(i) {
-        if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.') {
-            i += 1;
-        } else if is_xml_space(c) || c == b'>' || c == b'/' {
-            return Some(i);
-        } else {
-            return None;
+        match NAME_CLASS[c as usize] {
+            NAME_START | NAME_CHAR => i += 1,
+            NAME_END => return Some(i),
+            _ => return None,
         }
     }
     None
 }
+
+/// Byte classes for [`name_end`]: one table load per byte instead of a chain
+/// of range checks (element names are ~1/4 of a page's bytes).
+const NAME_OTHER: u8 = 0;
+const NAME_START: u8 = 1; // [A-Za-z_]
+const NAME_CHAR: u8 = 2; // [0-9.-]
+const NAME_END: u8 = 3; // XML space, '>' or '/'
+const NAME_CLASS: [u8; 256] = {
+    let mut t = [NAME_OTHER; 256];
+    let mut c = 0;
+    while c < 256 {
+        let b = c as u8;
+        t[c] = if b.is_ascii_alphabetic() || b == b'_' {
+            NAME_START
+        } else if b.is_ascii_digit() || b == b'-' || b == b'.' {
+            NAME_CHAR
+        } else if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') {
+            NAME_END
+        } else {
+            NAME_OTHER
+        };
+        c += 1;
+    }
+    t
+};
 
 #[inline]
 fn skip_space(b: &[u8], mut i: usize) -> usize {
@@ -437,14 +471,24 @@ fn close_tag(b: &[u8], lt: usize) -> Option<(&[u8], usize)> {
 /// `name`): returns `(text, index after the matching end tag)`.  Nested markup
 /// of any kind is outside the fast subset.
 #[inline]
-fn leaf_text<'a>(text: &'a str, start: usize, name: &[u8]) -> Option<(&'a str, usize)> {
+fn leaf_text<'a>(text: &'a str, start: usize, name: &[u8]) -> Option<(&'a str, usize, bool)> {
     let b = text.as_bytes();
-    let lt = start + memchr(b'<', &b[start..])?;
+    // One scan finds the end of the text and whether it holds a reference.
+    let mut lt = start + memchr2(b'<', b'&', &b[start..])?;
+    let has_ref = b[lt] == b'&';
+    if has_ref {
+        lt += memchr(b'<', &b[lt..])?;
+    }
     if b.get(lt + 1) != Some(&b'/') {
         return None;
     }
+    // Fast path: `</name>` exactly (the name was validated by `open_tag`).
+    let after_name = lt + 2 + name.len();
+    if b.get(lt + 2..after_name) == Some(name) && b.get(after_name) == Some(&b'>') {
+        return Some((&text[start..lt], after_name + 1, has_ref));
+    }
     let (close, after) = close_tag(b, lt)?;
-    (close == name).then(|| (&text[start..lt], after))
+    (close == name).then(|| (&text[start..lt], after, has_ref))
 }
 
 // ── Page parser ────────────────────────────────────────────
@@ -600,8 +644,14 @@ fn parse_contents(
     let mut size: Option<i64> = None;
 
     loop {
-        let lt = pos + memchr(b'<', &b[pos..])?;
-        if memchr(b'&', &b[pos..lt]).is_some() {
+        // Fields are usually back to back: skip the search when `pos` is
+        // already at the next tag.
+        let lt = if b.get(pos) == Some(&b'<') {
+            pos
+        } else {
+            pos + memchr(b'<', &b[pos..])?
+        };
+        if lt > pos && memchr(b'&', &b[pos..lt]).is_some() {
             return None;
         }
         match *b.get(lt + 1)? {
@@ -635,38 +685,63 @@ fn parse_contents(
             continue;
         }
         // A self-closing field reads as "" in the SDK.
-        let (raw, end) = if self_closing {
-            ("", after)
+        let (raw, end, has_ref) = if self_closing {
+            ("", after, false)
         } else {
             leaf_text(text, after, name)?
         };
         pos = end;
+        // The text as the SDK reads it; only a text with a reference needs
+        // unescaping (into `scratch`).
+        macro_rules! value {
+            () => {
+                if has_ref {
+                    unescape_scratch(raw, scratch)?
+                } else {
+                    raw
+                }
+            };
+        }
         match field {
             Field::Key => {
                 if key.is_some() {
                     return None;
                 }
-                key = Some(unescape_owned(raw)?);
+                key = Some(if has_ref {
+                    unescape_owned(raw)?
+                } else {
+                    raw.to_owned()
+                });
             }
             Field::LastModified => {
                 if last_modified.is_some() {
                     return None;
                 }
-                last_modified = Some(parse_timestamp_secs(unescape_scratch(raw, scratch)?)?);
+                last_modified = Some(parse_timestamp_secs(value!())?);
             }
             Field::ETag => {
                 if etag.is_some() {
                     return None;
                 }
-                etag = Some(parse_etag(unescape_scratch(raw, scratch)?.as_bytes()));
+                // `&quot;<md5>&quot;` is how every S3 endpoint sends it:
+                // read the inner text in place instead of unescaping.
+                let quoted = raw
+                    .strip_prefix("&quot;")
+                    .and_then(|r| r.strip_suffix("&quot;"))
+                    .filter(|inner| memchr(b'&', inner.as_bytes()).is_none());
+                etag = Some(match quoted {
+                    Some(inner) => crate::core::parse_etag_inner(inner.as_bytes()),
+                    None => parse_etag(value!()),
+                });
             }
             Field::Size => {
                 if size.is_some() {
                     return None;
                 }
-                size = Some(unescape_scratch(raw, scratch)?.parse::<i64>().ok()?);
+                size = Some(value!().parse::<i64>().ok()?);
             }
-            _ => validate_text(raw, scratch)?,
+            _ if has_ref => validate_text(raw, scratch)?,
+            _ => {}
         }
     }
 
@@ -691,8 +766,14 @@ fn parse_struct(
 ) -> Option<usize> {
     let b = text.as_bytes();
     loop {
-        let lt = pos + memchr(b'<', &b[pos..])?;
-        if memchr(b'&', &b[pos..lt]).is_some() {
+        // Fields are usually back to back: skip the search when `pos` is
+        // already at the next tag.
+        let lt = if b.get(pos) == Some(&b'<') {
+            pos
+        } else {
+            pos + memchr(b'<', &b[pos..])?
+        };
+        if lt > pos && memchr(b'&', &b[pos..lt]).is_some() {
             return None;
         }
         match *b.get(lt + 1)? {
@@ -704,8 +785,8 @@ fn parse_struct(
             _ => {}
         }
         let (name, after, self_closing) = open_tag(b, lt)?;
-        let (raw, end) = if self_closing {
-            ("", after)
+        let (raw, end, _) = if self_closing {
+            ("", after, false)
         } else {
             leaf_text(text, after, name)?
         };

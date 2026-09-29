@@ -23,6 +23,7 @@ artifacts/
 
 # Benchmark output
 /bench-results/
+/benchmark-results-local.json
 
 # Editor / OS noise
 *.swp

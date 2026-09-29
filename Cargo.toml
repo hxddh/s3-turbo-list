@@ -1,7 +1,7 @@
-# Releases are driven by this version field: see docs/release-checklist.md.
+# Releases are driven by this version field: see docs/releasing.md.
 [package]
 name = "s3-turbo-list"
-version = "0.36.0"
+version = "0.37.0"
 edition = "2024"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.94.1"
@@ -47,9 +47,20 @@ toml = "1"
 dashmap = "6"
 dirs-next = "2"
 
+# `access(2)` for the dry run's output-writability check: mode bits say
+# read-only to a root user who can write anyway (containers, CI).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+# The output-pipeline benchmark (the former hidden `benchmark-local`
+# subcommand); its tests run with `cargo test`.
+[[example]]
+name = "bench_local"
+test = true
 
 # Release artifacts ship from `cargo build --release` (see the release workflow),
 # so optimize that profile for a lean, fast binary: strip symbols, enable

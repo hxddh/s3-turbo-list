@@ -1,20 +1,8 @@
 use crate::profiles;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InitConfigReport {
-    pub status: String,
-    pub profile: String,
-    pub output: String,
-    pub output_written: bool,
-    pub overwrite: bool,
-    pub warnings: Vec<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ManifestSummaryReport {
@@ -92,50 +80,6 @@ pub struct ManifestCheckSummary {
     pub row_check: String,
     pub parquet_schema_check: String,
     pub exit_code_check: String,
-}
-
-pub fn init_config(
-    output: &str,
-    profile: Option<&str>,
-    overwrite: bool,
-) -> Result<InitConfigReport, String> {
-    let profile_name = profile.unwrap_or("aws").to_lowercase();
-    if profiles::get_profile(&profile_name).is_none() {
-        return Err(format!(
-            "'{}' is not an endpoint compatibility profile; use one of: {}",
-            profile_name,
-            profiles::all_profiles()
-                .iter()
-                .map(|p| p.name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    ensure_can_write(output, overwrite)?;
-    let warnings = init_config_warnings(&profile_name);
-    let rendered = init_config_template(&profile_name);
-    if let Some(parent) = Path::new(output)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "failed to create output directory '{}': {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-    std::fs::write(output, rendered)
-        .map_err(|e| format!("failed to write config '{}': {}", output, e))?;
-    Ok(InitConfigReport {
-        status: "success".to_string(),
-        profile: profile_name,
-        output: output.to_string(),
-        output_written: true,
-        overwrite,
-        warnings,
-    })
 }
 
 pub fn manifest_summary(
@@ -593,7 +537,7 @@ fn manifest_checks(
         }
 
         if let Some(recorded_sha256) = artifact.sha256.as_deref() {
-            let current_sha256 = sha256_file(&artifact.resolved_path).ok();
+            let current_sha256 = crate::agent::sha256_file(&artifact.resolved_path).ok();
             checks.push(ManifestCheck {
                 name: format!("artifact_sha256:{}", label),
                 status: if current_sha256.as_deref() == Some(recorded_sha256) {
@@ -701,25 +645,6 @@ fn current_parquet_summary(path: &str) -> Result<CurrentParquetSummary, String> 
     })
 }
 
-pub fn render_init_config_text(report: &InitConfigReport) -> String {
-    let mut out = String::new();
-    out.push_str("Config initialized:\n");
-    out.push_str(&format!("  Profile:         {}\n", report.profile));
-    out.push_str(&format!("  Output:          {}\n", report.output));
-    out.push_str("Next:\n");
-    out.push_str("  s3-turbo-list --config ");
-    out.push_str(&report.output);
-    out.push_str(" doctor --simple\n");
-    out.push_str("  s3-turbo-list --dry-run --agent --config ");
-    out.push_str(&report.output);
-    out.push_str(&format!(
-        " --output-dir out --delimiter '' list --bucket my-bucket --region {}\n",
-        crate::profiles::example_region(&report.profile)
-    ));
-    append_warnings_and_recommendations(&mut out, &report.warnings, &[]);
-    out
-}
-
 pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("Manifest: {}\n", report.manifest_file));
@@ -822,7 +747,7 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
     out
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = UNITS[0];
@@ -840,426 +765,131 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Providers with a hand-written quickstart, dispatched ahead of named recipes
-/// so that a bare provider name (e.g. `guide r2`) prints its quickstart.
-fn is_quickstart_provider(topic: &str) -> bool {
-    matches!(topic, "aws" | "minio" | "r2" | "bos")
-}
-
-/// Single guidance surface: bare `guide` prints the overview; a provider name
-/// (any known endpoint profile, e.g. aws/minio/r2/b2/oss/bos) prints that
-/// provider's quickstart followed by its endpoint-compatibility facts; anything
-/// else is treated as a recipe name (including `index`/`list`).
+/// `guide`: the overview, or one provider's quickstart and facts.
 pub fn render_guide(topic: Option<&str>) -> Result<String, String> {
     match topic {
         None => Ok(render_overview()),
-        Some(provider) if profiles::get_profile(provider).is_some() => {
-            // A provider name resolves to an endpoint profile. Print the
-            // hand-written quickstart when one exists (aws/minio/r2/bos), then
-            // append the profile's compatibility facts so providers without a
-            // quickstart (b2/oss) still produce guidance.
-            let mut out = String::new();
-            if is_quickstart_provider(provider) {
-                out.push_str(&render_quickstart(provider)?);
-                out.push('\n');
-            }
-            out.push_str(&render_profile_facts(provider));
-            Ok(out)
-        }
-        Some(name) => render_recipe(Some(name)),
+        Some(name) => match profiles::get_profile(name) {
+            Some(profile) => Ok(format!(
+                "{}\n{}",
+                render_quickstart(profile.name),
+                render_profile_facts(profile)
+            )),
+            None => Err(format!(
+                "unknown guide topic '{}': use one of {} (or no topic for the overview)",
+                name,
+                profile_names()
+            )),
+        },
     }
 }
 
-/// Plain-text endpoint-compatibility facts for a known profile, matching the
-/// former `profiles show` output (doctor/guide absorbed that command).
-fn render_profile_facts(name: &str) -> String {
-    let Some(profile) = profiles::get_profile(name) else {
-        return String::new();
-    };
-    let mut out = String::new();
-    out.push_str("Endpoint compatibility profile:\n");
-    out.push_str(&format!("  provider: {}\n", profile.provider));
-    out.push_str(&format!("  status: {}\n", profile.status));
-    out.push_str(&format!(
-        "  recommended_addressing_style: {}\n",
-        profile.recommended_addressing_style
-    ));
-    out.push_str(&format!(
-        "  default_endpoint_url: {}\n",
-        profile.default_endpoint_url.unwrap_or("-")
-    ));
-    out.push_str(&format!(
-        "  requires_explicit_endpoint: {}\n",
-        profile.requires_explicit_endpoint
-    ));
-    if !profile.notes.is_empty() {
-        out.push_str("  notes:\n");
-        for note in profile.notes {
-            out.push_str(&format!("    - {}\n", note));
-        }
-    }
-    out
-}
-
-fn render_recipe(name: Option<&str>) -> Result<String, String> {
-    let name = name.unwrap_or("index");
-    match name {
-        "index" | "list" => Ok(
-            r#"Available recipes:
-  aws-basic      Minimal AWS S3 dry-run and list
-  summary        Count objects and bytes without Parquet/KS outputs
-  pipe           Stream list results to shell tools or agents
-  filter         Local object filter examples and limits
-  verify         Validate a saved run manifest locally
-  release-check  Local pre-release checks without contacting S3
-  diff-safe      Parallel per-side bucket diff workflow
-  large-bucket   Automatic partitioning and output-dir workflow
-  local-minio    Local MinIO endpoint example
-  agent-safe     Local-only agent/CI commands
-
-Run: s3-turbo-list guide <name>
-"#
-            .to_string(),
-        ),
-        "aws-basic" => Ok(
-            r#"AWS basic:
-  export AWS_PROFILE=default
-  s3-turbo-list doctor --simple
-  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        "summary" => Ok(
-            r#"Summary only:
-  export AWS_PROFILE=default
-  s3-turbo-list doctor --simple
-  s3-turbo-list --dry-run --agent --summary-only --delimiter '' list --bucket my-bucket --region us-east-1
-  s3-turbo-list --summary-only --run-manifest summary.json --delimiter '' list --bucket my-bucket --region us-east-1
-  s3-turbo-list manifest-summary summary.json
-"#
-            .to_string(),
-        ),
-        "pipe" => Ok(
-            r#"Pipe-friendly list:
-  export AWS_PROFILE=default
-  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format tsv | wc -l
-  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format tsv | awk -F '\t' '{bytes += $2} END {print bytes}'
-  s3-turbo-list --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson | jq -r '.k'
-  s3-turbo-list --delimiter '' --run-manifest run.json list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
-  s3-turbo-list manifest-summary run.json --json
-"#
-            .to_string(),
-        ),
-        "filter" => Ok(
-            r#"Object filters:
-  # Filters are local: they run after S3 listing and before output.
-  # Use prefix/delimiter/max-keys for request-side shaping.
-
-  # Keep objects larger than 1 GiB
-  s3-turbo-list --filter 'SOURCE.size > 1073741824' --delimiter '' list --bucket my-bucket --region us-east-1
-
-  # Keep recently modified objects by epoch seconds
-  s3-turbo-list --filter 'SOURCE.last_modified >= 1715700000' --delimiter '' list --bucket my-bucket --region us-east-1
-
-  # Diff-only: keep rows where source and target sizes differ
-  s3-turbo-list --filter 'SOURCE.size != TARGET.size' diff --bucket left-bucket --region us-east-1 --target-bucket right-bucket --target-region us-east-1
-
-Allowed: SOURCE/TARGET size and last_modified numeric comparisons, arithmetic, &&, ||, !.
-Rejected before network: functions, methods, strings, arrays, maps, indexing, statements, large/deep expressions.
-"#
-            .to_string(),
-        ),
-        "verify" => Ok(
-            r#"Verify a saved run:
-  s3-turbo-list --run-manifest run.json --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-  s3-turbo-list manifest-summary run.json
-  s3-turbo-list manifest-summary run.json --check
-
-Pipe output with a manifest:
-  s3-turbo-list --run-manifest run.json --delimiter '' list --bucket my-bucket --region us-east-1 --output-format ndjson > objects.ndjson
-  s3-turbo-list manifest-summary run.json --check
-"#
-            .to_string(),
-        ),
-        "release-check" | "ci" => Ok(
-            r#"Release check (local only):
-  VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-  ./scripts/check-release-env.sh
-  cargo fmt --check
-  cargo check
-  cargo clippy --all-targets -- -D warnings
-  cargo test
-  cargo build
-  for f in examples/*.sh; do bash -n "$f" || exit 1; done
-  python3 -m py_compile examples/read-parquet.py
-  python3 -m py_compile examples/inspect-trace.py
-
-Benchmark smoke checks:
-  BUILD_MODE=clang OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh
-  BIN=./target/release/s3-turbo-list OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh
-
-Release build on Ubuntu 20.04 arm64:
-  BUILD_MODE=clang ./scripts/build-release.sh
-
-Release publication checks:
-  gh workflow run release-assets.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
-  RUN_ID=$(gh run list --repo hxddh/s3-turbo-list --workflow release-assets.yml --limit 1 --json databaseId --jq '.[0].databaseId')
-  gh run view "$RUN_ID" --repo hxddh/s3-turbo-list --json status,conclusion,jobs
-  ./scripts/verify-release-assets.sh "v${VERSION}"
-  git rev-parse main origin/main "v${VERSION}^{}"
-
-These commands do not contact S3-compatible cloud endpoints.
-"#
-            .to_string(),
-        ),
-        "diff-safe" => Ok(
-            r#"Safe diff:
-  export AWS_PROFILE=default
-  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' diff --bucket source-bucket --region us-east-1 --target-bucket target-bucket --target-region us-east-1
-  s3-turbo-list --run-manifest diff-run.json --output-dir out --delimiter '' diff --bucket source-bucket --region us-east-1 --target-bucket target-bucket --target-region us-east-1
-  s3-turbo-list manifest-summary diff-run.json --check
-"#
-            .to_string(),
-        ),
-        "large-bucket" => Ok(
-            r#"Large bucket:
-  # Key-space partitioning is automatic: the first run probes the bucket
-  # structure at startup, lists in parallel, and caches the boundaries.
-  # The concurrency default (100) is an upper bound the run settles below on
-  # its own; pinning it lower here would cap a large bucket for no reason.
-  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        "local-minio" => Ok(
-            r#"Local MinIO:
-  export AWS_ACCESS_KEY_ID=minioadmin
-  export AWS_SECRET_ACCESS_KEY=minioadmin
-  s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --addressing-style path --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        "agent-safe" => Ok(
-            r#"Agent-safe local commands:
-  s3-turbo-list doctor --json
-  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        other => Err(format!(
-            "unknown guide topic '{}'. Run 's3-turbo-list guide index' to list recipes.",
-            other
-        )),
-    }
+fn profile_names() -> String {
+    profiles::all_profiles()
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_overview() -> String {
-    r#"s3-turbo-list guide
+    format!(
+        r#"s3-turbo-list guide
 
 First run:
-  s3-turbo-list doctor --simple
-  s3-turbo-list init-config --output s3-turbo-list.toml
-  s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-  s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
+  s3-turbo-list doctor
+  s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out --dry-run
+  s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out
 
-Credentials vs endpoint profiles:
-  export AWS_PROFILE=my-credentials-profile
-  s3-turbo-list --profile r2 ...
+Other shapes:
+  list ... --output-format tsv | ndjson     rows on stdout, for pipes
+  list ... --output-format summary          counts only
+  list ... --resume                         continue after Ctrl-C
+  diff --bucket a --target-bucket b ...     one Parquet file with a flag per key
+  manifest-summary run.json --check         verify a run's outputs
 
-More guidance (s3-turbo-list guide <topic>):
-  guide aws | minio | r2 | b2 | oss | bos   provider quickstarts and compat facts
-  guide index                               list all recipes
-  guide filter | release-check | large-bucket
+Credentials come from the AWS SDK chain (AWS_PROFILE, env vars, ...);
+--provider only selects an S3-compatible endpoint preset.
 
-Useful local commands:
-  s3-turbo-list guide <provider>   endpoint-compatibility facts (aws/minio/r2/b2/oss/bos)
-  s3-turbo-list doctor --hints-file hints.toml --json
-  s3-turbo-list manifest-summary run.json --check
-"#
-    .to_string()
-}
-
-fn render_quickstart(provider: &str) -> Result<String, String> {
-    match provider {
-        "aws" => Ok(
-            r#"AWS quickstart:
-1. Set credentials:
-   export AWS_PROFILE=default
-2. Check local setup:
-   s3-turbo-list doctor --simple
-3. Dry-run:
-   s3-turbo-list --dry-run --agent --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-4. First list:
-   s3-turbo-list --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        "minio" => Ok(
-            r#"MinIO quickstart:
-1. Set local credentials:
-   export AWS_ACCESS_KEY_ID=minioadmin
-   export AWS_SECRET_ACCESS_KEY=minioadmin
-2. First list:
-   s3-turbo-list --profile minio --endpoint-url http://127.0.0.1:9000 --addressing-style path --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1
-"#
-            .to_string(),
-        ),
-        "r2" => Ok(
-            r#"Cloudflare R2 quickstart:
-1. Select credentials with AWS_PROFILE, not --profile:
-   export AWS_PROFILE=my-r2-creds
-2. Use --profile r2 for endpoint compatibility defaults:
-   s3-turbo-list --profile r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com --output-dir out --delimiter '' list --bucket my-bucket --region auto
-"#
-            .to_string(),
-        ),
-        "bos" => Ok(
-            r#"BOS quickstart:
-1. Select credentials with AWS_PROFILE, not --profile:
-   export AWS_PROFILE=my-bos-creds
-2. Use virtual-hosted addressing:
-   s3-turbo-list --profile bos --addressing-style virtual --output-dir out --delimiter '' list --bucket my-bucket --region bj
-3. BOS is fully S3 ListObjectsV2 compatible; hinted multi-segment listing and startup discovery run the same as on AWS S3.
-"#
-            .to_string(),
-        ),
-        other => Err(format!(
-            "unknown quickstart '{}'. Valid values: aws, minio, r2, bos.",
-            other
-        )),
-    }
-}
-
-fn ensure_can_write(path: &str, overwrite: bool) -> Result<(), String> {
-    if !overwrite && Path::new(path).exists() {
-        return Err(format!(
-            "Output file exists: {}\nNext step:\n  choose a different --output\n  or pass --overwrite",
-            path
-        ));
-    }
-    Ok(())
-}
-
-fn init_config_warnings(profile: &str) -> Vec<String> {
-    match profile {
-        "oss" | "r2" | "b2" => vec![format!(
-            "{} profile is documented but should be validated with compat-probe before production use",
-            profile
-        )],
-        _ => Vec::new(),
-    }
-}
-
-fn init_config_template(profile: &str) -> String {
-    // Only endpoints the user must supply are written live. A region-
-    // templated profile (bos, b2, oss) derives its endpoint from --region;
-    // writing the template with a `<region>` placeholder blocked every run
-    // until the line was deleted, so it is a comment instead.
-    let endpoint = match profile {
-        "minio" => "http://127.0.0.1:9000",
-        "r2" => "https://<account-id>.r2.cloudflarestorage.com",
-        _ => "",
-    };
-    let derived_endpoint = profiles::get_profile(profile)
-        .and_then(|p| p.endpoint_template)
-        .map(|template| template.replace("{region}", "<region>"));
-    let (addressing, force_path) = if let Some(profile) = profiles::get_profile(profile) {
-        let addressing = profile.recommended_addressing_style.to_string();
-        let force_path = matches!(
-            profile.recommended_addressing_style,
-            crate::config::AddressingStyle::Path
-        );
-        (addressing, force_path.to_string())
-    } else {
-        ("auto".to_string(), "false".to_string())
-    };
-    let endpoint_line = if let Some(derived) = derived_endpoint.filter(|_| endpoint.is_empty()) {
-        format!(
-            "# endpoint_url is derived from --region as {}; set it only to override\n\
-             # endpoint_url = \"{}\"",
-            derived, derived
-        )
-    } else if endpoint.is_empty() {
-        "# endpoint_url = \"https://s3.amazonaws.com\"".to_string()
-    } else {
-        format!("endpoint_url = \"{}\"", endpoint)
-    };
-    let profile_line = if profile == "aws" {
-        "# profile = \"aws\"".to_string()
-    } else {
-        format!("profile = \"{}\"", profile)
-    };
-    format!(
-        r#"# s3-turbo-list local config
-# AWS credentials are selected with AWS_PROFILE or the standard AWS SDK chain.
-# The s3-turbo-list `profile` below is an endpoint compatibility profile.
-
-[runtime]
-max_concurrency = 100
-
-[s3]
-{endpoint_line}
-{profile_line}
-addressing_style = "{addressing}"
-force_path_style = {force_path}
-max_attempts = 10
-initial_backoff_secs = 1
-connect_timeout_secs = 60
-operation_timeout_secs = 5
-
-[output]
-row_group_size = 100000
-compression = "zstd"
-compression_level = 1
-
-[channel]
-capacity = 64
-"#
+Provider quickstarts: s3-turbo-list guide <{}>
+"#,
+        profile_names().replace(", ", "|")
     )
 }
 
-fn append_warnings_and_recommendations(out: &mut String, warnings: &[String], recs: &[String]) {
-    if !warnings.is_empty() {
-        out.push_str("  Warnings:\n");
-        for warning in warnings {
-            out.push_str(&format!("    - {}\n", warning));
-        }
-    }
-    if !recs.is_empty() {
-        out.push_str("  Recommendations:\n");
-        for rec in recs {
-            out.push_str(&format!("    - {}\n", rec));
-        }
-    }
+fn render_quickstart(provider: &str) -> String {
+    // (credentials, provider options, list options). compat-probe takes the
+    // same endpoint options as the listing, so its line reuses them.
+    let (setup, endpoint, list) = match provider {
+        "minio" => (
+            "export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin",
+            "--provider minio --endpoint-url http://127.0.0.1:9000",
+            "--bucket my-bucket --region us-east-1",
+        ),
+        "r2" => (
+            "export AWS_PROFILE=my-r2-credentials",
+            "--provider r2 --endpoint-url https://<account-id>.r2.cloudflarestorage.com",
+            "--bucket my-bucket",
+        ),
+        "bos" => (
+            "export AWS_PROFILE=my-bos-credentials",
+            "--provider bos",
+            "--bucket my-bucket --region bj",
+        ),
+        "b2" => (
+            "export AWS_PROFILE=my-b2-credentials",
+            "--provider b2",
+            "--bucket my-bucket --region us-west-004",
+        ),
+        "oss" => (
+            "export AWS_PROFILE=my-oss-credentials",
+            "--provider oss",
+            "--bucket my-bucket --region oss-cn-beijing",
+        ),
+        _ => (
+            "export AWS_PROFILE=default",
+            "",
+            "--bucket my-bucket --region us-east-1",
+        ),
+    };
+    let global = if endpoint.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", endpoint)
+    };
+    let probe = if endpoint.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  s3-turbo-list {}compat-probe {}   # check the endpoint first\n",
+            global, list
+        )
+    };
+    format!(
+        "{} quickstart:\n  {}\n{}  s3-turbo-list {}list {} --output-dir out\n",
+        provider, setup, probe, global, list
+    )
 }
 
-fn sha256_file(path: &str) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open '{}' for hashing: {}", path, e))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("failed to read '{}' for hashing: {}", path, e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+fn render_profile_facts(profile: &profiles::EndpointProfile) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Provider preset '{}':\n", profile.name));
+    out.push_str(&format!("  provider: {}\n", profile.provider));
+    out.push_str(&format!("  status: {}\n", profile.status));
+    out.push_str(&format!(
+        "  addressing style: {}\n",
+        profile.recommended_addressing_style
+    ));
+    if let Some(template) = profile.endpoint_template {
+        out.push_str(&format!("  endpoint: {} (from --region)\n", template));
+    } else if profile.requires_explicit_endpoint {
+        out.push_str("  endpoint: pass --endpoint-url\n");
     }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-#[cfg(test)]
-mod init_warning_tests {
-    use super::*;
-
-    /// BOS is fully S3 ListObjectsV2 compatible, so `init` must not emit the
-    /// retired "BOS does not enable a pagination workaround" caveat. Guards
-    /// against reintroducing the BOS-specific warning.
-    #[test]
-    fn bos_init_emits_no_compatibility_warning() {
-        assert!(init_config_warnings("bos").is_empty());
+    if let Some(region) = profile.default_region {
+        out.push_str(&format!("  default region: {}\n", region));
     }
+    for note in profile.notes {
+        out.push_str(&format!("  - {}\n", note));
+    }
+    out
 }

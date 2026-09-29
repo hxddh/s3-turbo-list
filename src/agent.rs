@@ -25,6 +25,27 @@ pub enum ExitCode {
     Interrupted = 7,
 }
 
+/// `url` with any `user:password@` userinfo replaced: the command line is
+/// redacted, and the resolved config beside it must not print the same
+/// secret in full.
+pub fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let authority_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| scheme_end + i);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}{}@{}",
+            &url[..scheme_end],
+            REDACTED_ARG_VALUE,
+            &url[scheme_end + at + 1..]
+        ),
+        None => url.to_string(),
+    }
+}
+
 pub fn redacted_command_args() -> Vec<String> {
     redact_command_args(std::env::args())
 }
@@ -95,11 +116,15 @@ pub struct S3Summary {
     pub connect_timeout_secs: u64,
     pub operation_timeout_secs: u64,
     pub endpoint_url: Option<String>,
+    /// Deprecated (0.37): `addressing_style == "path"`.
     pub force_path_style: bool,
     pub addressing_style: String,
+    pub provider: Option<String>,
+    /// Deprecated (0.37): the same value as `provider`.
     pub profile: Option<String>,
     pub profile_known: bool,
     pub profile_warnings: Vec<String>,
+    /// Deprecated (0.37): `trace_compat == "-"`.
     pub debug_s3: bool,
     pub trace_compat: Option<String>,
     pub start_after: Option<String>,
@@ -151,11 +176,12 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 initial_backoff_secs: cfg.s3.initial_backoff_secs,
                 connect_timeout_secs: cfg.s3.connect_timeout_secs,
                 operation_timeout_secs: cfg.s3.operation_timeout_secs,
-                endpoint_url: cfg.s3.endpoint_url.clone(),
-                force_path_style: cfg.s3.force_path_style,
+                endpoint_url: cfg.s3.endpoint_url.as_deref().map(redact_url_userinfo),
+                force_path_style: cfg.s3.force_path_style(),
                 addressing_style: cfg.s3.addressing_style.to_string(),
+                provider: cfg.s3.profile.clone(),
                 profile: cfg.s3.profile.clone(),
-                debug_s3: cfg.s3.debug_s3,
+                debug_s3: cfg.s3.trace_compat.as_deref() == Some("-"),
                 trace_compat: cfg.s3.trace_compat.clone(),
                 start_after: cfg.s3.start_after.clone(),
             },
@@ -217,16 +243,20 @@ pub struct HintsPlan {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckpointPlan {
+    /// The run saves a checkpoint at `path` when it is interrupted.
     pub enabled: bool,
+    /// The run resumes from the checkpoint at `path` (`--resume`).
+    pub resume: bool,
     pub path: Option<String>,
     pub exists: bool,
     pub valid: Option<bool>,
     pub identity_matches: Option<bool>,
     pub identity_mismatches: Vec<String>,
+    /// Deprecated (0.37): always null; checkpoints record key ranges.
     pub completed_segments: Option<usize>,
+    /// Deprecated (0.37): always null.
     pub total_segments: Option<usize>,
-    /// Key ranges a resume would list (checkpoints written by 0.36+, which
-    /// record the unwritten key space instead of completed segment indices).
+    /// Key ranges a resume would list.
     pub remaining_ranges: Option<usize>,
     pub identity_fields: Vec<String>,
     /// Segments this run skipped because a checkpoint recorded them complete.
@@ -400,43 +430,6 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
-pub fn conventional_hints_path(bucket: &str, region: Option<&str>) -> String {
-    let bucket = sanitize_path_component(bucket);
-    match region {
-        Some(r) => format!("{}_{}_hints.toml", sanitize_path_component(r), bucket),
-        None => format!("{}_hints.toml", bucket),
-    }
-}
-
-/// Conventional hints cache path for a run listing under `prefix`.
-///
-/// Boundaries only partition the range the run actually lists, so a cache
-/// generated under one prefix is useless (and badly skewed) for another:
-/// every boundary sorts outside the other prefix's range, leaving one segment
-/// with all the keys and the rest issuing empty requests. Prefixed runs
-/// therefore get their own cache file. A whole-bucket run keeps the plain
-/// path, so existing caches stay valid.
-pub fn conventional_hints_path_for_prefix(
-    bucket: &str,
-    region: Option<&str>,
-    prefix: &str,
-) -> String {
-    if prefix.is_empty() {
-        return conventional_hints_path(bucket, region);
-    }
-    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
-    let bucket = sanitize_path_component(bucket);
-    match region {
-        Some(r) => format!(
-            "{}_{}_{}_hints.toml",
-            sanitize_path_component(r),
-            bucket,
-            &digest[..8]
-        ),
-        None => format!("{}_{}_hints.toml", bucket, &digest[..8]),
-    }
-}
-
 pub fn sanitize_path_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -459,9 +452,8 @@ pub fn sanitize_path_component(value: &str) -> String {
 /// order of decisions (see the hints/discovery block in `main`).
 pub struct HintsPlanInputs<'a> {
     pub explicit_hints_file: Option<&'a str>,
-    pub bucket: Option<&'a str>,
-    pub region: Option<&'a str>,
-    pub prefix: &'a str,
+    /// A run command with a bucket (not a local tool).
+    pub listing: bool,
     pub no_auto_hints: bool,
     /// `--start-after` or `--continuation-token`: one sequential chain.
     pub single_chain: bool,
@@ -472,9 +464,7 @@ pub struct HintsPlanInputs<'a> {
 pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     let HintsPlanInputs {
         explicit_hints_file,
-        bucket,
-        region,
-        prefix,
+        listing,
         no_auto_hints,
         single_chain,
         delimited,
@@ -523,40 +513,19 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     if no_auto_hints {
         return plan_without_hints(
             "disabled_single_segment_fallback",
-            "--no-auto-hints skips the hints cache and startup discovery; the run starts as \
-             one segment and relies on runtime splitting to fan out",
+            "--no-auto-hints skips startup discovery; the run starts as one segment and \
+             relies on runtime splitting to fan out",
         );
     }
 
-    if let Some(bucket) = bucket {
-        let path = conventional_hints_path_for_prefix(bucket, region, prefix);
-        let exists = Path::new(&path).exists();
-        let report = exists.then(|| inspect_hints_for_plan(&path)).flatten();
-        return HintsPlan {
-            // No cache: the run probes the bucket's structure at startup and
-            // partitions from what it finds (then caches it here), so this is
-            // not a single-segment plan.
-            source: if exists {
-                "auto_cache"
-            } else {
-                "startup_discovery"
-            }
-            .to_string(),
-            path: Some(path),
-            exists,
-            valid: report.as_ref().map(|r| r.valid),
-            format: report
-                .as_ref()
-                .map(|r| format!("{:?}", r.format).to_lowercase()),
-            boundary_count: report.as_ref().map(|r| r.boundary_count),
-            warnings: report.map(|r| r.warnings).unwrap_or_else(|| {
-                vec![
-                    "no cached hints; flat list runs probe bucket structure at startup \
-                     and cache the discovered boundaries here"
-                        .to_string(),
-                ]
-            }),
-        };
+    if listing {
+        // The run probes the bucket's structure at startup (every run: there
+        // is no cache) and partitions from what it finds.
+        return plan_without_hints(
+            "startup_discovery",
+            "startup discovery partitions the key space from the bucket's structure \
+             (a few delimiter or single-key probes); runtime splitting covers skew",
+        );
     }
 
     HintsPlan {
@@ -570,32 +539,17 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     }
 }
 
-pub fn diff_per_side_hints_plan(
-    bucket: Option<&str>,
-    region: Option<&str>,
-    prefix: &str,
-) -> HintsPlan {
-    let path = bucket.map(|bucket| conventional_hints_path_for_prefix(bucket, region, prefix));
-    let exists = path
-        .as_deref()
-        .map(|path| Path::new(path).exists())
-        .unwrap_or(false);
-    let report = path
-        .as_deref()
-        .filter(|_| exists)
-        .and_then(inspect_hints_for_plan);
-
+pub fn diff_per_side_hints_plan() -> HintsPlan {
     HintsPlan {
         source: "diff_per_side_automatic".to_string(),
-        path,
-        exists,
-        valid: report.as_ref().map(|r| r.valid),
-        format: report
-            .as_ref()
-            .map(|r| format!("{:?}", r.format).to_lowercase()),
-        boundary_count: report.as_ref().map(|r| r.boundary_count),
+        path: None,
+        exists: false,
+        valid: None,
+        format: None,
+        boundary_count: None,
         warnings: vec![
-            "diff partitions each side automatically (cached hints or startup discovery); explicit --hints-file and --resume remain unsupported for diff"
+            "diff partitions each side with startup discovery; --hints-file and --resume \
+             are list-only"
                 .to_string(),
         ],
     }
@@ -608,6 +562,7 @@ fn inspect_hints_for_plan(path: &str) -> Option<hints::HintsValidationReport> {
 pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> CheckpointPlan {
     CheckpointPlan {
         enabled,
+        resume: false,
         path,
         exists: false,
         valid: None,
@@ -634,13 +589,16 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
     }
 }
 
+/// `resume`: whether the run reads the checkpoint at `path`; `path`: where
+/// the run saves one on interrupt (`None` for runs that cannot resume).
 pub fn checkpoint_plan(
-    enabled: bool,
+    resume: bool,
     path: Option<String>,
     current_identity: Option<&CheckpointIdentity>,
     resumed_segments_skipped: Option<usize>,
 ) -> CheckpointPlan {
-    let mut plan = default_checkpoint_plan(enabled, path.clone());
+    let mut plan = default_checkpoint_plan(path.is_some(), path.clone());
+    plan.resume = resume;
     plan.resumed_segments_skipped = resumed_segments_skipped;
     let Some(path) = path else {
         return plan;
@@ -653,8 +611,6 @@ pub fn checkpoint_plan(
     match CheckpointJournal::load(&path) {
         Some(journal) => {
             plan.valid = Some(true);
-            plan.completed_segments = Some(journal.completed_indices.len());
-            plan.total_segments = Some(journal.total_segments);
             plan.remaining_ranges = journal.remaining.as_ref().map(Vec::len);
             if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
                 let mismatches = stored.diff(current);
@@ -708,11 +664,8 @@ pub fn output_path_problem(path: &str) -> Option<String> {
     // An existing target is opened in place, so its own permissions decide,
     // not its directory's: `/dev/null` is writable although macOS's `/dev`
     // is mode 555.
-    if let Ok(meta) = std::fs::metadata(target) {
-        return meta
-            .permissions()
-            .readonly()
-            .then(|| format!("'{}' is read-only", path));
+    if target.exists() {
+        return (!writable(target)).then(|| format!("'{}' is not writable", path));
     }
     let mut ancestor = target
         .parent()
@@ -726,8 +679,11 @@ pub fn output_path_problem(path: &str) -> Option<String> {
                     ancestor.display()
                 ));
             }
-            Ok(meta) if meta.permissions().readonly() => {
-                return Some(format!("directory '{}' is read-only", ancestor.display()));
+            Ok(_) if !writable(ancestor) => {
+                return Some(format!(
+                    "directory '{}' is not writable",
+                    ancestor.display()
+                ));
             }
             Ok(_) => return None,
             Err(_) => ancestor = ancestor.parent().filter(|p| !p.as_os_str().is_empty())?,
@@ -743,8 +699,25 @@ fn output_parent(path: &str) -> Option<PathBuf> {
 }
 
 fn parent_writable(path: PathBuf) -> Option<bool> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(!metadata.permissions().readonly())
+    path.exists().then(|| writable(&path))
+}
+
+/// Whether this process may write `path` (a file, or a directory to create
+/// files in). Mode bits alone are wrong both ways: root writes a mode-444
+/// file, and an ACL can grant or deny what the bits say.
+#[cfg(unix)]
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn writable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// The `.partN` paths a pooled list run's extra writers streamed to, given the
@@ -820,8 +793,9 @@ fn summarize_artifact(kind: &str, path: &str) -> ArtifactSummary {
     }
 }
 
-fn sha256_file(path: &str) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+pub fn sha256_file(path: &str) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open '{}' for hashing: {}", path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -910,64 +884,31 @@ pub fn doctor_report(
         },
         None => DoctorCheck {
             name: "config_file".to_string(),
-            status: "warn".to_string(),
-            message: "no config file loaded (searched ./s3-turbo-list.toml and \
-                      ~/.s3-turbo-list.toml); built-in defaults apply — run init-config \
-                      for a starter config"
+            status: "ok".to_string(),
+            message: "no config file (searched ./s3-turbo-list.toml and \
+                      ~/.s3-turbo-list.toml); built-in defaults apply"
                 .to_string(),
         },
     });
+    // Credentials come from the SDK chain whether or not AWS_PROFILE is set:
+    // an unset AWS_PROFILE is the normal case, not a warning.
     checks.push(DoctorCheck {
         name: "aws_profile".to_string(),
-        status: if std::env::var("AWS_PROFILE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
-            "ok"
-        } else {
-            "warn"
-        }
-        .to_string(),
+        status: "ok".to_string(),
         message: std::env::var("AWS_PROFILE")
             .ok()
             .filter(|v| !v.is_empty())
             .map(|v| format!("AWS_PROFILE={}", v))
             .unwrap_or_else(|| {
-                "AWS_PROFILE is not set; the AWS SDK will use its default credential chain"
-                    .to_string()
+                "AWS_PROFILE is not set; the AWS SDK uses its default credential chain".to_string()
             }),
     });
-    if let Some(profile) = std::env::var("AWS_PROFILE")
-        .ok()
-        .filter(|value| profiles::is_endpoint_preset_name(value))
-    {
-        checks.push(DoctorCheck {
-            name: "aws_profile_endpoint_preset_name".to_string(),
-            status: "warn".to_string(),
-            message: format!(
-                "AWS_PROFILE={} also matches an endpoint compatibility preset name; verify this is your credentials profile, not a --profile value pasted into AWS_PROFILE",
-                profile
-            ),
-        });
-    }
     checks.push(DoctorCheck {
-        name: "endpoint_profile".to_string(),
-        status: match cfg.s3.profile.as_deref() {
-            Some(name) if profiles::get_profile(name).is_some() => "ok",
-            Some(_) => "warn",
-            None => "ok",
-        }
-        .to_string(),
-        message: match cfg.s3.profile.as_deref() {
-            Some(name) if profiles::get_profile(name).is_some() => {
-                format!("endpoint compatibility profile '{}' is known", name)
-            }
-            Some(name) => format!(
-                "endpoint compatibility profile '{}' is unknown; this is not an AWS credentials profile",
-                name
-            ),
-            None => "no endpoint compatibility profile selected".to_string(),
+        name: "provider".to_string(),
+        status: "ok".to_string(),
+        message: match cfg.s3.profile.as_deref().and_then(profiles::get_profile) {
+            Some(profile) => format!("provider preset '{}' ({})", profile.name, profile.provider),
+            None => "no provider preset; plain S3 settings apply".to_string(),
         },
     });
     checks.push(endpoint_url_check(cfg));
@@ -1072,7 +1013,7 @@ fn proxy_check(cfg: &S3TurboConfig) -> DoctorCheck {
                 "endpoint_url is still a template; proxy rules are checked once it is a real URL",
             );
         }
-        Some(e) if cfg.s3.force_path_style => e,
+        Some(e) if cfg.s3.force_path_style() => e,
         _ => {
             return skipped(
                 "the request host depends on the bucket and region (virtual-hosted or AWS \
@@ -1108,7 +1049,7 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
                 status: "error".to_string(),
                 message: format!(
                     "endpoint_url contains template placeholders and must be edited before a real run: {}",
-                    endpoint
+                    redact_url_userinfo(endpoint)
                 ),
             };
         }
@@ -1150,29 +1091,24 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
     DoctorCheck {
         name: "endpoint_url".to_string(),
         status: "ok".to_string(),
-        message: "no explicit endpoint URL required by the selected profile".to_string(),
+        message: "no explicit endpoint URL required by the provider preset".to_string(),
     }
 }
 
+/// The same test the dry run applies (`output_path_problem`): the run
+/// creates missing parent directories itself, and fails on a path that is a
+/// directory or under an unwritable or non-directory ancestor.
 fn parent_dir_check(name: &str, path: &str) -> DoctorCheck {
-    let parent = Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty());
-    match parent {
-        Some(parent) if !parent.exists() => DoctorCheck {
+    match output_path_problem(path) {
+        Some(problem) => DoctorCheck {
             name: name.to_string(),
             status: "error".to_string(),
-            message: format!("parent directory does not exist: {}", parent.display()),
-        },
-        Some(parent) => DoctorCheck {
-            name: name.to_string(),
-            status: "ok".to_string(),
-            message: format!("parent directory exists: {}", parent.display()),
+            message: format!("output '{}' cannot be created: {}", path, problem),
         },
         None => DoctorCheck {
             name: name.to_string(),
             status: "ok".to_string(),
-            message: "path is relative to current directory".to_string(),
+            message: format!("output '{}' can be created", path),
         },
     }
 }
@@ -1221,7 +1157,7 @@ mod tests {
         assert_eq!(url, "http://127.0.0.1:9000/my-bucket");
     }
 
-    use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
+    use super::redact_command_args;
 
     fn parquet_outputs(base: &str) -> super::OutputPathSummary {
         super::OutputPathSummary {
@@ -1307,36 +1243,6 @@ mod tests {
             "out.part{}.parquet",
             super::super::data_map::MAX_LIST_OUTPUT_WORKERS - 1
         )));
-    }
-
-    #[test]
-    fn hints_cache_path_is_scoped_to_the_listing_prefix() {
-        // A whole-bucket run keeps the historical path, so caches written by
-        // earlier versions stay valid.
-        assert_eq!(
-            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), ""),
-            conventional_hints_path("my-bucket", Some("us-east-1"))
-        );
-        // Prefixed runs get their own file: boundaries under one prefix sort
-        // outside every other prefix's range.
-        let logs = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/");
-        let data = conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "data/");
-        assert_ne!(
-            logs,
-            conventional_hints_path("my-bucket", Some("us-east-1"))
-        );
-        assert_ne!(logs, data);
-        assert!(logs.starts_with("us-east-1_my-bucket_"), "{}", logs);
-        assert!(logs.ends_with("_hints.toml"), "{}", logs);
-        // Stable across calls, and defined without a region too.
-        assert_eq!(
-            logs,
-            conventional_hints_path_for_prefix("my-bucket", Some("us-east-1"), "logs/")
-        );
-        assert_ne!(
-            conventional_hints_path_for_prefix("my-bucket", None, "logs/"),
-            conventional_hints_path("my-bucket", None)
-        );
     }
 
     #[test]
@@ -1438,11 +1344,28 @@ mod tests {
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Opened in place: the read-only directory does not matter (macOS /dev).
         assert_eq!(super::output_path_problem(existing.to_str().unwrap()), None);
-        // A new file still needs a writable directory.
+        // Root writes regardless of mode bits, and so does the run: the check
+        // must agree with it (it used to block a run that would succeed).
+        let root = unsafe { libc::geteuid() } == 0;
         let fresh = ro.join("new.ks");
-        assert!(super::output_path_problem(fresh.to_str().unwrap()).is_some());
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o444)).unwrap();
-        assert!(super::output_path_problem(existing.to_str().unwrap()).is_some());
+        for path in [&fresh, &existing] {
+            assert_eq!(
+                super::output_path_problem(path.to_str().unwrap()).is_some(),
+                !root,
+                "{}",
+                path.display()
+            );
+        }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn redact_url_userinfo_hides_credentials_only() {
+        use super::redact_url_userinfo as r;
+        assert_eq!(r("http://u:pw@h:9000/x"), "http://<redacted>@h:9000/x");
+        assert_eq!(r("https://h.example/a@b"), "https://h.example/a@b");
+        assert_eq!(r("https://h.example"), "https://h.example");
+        assert_eq!(r("not a url"), "not a url");
     }
 }

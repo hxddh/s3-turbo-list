@@ -21,16 +21,22 @@ fn make_identity(
     )
 }
 
-fn make_journal(identity: CheckpointIdentity, completed: Vec<usize>) -> CheckpointJournal {
+fn make_journal(identity: CheckpointIdentity, remaining: &[&str]) -> CheckpointJournal {
     CheckpointJournal {
         bucket: "test-bucket".into(),
         prefix: "".into(),
-        total_segments: 4,
-        completed_indices: completed,
         last_updated: String::new(),
         identity: Some(identity),
-        remaining: None,
-        listed_ranges: None,
+        remaining: Some(
+            remaining
+                .iter()
+                .map(|start| checkpoint::ResumeRange {
+                    start_after: start.to_string(),
+                    end: None,
+                })
+                .collect(),
+        ),
+        listed_ranges: Some(2),
     }
 }
 
@@ -49,12 +55,12 @@ fn test_identity_exact_match_accepts() {
         Some("path"),
         Some("list"),
     );
-    let journal = make_journal(id.clone(), vec![0, 2]);
+    let journal = make_journal(id.clone(), &["m"]);
     journal.save(path_str).unwrap();
 
     let loaded = CheckpointJournal::load_and_verify(path_str, &id);
     assert!(loaded.is_some());
-    assert_eq!(loaded.unwrap().completed_indices, vec![0, 2]);
+    assert_eq!(loaded.unwrap().remaining.unwrap()[0].start_after, "m");
 }
 
 // ── Identity mismatch — each field separately ─────────────
@@ -66,7 +72,7 @@ fn test_identity_delimiter_mismatch_rejects() {
     let path_str = path.to_str().unwrap();
 
     let stored = make_identity(Some("/"), None, None, None, None);
-    let journal = make_journal(stored, vec![0]);
+    let journal = make_journal(stored, &["m"]);
     journal.save(path_str).unwrap();
 
     let current = make_identity(Some("#"), None, None, None, None);
@@ -80,7 +86,7 @@ fn test_identity_max_keys_mismatch_rejects() {
     let path_str = path.to_str().unwrap();
 
     let stored = make_identity(None, Some(100), None, None, None);
-    let journal = make_journal(stored, vec![0]);
+    let journal = make_journal(stored, &["m"]);
     journal.save(path_str).unwrap();
 
     let current = make_identity(None, Some(500), None, None, None);
@@ -94,7 +100,7 @@ fn test_identity_profile_mismatch_rejects() {
     let path_str = path.to_str().unwrap();
 
     let stored = make_identity(None, None, Some("bos"), None, None);
-    let journal = make_journal(stored, vec![0]);
+    let journal = make_journal(stored, &["m"]);
     journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, Some("minio"), None, None);
@@ -108,7 +114,7 @@ fn test_identity_mode_mismatch_rejects() {
     let path_str = path.to_str().unwrap();
 
     let stored = make_identity(None, None, None, None, Some("list"));
-    let journal = make_journal(stored, vec![0]);
+    let journal = make_journal(stored, &["m"]);
     journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, None, None, Some("bidir"));
@@ -122,7 +128,7 @@ fn test_identity_addressing_style_mismatch_rejects() {
     let path_str = path.to_str().unwrap();
 
     let stored = make_identity(None, None, None, Some("path"), None);
-    let journal = make_journal(stored, vec![0]);
+    let journal = make_journal(stored, &["m"]);
     journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, None, Some("virtual"), None);
@@ -161,11 +167,9 @@ fn test_legacy_checkpoint_blank_identity_rejects() {
     let journal = CheckpointJournal {
         bucket: "test-bucket".into(),
         prefix: "".into(),
-        total_segments: 4,
-        completed_indices: vec![0, 2],
         last_updated: String::new(),
         identity: None,
-        remaining: None,
+        remaining: Some(Vec::new()),
         listed_ranges: None,
     };
     journal.save(path_str).unwrap();
@@ -181,95 +185,6 @@ fn test_checkpoint_path_format() {
 
     let path_without_region = checkpoint::checkpoint_path("my-bucket", None);
     assert_eq!(path_without_region, "my-bucket_checkpoint.toml");
-}
-
-// ── Boundary-set verification ─────────────────────────────
-//
-// Completed segment indices are positional: carrying a checkpoint over to a
-// different boundary set marks ranges complete that were never listed.  The
-// segment count alone does not catch it — flat-namespace bisection always
-// produces exactly `target` boundaries, so two runs of a bucket that took
-// writes in between agree on the count and disagree on every boundary.
-
-fn journal_for(boundaries: &[String], completed: Vec<usize>) -> CheckpointJournal {
-    let identity =
-        make_identity(Some(""), None, None, Some("path"), Some("list")).with_boundaries(boundaries);
-    CheckpointJournal {
-        bucket: "test-bucket".into(),
-        prefix: "".into(),
-        total_segments: boundaries.len() + 1,
-        completed_indices: completed,
-        last_updated: String::new(),
-        identity: Some(identity),
-        remaining: None,
-        listed_ranges: None,
-    }
-}
-
-fn boundaries(values: &[&str]) -> Vec<String> {
-    values.iter().map(|v| v.to_string()).collect()
-}
-
-#[test]
-fn test_same_boundaries_resume_accepted() {
-    let current = boundaries(&["obj-0050", "obj-0100", "obj-0150"]);
-    let journal = journal_for(&current, vec![0, 2]);
-    assert!(journal.verify_segments(&current, current.len() + 1));
-}
-
-#[test]
-fn test_same_count_different_boundaries_rejected() {
-    let recorded = boundaries(&["obj-0050", "obj-0100", "obj-0150"]);
-    let journal = journal_for(&recorded, vec![0, 2]);
-    // Same segment count, every boundary shifted — the old count-only guard
-    // accepted this and silently skipped whatever indices 0 and 2 now cover.
-    let current = boundaries(&["obj-0060", "obj-0120", "obj-0180"]);
-    assert_eq!(recorded.len(), current.len());
-    assert!(!journal.verify_segments(&current, current.len() + 1));
-}
-
-#[test]
-fn test_segment_count_mismatch_still_rejected() {
-    let recorded = boundaries(&["a/", "b/"]);
-    let journal = journal_for(&recorded, vec![0]);
-    let current = boundaries(&["a/", "b/", "c/"]);
-    assert!(!journal.verify_segments(&current, current.len() + 1));
-}
-
-#[test]
-fn test_checkpoint_without_boundary_digest_rejected() {
-    // Written by a version that recorded no fingerprint: the boundary set it
-    // resumed against cannot be verified, so it is discarded.
-    let current = boundaries(&["a/", "b/"]);
-    let identity = make_identity(Some(""), None, None, Some("path"), Some("list"));
-    let journal = CheckpointJournal {
-        bucket: "test-bucket".into(),
-        prefix: "".into(),
-        total_segments: current.len() + 1,
-        completed_indices: vec![0],
-        last_updated: String::new(),
-        identity: Some(identity),
-        remaining: None,
-        listed_ranges: None,
-    };
-    assert!(!journal.verify_segments(&current, current.len() + 1));
-}
-
-#[test]
-fn test_boundaries_digest_is_order_and_separator_sensitive() {
-    // "ab" + "c" must not collide with "a" + "bc".
-    assert_ne!(
-        checkpoint::boundaries_digest(&boundaries(&["ab", "c"])),
-        checkpoint::boundaries_digest(&boundaries(&["a", "bc"]))
-    );
-    assert_ne!(
-        checkpoint::boundaries_digest(&boundaries(&["a", "b"])),
-        checkpoint::boundaries_digest(&boundaries(&["b", "a"]))
-    );
-    assert_eq!(
-        checkpoint::boundaries_digest(&boundaries(&["a", "b"])),
-        checkpoint::boundaries_digest(&boundaries(&["a", "b"]))
-    );
 }
 
 #[test]
@@ -309,11 +224,9 @@ fn test_checkpoint_identity_includes_endpoint() {
     let journal = CheckpointJournal {
         bucket: "b".into(),
         prefix: String::new(),
-        total_segments: 2,
-        completed_indices: vec![0],
         last_updated: "now".into(),
         identity: Some(id(Some("http://x:9000"))),
-        remaining: None,
+        remaining: Some(Vec::new()),
         listed_ranges: None,
     };
     journal.save(path_str).unwrap();

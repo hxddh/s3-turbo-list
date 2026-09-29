@@ -49,66 +49,6 @@ pub fn parse_hints_file(path: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Load the conventional hints cache, rejecting one generated for a different
-/// listing prefix.  The cache path is prefix-scoped, but a cache written by an
-/// older version — which keyed the path on bucket and region alone — can still
-/// sit at the whole-bucket path with a `prefix` recorded inside it.  Its
-/// boundaries all sort outside this run's range, which costs an empty request
-/// per segment and concentrates every key in one of them.
-pub fn parse_conventional_hints_file(path: &str, prefix: &str) -> Result<Vec<String>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read hints file '{}': {}", path, e))?;
-
-    if !looks_like_toml_hints(&content) {
-        // Plain files carry no provenance; they are user-managed, so they are
-        // taken at face value exactly as `--hints-file` would.
-        return parse_as_plain(path, &content);
-    }
-
-    let cache = parse_toml_cache(path, &content)?;
-    let cached_prefix = cache.prefix.as_deref().unwrap_or("");
-    if cached_prefix != prefix {
-        return Err(format!(
-            "hints cache '{}' was generated for prefix '{}' but this run lists prefix '{}'",
-            path, cached_prefix, prefix
-        ));
-    }
-    warn_if_stale(path, &cache.generated_at);
-    // Segments are consecutive boundary pairs: an unsorted or duplicated
-    // (hand-edited) cache made ranges overlap and listed keys twice. The
-    // `--hints-file` TOML path already normalized; this one did not.
-    let mut boundaries = cache.boundaries;
-    boundaries.sort();
-    boundaries.dedup();
-    info!(
-        "Loaded {} key-space boundaries from TOML hints cache '{}'",
-        boundaries.len(),
-        path
-    );
-    Ok(boundaries)
-}
-
-/// Age past which a cache is worth a word.  Boundaries are cut points in a
-/// bucket that keeps changing — flat-namespace boundaries are literal object
-/// keys — so an old cache still partitions correctly but increasingly
-/// unevenly, and nothing else would ever say so.
-const HINTS_CACHE_STALE_DAYS: i64 = 30;
-
-fn warn_if_stale(path: &str, generated_at: &str) {
-    let Ok(generated) = chrono::DateTime::parse_from_rfc3339(generated_at) else {
-        return;
-    };
-    let age_days = (chrono::Utc::now() - generated.with_timezone(&chrono::Utc)).num_days();
-    if age_days >= HINTS_CACHE_STALE_DAYS {
-        log::warn!(
-            "Hints cache '{}' was generated {} days ago; segments may have drifted with the \
-             bucket — delete it to re-derive boundaries at startup",
-            path,
-            age_days
-        );
-    }
-}
-
 pub fn inspect_hints_file(
     path: &str,
     preview_limit: usize,
@@ -488,22 +428,6 @@ generated_at = "2026-01-01T00:00:00Z"
     }
 
     #[test]
-    fn test_conventional_toml_cache_sorts_dedups_and_rejects_empty() {
-        let content =
-            "bucket = \"b\"\ngenerated_at = \"x\"\nboundaries = [\"k003\", \"k001\", \"k003\"]\n";
-        let (_dir, path) = write_tmp(content);
-        assert_eq!(
-            parse_conventional_hints_file(&path, "").unwrap(),
-            vec!["k001".to_string(), "k003".to_string()]
-        );
-        // An empty boundary would end a segment "unbounded" and list keys twice.
-        let content = "bucket = \"b\"\ngenerated_at = \"x\"\nboundaries = [\"\", \"k003\"]\n";
-        let (_dir, path) = write_tmp(content);
-        assert!(parse_conventional_hints_file(&path, "").is_err());
-        assert!(parse_hints_file(&path).is_err());
-    }
-
-    #[test]
     fn test_parse_toml_hints_fails_on_malformed() {
         let content = "boundaries = [\n    alpha,\n    beta\n";
         let (_dir, path) = write_tmp(content);
@@ -559,78 +483,6 @@ generated_at = "2026-01-01T00:00:00Z"
         assert_eq!(report.boundary_count, 2);
         assert!(report.warnings.iter().any(|w| w.contains("not sorted")));
         assert!(report.warnings.iter().any(|w| w.contains("duplicate")));
-    }
-
-    #[test]
-    fn test_conventional_cache_rejects_other_prefix() {
-        let content = r#"bucket = "b"
-region = "r"
-prefix = "logs/"
-boundaries = ["logs/a", "logs/b"]
-generated_at = "2026-01-01T00:00:00Z"
-"#;
-        let (_dir, path) = write_tmp(content);
-        // A cache written under logs/ describes boundaries that all sort
-        // outside a whole-bucket run's useful range.
-        let err = parse_conventional_hints_file(&path, "").unwrap_err();
-        assert!(err.contains("generated for prefix 'logs/'"), "{}", err);
-        // The run it was generated for still loads it.
-        assert_eq!(
-            parse_conventional_hints_file(&path, "logs/").unwrap(),
-            vec!["logs/a", "logs/b"]
-        );
-    }
-
-    #[test]
-    fn test_conventional_cache_without_prefix_field_is_whole_bucket() {
-        let content = r#"bucket = "b"
-boundaries = ["a/", "b/"]
-generated_at = "2026-01-01T00:00:00Z"
-"#;
-        let (_dir, path) = write_tmp(content);
-        assert_eq!(
-            parse_conventional_hints_file(&path, "").unwrap(),
-            vec!["a/", "b/"]
-        );
-        assert!(parse_conventional_hints_file(&path, "logs/").is_err());
-    }
-
-    #[test]
-    fn test_conventional_cache_stale_warning_does_not_reject() {
-        // Stale is a warning, never a rejection: an old cache still
-        // partitions the key space correctly, just less evenly.
-        let content = r#"bucket = "b"
-boundaries = ["a/", "b/"]
-generated_at = "2020-01-01T00:00:00Z"
-"#;
-        let (_dir, path) = write_tmp(content);
-        assert_eq!(
-            parse_conventional_hints_file(&path, "").unwrap(),
-            vec!["a/", "b/"]
-        );
-    }
-
-    #[test]
-    fn test_conventional_cache_unparseable_timestamp_is_not_fatal() {
-        let content = r#"bucket = "b"
-boundaries = ["a/"]
-generated_at = "not-a-timestamp"
-"#;
-        let (_dir, path) = write_tmp(content);
-        assert_eq!(
-            parse_conventional_hints_file(&path, "").unwrap(),
-            vec!["a/"]
-        );
-    }
-
-    #[test]
-    fn test_conventional_cache_plain_file_is_taken_at_face_value() {
-        // Plain files carry no provenance and are user-managed.
-        let (_dir, path) = write_tmp("alpha/\nbeta/\n");
-        assert_eq!(
-            parse_conventional_hints_file(&path, "logs/").unwrap(),
-            vec!["alpha/", "beta/"]
-        );
     }
 
     #[test]

@@ -28,47 +28,54 @@ Download the binary for your platform from the
 [GitHub release](https://github.com/hxddh/s3-turbo-list/releases), verify it
 against `SHA256SUMS`, and put it on your `PATH`. Credentials come from the
 standard AWS SDK chain (`AWS_PROFILE`, environment variables, or instance
-roles). Platform-specific steps and provider configuration are in
-[INSTALL.md](INSTALL.md). Build from source with `cargo build --release`
-(see [BUILD.md](BUILD.md) for the Ubuntu 20.04 aarch64 workaround).
+roles). Platform-specific steps are in [INSTALL.md](INSTALL.md). Build from
+source with `cargo build --release` (see
+[`docs/releasing.md`](docs/releasing.md) for the Ubuntu 20.04 aarch64
+workaround).
 
 ## Quick start
 
 ```bash
 # Local preflight — no S3 access
-s3-turbo-list doctor --simple
+s3-turbo-list doctor
 
 # Full recursive inventory → Parquet + keyspace CSV in out/
 export AWS_PROFILE=default
-s3-turbo-list --output-dir out list --region us-east-2 --bucket my-bucket
+s3-turbo-list list --bucket my-bucket --region us-east-2 --output-dir out
+
+# Preview the same run as a JSON plan, without contacting S3
+s3-turbo-list list --bucket my-bucket --region us-east-2 --output-dir out --dry-run
 
 # Count objects and bytes without writing files
-s3-turbo-list --summary-only list --region us-east-2 --bucket my-bucket
+s3-turbo-list list --bucket my-bucket --region us-east-2 --output-format summary
 
 # Stream rows to shell tools instead of Parquet
-s3-turbo-list list --region us-east-2 --bucket my-bucket \
+s3-turbo-list list --bucket my-bucket --region us-east-2 \
   --output-format ndjson > objects.ndjson
 ```
 
-Listing is recursive by default. Use `--delimiter '/'` for a hierarchical
-listing: the objects at that level plus one row per `CommonPrefix` ("folder"),
-whose `Key` ends with the delimiter and whose `Size`/`LastModified` are 0 and
-`ETag` empty. Folder rows count in `streamed_rows` but not in the KS object
-counts or `bytes_total`. Preview any run without
-contacting S3 by adding `--dry-run --agent`. `guide` prints command examples,
-`init-config` writes a starter config, and `completions`/`man` generate shell
-completions and a man page.
+Options follow the command name, and each command's `--help` lists only
+what it takes. `--config`, `--provider`, `--endpoint-url` and
+`--addressing-style` are global and may go on either side of it.
 
-Output files are auto-named:
+Listing is recursive by default; `--prefix logs/2026/` narrows it. Use
+`--delimiter '/'` for a hierarchical listing: the objects at that level plus
+one row per `CommonPrefix` ("folder"), whose `Key` ends with the delimiter and
+whose `Size`/`LastModified` are 0 and `ETag` empty. Folder rows count in
+`streamed_rows` but not in the KS object counts or `bytes_total`. `guide`
+prints a quickstart overview and per-provider pages, and `completions`/`man`
+generate shell completions and a man page.
+
+Output files are auto-named in `--output-dir` (else the working directory):
 
 - `<region>_<bucket>_<timestamp>.parquet` — the object listing
 - `<region>_<bucket>_<timestamp>.ks` — per-prefix object counts (CSV)
 
-A `--prefix` run adds a short hash of the prefix (`…_<bucket>_p1a2b3c4d_<timestamp>`),
-so parallel runs over different prefixes never share a name, and a name
-already taken in the output directory gets a `_N` suffix rather than
-overwriting another run's files. `--log` writes `turbo_list_<timestamp>.log`
-into `--output-dir` when one is given.
+A `--prefix` run adds a short hash of the prefix
+(`…_<bucket>_p1a2b3c4d_<timestamp>`), and a name already taken gets a `_N`
+suffix; names are reserved atomically, so concurrent runs never share one.
+With `--output-parquet-file out/list.parquet` the KeySpace file is written
+beside it as `out/list.ks`. `--log` writes `<name>.log` beside the outputs.
 
 ## Output
 
@@ -77,8 +84,8 @@ into `--output-dir` when one is given.
 | Parquet (default) | `list` | Parquet + KS files; streaming, bounded memory. |
 | TSV | `list --output-format tsv` | `key<TAB>size<TAB>epoch` on stdout. |
 | NDJSON | `list --output-format ndjson` | `{"k":…,"s":…,"m":…}` on stdout. |
-| Summary | `--summary-only` | Aggregate metrics only (objects, bytes, top prefixes). |
-| Dry run | `--dry-run` | Plan only; no S3 requests. |
+| Summary | `list --output-format summary` | Aggregate metrics only (objects, bytes, top prefixes). |
+| Dry run | `--dry-run` | JSON plan on stdout; no S3 requests. |
 
 The Parquet schema is five columns:
 
@@ -130,11 +137,11 @@ filtered populations into one output file, and the run manifest records the
 expression under `inputs.filter`.
 
 ```bash
-s3-turbo-list --filter 'SOURCE.size > 1073741824' \
-  list --region us-east-2 --bucket my-bucket
-s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
-  diff --bucket left-bucket --region us-east-1 \
-  --target-bucket right-bucket --target-region us-east-1
+s3-turbo-list list --bucket my-bucket --region us-east-2 \
+  --filter 'SOURCE.size > 1073741824'
+s3-turbo-list diff --bucket left-bucket --region us-east-1 \
+  --target-bucket right-bucket --target-region us-east-1 \
+  --filter 'SOURCE.size != TARGET.size'
 ```
 
 ## Performance
@@ -142,23 +149,21 @@ s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
 Recursive list runs parallelize across key-space segments. Boundaries come
 from, in precedence order:
 
-1. `--hints-file` — explicit control for repeated inventories.
-2. The conventional hints cache (`<region>_<bucket>_hints.toml`) written by a
-   previous run.
-3. **Startup structural discovery** (automatic) — a handful of delimiter
-   probes find real `CommonPrefixes` boundaries and cache them. First runs are
-   parallel with zero flags.
-4. **Startup bisection** (automatic) — a flat namespace with no
+1. `--hints-file` — pins exact boundaries for repeated inventories.
+2. **Startup structural discovery** (automatic, every run) — a handful of
+   delimiter probes find real `CommonPrefixes` boundaries. Every run is
+   parallel with zero flags; nothing is cached in the working directory.
+3. **Startup bisection** (automatic) — a flat namespace with no
    `CommonPrefixes` is partitioned by single-key probes instead, so it also
    starts parallel. Runtime splitting still covers mid-run skew.
-5. A single segment for listings that fit in one page (nothing to partition)
-   and for `--no-auto-hints`, `--start-after`, `--continuation-token`, and
-   `--delimiter` runs.
+4. A single segment for listings that fit in one page (nothing to partition)
+   and for `--start-after` and `--delimiter` runs.
 
 Segments also **split at runtime**: when one segment turns out to hold most of
 the data, the run probes its remaining range and fans it across idle workers —
 using `CommonPrefixes` boundaries where the range has structure, and
-cursor-derived single-key probes where it is flat. Fan-out is throughput-aware:
+single-key probes near the middle of the remaining keys where it is flat.
+Fan-out is throughput-aware:
 it stops adding segments once a bucket is at its request-rate ceiling, so
 `--concurrency` acts as an upper bound rather than a target. Hints formats,
 boundary semantics, and tuning knobs (including validating a hints file with
@@ -167,9 +172,8 @@ boundary semantics, and tuning knobs (including validating a hints file with
 ## Diff
 
 ```bash
-s3-turbo-list diff \
-  --region us-east-2 --bucket source-bucket \
-  --target-region us-west-2 --target-bucket target-bucket
+s3-turbo-list diff --bucket source-bucket --region us-east-2 \
+  --target-bucket target-bucket --target-region us-west-2 --output-dir out
 ```
 
 Diff lists both buckets, partitioning and listing each side's segments in
@@ -177,66 +181,63 @@ parallel, then merges the outputs in key order and streams one Parquet with a
 `DiffFlag` per object (equal rows included; filter `DiffFlag != 0`
 downstream). Memory stays bounded regardless of bucket size, and any ordering
 violation or segment failure fails the run loudly rather than producing a wrong
-diff. `--hints-file` and `--resume` are rejected for diff.
+diff. `--target-region` defaults to `--region`. Diff takes no `--hints-file`
+or `--resume`.
 
 ## Checkpoint / resume
 
 ```bash
-s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # interrupted (Ctrl-C / SIGTERM)…
-s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
+s3-turbo-list list --bucket my-bucket --region us-east-2 --output-dir out            # interrupted (Ctrl-C / SIGTERM, exit 7)…
+s3-turbo-list list --bucket my-bucket --region us-east-2 --output-dir out --resume   # …lists only what is left
 ```
 
-Checkpoints are only kept by `--resume` runs, so pass it on the first run too.
-Progress is saved when the run is interrupted gracefully (Ctrl-C or SIGTERM),
-after the outputs are finalized. The checkpoint records exactly the key ranges
-that were not yet written — each unfinished segment (including ones split at
-runtime) is cut at its last key whose rows reached the output — and the next
-`--resume` lists those ranges and nothing else, so the interrupted and resumed
-outputs together hold every key exactly once. There are no mid-run saves:
-until an output file is closed its rows are not durable, so a crash (or a
-failed write) leaves the previous checkpoint unchanged. If the checkpoint
-cannot be written, the run says so and the exit line does not promise a
-resume.
+Every interrupted `list` run saves a checkpoint; `--resume` only reads it.
+The checkpoint is `<region>_<bucket>[_<prefix-hash>]_checkpoint.toml` in
+`--output-dir` when one is given (else the working directory), so resume with
+the same `--output-dir`. It is saved when the run is interrupted gracefully,
+after the outputs are finalized, and records exactly the key ranges not yet
+written — each unfinished segment (including ones split at runtime) is cut at
+its last key whose rows reached the output — so the resumed run lists those
+ranges and nothing else. There are no mid-run saves: a crash or failed write
+leaves the previous checkpoint unchanged. If the checkpoint cannot be written,
+the run says so and the exit line does not promise a resume. `diff` and
+`--start-after` runs do not checkpoint.
 
-Checkpoint files are named per bucket, region and prefix. The checkpoint
-identity covers bucket, region, endpoint, prefix, delimiter, max-keys,
-addressing style, profile, mode and filter; a checkpoint written for another
-identity is ignored with a warning, and is never deleted or overwritten by a
-run it does not belong to. Checkpoints written before 0.36 (which record
-completed segment indices) are still honoured, together with the boundary set
-they were written against.
-
-A run that lists its whole key space removes its checkpoint on the way out:
-there is no resume point left, and leaving one behind meant the next
-`--resume` invocation skipped those ranges and listed only the remainder.
+The checkpoint identity covers bucket, region, endpoint, prefix, delimiter,
+max-keys, addressing style, provider, mode and filter; a checkpoint written
+for another identity is ignored with a warning, and is never deleted or
+overwritten by a run it does not belong to. Checkpoints written before 0.36
+are discarded with a warning and the run starts over. A run that lists its
+whole key space removes its checkpoint on the way out.
 
 **A resumed run's output covers only the ranges it listed.** The rest are in
-the output of the run that was interrupted — combine the two. Pointing both
-runs at the same `--output-parquet-file` leaves only the second run's part.
-A resumed run says so on stderr, and the run manifest records it under
+the output of the run that was interrupted — combine the two (auto-named
+outputs get fresh names, so neither overwrites the other; pointing both runs
+at the same `--output-parquet-file` leaves only the second run's part). A
+resumed run says so on stderr, and the run manifest records it under
 `checkpoint.resumed_segments_skipped`.
 
 ## Providers
 
 Works against any S3-compatible endpoint via `--endpoint-url` and
-`--addressing-style`. Optional presets fill safe endpoint and addressing
-defaults for common providers — they never touch credentials. Use
-`AWS_PROFILE` for credentials; `--profile` selects an *endpoint* preset only.
+`--addressing-style`. Optional `--provider` presets fill safe endpoint and
+addressing defaults for common providers — they never touch credentials. Use
+`AWS_PROFILE` for credentials; `--provider` selects an *endpoint* preset only.
 
 ```bash
-s3-turbo-list guide oss              # endpoint-compatibility facts
+s3-turbo-list guide oss              # provider quickstart, local only
 
 # Region-derived endpoints need no --endpoint-url:
-s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket
+s3-turbo-list --provider oss list --bucket my-bucket --region oss-cn-beijing --output-dir out
 
 # Deployment-specific endpoints stay explicit:
-s3-turbo-list --profile minio --endpoint-url http://localhost:9000 \
-  list --bucket my-bucket
+s3-turbo-list --provider minio --endpoint-url http://localhost:9000 \
+  list --bucket my-bucket --region us-east-1 --output-dir out
 ```
 
-Built-in presets: `aws`, `minio`, `bos`, `r2`, `b2`, `oss`. Per-provider notes
-(including BOS addressing guidance) are in
-[`docs/endpoint-profiles.md`](docs/endpoint-profiles.md).
+Built-in presets: `aws`, `minio`, `bos`, `r2`, `b2`, `oss`. Presets, the
+config file (for a custom endpoint you use repeatedly), and the
+`compat-probe` report are in [`docs/providers.md`](docs/providers.md).
 
 | Endpoint | Status |
 |---|---|
@@ -255,21 +256,23 @@ it uses for each side's resolved endpoint before its first request.
 Validate any endpoint before a full run:
 
 ```bash
-s3-turbo-list --endpoint-url https://endpoint compat-probe --region r --bucket b
+s3-turbo-list compat-probe --endpoint-url https://endpoint --bucket my-bucket
 ```
 
 ## Automation
 
 For CI and agents, every surface has a machine-readable form:
 
-- `--dry-run --agent` emits a JSON plan without contacting S3.
+- `--dry-run` prints a JSON plan without contacting S3 (`> plan.json` to
+  keep it).
 - `doctor --json` reports environment and resolved config; add `--hints-file`
   to lint a hints file.
 - `--run-manifest run.json` records artifacts with SHA256 and Parquet
-  row/schema metadata; `manifest-summary run.json --check` verifies a completed
-  run locally.
+  row/schema metadata, and `--agent` prints the manifest on stdout;
+  `manifest-summary run.json --check` verifies a completed run locally.
 - `--trace-compat trace.jsonl` records every S3 API call as JSONL
-  ([`docs/trace-reference.md`](docs/trace-reference.md)).
+  (`--trace-compat -` for stderr; fields in
+  [`docs/tuning.md`](docs/tuning.md#trace-event-fields)).
 
 Exit-code classes are stable. Full reference:
 [`docs/agent-usage.md`](docs/agent-usage.md).
@@ -281,7 +284,7 @@ Exit-code classes are stable. Full reference:
    mid-run, so a segment that turns out skewed cannot rebalance the way list
    mode does. List mode remains the fastest path for one-bucket inventories.
 2. **Release builds on Ubuntu 20.04 arm64** may need the `aws-lc-sys`
-   workaround in [BUILD.md](BUILD.md).
+   workaround in [`docs/releasing.md`](docs/releasing.md).
 
 ## Project principles
 

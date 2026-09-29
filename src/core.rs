@@ -143,7 +143,7 @@ pub struct ObjectProps {
     #[serde(skip)]
     pub(crate) status: u8,
     #[serde(skip)]
-    #[allow(dead_code)] // Phase 5: alignment padding for cache-line behaviour
+    #[allow(dead_code)] // explicit padding: keeps the layout of this hot struct fixed
     pub(crate) pad: u16,
     #[serde(skip)]
     pub(crate) etag_parts: u32,
@@ -347,28 +347,71 @@ pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
 /// count used to fall back to the single-part reading of the same digest,
 /// with the same effect.
 pub(crate) fn parse_etag_bytes(etag: &str) -> ([u8; 16], u32) {
-    const UNAVAILABLE: ([u8; 16], u32) = ([0u8; 16], 0);
     let raw = etag.as_bytes();
+    if raw.len() < 2 {
+        return ([0u8; 16], 0);
+    }
+    // The rules only look at the bytes between the first and last one.
+    parse_etag_inner(&raw[1..raw.len() - 1])
+}
+
+/// [`parse_etag_bytes`] of an ETag whose first and last bytes (normally the
+/// quotes) are already stripped: `<32 hex>` or `<32 hex>-<parts>`.
+pub(crate) fn parse_etag_inner(inner: &[u8]) -> ([u8; 16], u32) {
+    const UNAVAILABLE: ([u8; 16], u32) = ([0u8; 16], 0);
     let mut md5 = [0u8; 16];
-    let Some(hex_span) = raw.get(1..33) else {
-        return UNAVAILABLE;
-    };
-    if raw.len() == 34 {
-        if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
+    if inner.len() == 32 {
+        if decode_hex16(inner, &mut md5) {
             return (md5, 0);
         }
-    } else if raw.len() >= 36 && raw.get(33) == Some(&b'-') {
-        let parts = raw
-            .get(34..raw.len() - 1)
-            .and_then(|p| std::str::from_utf8(p).ok())
+    } else if inner.len() >= 34 && inner[32] == b'-' {
+        let parts = std::str::from_utf8(&inner[33..])
+            .ok()
             .and_then(|p| p.parse::<u32>().ok());
         if let Some(parts) = parts
-            && hex::decode_to_slice(hex_span, &mut md5).is_ok()
+            && decode_hex16(&inner[..32], &mut md5)
         {
             return (md5, parts);
         }
     }
     UNAVAILABLE
+}
+
+/// Hex digit value, or 0xFF for anything `hex::decode_to_slice` rejects
+/// (it accepts `0-9`, `a-f` and `A-F`).
+const HEX_VALUE: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        t[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// Decode 32 hex digits into `out`; `false` (with `out` unspecified) on any
+/// non-hex byte. Table-driven and branch-free per digit: the `hex` crate's
+/// per-character match was ~20% of the fast list parser's time on random
+/// (unpredictable digit/letter) MD5s.
+#[inline]
+fn decode_hex16(hex: &[u8], out: &mut [u8; 16]) -> bool {
+    let Ok(hex) = <&[u8; 32]>::try_from(hex) else {
+        return false;
+    };
+    let mut bad = 0u8;
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = HEX_VALUE[hex[2 * i] as usize];
+        let lo = HEX_VALUE[hex[2 * i + 1] as usize];
+        bad |= hi | lo;
+        *byte = (hi << 4) | (lo & 0x0F);
+    }
+    bad & 0xF0 == 0
 }
 
 impl From<&aws_sdk_s3::types::Object> for ObjectProps {
@@ -798,10 +841,29 @@ pub struct S3TaskContext {
     pub start_after: Option<String>,
     /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
     pub continuation_token: Option<String>,
-    pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
+}
+
+/// What `S3TaskContext::new` builds a list side's context from.
+pub struct TaskContextParams<'a> {
+    pub bucket: &'a str,
+    pub region: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+    pub force_path_style: bool,
+    pub sdk_config: &'a aws_config::SdkConfig,
+    pub s3_config: &'a S3Config,
+    pub data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
+    pub dir: u8,
+    pub g_state: GlobalState,
+    pub trace_writer: Option<Arc<dyn S3TraceWriter>>,
+    pub addressing_style: &'a str,
+    pub profile: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
+    pub max_keys: Option<i32>,
+    pub start_after: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
 }
 
 impl S3TaskContext {
@@ -844,46 +906,27 @@ impl S3TaskContext {
             .await
     }
 
-    pub fn new(
-        bucket: &str,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-        force_path_style: bool,
-        sdk_config: &aws_config::SdkConfig,
-        s3_config: &S3Config,
-        data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
-        dir: u8,
-        g_state: GlobalState,
-        trace_writer: Option<Arc<dyn S3TraceWriter>>,
-        addressing_style: &str,
-        profile: Option<&str>,
-        delimiter: Option<&str>,
-        max_keys: Option<i32>,
-        start_after: Option<&str>,
-        continuation_token: Option<&str>,
-        checkpoint_completed: Arc<Mutex<Vec<usize>>>,
-    ) -> Self {
-        let s3_client = build_s3_client(sdk_config, region, endpoint, force_path_style);
+    pub fn new(p: TaskContextParams<'_>) -> Self {
+        let s3_client = build_s3_client(p.sdk_config, p.region, p.endpoint, p.force_path_style);
 
         Self {
-            s3_bucket_name: bucket.to_string(),
+            s3_bucket_name: p.bucket.to_string(),
             s3_client,
-            data_map_channel,
-            dir,
-            g_state,
-            trace_writer,
-            endpoint_url: endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
-            region: region.map(|r| r.to_string()),
-            addressing_style: addressing_style.to_string(),
-            profile: profile.map(|p| p.to_string()),
-            delimiter: delimiter.map(|d| d.to_string()),
-            max_keys,
-            max_attempts: s3_config.max_attempts.max(1),
-            initial_backoff_secs: s3_config.initial_backoff_secs,
-            operation_timeout_secs: s3_config.operation_timeout_secs.max(1),
-            start_after: start_after.map(|s| s.to_string()),
-            continuation_token: continuation_token.map(|s| s.to_string()),
-            checkpoint_completed,
+            data_map_channel: p.data_map_channel,
+            dir: p.dir,
+            g_state: p.g_state,
+            trace_writer: p.trace_writer,
+            endpoint_url: p.endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
+            region: p.region.map(str::to_string),
+            addressing_style: p.addressing_style.to_string(),
+            profile: p.profile.map(str::to_string),
+            delimiter: p.delimiter.map(str::to_string),
+            max_keys: p.max_keys,
+            max_attempts: p.s3_config.max_attempts.max(1),
+            initial_backoff_secs: p.s3_config.initial_backoff_secs,
+            operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
+            start_after: p.start_after.map(str::to_string),
+            continuation_token: p.continuation_token.map(str::to_string),
             resume_progress: Arc::new(Mutex::new(None)),
         }
     }
@@ -1163,6 +1206,26 @@ impl KeySpaceHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_hex16_matches_the_hex_crate_for_every_byte_at_every_position() {
+        let base = *b"0123456789abcdefABCDEF0123456789";
+        for pos in 0..32 {
+            for byte in 0..=255u8 {
+                let mut input = base;
+                input[pos] = byte;
+                let mut ours = [0u8; 16];
+                let mut theirs = [0u8; 16];
+                let ok = decode_hex16(&input, &mut ours);
+                let expected = hex::decode_to_slice(input, &mut theirs).is_ok();
+                assert_eq!(ok, expected, "pos {pos} byte {byte:#x}");
+                if ok {
+                    assert_eq!(ours, theirs, "pos {pos} byte {byte:#x}");
+                }
+            }
+        }
+        assert!(!decode_hex16(b"0123", &mut [0u8; 16]));
+    }
 
     #[test]
     fn test_object_key_top_level() {

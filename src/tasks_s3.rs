@@ -15,9 +15,9 @@ use tokio::time::{Instant, timeout_at};
 struct SegmentOutcome {
     index: usize,
     completed: bool,
-    /// Original hint segments record checkpoint progress; runtime-split
-    /// children (and split parents) conservatively do not.
-    checkpointable: bool,
+    /// An original hint segment (counted in the heartbeat's done/remaining),
+    /// not a runtime-split child.
+    from_hints: bool,
 }
 
 // ── Adaptive long-tail splitting ───────────────────────────
@@ -85,8 +85,6 @@ pub(crate) struct SegmentControl {
     next_probe_page: AtomicU32,
     /// Consecutive probes that failed (as opposed to finding no boundary).
     probe_failures: AtomicU32,
-    /// Segment gave part of its range away; checkpoint must not record it.
-    was_split: AtomicBool,
     /// Last key whose page reached the output channel (`None`: nothing yet).
     /// Unlike `cursor` — recorded before the send, for split decisions — it
     /// only ever covers rows the data map will write, so an interrupted run
@@ -105,7 +103,6 @@ impl SegmentControl {
             unsplittable: AtomicBool::new(false),
             next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
             probe_failures: AtomicU32::new(0),
-            was_split: AtomicBool::new(false),
             sent: Mutex::new(None),
         }
     }
@@ -153,10 +150,6 @@ impl SegmentControl {
         (self.cursor.lock().unwrap().clone(), self.current_end())
     }
 
-    fn was_split(&self) -> bool {
-        self.was_split.load(Ordering::Relaxed)
-    }
-
     fn is_split_candidate(&self) -> bool {
         self.pages.load(Ordering::Relaxed) >= self.next_probe_page.load(Ordering::Relaxed)
             && !self.splitting.load(Ordering::Relaxed)
@@ -177,7 +170,6 @@ impl SegmentControl {
             return None;
         }
         let old_end = end.replace(proposed.clone());
-        self.was_split.store(true, Ordering::Relaxed);
         self.splitting.store(false, Ordering::Relaxed);
         Some(SplitRange {
             start: proposed,
@@ -242,12 +234,13 @@ enum SplitProbe {
 
 /// One delimiter probe per ancestor rung; returns the middle CommonPrefix
 /// strictly inside `(cursor, end)`. When the range has no prefix structure,
-/// falls back to flat-range cuts derived from the cursor itself.
+/// falls back to a flat-range cut near the middle of the remaining keys.
 async fn probe_split_candidate(
     ctx: &S3TaskContext,
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
+    flat_high: &FlatHigh,
 ) -> SplitProbe {
     for dir in ancestor_dirs(cursor, listing_prefix)
         .into_iter()
@@ -261,6 +254,12 @@ async fn probe_split_candidate(
             .prefix(&dir)
             .start_after(cursor)
             .delimiter("/")
+            // Only CommonPrefixes matter here, but at the leaf rung the page
+            // is up to 1000 `<Contents>`: let the fast parser strip them (the
+            // SDK's per-object deserializer made these probes ~15% of a
+            // listing's CPU). The parsed rows are simply dropped.
+            .customize()
+            .interceptor(FastContentsInterceptor::new(ParsedPageSlot::default()))
             .send();
         let response = match timeout_at(Instant::now() + timeout_dur, send).await {
             Ok(Ok(r)) => r,
@@ -286,25 +285,29 @@ async fn probe_split_candidate(
         }
     }
 
-    probe_flat_cut(ctx, listing_prefix, cursor, end).await
+    probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high).await
 }
 
-/// Flat-range split: no CommonPrefix structure exists, so derive candidate
-/// cuts from the cursor — a real key inside the live region — by truncating
-/// it at several depths and bumping one character (which keeps every
-/// candidate strictly above the cursor while sharing its key-space shape;
-/// for numeric tails a mid-depth bump lands near a power-of-ten boundary).
-/// Each candidate costs one max_keys=1 request; the first real key returned
-/// inside `(cursor, end)` becomes the cut, so the boundary is always an
-/// observed key, never a synthetic guess. Unbalanced cuts are fine: children
-/// are themselves splittable, so fan-out continues recursively.
+/// Near-maximal real key of the listing, shared by a run's split probes: an
+/// open-ended segment (the last one) needs an upper end to cut toward, and
+/// estimating it costs several probe rounds, so the estimate is kept.
+type FlatHigh = Arc<Mutex<Option<String>>>;
+
+/// Flat-range split: no CommonPrefix structure exists, so cut near the middle
+/// of the segment's remaining keys with max_keys=1 probes (see `flat_cut`):
+/// a candidate between the cursor and the segment's upper end — its end
+/// bound, or the listing's estimated high key when it is open-ended — whose
+/// probe returns the real key that becomes the cut. The boundary is always an
+/// observed key, never a synthetic guess, and children are themselves
+/// splittable, so fan-out continues recursively.
 async fn probe_flat_cut(
     ctx: &S3TaskContext,
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
+    flat_high: &FlatHigh,
 ) -> SplitProbe {
-    for candidate in flat_cut_candidates(cursor, listing_prefix, end) {
+    let probe = |candidate: String| async move {
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let send = ctx
             .s3_client
@@ -314,60 +317,37 @@ async fn probe_flat_cut(
             .start_after(&candidate)
             .max_keys(1)
             .send();
-        let response = match timeout_at(Instant::now() + timeout_dur, send).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                debug!("Flat cut probe failed at '{}': {:?}", candidate, e);
-                return SplitProbe::Failed;
+        match timeout_at(Instant::now() + timeout_dur, send).await {
+            Ok(Ok(r)) => Ok(r
+                .contents()
+                .first()
+                .and_then(|o| o.key())
+                .map(str::to_string)),
+            Ok(Err(e)) => Err(format!("probe at '{}' failed: {:?}", candidate, e)),
+            Err(_elapsed) => Err(format!("probe at '{}' timed out", candidate)),
+        }
+    };
+    let known_high = flat_high.lock().unwrap().clone();
+    match crate::flat_cut::find_flat_cut(listing_prefix, cursor, end, known_high.as_deref(), &probe)
+        .await
+    {
+        Ok(found) => {
+            if let Some(high) = found.high {
+                let mut shared = flat_high.lock().unwrap();
+                if shared.as_ref().is_none_or(|k| high > *k) {
+                    *shared = Some(high);
+                }
             }
-            Err(_elapsed) => {
-                debug!("Flat cut probe timed out at '{}'", candidate);
-                return SplitProbe::Failed;
-            }
-        };
-        if let Some(key) = response.contents().first().and_then(|o| o.key()) {
-            if key > cursor && end.is_none_or(|e| key < e) {
-                return SplitProbe::Cut(key.to_string());
+            match found.cut {
+                Some(key) => SplitProbe::Cut(key),
+                None => SplitProbe::NoBoundary,
             }
         }
-    }
-    SplitProbe::NoBoundary
-}
-
-/// Candidate cuts for a flat range, mid-depth first (most balanced for
-/// structured tails), then deeper (closer to the cursor, higher hit rate).
-pub(crate) fn flat_cut_candidates(
-    cursor: &str,
-    listing_prefix: &str,
-    end: Option<&str>,
-) -> Vec<String> {
-    let tail_start = listing_prefix.len().min(cursor.len());
-    let tail_len = cursor.len() - tail_start;
-    if tail_len == 0 {
-        return Vec::new();
-    }
-
-    let bytes = cursor.as_bytes();
-    let mut candidates: Vec<String> = Vec::new();
-    // Tail depths to bump at: 1/2 first (most balanced), then deeper
-    // (3/4, 7/8 — closer to the cursor, higher hit rate), then 1/4.
-    for (numerator, denominator) in [(1usize, 2usize), (3, 4), (7, 8), (1, 4)] {
-        let pos = tail_start + (tail_len * numerator / denominator).min(tail_len - 1);
-        // Only bump printable ASCII at a char boundary; skip otherwise.
-        let byte = bytes[pos];
-        if !cursor.is_char_boundary(pos) || !(0x20..0x7e).contains(&byte) {
-            continue;
-        }
-        let mut candidate = cursor[..pos].to_string();
-        candidate.push((byte + 1) as char);
-        if candidate.as_str() > cursor
-            && end.is_none_or(|e| candidate.as_str() < e)
-            && !candidates.contains(&candidate)
-        {
-            candidates.push(candidate);
+        Err(e) => {
+            debug!("Flat cut {}", e);
+            SplitProbe::Failed
         }
     }
-    candidates
 }
 
 // ── Throughput-aware fan-out governor ──────────────────────
@@ -515,11 +495,17 @@ async fn flat_reactor_task(
     // unsplit and gets checkpointed while the child's range is still unlisted.
     let mut next_child_index = hints.index_end();
     let mut split_count = 0usize;
+    let flat_high: FlatHigh = Arc::new(Mutex::new(None));
     let mut retired_pages = 0u64;
     let mut gov = FanOutGovernor::new(flat_concurrency);
     let mut last_ts = epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
+    // In-flight split probes. Each holds a context clone — and with it a
+    // data-map sender — so a detached probe kept the output open, delaying
+    // the end of the run (and Ctrl-C) by up to its request timeouts. They
+    // are aborted when the reactor exits.
+    let mut probes = tokio::task::JoinSet::new();
     let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -528,7 +514,7 @@ async fn flat_reactor_task(
         // Nothing new starts once the run is asked to stop — an interrupt
         // during startup discovery used to be followed by a full first fill.
         while set.len() < flat_concurrency && !ctx.is_quit() {
-            let (index, start, end, checkpointable) = if let Some(child) = pending_children.pop() {
+            let (index, start, end, from_hints) = if let Some(child) = pending_children.pop() {
                 let index = next_child_index;
                 next_child_index += 1;
                 (index, child.start, child.end, false)
@@ -558,12 +544,28 @@ async fn flat_reactor_task(
                 SegmentOutcome {
                     index,
                     completed,
-                    checkpointable,
+                    from_hints,
                 }
             });
         }
 
-        if set.is_empty() {
+        while probes.try_join_next().is_some() {}
+
+        // A segment that accepted a split sent its child range before it
+        // finished; when `join_next` won the race below, that child is still
+        // queued here. Leaving it there dropped its keys from the listing —
+        // and from the resume ranges — while the run reported success.
+        let mut drained = false;
+        while let Ok(range) = split_rx.try_recv() {
+            split_count += 1;
+            pending_children.push(range);
+            drained = true;
+        }
+        if drained && !ctx.is_quit() {
+            continue;
+        }
+
+        if set.is_empty() && pending_children.is_empty() {
             // Every segment task has joined, so every cloned sender is dropped
             // and every `send` has completed — the batches are in the channel.
             // Returning drops the last sender, and the data map receives all of
@@ -594,24 +596,8 @@ async fn flat_reactor_task(
                         completed_pieces += 1;
                         starts.remove(&outcome.index);
                     }
-                    if outcome.completed {
-                        if outcome.checkpointable {
-                            hints.finish(outcome.index);
-                            let split = control.is_some_and(|c| c.was_split());
-                            if split {
-                                debug!(
-                                    "Segment {} was split at runtime; not marking checkpoint progress",
-                                    outcome.index
-                                );
-                            } else {
-                                ctx.checkpoint_completed.lock().unwrap().push(outcome.index);
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "Segment {} did not complete successfully; not marking checkpoint progress",
-                            outcome.index
-                        );
+                    if outcome.completed && outcome.from_hints {
+                        hints.finish(outcome.index);
                     }
                 }
                 Some(Err(e)) => {
@@ -672,7 +658,14 @@ async fn flat_reactor_task(
                     && hints.is_empty()
                 {
                     let idle = cap - set.len();
-                    maybe_start_split_probes(ctx, start_prefix, &controls, idle);
+                    maybe_start_split_probes(
+                        ctx,
+                        start_prefix,
+                        &controls,
+                        idle,
+                        &flat_high,
+                        &mut probes,
+                    );
                 }
             },
         }
@@ -692,11 +685,17 @@ async fn flat_reactor_task(
                     completed_pieces += 1;
                 }
             }
+            // Children split off before or during the abort are unlisted
+            // ranges: they belong in the resume ranges.
+            while let Ok(range) = split_rx.try_recv() {
+                pending_children.push(range);
+            }
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
         }
     }
 
+    probes.abort_all();
     controls.extend(unfinished);
     *ctx.resume_progress.lock().unwrap() = Some(resume_progress(
         &controls,
@@ -801,19 +800,29 @@ fn maybe_start_split_probes(
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
+    flat_high: &FlatHigh,
+    probes: &mut tokio::task::JoinSet<()>,
 ) {
     for index in select_split_targets(controls, idle_capacity) {
         let control = Arc::clone(&controls[&index]);
         control.splitting.store(true, Ordering::Relaxed);
         let probe_ctx = ctx.clone();
         let listing_prefix = start_prefix.to_string();
-        tokio::spawn(async move {
+        let flat_high = Arc::clone(flat_high);
+        probes.spawn(async move {
             let (cursor, end) = control.snapshot();
             if cursor.is_empty() {
                 control.splitting.store(false, Ordering::Relaxed);
                 return;
             }
-            match probe_split_candidate(&probe_ctx, &listing_prefix, &cursor, end.as_deref()).await
+            match probe_split_candidate(
+                &probe_ctx,
+                &listing_prefix,
+                &cursor,
+                end.as_deref(),
+                &flat_high,
+            )
+            .await
             {
                 SplitProbe::Cut(mid) => {
                     debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
@@ -1253,9 +1262,8 @@ async fn flat_list(
                 // against the authoritative cursor. A segment that already
                 // crossed its boundary must not accept one: S3 order means
                 // no keys remain in its range, so the child would be an
-                // empty segment (a wasted request) and `was_split` would
-                // withhold this fully-completed segment's checkpoint record.
-                if let (Some(tx), false) = (split_tx, is_ended) {
+                // empty segment (a wasted request).
+                if let (Some(tx), false) = (split_tx, is_ended || ctx.is_quit()) {
                     if let Some(child) = control.try_accept_split() {
                         info!(
                             "Segment {} accepted runtime split at '{}'",
@@ -1749,7 +1757,6 @@ mod tests {
         assert_eq!(child.start, "big/b/");
         assert_eq!(child.end.as_deref(), Some("small/"));
         assert_eq!(control.current_end().as_deref(), Some("big/b/"));
-        assert!(control.was_split());
         assert!(!control.splitting.load(Ordering::Relaxed));
     }
 
@@ -1763,7 +1770,6 @@ mod tests {
 
         assert!(control.try_accept_split().is_none());
         assert_eq!(control.current_end(), None);
-        assert!(!control.was_split());
         assert!(!control.splitting.load(Ordering::Relaxed));
     }
 
@@ -1947,49 +1953,39 @@ mod join_failure_tests {
 
 #[cfg(test)]
 mod flat_cut_tests {
-    use super::*;
+    use crate::flat_cut::flat_cut_candidate;
 
     #[test]
     fn test_flat_cut_candidates_numeric_tail() {
-        // cursor tail "obj-0014" (8 chars): 1/2-depth bump first.
-        let candidates = flat_cut_candidates("obj-0014", "", None);
-        assert!(!candidates.is_empty());
-        // Every candidate is strictly above the cursor.
-        for c in &candidates {
-            assert!(c.as_str() > "obj-0014", "{}", c);
-        }
-        // The mid-depth bump comes first: "obj-0014"[..4] + '1' = "obj-1".
-        assert_eq!(candidates[0], "obj-1");
+        // Numeric tail: the cut lands at the numeric midpoint of the range,
+        // strictly above the cursor.
+        let candidate = flat_cut_candidate("obj-0014", "", "obj-0214").unwrap();
+        assert!(candidate.as_str() > "obj-0014", "{}", candidate);
+        assert_eq!(candidate, "obj-0114");
     }
 
     #[test]
     fn test_flat_cut_candidates_respect_end_bound() {
-        let candidates = flat_cut_candidates("prefix-3/object-000123", "", Some("prefix-3/p"));
-        for c in &candidates {
-            assert!(c.as_str() > "prefix-3/object-000123", "{}", c);
-            assert!(c.as_str() < "prefix-3/p", "{}", c);
-        }
+        let c = flat_cut_candidate("prefix-3/object-000123", "", "prefix-3/p").unwrap();
+        assert!(c.as_str() > "prefix-3/object-000123", "{}", c);
+        assert!(c.as_str() < "prefix-3/p", "{}", c);
     }
 
     #[test]
     fn test_flat_cut_candidates_listing_prefix_scopes_tail() {
-        // Bumps happen inside the tail after the listing prefix, so every
+        // The cut lies between two keys under the listing prefix, so the
         // candidate stays under the listing prefix scope.
-        let candidates = flat_cut_candidates("logs/2026/abcdef", "logs/", None);
-        assert!(!candidates.is_empty());
-        for c in &candidates {
-            assert!(c.starts_with("logs/"), "{}", c);
-        }
+        let c = flat_cut_candidate("logs/2026/abcdef", "logs/", "logs/2027/zz").unwrap();
+        assert!(c.starts_with("logs/"), "{}", c);
     }
 
     #[test]
     fn test_flat_cut_candidates_empty_or_non_ascii_tail() {
-        assert!(flat_cut_candidates("", "", None).is_empty());
-        // Multibyte tail positions are skipped rather than corrupting keys.
-        let candidates = flat_cut_candidates("中文键", "", None);
-        for c in &candidates {
-            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
-        }
+        assert!(flat_cut_candidate("", "", "").is_none());
+        // Multibyte keys yield valid UTF-8 candidates, never split characters.
+        let c = flat_cut_candidate("中文键", "", "中文键键").unwrap();
+        assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        assert!(c.as_str() > "中文键" && c.as_str() < "中文键键", "{}", c);
     }
 }
 
@@ -2002,10 +1998,20 @@ mod flat_cut_tests {
 // the prefetch window, bounding memory. Runtime splitting stays disabled
 // for diff: the segment set must remain static for ordered consumption.
 
-/// Per-segment channel capacity (batches) — the diff prefetch window.
-pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 4;
+/// Per-segment channel capacity (batches): how far one segment may list
+/// ahead of the merge.  At 4, a segment behind the merge head stalled after
+/// four pages, so a side with a few large segments listed nearly serially
+/// (one page per round trip).
+pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 32;
 /// Upper bound on concurrently listing segments per diff side.
 const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+/// Segments a side may start ahead of the one the merge is reading.  With
+/// the channel capacity this bounds a side's buffered batches to
+/// `DIFF_SIDE_LOOKAHEAD_SEGMENTS * DIFF_SEGMENT_CHANNEL_CAP` whatever the
+/// segment count: finished segments used to keep their batches queued, so a
+/// many-segment side could buffer most of the listing (RSS grew with bucket
+/// size).
+const DIFF_SIDE_LOOKAHEAD_SEGMENTS: usize = 16;
 
 /// List one diff side across its static segments, writing each segment's
 /// batches to the index-aligned sender. Any segment failure marks the run
@@ -2016,6 +2022,8 @@ pub async fn diff_list_side_task(
     concurrency: usize,
     boundaries: &[String],
     senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>>,
+    // Index of the segment the merge is reading (see `DiffSideStream`).
+    mut merge_head: Option<tokio::sync::watch::Receiver<usize>>,
 ) {
     ctx.start();
     ctx.g_state.wait_to_start().await;
@@ -2036,9 +2044,17 @@ pub async fn diff_list_side_task(
     let mut senders = senders.into_iter();
     let mut set = tokio::task::JoinSet::new();
 
+    let mut next_pair = hints.next();
     loop {
         while set.len() < concurrency {
-            let Some(pair) = hints.next() else { break };
+            let Some(pair) = next_pair.take() else { break };
+            if let Some(head) = &merge_head {
+                if pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS {
+                    next_pair = Some(pair);
+                    break;
+                }
+            }
+            next_pair = hints.next();
             let sender = senders.next().expect("sender per segment");
             let mut task_ctx = ctx.clone();
             task_ctx.data_map_channel = sender;
@@ -2052,10 +2068,27 @@ pub async fn diff_list_side_task(
             });
         }
 
-        if set.is_empty() {
+        if set.is_empty() && next_pair.is_none() {
             break;
         }
-        match set.join_next().await {
+        // Wait for a segment to finish or, when the next segment is held
+        // back by the lookahead window, for the merge to move on.
+        let joined = tokio::select! {
+            joined = set.join_next(), if !set.is_empty() => joined,
+            changed = async {
+                match merge_head.as_mut() {
+                    Some(head) => head.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if next_pair.is_some() => {
+                if changed.is_err() {
+                    // The merge is gone; stop gating (the sends will fail).
+                    merge_head = None;
+                }
+                continue;
+            }
+        };
+        match joined {
             Some(Ok(_completed)) => {}
             Some(Err(e)) => {
                 // Losing a segment is worse here than in list mode: the merge

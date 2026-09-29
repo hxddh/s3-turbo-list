@@ -60,20 +60,35 @@ pub struct S3Config {
     pub operation_timeout_secs: u64,
     #[serde(default)]
     pub endpoint_url: Option<String>,
-    #[serde(default)]
-    pub force_path_style: bool,
-    #[serde(default)]
+    /// The addressing style set in the config file, if any. The resolved
+    /// style (CLI, then this, then the provider preset, then auto) is
+    /// `addressing_style`.
+    #[serde(default, rename = "addressing_style", skip_serializing)]
+    pub addressing_style_setting: Option<AddressingStyle>,
+    /// Deprecated spelling of `addressing_style = "path"`.
+    #[serde(default, skip_serializing)]
+    pub force_path_style: Option<bool>,
+    #[serde(skip)]
     pub addressing_style: AddressingStyle,
-    #[serde(default)]
+    /// Whether `addressing_style` came from the CLI or the config file (a
+    /// provider preset only fills in a style nobody chose).
+    #[serde(skip)]
+    pub addressing_style_explicit: bool,
+    /// The provider preset (`provider`; `profile` is its pre-0.37 name).
+    #[serde(default, rename = "provider", alias = "profile")]
     pub profile: Option<String>,
-    #[serde(default)]
-    pub debug_s3: bool,
-    #[serde(default)]
+    /// Per-run settings from the command line; not config-file keys (a
+    /// `start_after` in a config file silently truncated every run).
+    #[serde(skip)]
     pub trace_compat: Option<String>,
-    /// CLI `--start-after` override — if set, listing begins after this key
-    /// regardless of hint-segment boundaries.
-    #[serde(default)]
+    #[serde(skip)]
     pub start_after: Option<String>,
+}
+
+impl S3Config {
+    pub fn force_path_style(&self) -> bool {
+        self.addressing_style == AddressingStyle::Path
+    }
 }
 
 impl Default for S3Config {
@@ -84,10 +99,11 @@ impl Default for S3Config {
             connect_timeout_secs: default_connect_timeout_secs(),
             operation_timeout_secs: default_operation_timeout_secs(),
             endpoint_url: None,
-            force_path_style: false,
+            addressing_style_setting: None,
+            force_path_style: None,
             addressing_style: AddressingStyle::default(),
+            addressing_style_explicit: false,
             profile: None,
-            debug_s3: false,
             trace_compat: None,
             start_after: None,
         }
@@ -125,11 +141,14 @@ pub struct OutputConfig {
     pub compression: String,
     #[serde(default = "default_compression_level")]
     pub compression_level: u32,
-    #[serde(default)]
+    /// Output paths are per-run settings from the command line, not
+    /// config-file keys: a path in the config file made every run write
+    /// (and overwrite) the same files.
+    #[serde(skip)]
     pub log_file: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub ks_file: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub parquet_file: Option<String>,
 }
 
@@ -269,9 +288,8 @@ impl S3TurboConfig {
             if path.exists() {
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
-                let file_config: S3TurboConfig = toml::from_str(&content)
+                config = Self::parse(&content)
                     .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
-                config.merge(file_config);
                 log::info!("Loaded config from {}", path.display());
                 loaded_config = Some(path.display().to_string());
                 loaded_config_kind = (*kind).to_string();
@@ -304,6 +322,14 @@ impl S3TurboConfig {
         Ok((config, summary))
     }
 
+    /// A config file's content over the defaults.
+    pub fn parse(content: &str) -> Result<Self, String> {
+        let file_config: S3TurboConfig = toml::from_str(content).map_err(|e| e.to_string())?;
+        let mut config = Self::default();
+        config.merge(file_config);
+        Ok(config)
+    }
+
     fn merge(&mut self, other: S3TurboConfig) {
         self.s3.max_attempts = other.s3.max_attempts;
         self.s3.initial_backoff_secs = other.s3.initial_backoff_secs;
@@ -312,17 +338,20 @@ impl S3TurboConfig {
         if other.s3.endpoint_url.is_some() {
             self.s3.endpoint_url = other.s3.endpoint_url;
         }
-        self.s3.force_path_style = other.s3.force_path_style;
-        self.s3.addressing_style = other.s3.addressing_style;
+        // The deprecated `force_path_style = true` means path addressing
+        // unless the file also names a style.
+        let setting = other.s3.addressing_style_setting.or_else(|| {
+            other
+                .s3
+                .force_path_style
+                .and_then(|path| path.then_some(AddressingStyle::Path))
+        });
+        if let Some(style) = setting {
+            self.s3.addressing_style = style;
+            self.s3.addressing_style_explicit = true;
+        }
         if other.s3.profile.is_some() {
             self.s3.profile = other.s3.profile;
-        }
-        self.s3.debug_s3 = other.s3.debug_s3;
-        if other.s3.trace_compat.is_some() {
-            self.s3.trace_compat = other.s3.trace_compat;
-        }
-        if other.s3.start_after.is_some() {
-            self.s3.start_after = other.s3.start_after;
         }
         self.runtime.worker_threads = other.runtime.worker_threads;
         self.runtime.max_concurrency = other.runtime.max_concurrency;
@@ -333,86 +362,36 @@ impl S3TurboConfig {
             self.output.compression = other.output.compression;
         }
         self.output.compression_level = other.output.compression_level;
-        if other.output.log_file.is_some() {
-            self.output.log_file = other.output.log_file;
-        }
-        if other.output.ks_file.is_some() {
-            self.output.ks_file = other.output.ks_file;
-        }
-        if other.output.parquet_file.is_some() {
-            self.output.parquet_file = other.output.parquet_file;
-        }
         self.channel.capacity = other.channel.capacity;
     }
 
-    pub fn apply_cli_overrides(
-        &mut self,
-        threads: Option<usize>,
-        concurrency: Option<usize>,
-        endpoint: Option<&str>,
-        addressing_style: Option<&str>,
-        profile: Option<&str>,
-        debug_s3: bool,
-        trace_compat: Option<&str>,
-        start_after: Option<&str>,
-        log_file: Option<&str>,
-        ks_file: Option<&str>,
-        parquet_file: Option<&str>,
-        compression: Option<&str>,
-        compression_level: Option<u32>,
-    ) {
-        if let Some(t) = threads {
+    /// Command-line settings, applied over the config file.
+    pub fn apply_cli_overrides(&mut self, cli: CliOverrides<'_>) {
+        if let Some(t) = cli.threads {
             self.runtime.worker_threads = t;
         }
-        if let Some(c) = concurrency {
+        if let Some(c) = cli.concurrency {
             self.runtime.max_concurrency = c;
         }
-        if let Some(e) = endpoint {
+        if let Some(e) = cli.endpoint {
             self.s3.endpoint_url = Some(e.to_string());
         }
-        if let Some(s) = addressing_style {
-            if let Ok(style) = s.parse::<AddressingStyle>() {
-                match style {
-                    AddressingStyle::Path => {
-                        self.s3.addressing_style = AddressingStyle::Path;
-                        self.s3.force_path_style = true;
-                    }
-                    AddressingStyle::Virtual => {
-                        self.s3.addressing_style = AddressingStyle::Virtual;
-                        self.s3.force_path_style = false;
-                    }
-                    AddressingStyle::Auto => {
-                        self.s3.addressing_style = AddressingStyle::Auto;
-                        self.s3.force_path_style = false;
-                    }
-                }
-            }
+        if let Some(style) = cli.addressing_style.and_then(|s| s.parse().ok()) {
+            self.s3.addressing_style = style;
+            self.s3.addressing_style_explicit = true;
         }
-        if let Some(p) = profile {
+        if let Some(p) = cli.provider {
             self.s3.profile = Some(p.to_string());
         }
-        if debug_s3 {
-            self.s3.debug_s3 = true;
-        }
-        if let Some(tc) = trace_compat {
-            self.s3.trace_compat = Some(tc.to_string());
-        }
-        if let Some(sa) = start_after {
-            self.s3.start_after = Some(sa.to_string());
-        }
-        if let Some(lf) = log_file {
-            self.output.log_file = Some(lf.to_string());
-        }
-        if let Some(kf) = ks_file {
-            self.output.ks_file = Some(kf.to_string());
-        }
-        if let Some(pf) = parquet_file {
-            self.output.parquet_file = Some(pf.to_string());
-        }
-        if let Some(codec) = compression {
+        self.s3.trace_compat = cli.trace_compat.map(str::to_string);
+        self.s3.start_after = cli.start_after.map(str::to_string);
+        self.output.log_file = cli.log_file.map(str::to_string);
+        self.output.ks_file = cli.ks_file.map(str::to_string);
+        self.output.parquet_file = cli.parquet_file.map(str::to_string);
+        if let Some(codec) = cli.compression {
             self.output.compression = codec.to_string();
         }
-        if let Some(level) = compression_level {
+        if let Some(level) = cli.compression_level {
             self.output.compression_level = level;
         }
     }
@@ -434,18 +413,23 @@ impl S3TurboConfig {
             }
         }
     }
+}
 
-    pub fn normalize_addressing_style(&mut self) {
-        if self.s3.force_path_style {
-            self.s3.addressing_style = AddressingStyle::Path;
-            return;
-        }
-
-        match self.s3.addressing_style {
-            AddressingStyle::Path => self.s3.force_path_style = true,
-            AddressingStyle::Virtual | AddressingStyle::Auto => self.s3.force_path_style = false,
-        }
-    }
+/// The command-line values `apply_cli_overrides` takes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CliOverrides<'a> {
+    pub threads: Option<usize>,
+    pub concurrency: Option<usize>,
+    pub endpoint: Option<&'a str>,
+    pub addressing_style: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub trace_compat: Option<&'a str>,
+    pub start_after: Option<&'a str>,
+    pub log_file: Option<&'a str>,
+    pub ks_file: Option<&'a str>,
+    pub parquet_file: Option<&'a str>,
+    pub compression: Option<&'a str>,
+    pub compression_level: Option<u32>,
 }
 
 // ── Filter compilation ─────────────────────────────────────
@@ -477,7 +461,7 @@ fn build_filter_engine(expr: &str, mode: Option<&RunMode>) -> Result<ObjectFilte
     )))
 }
 
-#[allow(dead_code)] // Phase 5: standalone convenience wrapper
+#[cfg(test)]
 pub fn compile_filter(expr: &str) -> Result<ObjectFilter, String> {
     build_filter_engine(expr, None)
 }
@@ -518,7 +502,6 @@ mod tests {
         assert_eq!(config.channel.capacity, 64);
         assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
         assert!(config.s3.profile.is_none());
-        assert!(!config.s3.debug_s3);
         assert!(config.s3.trace_compat.is_none());
     }
 
@@ -553,20 +536,50 @@ max_concurrency = 50
     }
 
     #[test]
-    fn test_parse_bos_profile_toml() {
-        let toml_str = r#"
-[s3]
-endpoint_url = "https://s3.bj.bcebos.com"
-addressing_style = "path"
-profile = "bos"
-"#;
-        let config: S3TurboConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            config.s3.endpoint_url.as_deref(),
-            Some("https://s3.bj.bcebos.com")
-        );
+    fn test_parse_provider_toml_and_legacy_profile_key() {
+        for key in ["provider", "profile"] {
+            let config = S3TurboConfig::parse(&format!(
+                "[s3]\nendpoint_url = \"https://s3.bj.bcebos.com\"\naddressing_style = \"path\"\n{} = \"bos\"\n",
+                key
+            ))
+            .unwrap();
+            assert_eq!(
+                config.s3.endpoint_url.as_deref(),
+                Some("https://s3.bj.bcebos.com")
+            );
+            assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
+            assert!(config.s3.addressing_style_explicit);
+            assert_eq!(config.s3.profile.as_deref(), Some("bos"));
+        }
+    }
+
+    #[test]
+    fn test_per_run_keys_are_not_config_keys() {
+        // Output paths and start_after pinned every run to the same files or
+        // silently truncated it; debug_s3/trace_compat are command-line only.
+        for key in [
+            "[s3]\nstart_after = \"k\"\n",
+            "[s3]\ndebug_s3 = true\n",
+            "[s3]\ntrace_compat = \"t.jsonl\"\n",
+            "[output]\nparquet_file = \"o.parquet\"\n",
+            "[output]\nks_file = \"o.ks\"\n",
+            "[output]\nlog_file = \"o.log\"\n",
+        ] {
+            let err = S3TurboConfig::parse(key).unwrap_err();
+            assert!(err.contains("unknown field"), "{key:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_force_path_style_means_path() {
+        let config = S3TurboConfig::parse("[s3]\nforce_path_style = true\n").unwrap();
         assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
-        assert_eq!(config.s3.profile.as_deref(), Some("bos"));
+        let config =
+            S3TurboConfig::parse("[s3]\nforce_path_style = true\naddressing_style = \"virtual\"\n")
+                .unwrap();
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
+        let config = S3TurboConfig::parse("[s3]\nforce_path_style = false\n").unwrap();
+        assert!(!config.s3.addressing_style_explicit);
     }
 
     #[test]
@@ -600,31 +613,28 @@ profile = "bos"
     #[test]
     fn test_apply_cli_overrides() {
         let mut config = S3TurboConfig::default();
-        config.apply_cli_overrides(
-            Some(4),
-            Some(200),
-            Some("https://custom.example.com"),
-            Some("path"),
-            Some("test-profile"),
-            true,
-            Some("/tmp/trace.jsonl"),
-            Some("after-key"),
-            Some("log.txt"),
-            Some("ks.csv"),
-            Some("out.parquet"),
-            Some("zstd"),
-            Some(3),
-        );
+        config.apply_cli_overrides(CliOverrides {
+            threads: Some(4),
+            concurrency: Some(200),
+            endpoint: Some("https://custom.example.com"),
+            addressing_style: Some("path"),
+            provider: Some("test-profile"),
+            trace_compat: Some("/tmp/trace.jsonl"),
+            start_after: Some("after-key"),
+            log_file: Some("log.txt"),
+            ks_file: Some("ks.csv"),
+            parquet_file: Some("out.parquet"),
+            compression: Some("zstd"),
+            compression_level: Some(3),
+        });
         assert_eq!(config.runtime.worker_threads, 4);
         assert_eq!(config.runtime.max_concurrency, 200);
         assert_eq!(
             config.s3.endpoint_url.as_deref(),
             Some("https://custom.example.com")
         );
-        assert!(config.s3.force_path_style);
-        assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
+        assert!(config.s3.force_path_style());
         assert_eq!(config.s3.profile.as_deref(), Some("test-profile"));
-        assert!(config.s3.debug_s3);
         assert_eq!(config.s3.trace_compat.as_deref(), Some("/tmp/trace.jsonl"));
         assert_eq!(config.s3.start_after.as_deref(), Some("after-key"));
         assert_eq!(config.output.log_file.as_deref(), Some("log.txt"));
@@ -691,84 +701,48 @@ profile = "bos"
             Some("https://s3.bj.bcebos.com")
         );
         assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
-        assert!(!config.s3.force_path_style);
+        assert!(!config.s3.force_path_style());
     }
 
     #[test]
-    fn test_apply_bos_profile_preserves_explicit_path_style() {
+    fn test_explicit_addressing_style_wins_over_the_preset() {
+        // Explicit `auto` included: it used to be indistinguishable from the
+        // default and was replaced by the preset's style.
+        for style in ["path", "auto"] {
+            let mut config = S3TurboConfig::default();
+            config.apply_cli_overrides(CliOverrides {
+                provider: Some("minio"),
+                addressing_style: Some(style),
+                ..CliOverrides::default()
+            });
+            config.apply_profile_preset(None);
+            assert_eq!(config.s3.addressing_style.to_string(), style);
+        }
         let mut config = S3TurboConfig::default();
-        config.s3.profile = Some("bos".to_string());
-        config.s3.addressing_style = AddressingStyle::Path;
+        config.s3.profile = Some("minio".to_string());
         config.apply_profile_preset(None);
-        config.normalize_addressing_style();
         assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
-        assert!(config.s3.force_path_style);
-    }
-
-    #[test]
-    fn test_normalize_addressing_style_path_forces_path_style() {
-        let mut config = S3TurboConfig::default();
-        config.s3.addressing_style = AddressingStyle::Path;
-        config.normalize_addressing_style();
-        assert!(config.s3.force_path_style);
-    }
-
-    #[test]
-    fn test_normalize_addressing_style_force_path_style_wins() {
-        let mut config = S3TurboConfig::default();
-        config.s3.addressing_style = AddressingStyle::Virtual;
-        config.s3.force_path_style = true;
-        config.normalize_addressing_style();
-        assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
-        assert!(config.s3.force_path_style);
     }
 
     #[test]
     fn test_endpoint_url_does_not_force_path_style() {
         let mut config = S3TurboConfig::default();
-        config.apply_cli_overrides(
-            None,
-            None,
-            Some("https://s3.bj.bcebos.com"),
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        config.normalize_addressing_style();
+        config.apply_cli_overrides(CliOverrides {
+            endpoint: Some("https://s3.bj.bcebos.com"),
+            ..CliOverrides::default()
+        });
         assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
-        assert!(!config.s3.force_path_style);
+        assert!(!config.s3.force_path_style());
     }
 
     #[test]
-    fn test_cli_virtual_addressing_overrides_config_force_path_style() {
-        let mut config = S3TurboConfig::default();
-        config.s3.force_path_style = true;
-        config.s3.addressing_style = AddressingStyle::Path;
-        config.apply_cli_overrides(
-            None,
-            None,
-            None,
-            Some("virtual"),
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        config.normalize_addressing_style();
+    fn test_cli_virtual_addressing_overrides_config_file_style() {
+        let mut config = S3TurboConfig::parse("[s3]\naddressing_style = \"path\"\n").unwrap();
+        config.apply_cli_overrides(CliOverrides {
+            addressing_style: Some("virtual"),
+            ..CliOverrides::default()
+        });
         assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
-        assert!(!config.s3.force_path_style);
     }
 
     #[test]
