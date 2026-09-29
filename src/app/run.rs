@@ -725,8 +725,6 @@ pub(crate) fn run() {
         }
         // ── Spawn list / diff side tasks ─────────────────────
         let is_diff = mode == RunMode::BiDir;
-        let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
         // The list reactor's report of the key ranges it left unwritten.
         let mut resume_slot: Option<Arc<std::sync::Mutex<Option<checkpoint::ResumeProgress>>>> =
             None;
@@ -810,44 +808,42 @@ pub(crate) fn run() {
 
             // Base contexts; each segment task swaps in its own sender.
             let (placeholder_tx, _) = tokio::sync::mpsc::channel(1);
-            let left_ctx = core::S3TaskContext::new(
-                opt_bucket,
-                opt_region,
-                cfg.s3.endpoint_url.as_deref(),
-                cfg.s3.force_path_style(),
-                &sdk_config,
-                &s3_cfg,
-                placeholder_tx.clone(),
-                core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                g_state.clone(),
-                trace_writer.clone(),
-                &cfg.s3.addressing_style.to_string(),
-                cfg.s3.profile.as_deref(),
-                Some(&cli.delimiter),
-                cli.max_keys,
-                cfg.s3.start_after.as_deref(),
-                cli.continuation_token.as_deref(),
-                left_checkpoint.clone(),
-            );
-            let right_ctx = core::S3TaskContext::new(
-                target_bucket,
-                target_region,
-                diff_target_endpoint.as_deref(),
-                cfg.s3.force_path_style(),
-                &sdk_config,
-                &s3_cfg,
-                placeholder_tx,
-                core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                g_state.clone(),
-                trace_writer.clone(),
-                &cfg.s3.addressing_style.to_string(),
-                cfg.s3.profile.as_deref(),
-                Some(&cli.delimiter),
-                cli.max_keys,
-                cfg.s3.start_after.as_deref(),
-                cli.continuation_token.as_deref(),
-                left_checkpoint.clone(),
-            );
+            let left_ctx = core::S3TaskContext::new(core::TaskContextParams {
+                bucket: opt_bucket,
+                region: opt_region,
+                endpoint: cfg.s3.endpoint_url.as_deref(),
+                force_path_style: cfg.s3.force_path_style(),
+                sdk_config: &sdk_config,
+                s3_config: &s3_cfg,
+                data_map_channel: placeholder_tx.clone(),
+                dir: core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+                g_state: g_state.clone(),
+                trace_writer: trace_writer.clone(),
+                addressing_style: &cfg.s3.addressing_style.to_string(),
+                profile: cfg.s3.profile.as_deref(),
+                delimiter: Some(&cli.delimiter),
+                max_keys: cli.max_keys,
+                start_after: cfg.s3.start_after.as_deref(),
+                continuation_token: cli.continuation_token.as_deref(),
+            });
+            let right_ctx = core::S3TaskContext::new(core::TaskContextParams {
+                bucket: target_bucket,
+                region: target_region,
+                endpoint: diff_target_endpoint.as_deref(),
+                force_path_style: cfg.s3.force_path_style(),
+                sdk_config: &sdk_config,
+                s3_config: &s3_cfg,
+                data_map_channel: placeholder_tx,
+                dir: core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+                g_state: g_state.clone(),
+                trace_writer: trace_writer.clone(),
+                addressing_style: &cfg.s3.addressing_style.to_string(),
+                profile: cfg.s3.profile.as_deref(),
+                delimiter: Some(&cli.delimiter),
+                max_keys: cli.max_keys,
+                start_after: cfg.s3.start_after.as_deref(),
+                continuation_token: cli.continuation_token.as_deref(),
+            });
 
             let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
             let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
@@ -901,25 +897,24 @@ pub(crate) fn run() {
             });
         } else {
             let prefix = opt_prefix.clone();
-            let task_ctx = core::S3TaskContext::new(
-                opt_bucket,
-                opt_region,
-                cfg.s3.endpoint_url.as_deref(),
-                cfg.s3.force_path_style(),
-                &sdk_config,
-                &s3_cfg,
-                tx.expect("list mode allocates the streaming channel"),
-                core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
-                g_state.clone(),
-                trace_writer.clone(),
-                &cfg.s3.addressing_style.to_string(),
-                cfg.s3.profile.as_deref(),
-                Some(&cli.delimiter),
-                cli.max_keys,
-                cfg.s3.start_after.as_deref(),
-                cli.continuation_token.as_deref(),
-                left_checkpoint.clone(),
-            );
+            let task_ctx = core::S3TaskContext::new(core::TaskContextParams {
+                bucket: opt_bucket,
+                region: opt_region,
+                endpoint: cfg.s3.endpoint_url.as_deref(),
+                force_path_style: cfg.s3.force_path_style(),
+                sdk_config: &sdk_config,
+                s3_config: &s3_cfg,
+                data_map_channel: tx.expect("list mode allocates the streaming channel"),
+                dir: core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+                g_state: g_state.clone(),
+                trace_writer: trace_writer.clone(),
+                addressing_style: &cfg.s3.addressing_style.to_string(),
+                profile: cfg.s3.profile.as_deref(),
+                delimiter: Some(&cli.delimiter),
+                max_keys: cli.max_keys,
+                start_after: cfg.s3.start_after.as_deref(),
+                continuation_token: cli.continuation_token.as_deref(),
+            });
             resume_slot = Some(task_ctx.resume_progress.clone());
             set.spawn(async move {
                 tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await

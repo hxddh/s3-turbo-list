@@ -841,10 +841,29 @@ pub struct S3TaskContext {
     pub start_after: Option<String>,
     /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
     pub continuation_token: Option<String>,
-    pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
+}
+
+/// What `S3TaskContext::new` builds a list side's context from.
+pub struct TaskContextParams<'a> {
+    pub bucket: &'a str,
+    pub region: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+    pub force_path_style: bool,
+    pub sdk_config: &'a aws_config::SdkConfig,
+    pub s3_config: &'a S3Config,
+    pub data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
+    pub dir: u8,
+    pub g_state: GlobalState,
+    pub trace_writer: Option<Arc<dyn S3TraceWriter>>,
+    pub addressing_style: &'a str,
+    pub profile: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
+    pub max_keys: Option<i32>,
+    pub start_after: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
 }
 
 impl S3TaskContext {
@@ -887,46 +906,27 @@ impl S3TaskContext {
             .await
     }
 
-    pub fn new(
-        bucket: &str,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-        force_path_style: bool,
-        sdk_config: &aws_config::SdkConfig,
-        s3_config: &S3Config,
-        data_map_channel: mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>,
-        dir: u8,
-        g_state: GlobalState,
-        trace_writer: Option<Arc<dyn S3TraceWriter>>,
-        addressing_style: &str,
-        profile: Option<&str>,
-        delimiter: Option<&str>,
-        max_keys: Option<i32>,
-        start_after: Option<&str>,
-        continuation_token: Option<&str>,
-        checkpoint_completed: Arc<Mutex<Vec<usize>>>,
-    ) -> Self {
-        let s3_client = build_s3_client(sdk_config, region, endpoint, force_path_style);
+    pub fn new(p: TaskContextParams<'_>) -> Self {
+        let s3_client = build_s3_client(p.sdk_config, p.region, p.endpoint, p.force_path_style);
 
         Self {
-            s3_bucket_name: bucket.to_string(),
+            s3_bucket_name: p.bucket.to_string(),
             s3_client,
-            data_map_channel,
-            dir,
-            g_state,
-            trace_writer,
-            endpoint_url: endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
-            region: region.map(|r| r.to_string()),
-            addressing_style: addressing_style.to_string(),
-            profile: profile.map(|p| p.to_string()),
-            delimiter: delimiter.map(|d| d.to_string()),
-            max_keys,
-            max_attempts: s3_config.max_attempts.max(1),
-            initial_backoff_secs: s3_config.initial_backoff_secs,
-            operation_timeout_secs: s3_config.operation_timeout_secs.max(1),
-            start_after: start_after.map(|s| s.to_string()),
-            continuation_token: continuation_token.map(|s| s.to_string()),
-            checkpoint_completed,
+            data_map_channel: p.data_map_channel,
+            dir: p.dir,
+            g_state: p.g_state,
+            trace_writer: p.trace_writer,
+            endpoint_url: p.endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
+            region: p.region.map(str::to_string),
+            addressing_style: p.addressing_style.to_string(),
+            profile: p.profile.map(str::to_string),
+            delimiter: p.delimiter.map(str::to_string),
+            max_keys: p.max_keys,
+            max_attempts: p.s3_config.max_attempts.max(1),
+            initial_backoff_secs: p.s3_config.initial_backoff_secs,
+            operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
+            start_after: p.start_after.map(str::to_string),
+            continuation_token: p.continuation_token.map(str::to_string),
             resume_progress: Arc::new(Mutex::new(None)),
         }
     }

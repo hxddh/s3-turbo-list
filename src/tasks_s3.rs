@@ -15,9 +15,9 @@ use tokio::time::{Instant, timeout_at};
 struct SegmentOutcome {
     index: usize,
     completed: bool,
-    /// Original hint segments record checkpoint progress; runtime-split
-    /// children (and split parents) conservatively do not.
-    checkpointable: bool,
+    /// An original hint segment (counted in the heartbeat's done/remaining),
+    /// not a runtime-split child.
+    from_hints: bool,
 }
 
 // ── Adaptive long-tail splitting ───────────────────────────
@@ -85,8 +85,6 @@ pub(crate) struct SegmentControl {
     next_probe_page: AtomicU32,
     /// Consecutive probes that failed (as opposed to finding no boundary).
     probe_failures: AtomicU32,
-    /// Segment gave part of its range away; checkpoint must not record it.
-    was_split: AtomicBool,
     /// Last key whose page reached the output channel (`None`: nothing yet).
     /// Unlike `cursor` — recorded before the send, for split decisions — it
     /// only ever covers rows the data map will write, so an interrupted run
@@ -105,7 +103,6 @@ impl SegmentControl {
             unsplittable: AtomicBool::new(false),
             next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
             probe_failures: AtomicU32::new(0),
-            was_split: AtomicBool::new(false),
             sent: Mutex::new(None),
         }
     }
@@ -153,10 +150,6 @@ impl SegmentControl {
         (self.cursor.lock().unwrap().clone(), self.current_end())
     }
 
-    fn was_split(&self) -> bool {
-        self.was_split.load(Ordering::Relaxed)
-    }
-
     fn is_split_candidate(&self) -> bool {
         self.pages.load(Ordering::Relaxed) >= self.next_probe_page.load(Ordering::Relaxed)
             && !self.splitting.load(Ordering::Relaxed)
@@ -177,7 +170,6 @@ impl SegmentControl {
             return None;
         }
         let old_end = end.replace(proposed.clone());
-        self.was_split.store(true, Ordering::Relaxed);
         self.splitting.store(false, Ordering::Relaxed);
         Some(SplitRange {
             start: proposed,
@@ -539,7 +531,7 @@ async fn flat_reactor_task(
         // Nothing new starts once the run is asked to stop — an interrupt
         // during startup discovery used to be followed by a full first fill.
         while set.len() < flat_concurrency && !ctx.is_quit() {
-            let (index, start, end, checkpointable) = if let Some(child) = pending_children.pop() {
+            let (index, start, end, from_hints) = if let Some(child) = pending_children.pop() {
                 let index = next_child_index;
                 next_child_index += 1;
                 (index, child.start, child.end, false)
@@ -569,7 +561,7 @@ async fn flat_reactor_task(
                 SegmentOutcome {
                     index,
                     completed,
-                    checkpointable,
+                    from_hints,
                 }
             });
         }
@@ -621,24 +613,8 @@ async fn flat_reactor_task(
                         completed_pieces += 1;
                         starts.remove(&outcome.index);
                     }
-                    if outcome.completed {
-                        if outcome.checkpointable {
-                            hints.finish(outcome.index);
-                            let split = control.is_some_and(|c| c.was_split());
-                            if split {
-                                debug!(
-                                    "Segment {} was split at runtime; not marking checkpoint progress",
-                                    outcome.index
-                                );
-                            } else {
-                                ctx.checkpoint_completed.lock().unwrap().push(outcome.index);
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "Segment {} did not complete successfully; not marking checkpoint progress",
-                            outcome.index
-                        );
+                    if outcome.completed && outcome.from_hints {
+                        hints.finish(outcome.index);
                     }
                 }
                 Some(Err(e)) => {
@@ -1287,8 +1263,7 @@ async fn flat_list(
                 // against the authoritative cursor. A segment that already
                 // crossed its boundary must not accept one: S3 order means
                 // no keys remain in its range, so the child would be an
-                // empty segment (a wasted request) and `was_split` would
-                // withhold this fully-completed segment's checkpoint record.
+                // empty segment (a wasted request).
                 if let (Some(tx), false) = (split_tx, is_ended || ctx.is_quit()) {
                     if let Some(child) = control.try_accept_split() {
                         info!(
@@ -1783,7 +1758,6 @@ mod tests {
         assert_eq!(child.start, "big/b/");
         assert_eq!(child.end.as_deref(), Some("small/"));
         assert_eq!(control.current_end().as_deref(), Some("big/b/"));
-        assert!(control.was_split());
         assert!(!control.splitting.load(Ordering::Relaxed));
     }
 
@@ -1797,7 +1771,6 @@ mod tests {
 
         assert!(control.try_accept_split().is_none());
         assert_eq!(control.current_end(), None);
-        assert!(!control.was_split());
         assert!(!control.splitting.load(Ordering::Relaxed));
     }
 
