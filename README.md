@@ -237,7 +237,8 @@ Behind an HTTP proxy, the standard `HTTPS_PROXY` / `HTTP_PROXY` /
 `ALL_PROXY` / `NO_PROXY` variables apply, as with curl and the AWS CLI. A
 local endpoint (for example MinIO on `http://localhost:9000`) goes through
 `HTTP_PROXY` too unless its host is in `NO_PROXY`. `doctor` reports whether a
-proxy applies to the configured endpoint, and the run log names it.
+proxy applies to an explicit path-style endpoint, and every run names the proxy
+it uses for each side's resolved endpoint before its first request.
 
 Validate any endpoint before a full run:
 

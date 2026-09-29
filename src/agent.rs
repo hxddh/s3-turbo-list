@@ -962,19 +962,44 @@ pub fn doctor_report(
     }
 }
 
-/// The endpoint a run talks to when none is configured: the SDK then resolves
-/// an AWS S3 host, which `NO_PROXY` rules such as `.amazonaws.com` match.
-pub const DEFAULT_AWS_ENDPOINT: &str = "https://s3.amazonaws.com";
+/// The URL the SDK will send a bucket's requests to: the S3 endpoint resolver
+/// the client itself uses, given the same bucket, region, endpoint override and
+/// addressing style (a virtual-hosted AWS request goes to
+/// `<bucket>.s3.<region>.amazonaws.com`, not a fixed global host).
+pub fn resolved_request_url(
+    bucket: Option<&str>,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+    force_path_style: bool,
+) -> Option<String> {
+    use aws_sdk_s3::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
+    let mut params = Params::builder().force_path_style(force_path_style);
+    if let Some(bucket) = bucket {
+        params = params.bucket(bucket);
+    }
+    if let Some(region) = region {
+        params = params.region(region);
+    }
+    if let Some(endpoint) = endpoint {
+        params = params.endpoint(endpoint);
+    }
+    let params = params.build().ok()?;
+    // The default resolver answers synchronously; its future is ready at once.
+    let endpoint =
+        futures::executor::block_on(DefaultResolver::new().resolve_endpoint(&params)).ok()?;
+    Some(endpoint.url().to_string())
+}
 
-/// The proxy the SDK's HTTP client will route `endpoint` through, if any.
+/// The proxy the SDK's HTTP client will route `url` through, if any.
 ///
 /// The SDK (behavior version 2025-08-07 and later, which this binary uses)
 /// builds its connector's proxy rules from `HTTP_PROXY` / `HTTPS_PROXY` /
 /// `ALL_PROXY` / `NO_PROXY` with hyper-util's `Matcher::from_env`; asking the
-/// same matcher gives the same answer the run will get. Only the proxy's
-/// scheme, host and port are returned — never credentials in its URL.
-pub fn env_proxy_for_endpoint(endpoint: &str) -> Option<String> {
-    let uri: http::Uri = endpoint.parse().ok()?;
+/// same matcher about the same request URL gives the same answer the run
+/// gets. Only the proxy's scheme, host and port are returned — never
+/// credentials in its URL.
+pub fn env_proxy_for_url(url: &str) -> Option<String> {
+    let uri: http::Uri = url.parse().ok()?;
     let intercept = hyper_util::client::proxy::matcher::Matcher::from_env().intercept(&uri)?;
     let proxy = intercept.uri();
     let host = proxy.host()?;
@@ -985,45 +1010,44 @@ pub fn env_proxy_for_endpoint(endpoint: &str) -> Option<String> {
     })
 }
 
+/// Doctor has no bucket, so it can only answer exactly when the request host
+/// does not depend on one: an explicit endpoint with path-style addressing.
+/// Anywhere else a `NO_PROXY` entry could match the real (bucket-qualified,
+/// regional) host and not a stand-in, so the check is skipped rather than
+/// guessed; the run log names the decision for each resolved endpoint.
 fn proxy_check(cfg: &S3TurboConfig) -> DoctorCheck {
-    let endpoint = match cfg.s3.endpoint_url.as_deref() {
-        Some(e) if !profiles::endpoint_url_has_template_placeholder(e) => e,
-        Some(_) => {
-            return DoctorCheck {
-                name: "proxy".to_string(),
-                status: "skipped".to_string(),
-                message: "endpoint_url is still a template; proxy rules are checked once it \
-                          is a real URL"
-                    .to_string(),
-            }
-        }
-        // A non-AWS profile without an explicit endpoint derives it from the
-        // region, which doctor does not take; the default AWS host would
-        // report the wrong answer.
-        None if cfg.s3.profile.as_deref().is_some_and(|p| p != "aws") => {
-            return DoctorCheck {
-                name: "proxy".to_string(),
-                status: "skipped".to_string(),
-                message: "the endpoint is derived from --region at run time; the run log \
-                          names the proxy it uses, if any"
-                    .to_string(),
-            }
-        }
-        None => DEFAULT_AWS_ENDPOINT,
+    let skipped = |message: &str| DoctorCheck {
+        name: "proxy".to_string(),
+        status: "skipped".to_string(),
+        message: message.to_string(),
     };
+    let endpoint = match cfg.s3.endpoint_url.as_deref() {
+        Some(e) if profiles::endpoint_url_has_template_placeholder(e) => {
+            return skipped(
+                "endpoint_url is still a template; proxy rules are checked once it is a real URL",
+            );
+        }
+        Some(e) if cfg.s3.force_path_style => e,
+        _ => {
+            return skipped(
+                "the request host depends on the bucket and region (virtual-hosted or AWS \
+                 endpoint), which doctor does not take; the run log names the proxy, if \
+                 any, for each resolved endpoint",
+            );
+        }
+    };
+    let url = resolved_request_url(None, None, Some(endpoint), true)
+        .unwrap_or_else(|| endpoint.to_string());
     DoctorCheck {
         name: "proxy".to_string(),
         status: "ok".to_string(),
-        message: match env_proxy_for_endpoint(endpoint) {
+        message: match env_proxy_for_url(&url) {
             Some(proxy) => format!(
                 "requests to {} go through proxy {} (from HTTP(S)_PROXY / ALL_PROXY; \
                  add the host to NO_PROXY to connect directly)",
-                endpoint, proxy
+                url, proxy
             ),
-            None => format!(
-                "requests to {} connect directly (no proxy applies)",
-                endpoint
-            ),
+            None => format!("requests to {} connect directly (no proxy applies)", url),
         },
     }
 }
@@ -1131,6 +1155,27 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolved_request_url_matches_the_sdk_request_host() {
+        // Virtual-hosted AWS: bucket-qualified, regional host.
+        let url =
+            super::resolved_request_url(Some("my-bucket"), Some("us-west-2"), None, false).unwrap();
+        assert!(
+            url.starts_with("https://my-bucket.s3.us-west-2.amazonaws.com"),
+            "{}",
+            url
+        );
+        // Path-style custom endpoint: the endpoint plus the bucket path.
+        let url = super::resolved_request_url(
+            Some("my-bucket"),
+            Some("us-east-1"),
+            Some("http://127.0.0.1:9000"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:9000/my-bucket");
+    }
+
     use super::{conventional_hints_path, conventional_hints_path_for_prefix, redact_command_args};
 
     fn parquet_outputs(base: &str) -> super::OutputPathSummary {

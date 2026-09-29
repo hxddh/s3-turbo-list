@@ -1044,6 +1044,44 @@ fn main() {
             (None, None)
         };
 
+        // ── Proxy routing, before the first S3 request ───────
+        // Startup discovery below already talks to the endpoint, so an
+        // unexpected proxy must be named before it; a diff names both sides,
+        // whose endpoints (and NO_PROXY matches) can differ.
+        let sdk_region = sdk_config.region().map(|r| r.as_ref().to_string());
+        let mut sides = vec![(
+            "source",
+            opt_bucket,
+            opt_region.or(sdk_region.as_deref()),
+            cfg.s3.endpoint_url.as_deref(),
+        )];
+        if let Some(target_bucket) = opt_target_bucket {
+            sides.push((
+                "target",
+                target_bucket,
+                opt_target_region
+                    .flatten()
+                    .or(sdk_region.as_deref()),
+                diff_target_endpoint.as_deref(),
+            ));
+        }
+        for (side, bucket, region, endpoint) in sides {
+            if let Some(url) = agent::resolved_request_url(
+                Some(bucket),
+                region,
+                endpoint,
+                cfg.s3.force_path_style,
+            ) {
+                match agent::env_proxy_for_url(&url) {
+                    Some(proxy) => info!(
+                        "  {} requests to {} go through proxy {} (from the proxy environment variables)",
+                        side, url, proxy
+                    ),
+                    None => log::debug!("  {} requests to {} connect directly", side, url),
+                }
+            }
+        }
+
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
         let trace_writer: Option<Arc<dyn S3TraceWriter>> =
@@ -1204,15 +1242,6 @@ fn main() {
         if let Some(ep) = &cfg.s3.endpoint_url {
             info!("  endpoint: {}", ep);
         }
-        let proxy_probe = cfg
-            .s3
-            .endpoint_url
-            .as_deref()
-            .unwrap_or(agent::DEFAULT_AWS_ENDPOINT);
-        if let Some(proxy) = agent::env_proxy_for_endpoint(proxy_probe) {
-            info!("  proxy: {} (from the proxy environment variables)", proxy);
-        }
-
         // ── Spawn list / diff side tasks ─────────────────────
         let is_diff = mode == RunMode::BiDir;
         let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =

@@ -21,12 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crates require.
 
 ### Added
-- **`doctor` reports the HTTP proxy that applies to the endpoint** (`proxy`
-  check), and a run logs it at startup. Runs have always honoured
-  `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` through the SDK's
-  HTTP client; the check uses the same matcher, so a local endpoint
-  unexpectedly routed through a proxy is visible before the run. Credentials in
-  the proxy URL are never printed. README documents the behaviour.
+- **Runs name the HTTP proxy they use, and `doctor` checks it** (`proxy`
+  check). Runs have always honoured `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` /
+  `NO_PROXY` through the SDK's HTTP client. Each run now logs, before its first
+  request, the proxy for each side's endpoint as the SDK resolves it (bucket,
+  region and addressing style; both sides of a diff). `doctor` answers for an
+  explicit path-style endpoint and reports `skipped` when the host depends on
+  the bucket. Both use the SDK's own endpoint resolver and proxy matcher, so a
+  local endpoint unexpectedly routed through a proxy is visible up front.
+  Credentials in the proxy URL are never printed. README documents the
+  behaviour.
 
 ## [0.34.0] - 2026-09-29
 

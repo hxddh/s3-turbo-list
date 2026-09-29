@@ -5108,6 +5108,15 @@ fn local_mock_list_routes_through_http_proxy_from_environment() {
         run_cli_with_env(&args, dir.path(), &[("HTTP_PROXY", proxy.as_str())]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert_eq!(stdout.lines().count(), 2, "stdout: {}", stdout);
+    // The run names the proxy for the resolved request URL before any request.
+    assert!(
+        stderr.contains(&format!(
+            "source requests to http://s3-proxy-only.invalid:9000/mock-bucket go through proxy {}",
+            proxy
+        )),
+        "stderr: {}",
+        stderr
+    );
     let requests = server.requests();
     assert!(!requests.is_empty());
     for request in &requests {
@@ -5138,6 +5147,8 @@ fn local_mock_doctor_reports_the_proxy_without_credentials() {
     let args: Vec<String> = [
         "--endpoint-url",
         "https://storage.example.test",
+        "--addressing-style",
+        "path",
         "doctor",
         "--json",
     ]
@@ -5190,4 +5201,42 @@ fn local_mock_doctor_reports_the_proxy_without_credentials() {
         "{}",
         check["message"]
     );
+}
+
+#[test]
+fn local_mock_doctor_skips_the_proxy_check_when_the_host_depends_on_the_bucket() {
+    // Without an explicit path-style endpoint the request host is
+    // bucket-qualified and regional (e.g. <bucket>.s3.us-west-2.amazonaws.com);
+    // doctor has no bucket, so any stand-in host could disagree with a
+    // NO_PROXY rule. It reports the check as skipped instead of guessing.
+    let dir = tempfile::tempdir().unwrap();
+    for extra in [
+        vec![],
+        vec!["--endpoint-url", "https://storage.example.test"],
+    ] {
+        let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        args.extend(["doctor".to_string(), "--json".to_string()]);
+        let (code, stdout, stderr) = run_cli_with_env(
+            &args,
+            dir.path(),
+            &[
+                ("HTTPS_PROXY", "http://proxy.example.test:3128"),
+                ("NO_PROXY", ".s3.us-west-2.amazonaws.com"),
+            ],
+        );
+        assert!(
+            code == 0 || code == 2,
+            "stdout: {}\nstderr: {}",
+            stdout,
+            stderr
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "proxy")
+            .expect("proxy check");
+        assert_eq!(check["status"], "skipped", "{}", check);
+    }
 }
