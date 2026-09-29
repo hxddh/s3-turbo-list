@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-09-29
+
 ### Changed
 - **Dependencies upgraded.** The AWS SDK moves to `aws-sdk-s3` 1.150 /
   `aws-config` 1.12 with the matching smithy runtime; its HTTP client now sets
