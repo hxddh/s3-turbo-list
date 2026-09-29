@@ -2584,3 +2584,54 @@ fn test_dry_run_plans_prefix_distinct_names_log_file_and_slash_warning() {
         slashed["warnings"]
     );
 }
+
+#[test]
+fn test_diff_target_region_defaults_to_region() {
+    // It used to fall through to the ambient AWS_REGION, invisibly.
+    let (code, stdout, stderr) = run_cli(&[
+        "--dry-run",
+        "diff",
+        "--bucket",
+        "src",
+        "--region",
+        "us-west-2",
+        "--target-bucket",
+        "dst",
+    ]);
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(plan["inputs"]["target_region"], "us-west-2");
+}
+
+#[test]
+fn test_pre_run_failures_report_like_failed_runs() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--filter",
+        "SOURCE.size >",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("s3-turbo-list: run failed (exit 2):"),
+        "stderr: {}",
+        stderr
+    );
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 2);
+}
+
+#[test]
+fn test_doctor_json_reports_an_unreadable_hints_file_as_json() {
+    let (code, stdout, _stderr) =
+        run_cli(&["--hints-file", "does-not-exist.txt", "doctor", "--json"]);
+    assert_eq!(code, 2);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["checks"][0]["name"], "hints");
+}

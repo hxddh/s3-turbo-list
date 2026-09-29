@@ -831,6 +831,11 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     let mut out = Vec::with_capacity(batch.len().saturating_mul(96).min(1024 * 1024));
     let mut folder = PrefixRunFolder::default();
+    // Counted into `stats` only once the batch is written: a reader that
+    // closed the pipe (`| head`) used to leave the manifest claiming the
+    // rows of the batch that failed to write.
+    let mut rows = 0usize;
+    let mut bytes = 0u64;
 
     for (key, props) in batch {
         if !props.include_in_list_output() {
@@ -840,8 +845,8 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         if !props.is_common_prefix() {
             folder.add(prefix_stats, key.prefix(), props.size());
         }
-        stats.streamed_rows += 1;
-        stats.bytes_total = stats.bytes_total.saturating_add(props.size());
+        rows += 1;
+        bytes = bytes.saturating_add(props.size());
 
         if let Err(e) = render_text_row(
             &mut out,
@@ -870,6 +875,8 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     }
 
+    stats.streamed_rows += rows;
+    stats.bytes_total = stats.bytes_total.saturating_add(bytes);
     true
 }
 
@@ -1592,7 +1599,7 @@ pub async fn data_map_task_diff_streaming(
     let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
         buf_writer,
-        filename_ks,
+        filename_output,
         output_config.row_group_size,
         &output_config.compression,
         output_config.compression_level,
@@ -1605,7 +1612,17 @@ pub async fn data_map_task_diff_streaming(
         Ok(outcome) => Some(outcome),
         Err(e) => {
             log::error!("Diff merge failed: {}", e);
-            output_ok = false;
+            // A merge stopped because the run is quitting — a side failed
+            // (AccessDenied, retries exhausted) or the run was interrupted —
+            // is explained by that fatal error or interrupt; counting it as an
+            // output failure made a side's AccessDenied exit 5 "output write
+            // failed" instead of 3 with the S3 reason. Anything else (an
+            // ordering violation, a write error) is an output failure with
+            // this message as its reason.
+            if !g_state.is_quit() {
+                g_state.note_output_error(format!("diff merge failed: {}", e));
+                output_ok = false;
+            }
             None
         }
     };
@@ -1616,6 +1633,7 @@ pub async fn data_map_task_diff_streaming(
             Ok(count) => count,
             Err(e) => {
                 log::error!("{}", e);
+                g_state.note_output_error(format!("{}: {}", filename_ks, e));
                 output_ok = false;
                 0
             }

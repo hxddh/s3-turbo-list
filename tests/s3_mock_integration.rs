@@ -141,12 +141,16 @@ impl MockS3Server {
                         let concurrency = Arc::clone(&thread_concurrency);
                         let panic_slot = Arc::clone(&thread_panic);
                         workers.push(thread::spawn(move || {
-                            concurrency.enter();
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    handle_connection(stream, seq, &requests, handler.as_ref())
+                                    handle_connection(
+                                        stream,
+                                        seq,
+                                        &requests,
+                                        handler.as_ref(),
+                                        &concurrency,
+                                    )
                                 }));
-                            concurrency.leave();
                             if let Err(payload) = result {
                                 let message = payload
                                     .downcast_ref::<&str>()
@@ -218,6 +222,7 @@ fn handle_connection(
     sequence: usize,
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
     handler: &(dyn Fn(RecordedRequest, usize) -> MockResponse + Send + Sync),
+    concurrency: &ServedConcurrency,
 ) {
     // The listener is non-blocking, and on macOS (BSD) an accepted socket
     // inherits O_NONBLOCK. A read that raced ahead of the client's bytes then
@@ -230,7 +235,13 @@ fn handle_connection(
         return;
     };
     requests.lock().unwrap().push(request.clone());
+    // Count a request as in flight only while its response is being
+    // produced. Counting the whole connection thread let a strictly serial
+    // client overlap itself: it sends the next request as soon as it has the
+    // previous response, possibly before that connection's thread returned.
+    concurrency.enter();
     let response = handler(request, sequence);
+    concurrency.leave();
     if response.drop_connection {
         let _ = stream.shutdown(std::net::Shutdown::Both);
         return;
@@ -5102,6 +5113,120 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
     let (code, stdout, stderr) = run_cli(&filtered, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert_eq!(stdout.lines().count(), 3, "stdout: {}", stdout);
+}
+
+#[test]
+fn local_mock_manifest_check_follows_a_moved_run_directory() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["a/1.txt", "b/2.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let run_dir = root.path().join("run1");
+    std::fs::create_dir(&run_dir).unwrap();
+    let config = run_dir.join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "--output-parquet-file",
+        "out.parquet",
+        "--output-ks-file",
+        "out.ks",
+        "--run-manifest",
+        "run.json",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, _stdout, stderr) = run_cli(&args, &run_dir);
+    assert_eq!(code, 0, "stderr: {}", stderr);
+
+    // The run directory moves; the manifest's recorded cwd no longer exists.
+    let moved = root.path().join("moved");
+    std::fs::rename(&run_dir, &moved).unwrap();
+    let check: Vec<String> = ["manifest-summary", "run.json", "--check", "--json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (code, stdout, stderr) = run_cli(&check, &moved);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["check"]["parquet_schema_check"], "ok");
+
+    // A missing Parquet artifact fails the schema check rather than reading
+    // "not applicable".
+    std::fs::remove_file(moved.join("out.parquet")).unwrap();
+    let (code, stdout, _stderr) = run_cli(&check, &moved);
+    assert_eq!(code, 6);
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["check"]["parquet_schema_check"], "fail");
+}
+
+#[test]
+fn local_mock_diff_side_access_denied_exits_3_with_the_s3_reason() {
+    // A side's AccessDenied aborts the merge; that used to be counted as an
+    // output failure, so the run exited 5 "an output write failed".
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.path.starts_with("/dst") {
+            MockResponse::error(403, "AccessDenied", "Access Denied")
+        } else {
+            MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &["a/1.txt", "b/2.txt"],
+                &[],
+                false,
+                None,
+            ))
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "--output-parquet-file",
+        "diff.parquet",
+        "diff",
+        "--bucket",
+        "src",
+        "--region",
+        "us-east-1",
+        "--target-bucket",
+        "dst",
+        "--target-region",
+        "us-east-1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("AccessDenied"), "stderr: {}", stderr);
+    assert!(!dir.path().join("diff.parquet").exists());
 }
 
 #[cfg(unix)]

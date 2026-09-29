@@ -187,7 +187,7 @@ enum Commands {
         #[arg(long)]
         bucket: String,
 
-        /// Target AWS region
+        /// Target AWS region [default: --region]
         #[arg(long)]
         target_region: Option<String>,
 
@@ -433,6 +433,59 @@ static DOCTOR_JSON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// Exit 2 on a config/CLI validation error, in doctor's JSON shape when
 /// doctor's JSON output was requested.
 fn exit_config_error(message: &str) -> ! {
+    exit_doctor_check_error("config_parse", message)
+}
+
+/// Set once the command is a real `list` / `diff` / `compat-probe` run (not a
+/// dry run): its pre-run failures report like failed runs.
+static RUN_COMMAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// `--agent` on such a run: stdout carries a JSON result even when the run
+/// stops before listing.
+static AGENT_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Stop before (or instead of) listing with `code`. Every command prints the
+/// reason on stderr as before; a run command also prints the documented
+/// `s3-turbo-list: run failed (exit N): <reason>` line and, under `--agent`,
+/// a minimal JSON result on stdout — agents branch on those, and pre-run
+/// failures (a bad filter, no region, an uncreatable output) used to give
+/// neither.
+fn exit_before_run(code: agent::ExitCode, message: String) -> ! {
+    eprintln!("{}", message);
+    run_failure_epilogue(code, &message);
+    std::process::exit(code.code())
+}
+
+fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
+    if !RUN_COMMAND.get().copied().unwrap_or(false) {
+        return;
+    }
+    let reason = message
+        .lines()
+        .next()
+        .unwrap_or(message)
+        .trim_end_matches('.');
+    eprintln!(
+        "s3-turbo-list: run failed (exit {}): {}. Nothing was listed.",
+        code.code(),
+        reason
+    );
+    if AGENT_RUN.get().copied().unwrap_or(false) {
+        println!(
+            "{}",
+            agent::to_pretty_json(&serde_json::json!({
+                "schema_version": agent::AGENT_SCHEMA_VERSION,
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "status": "failed",
+                "exit_code": code.code(),
+                "error": message,
+            }))
+        );
+    }
+}
+
+/// Exit 2 on a local input error; `doctor --json` still prints its JSON
+/// report (one `error` check named `check`), so its stdout is never empty.
+fn exit_doctor_check_error(check: &str, message: &str) -> ! {
     eprintln!("{}", message);
     if DOCTOR_JSON.get().copied().unwrap_or(false) {
         println!(
@@ -442,18 +495,40 @@ fn exit_config_error(message: &str) -> ! {
                 "tool_version": env!("CARGO_PKG_VERSION"),
                 "status": "error",
                 "checks": [{
-                    "name": "config_parse",
+                    "name": check,
                     "status": "error",
                     "message": message,
                 }],
             }))
         );
     }
+    run_failure_epilogue(agent::ExitCode::CliConfig, message);
     std::process::exit(agent::ExitCode::CliConfig.code());
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // A diff without --target-region lists the target in --region. It used to
+    // fall through to the SDK's ambient region (AWS_REGION / profile), so the
+    // target was signed for another region than the plan showed (it showed
+    // none), and a region-templated profile kept the source's endpoint.
+    if let Commands::Diff {
+        region,
+        target_region,
+        ..
+    } = &mut cli.cmd
+        && target_region.is_none()
+    {
+        *target_region = region.clone();
+    }
+    let cli = cli;
+    let run_command = !cli.dry_run
+        && matches!(
+            cli.cmd,
+            Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
+        );
+    let _ = RUN_COMMAND.set(run_command);
+    let _ = AGENT_RUN.set(run_command && cli.agent);
     let _ = DOCTOR_JSON.set(
         matches!(cli.cmd, Commands::Doctor { json: true, .. })
             || (cli.agent && matches!(cli.cmd, Commands::Doctor { .. })),
@@ -485,11 +560,13 @@ fn main() {
             if cli.dry_run {
                 // init-config only writes a local file; a "dry run" that
                 // wrote it anyway (as it did) is worse than a clear refusal.
-                eprintln!(
-                    "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
-                    output
+                exit_before_run(
+                    agent::ExitCode::CliConfig,
+                    format!(
+                        "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
+                        output
+                    ),
                 );
-                std::process::exit(agent::ExitCode::CliConfig.code());
             }
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
@@ -569,8 +646,7 @@ fn main() {
             // file is supplied it is linted and embedded in the report.
             let hints = cli.hints_file.as_deref().map(|path| {
                 hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
-                    eprintln!("Hints validation failed: {}", e);
-                    std::process::exit(agent::ExitCode::CliConfig.code());
+                    exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
                 })
             });
             let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
@@ -655,8 +731,10 @@ fn main() {
                 if let Some(path) = output.as_deref()
                     && let Err(e) = agent::write_json_file(path, &report)
                 {
-                    eprintln!("Benchmark write error: {}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                    exit_before_run(
+                        agent::ExitCode::OutputWrite,
+                        format!("Benchmark write error: {}", e),
+                    );
                 }
                 if *json {
                     println!("{}", rendered);
@@ -694,8 +772,7 @@ fn main() {
                 RunMode::List
             };
             if let Err(e) = config::compile_filter_with_mode(filter_expr, &mode) {
-                eprintln!("Filter error: {}", e);
-                std::process::exit(agent::ExitCode::CliConfig.code());
+                exit_before_run(agent::ExitCode::CliConfig, format!("Filter error: {}", e));
             }
         }
         let (planned_ks, planned_parquet, _) = planned_output_paths(&cli, &cfg);
@@ -714,8 +791,10 @@ fn main() {
         if let Some(path) = cli.plan_json.as_deref()
             && let Err(e) = agent::write_json_file(path, &report)
         {
-            eprintln!("Plan write error: {}", e);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!("Plan write error: {}", e),
+            );
         }
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
@@ -725,18 +804,24 @@ fn main() {
         if let Some(path) = cli.hints_file.as_deref()
             && let Err(e) = hints::parse_hints_file(path)
         {
-            eprintln!("Hints file error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!("Hints file error: {}", e),
+            );
         }
         // The plan must predict the run: a setup problem the run would stop
         // on with exit 3 fails the dry run the same way (plan still written).
         if let Some(error) = provider_setup_guardrail_warnings(&cli, &cfg).first() {
-            eprintln!("Provider setup error: {}", error);
-            std::process::exit(agent::ExitCode::ProviderSetup.code());
+            exit_before_run(
+                agent::ExitCode::ProviderSetup,
+                format!("Provider setup error: {}", error),
+            );
         }
         if let Some(problem) = planned_output_problems(&report.outputs, &cli).first() {
-            eprintln!("Output error: {}", problem);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!("Output error: {}", problem),
+            );
         }
         return;
     }
@@ -769,8 +854,10 @@ fn main() {
             Err(e) => {
                 // An unwritable log path is an output failure, reported
                 // through the documented exit codes like every other one.
-                eprintln!("Failed to open log file '{}': {}", logfile_s, e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
+                exit_before_run(
+                    agent::ExitCode::OutputWrite,
+                    format!("Failed to open log file '{}': {}", logfile_s, e),
+                );
             }
         };
         env_logger::Builder::new()
@@ -817,22 +904,21 @@ fn main() {
                 .or(cli.endpoint.as_deref())
                 .or(cfg.s3.endpoint_url.as_deref())
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
-                         or set s3.endpoint_url in the config"
-                    );
-                    std::process::exit(agent::ExitCode::CliConfig.code());
+                    exit_before_run(agent::ExitCode::CliConfig, "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
+                         or set s3.endpoint_url in the config".to_string());
                 })
                 .to_string();
             let addressing_style = match addressing_style.as_deref() {
                 Some(style) => match style.parse::<config::AddressingStyle>() {
                     Ok(parsed) => parsed.to_string(),
                     Err(_) => {
-                        eprintln!(
-                            "--addressing-style '{}' is not one of: path, virtual, auto",
-                            style
+                        exit_before_run(
+                            agent::ExitCode::CliConfig,
+                            format!(
+                                "--addressing-style '{}' is not one of: path, virtual, auto",
+                                style
+                            ),
                         );
-                        std::process::exit(agent::ExitCode::CliConfig.code());
                     }
                 },
                 None => cfg.s3.addressing_style.to_string(),
@@ -870,8 +956,7 @@ fn main() {
     // Install filter if provided.
     if let Some(ref filter_expr) = cli.filter {
         if let Err(e) = config::install_filter(filter_expr, &mode) {
-            eprintln!("Filter error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(agent::ExitCode::CliConfig, format!("Filter error: {}", e));
         }
         info!("Filter installed: \"{}\"", filter_expr);
     }
@@ -916,11 +1001,13 @@ fn main() {
             match std::fs::remove_file(path) {
                 Ok(()) => removed += 1,
                 Err(e) => {
-                    eprintln!(
-                        "Output error: cannot remove stale part file '{}': {}",
-                        path, e
+                    exit_before_run(
+                        agent::ExitCode::OutputWrite,
+                        format!(
+                            "Output error: cannot remove stale part file '{}': {}",
+                            path, e
+                        ),
                     );
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
                 }
             }
         }
@@ -945,8 +1032,10 @@ fn main() {
         q.store(true, Ordering::SeqCst);
         i.store(true, Ordering::SeqCst);
     }) {
-        eprintln!("Failed to set ctrl-c signal handler: {}", e);
-        std::process::exit(agent::ExitCode::InternalError.code());
+        exit_before_run(
+            agent::ExitCode::InternalError,
+            format!("Failed to set ctrl-c signal handler: {}", e),
+        );
     }
 
     let g_state = core::GlobalState::new(quit, g_tasks_count);
@@ -1019,13 +1108,10 @@ fn main() {
         let side_without_region =
             opt_region.is_none() || opt_target_region.is_some_and(|r| r.is_none());
         if side_without_region && sdk_config.region().is_none() {
-            eprintln!(
-                "No AWS region resolved{}: pass --region{} or set AWS_REGION \
+            exit_before_run(agent::ExitCode::ProviderSetup, format!("No AWS region resolved{}: pass --region{} or set AWS_REGION \
                  (or a region in the AWS profile).",
                 if opt_region.is_none() { "" } else { " for the diff target" },
-                if opt_region.is_none() { "" } else { " / --target-region" },
-            );
-            std::process::exit(agent::ExitCode::ProviderSetup.code());
+                if opt_region.is_none() { "" } else { " / --target-region" },));
         }
 
         // List mode streams over one channel; diff builds per-segment
@@ -1824,13 +1910,15 @@ fn main() {
     if let Some(path) = cli.run_manifest.as_deref()
         && let Err(e) = agent::write_json_file(path, &manifest)
     {
-        eprintln!("Manifest write error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Manifest write error: {}", e),
+        );
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
     } else if exit_code == agent::ExitCode::Success && cli.summary_only {
-        print_summary(&manifest.metrics);
+        print_summary(&manifest.metrics, &cli.delimiter);
     } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
         // stdout is reserved for TSV/NDJSON rows.
     } else if exit_code == agent::ExitCode::Success {
@@ -1873,12 +1961,16 @@ fn generate_man_page() {
     let man = clap_mangen::Man::new(cmd);
     let mut buffer: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buffer) {
-        eprintln!("Man page generation error: {}", e);
-        std::process::exit(agent::ExitCode::InternalError.code());
+        exit_before_run(
+            agent::ExitCode::InternalError,
+            format!("Man page generation error: {}", e),
+        );
     }
     if let Err(e) = std::io::stdout().write_all(&buffer) {
-        eprintln!("Man page write error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Man page write error: {}", e),
+        );
     }
 }
 
@@ -1888,8 +1980,10 @@ fn build_runtime_or_exit(worker_threads: usize) -> tokio::runtime::Runtime {
         .worker_threads(worker_threads)
         .build()
         .unwrap_or_else(|e| {
-            eprintln!("Runtime initialization error: {}", e);
-            std::process::exit(agent::ExitCode::InternalError.code());
+            exit_before_run(
+                agent::ExitCode::InternalError,
+                format!("Runtime initialization error: {}", e),
+            );
         })
 }
 
@@ -1930,8 +2024,7 @@ fn run_guide(topic: Option<&str>) {
     match local_tools::render_guide(topic) {
         Ok(rendered) => print!("{}", rendered),
         Err(e) => {
-            eprintln!("Guide error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(agent::ExitCode::CliConfig, format!("Guide error: {}", e));
         }
     }
 }
@@ -2071,8 +2164,10 @@ fn validate_compat_probe_command(cli: &Cli) {
 
 fn validate_summary_only_command(cli: &Cli) {
     if cli.summary_only && !matches!(cli.cmd, Commands::List { .. }) {
-        eprintln!("--summary-only is only supported with the list command");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--summary-only is only supported with the list command".to_string(),
+        );
     }
 }
 
@@ -2081,14 +2176,16 @@ fn validate_output_format_command(cli: &Cli) {
         return;
     };
     if cli.summary_only && format.writes_stdout_rows() {
-        eprintln!("--summary-only cannot be combined with --output-format tsv or ndjson");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--summary-only cannot be combined with --output-format tsv or ndjson".to_string(),
+        );
     }
     if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
-        eprintln!(
-            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
@@ -2186,28 +2283,35 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         return;
     };
     if token.trim().is_empty() {
-        eprintln!("--continuation-token cannot be empty");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be empty".to_string(),
+        );
     }
     let Commands::List { region, bucket, .. } = &cli.cmd else {
-        eprintln!("--continuation-token is only supported with the list command");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token is only supported with the list command".to_string(),
+        );
     };
     if cli.resume {
-        eprintln!(
-            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if cfg.s3.start_after.is_some() {
-        eprintln!("--continuation-token cannot be combined with --start-after");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be combined with --start-after".to_string(),
+        );
     }
     if cli.hints_file.is_some() {
-        eprintln!(
+        exit_before_run(
+            agent::ExitCode::CliConfig,
             "--continuation-token is single-chain only and cannot be combined with --hints-file"
+                .to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if !cli.no_auto_hints {
         let hints_path = agent::conventional_hints_path_for_prefix(
@@ -2216,11 +2320,13 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
             &listing_prefix(cli),
         );
         if std::path::Path::new(&hints_path).exists() {
-            eprintln!(
-                "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
-                hints_path
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!(
+                    "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
+                    hints_path
+                ),
             );
-            std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
 }
@@ -2240,10 +2346,11 @@ fn validate_delimiter_hints_command(cli: &Cli) {
         && !cli.delimiter.is_empty()
         && cli.hints_file.is_some()
     {
-        eprintln!(
+        exit_before_run(
+            agent::ExitCode::CliConfig,
             "--delimiter lists one hierarchical segment and cannot be combined with --hints-file"
+                .to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
@@ -2257,14 +2364,17 @@ fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
         return;
     }
     if cli.resume {
-        eprintln!(
-            "--start-after cannot be combined with --resume; checkpoint segments describe the full key space and would mis-resume a partial-range listing"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--start-after cannot be combined with --resume; checkpoint segments describe the full key space and would mis-resume a partial-range listing".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if cli.hints_file.is_some() {
-        eprintln!("--start-after is single-chain only and cannot be combined with --hints-file");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--start-after is single-chain only and cannot be combined with --hints-file"
+                .to_string(),
+        );
     }
 }
 
@@ -2273,27 +2383,29 @@ fn validate_diff_hints_command(cli: &Cli) {
         return;
     }
     if cli.hints_file.is_some() {
-        eprintln!(
-            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
 fn validate_diff_resume_command(cli: &Cli) {
     if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
-        eprintln!(
-            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
 fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
     let warnings = provider_setup_guardrail_warnings(cli, cfg);
     if let Some(error) = warnings.first() {
-        eprintln!("Provider setup error: {}", error);
-        std::process::exit(agent::ExitCode::ProviderSetup.code());
+        exit_before_run(
+            agent::ExitCode::ProviderSetup,
+            format!("Provider setup error: {}", error),
+        );
     }
 }
 
@@ -2564,11 +2676,13 @@ fn validate_distinct_output_paths(
         if let Some((_, other_label, other_path)) =
             seen.iter().find(|(seen_key, _, _)| *seen_key == k)
         {
-            eprintln!(
-                "{} '{}' and {} '{}' are the same file; every output needs its own path",
-                other_label, other_path, label, path
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!(
+                    "{} '{}' and {} '{}' are the same file; every output needs its own path",
+                    other_label, other_path, label, path
+                ),
             );
-            std::process::exit(agent::ExitCode::CliConfig.code());
         }
         seen.push((k, label, path));
     }
@@ -2600,13 +2714,15 @@ fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
             continue;
         };
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "Output error: cannot create directory '{}' for '{}': {}",
-                parent.display(),
-                path,
-                e
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!(
+                    "Output error: cannot create directory '{}' for '{}': {}",
+                    parent.display(),
+                    path,
+                    e
+                ),
             );
-            std::process::exit(agent::ExitCode::OutputWrite.code());
         }
     }
 }
@@ -2618,8 +2734,10 @@ fn ensure_output_dir(cli: &Cli) {
     if let Some(dir) = cli.output_dir.as_deref()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
-        eprintln!("Output directory error: failed to create '{}': {}", dir, e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Output directory error: failed to create '{}': {}", dir, e),
+        );
     }
 }
 
@@ -2645,9 +2763,18 @@ fn print_wrote_summary(outputs: &agent::OutputPathSummary, output_files: usize) 
     }
 }
 
-fn print_summary(metrics: &agent::MetricsSummary) {
+fn print_summary(metrics: &agent::MetricsSummary, delimiter: &str) {
     println!("Summary:");
-    println!("  objects:  {}", metrics.streamed_rows);
+    if delimiter.is_empty() {
+        println!("  objects:  {}", metrics.streamed_rows);
+    } else {
+        // A --delimiter listing also emits one row per folder (CommonPrefix),
+        // which is not an object; bytes and prefixes count objects only.
+        println!(
+            "  rows:     {} (objects and '{}' folders)",
+            metrics.streamed_rows, delimiter
+        );
+    }
     println!(
         "  bytes:    {} ({})",
         metrics.bytes_total,
@@ -2659,7 +2786,11 @@ fn print_summary(metrics: &agent::MetricsSummary) {
         for prefix in metrics.top_prefixes.iter().take(10) {
             println!(
                 "  {}  objects={} bytes={} ({})",
-                prefix.prefix,
+                if prefix.prefix.is_empty() {
+                    "\"\" (root)"
+                } else {
+                    prefix.prefix.as_str()
+                },
                 prefix.objects,
                 prefix.bytes,
                 human_bytes(prefix.bytes)
@@ -2833,12 +2964,14 @@ fn run_benchmark_local(
     );
     let artifact_dir = std::env::temp_dir().join(format!("s3-turbo-list-benchmark-{}", suffix));
     std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
-        eprintln!(
-            "Benchmark setup error: failed to create {}: {}",
-            artifact_dir.display(),
-            e
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!(
+                "Benchmark setup error: failed to create {}: {}",
+                artifact_dir.display(),
+                e
+            ),
         );
-        std::process::exit(agent::ExitCode::OutputWrite.code());
     });
     let parquet_file = artifact_dir.join("benchmark.parquet");
     let ks_file = artifact_dir.join("benchmark.ks");
@@ -3066,12 +3199,14 @@ fn run_benchmark_local_diff(
         );
         let dir = std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-            eprintln!(
-                "Benchmark setup error: failed to create {}: {}",
-                dir.display(),
-                e
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!(
+                    "Benchmark setup error: failed to create {}: {}",
+                    dir.display(),
+                    e
+                ),
             );
-            std::process::exit(agent::ExitCode::OutputWrite.code());
         });
         let parquet = dir.join("diff.parquet");
         let ks = dir.join("diff.ks");
@@ -3151,8 +3286,10 @@ fn run_benchmark_local_diff(
     rt.shutdown_background();
 
     let outcome = outcome.unwrap_or_else(|e| {
-        eprintln!("Benchmark output error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Benchmark output error: {}", e),
+        );
     });
 
     let mut parquet_bytes = 0u64;
@@ -4217,8 +4354,10 @@ fn run_compat_probe(
         {
             Ok(report) => report,
             Err(e) => {
-                eprintln!("Compat-probe output error: {}", e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
+                exit_before_run(
+                    agent::ExitCode::OutputWrite,
+                    format!("Compat-probe output error: {}", e),
+                );
             }
         }
     });

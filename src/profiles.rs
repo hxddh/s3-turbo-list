@@ -236,6 +236,19 @@ pub fn apply_profile_preset(
     })
 }
 
+/// A real region for the profile, for example commands: bos/b2/oss derive
+/// their endpoint from the region, so `us-east-1` there names a host that
+/// does not exist, and R2 uses `auto`.
+pub fn example_region(profile: &str) -> &'static str {
+    match profile {
+        "bos" => "bj",
+        "r2" => "auto",
+        "b2" => "us-west-004",
+        "oss" => "oss-cn-beijing",
+        _ => "us-east-1",
+    }
+}
+
 #[cfg(test)]
 mod profile_metadata_tests {
     use super::*;
