@@ -1661,10 +1661,13 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 
     let requests = server.requests();
     assert!(requests.iter().any(|request| request.method == "HEAD"));
-    assert!(requests.iter().any(|request| {
-        request.method == "GET"
-            && request.query.get("encoding-type").map(String::as_str) == Some("url")
-    }));
+    // The probe sends only requests a listing run sends (it used to try
+    // encoding-type=url, which the list engine never uses).
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.query.contains_key("encoding-type"))
+    );
     assert!(requests.iter().any(|request| {
         request.query.get("continuation-token").map(String::as_str) == Some("probe-page-2")
     }));

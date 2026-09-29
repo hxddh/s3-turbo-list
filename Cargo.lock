@@ -2792,6 +2792,7 @@ dependencies = [
  "http-body 1.1.0",
  "hyper-util",
  "itoa",
+ "libc",
  "log",
  "memchr",
  "parquet",

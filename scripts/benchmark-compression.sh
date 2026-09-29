@@ -6,7 +6,7 @@ if [[ -n "${BIN+x}" ]]; then
   BIN_WAS_SET=1
 else
   BIN_WAS_SET=0
-  BIN="$ROOT/target/release/s3-turbo-list"
+  BIN="$ROOT/target/release/examples/bench_local"
 fi
 OBJECTS="${OBJECTS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-5000}"
@@ -20,8 +20,15 @@ if [[ ! -x "$BIN" ]]; then
     echo "ERROR: BIN is set but is not executable: $BIN" >&2
     exit 1
   fi
-  BUILD_MODE="${BUILD_MODE:-default}" "$ROOT/scripts/build-release.sh" >/dev/null
-  BIN="$ROOT/target/release/s3-turbo-list"
+  # The benchmark is the bench_local example (it left the shipped binary in
+  # 0.37); BUILD_MODE picks the same compiler workarounds as build-release.sh.
+  case "${BUILD_MODE:-default}" in
+    clang) (cd "$ROOT" && CC=clang CXX=clang++ cargo build --release --example bench_local) >/dev/null ;;
+    gcc10) (cd "$ROOT" && CC=gcc-10 CXX=g++-10 cargo build --release --example bench_local) >/dev/null ;;
+    no-asm) (cd "$ROOT" && AWS_LC_SYS_CFLAGS=-DAWS_LC_NO_ASM=1 cargo build --release --example bench_local) >/dev/null ;;
+    *) (cd "$ROOT" && cargo build --release --example bench_local) >/dev/null ;;
+  esac
+  BIN="$ROOT/target/release/examples/bench_local"
 fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/s3-turbo-list-compression.XXXXXX")"
@@ -34,8 +41,7 @@ run_case() {
   local output="$TMPDIR/${name}.json"
   local args=(
     --compression "$codec"
-    benchmark-local
-    --objects "$OBJECTS"
+      --objects "$OBJECTS"
     --batch-size "$BATCH_SIZE"
     --prefixes "$PREFIXES"
     --output "$output"

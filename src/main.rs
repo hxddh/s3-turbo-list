@@ -12,18 +12,23 @@ use s3_turbo_list::{
 };
 
 use chrono::Local;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use config::S3TurboConfig;
 use core::RunMode;
 use log::{error, info, warn};
-use serde::Serialize;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ── CLI definition ─────────────────────────────────────────
+//
+// Only the endpoint options are global. Every other option belongs to the
+// commands that use it, so clap rejects a misplaced flag itself and each
+// command's --help lists only what it takes. Run options written before the
+// command name (`s3-turbo-list --output-dir out list …`, the pre-0.37
+// spelling) are moved behind it by `hoist_command_flags` before parsing.
 
 #[derive(Parser)]
 #[command(name = "s3-turbo-list")]
@@ -34,303 +39,659 @@ use std::time::Instant;
     long_about = None
 )]
 #[command(propagate_version = true)]
-struct Cli {
+struct CliArgs {
     #[command(subcommand)]
     cmd: Commands,
 
+    #[command(flatten)]
+    global: GlobalArgs,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct GlobalArgs {
     /// Path to TOML config file
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Endpoint")]
     config: Option<String>,
 
-    /// Key prefix to list, e.g. `logs/2026/` (S3 keys do not start with '/';
-    /// the default "/" means the whole bucket)
-    #[arg(short, long, default_value = "/", global = true)]
-    prefix: String,
-
-    /// Worker threads for tokio runtime
-    #[arg(short = 'T', long, global = true)]
-    threads: Option<usize>,
-
-    /// Max concurrent list operations
-    #[arg(short, long, global = true)]
-    concurrency: Option<usize>,
-
-    /// Input key space hints file (overrides automatic discovery)
-    #[arg(short = 'H', long, global = true)]
-    hints_file: Option<String>,
-
-    /// Object filter expression (e.g. "SOURCE.size > 1000")
-    #[arg(short, long, global = true)]
-    filter: Option<String>,
-
-    /// Log to file
-    #[arg(short, long, global = true)]
-    log: bool,
+    /// S3-compatible provider preset: aws, minio, bos, r2, b2 or oss (sets
+    /// the endpoint and addressing style; credentials profiles go in
+    /// AWS_PROFILE)
+    #[arg(long, global = true, alias = "profile", help_heading = "Endpoint")]
+    provider: Option<String>,
 
     /// Custom S3 endpoint URL
-    #[arg(long = "endpoint-url", global = true)]
+    #[arg(
+        long = "endpoint-url",
+        global = true,
+        alias = "endpoint",
+        help_heading = "Endpoint"
+    )]
     endpoint: Option<String>,
 
-    /// Log file path (implies --log)
-    #[arg(long, global = true)]
-    output_log_file: Option<String>,
+    /// S3 addressing style: path, virtual, or auto
+    #[arg(long, global = true, help_heading = "Endpoint")]
+    addressing_style: Option<String>,
+}
 
-    /// KeySpace file output path
-    #[arg(long, global = true)]
-    output_ks_file: Option<String>,
+/// What to list: shared by list and diff.
+#[derive(Args, Debug, Clone, Default)]
+struct SourceArgs {
+    /// Key prefix to list, e.g. `logs/2026/` (default: the whole bucket)
+    #[arg(
+        short,
+        long,
+        default_value = "",
+        hide_default_value = true,
+        help_heading = "Source"
+    )]
+    prefix: String,
 
-    /// Parquet file output path
-    #[arg(long, global = true)]
-    output_parquet_file: Option<String>,
-
-    /// Parquet compression codec: gzip, zstd, snappy, lz4, lz4_raw, brotli, or uncompressed
-    #[arg(long, global = true)]
-    compression: Option<String>,
-
-    /// Parquet compression level for codecs that support levels
-    #[arg(long, global = true)]
-    compression_level: Option<u32>,
-
-    /// Directory for default Parquet and KeySpace outputs
-    #[arg(long, global = true)]
-    output_dir: Option<String>,
-
-    /// Resume from checkpoint
-    #[arg(long, global = true)]
-    resume: bool,
-
-    /// Disable automatic startup discovery (use --hints-file or single-segment)
-    #[arg(long, global = true)]
-    no_auto_hints: bool,
-
-    // ── S3-compatible observability flags ─────────────────
-    /// Delimiter for ListObjectsV2; the default '' is a recursive
-    /// full-bucket listing, use --delimiter '/' for hierarchical
-    /// top-level listing (objects plus one row per CommonPrefix)
-    #[arg(long, default_value = "", global = true)]
+    /// ListObjectsV2 delimiter: '/' lists one level (objects plus one row per
+    /// folder); the default lists every key recursively
+    #[arg(
+        long,
+        default_value = "",
+        hide_default_value = true,
+        help_heading = "Source"
+    )]
     delimiter: String,
 
-    /// Max keys per ListObjectsV2 page
-    #[arg(long, global = true, value_parser = clap::value_parser!(i32).range(1..))]
-    max_keys: Option<i32>,
-
-    /// Start listing after this key (single-chain: skips hints and
-    /// lists as one segment; cannot combine with --hints-file/--resume)
-    #[arg(long, global = true)]
+    /// Start listing after this key (lists one segment; not with
+    /// --hints-file or --resume)
+    #[arg(long, help_heading = "Source")]
     start_after: Option<String>,
 
-    /// Resume from a specific continuation token
-    #[arg(long, global = true)]
-    continuation_token: Option<String>,
+    /// Object filter expression (e.g. "SOURCE.size > 1000")
+    #[arg(short, long, help_heading = "Source")]
+    filter: Option<String>,
+}
 
-    /// Endpoint compatibility profile name (e.g. "bos", "minio", "r2")
-    #[arg(long, global = true)]
-    profile: Option<String>,
+/// Where results go: shared by list and diff.
+#[derive(Args, Debug, Clone, Default)]
+struct OutputArgs {
+    /// Directory for the auto-named outputs (Parquet, KeySpace, log)
+    #[arg(long, help_heading = "Output")]
+    output_dir: Option<String>,
 
-    /// S3 addressing style: path, virtual, or auto
-    #[arg(long, global = true)]
-    addressing_style: Option<String>,
+    /// Parquet output path; the KeySpace file is written beside it as
+    /// `<name>.ks`
+    #[arg(long, help_heading = "Output")]
+    output_parquet_file: Option<String>,
 
-    /// Emit S3 compat trace events to stderr
-    #[arg(long, global = true)]
-    debug_s3: bool,
+    /// Parquet compression codec: zstd (default), gzip, snappy, lz4,
+    /// lz4_raw, brotli, or uncompressed
+    #[arg(long, help_heading = "Output")]
+    compression: Option<String>,
 
-    /// Write S3 compat trace events to this JSONL file
-    #[arg(long, global = true)]
-    trace_compat: Option<String>,
+    /// Write the run log to a file (`<name>.log` beside the outputs)
+    #[arg(short, long, help_heading = "Output")]
+    log: bool,
 
-    /// Emit machine-readable summaries for AI agents and automation
-    #[arg(long, global = true)]
-    agent: bool,
+    /// KeySpace output path (deprecated: derived from --output-parquet-file)
+    #[arg(long, hide = true)]
+    output_ks_file: Option<String>,
 
-    /// Resolve inputs and outputs without contacting S3
-    #[arg(long, global = true)]
+    /// Log file path (deprecated: --log names it after the outputs)
+    #[arg(long, hide = true)]
+    output_log_file: Option<String>,
+
+    /// Parquet compression level (config: output.compression_level)
+    #[arg(long, hide = true)]
+    compression_level: Option<u32>,
+}
+
+/// How hard to list: shared by list and diff. Only --concurrency is shown;
+/// the rest are for debugging and tests.
+#[derive(Args, Debug, Clone, Default)]
+struct TuningArgs {
+    /// Max concurrent list operations (default 100)
+    #[arg(short, long, help_heading = "Run")]
+    concurrency: Option<usize>,
+
+    /// Worker threads (default: CPU count)
+    #[arg(short = 'T', long, hide = true)]
+    threads: Option<usize>,
+
+    /// Max keys per ListObjectsV2 page
+    #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(1..))]
+    max_keys: Option<i32>,
+
+    /// Disable startup discovery (lists one segment unless --hints-file)
+    #[arg(long, hide = true)]
+    no_auto_hints: bool,
+}
+
+/// Machine-facing switches: shared by list and diff.
+#[derive(Args, Debug, Clone, Default)]
+struct AutomationArgs {
+    /// Print the resolved plan as JSON and exit without contacting S3
+    #[arg(long, help_heading = "Automation")]
     dry_run: bool,
 
-    /// Write dry-run plan JSON to this path (requires --dry-run)
-    #[arg(long, global = true, requires = "dry_run")]
-    plan_json: Option<String>,
+    /// Print the run manifest JSON on stdout and keep stderr quiet
+    #[arg(long, help_heading = "Automation")]
+    agent: bool,
 
-    /// Write final run manifest JSON to this path
-    #[arg(long, global = true)]
+    /// Write the run manifest JSON to this path
+    #[arg(long, help_heading = "Automation")]
     run_manifest: Option<String>,
 
-    /// Scan and report aggregate metrics without writing Parquet or KeySpace outputs
-    #[arg(long, global = true)]
-    summary_only: bool,
+    /// Write S3 request trace events as JSONL to this file (`-`: stderr)
+    #[arg(long, help_heading = "Automation")]
+    trace_compat: Option<String>,
+
+    /// Write the dry-run plan to this path (deprecated: `--dry-run > file`)
+    #[arg(long, hide = true, requires = "dry_run")]
+    plan_json: Option<String>,
+
+    /// Trace S3 requests to stderr (deprecated: `--trace-compat -`)
+    #[arg(long, hide = true)]
+    debug_s3: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Fast list a single bucket and export results
+    /// List a bucket to Parquet (or tsv / ndjson rows on stdout, or a summary)
     List {
-        /// AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Source bucket to list
+        /// Bucket to list
         #[arg(long)]
         bucket: String,
 
-        /// Output format for list results; parquet writes artifacts, tsv/ndjson stream rows to stdout
-        #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
+        /// AWS region (or the provider's region)
+        #[arg(long)]
+        region: Option<String>,
+
+        #[command(flatten)]
+        source: SourceArgs,
+
+        /// parquet writes files; tsv/ndjson stream rows to stdout; summary
+        /// only counts
+        #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet, help_heading = "Output")]
         output_format: ListOutputFormat,
+
+        #[command(flatten)]
+        output: OutputArgs,
+
+        /// Continue an interrupted run from its checkpoint
+        #[arg(long, help_heading = "Run")]
+        resume: bool,
+
+        /// Key-space boundaries file (overrides automatic partitioning)
+        #[arg(short = 'H', long, help_heading = "Run")]
+        hints_file: Option<String>,
+
+        #[command(flatten)]
+        tuning: TuningArgs,
+        #[command(flatten)]
+        automation: AutomationArgs,
+
+        /// Resume from a continuation token (deprecated: use --resume or
+        /// --start-after)
+        #[arg(long, hide = true)]
+        continuation_token: Option<String>,
+
+        /// Count only (deprecated: --output-format summary)
+        #[arg(long, hide = true)]
+        summary_only: bool,
     },
 
-    /// Bi-directional fast list and diff results
+    /// Diff two buckets into one Parquet file with a flag per key
     Diff {
-        /// Source AWS region
-        #[arg(long)]
-        region: Option<String>,
-
-        /// Source bucket to list
+        /// Source bucket
         #[arg(long)]
         bucket: String,
 
-        /// Target AWS region [default: --region]
+        /// Source region
+        #[arg(long)]
+        region: Option<String>,
+
+        /// Target bucket
+        #[arg(long)]
+        target_bucket: String,
+
+        /// Target region [default: --region]
         #[arg(long)]
         target_region: Option<String>,
 
-        /// Target bucket to list
-        #[arg(long)]
-        target_bucket: String,
+        #[command(flatten)]
+        source: SourceArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        tuning: TuningArgs,
+        #[command(flatten)]
+        automation: AutomationArgs,
     },
 
-    /// Validate S3-compatible provider compatibility before listing
+    /// Check an S3-compatible endpoint with a few requests before a full run
     CompatProbe {
-        /// Endpoint URL (defaults to the global --endpoint-url)
-        #[arg(long = "endpoint")]
-        endpoint_url: Option<String>,
-
-        /// AWS region or vendor region
-        #[arg(long)]
-        region: String,
-
         /// Bucket to probe
         #[arg(long)]
         bucket: String,
 
-        /// Addressing style: path, virtual, or auto (defaults to the
-        /// resolved config: global flag, config file, then profile)
+        /// Region (default: the provider's, or the SDK's)
         #[arg(long)]
-        addressing_style: Option<String>,
+        region: Option<String>,
 
-        /// Output JSON report file path (default: stdout)
+        /// Key prefix to probe under
+        #[arg(short, long, default_value = "", hide_default_value = true)]
+        prefix: String,
+
+        /// JSON report path (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Write the log to a file
+        #[arg(short, long)]
+        log: bool,
+
+        /// Print the resolved plan as JSON and exit without contacting S3
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Machine-readable output
+        #[arg(long)]
+        agent: bool,
+
+        /// Write S3 request trace events as JSONL to this file (`-`: stderr)
+        #[arg(long)]
+        trace_compat: Option<String>,
+
+        #[arg(long, hide = true)]
+        debug_s3: bool,
     },
 
-    /// Summarize a local run manifest JSON file without contacting S3
+    /// Local preflight: config, provider, endpoint, proxy, outputs, hints file
+    Doctor {
+        /// Emit JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Validate this hints file
+        #[arg(short = 'H', long)]
+        hints_file: Option<String>,
+
+        /// Check that this filter expression compiles
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Check that outputs can be created in this directory
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// Check that this Parquet output can be created
+        #[arg(long)]
+        output_parquet_file: Option<String>,
+
+        /// Check that this trace file can be created
+        #[arg(long)]
+        trace_compat: Option<String>,
+
+        #[arg(long, hide = true)]
+        output_ks_file: Option<String>,
+        #[arg(long, hide = true)]
+        output_log_file: Option<String>,
+        #[arg(long, hide = true)]
+        agent: bool,
+        /// Deprecated: the default output is the compact form
+        #[arg(long, hide = true)]
+        simple: bool,
+        /// Deprecated: suggestions are printed when something is wrong
+        #[arg(long, hide = true)]
+        fix_suggestions: bool,
+    },
+
+    /// Summarize a run manifest, or --check it (exit 6 on a mismatch)
     ManifestSummary {
-        /// Run manifest JSON file written by --run-manifest
+        /// Run manifest JSON file written by --run-manifest or --agent
         manifest_file: String,
 
         /// Emit JSON report
         #[arg(long)]
         json: bool,
 
-        /// Validate manifest success, counters, row checks, and recorded artifacts via exit code
+        /// Validate manifest success, counters, row checks, and recorded
+        /// artifacts via exit code
         #[arg(long)]
         check: bool,
+
+        #[arg(long, hide = true)]
+        agent: bool,
     },
 
-    /// Write a starter local TOML config without contacting S3
-    InitConfig {
-        /// Endpoint compatibility profile template: aws, minio, r2, b2, oss, or bos
-        #[arg(long)]
-        profile: Option<String>,
-
-        /// Output config path
-        #[arg(short, long, default_value = "s3-turbo-list.toml")]
-        output: String,
-
-        /// Allow replacing an existing config file
-        #[arg(long)]
-        overwrite: bool,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Print guidance without contacting S3: an overview when no topic is
-    /// given, a provider quickstart (aws/minio/r2/bos) or profile facts
-    /// (b2/oss), or a named recipe
+    /// Provider quickstarts: aws, minio, bos, r2, b2, oss
     Guide {
-        /// Topic: a provider (aws/minio/r2/bos/b2/oss), a recipe name (e.g.
-        /// large-bucket, filter, release-check), or `index` to list recipes
+        /// A provider (aws/minio/bos/r2/b2/oss); omit for an overview
         topic: Option<String>,
     },
 
-    /// Run local environment checks without contacting S3
-    Doctor {
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Emit compact OK/WARN/NEXT output
-        #[arg(long)]
-        simple: bool,
-
-        /// Include command suggestions for common local issues
-        #[arg(long)]
-        fix_suggestions: bool,
-    },
-
-    /// Generate shell completions without contacting S3
+    /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
     },
 
-    /// Generate a man page to stdout without contacting S3
+    /// Generate a man page to stdout
     Man,
 
-    /// Run a local synthetic streaming-output benchmark without contacting S3
-    /// (developer tool; hidden from help)
+    /// Removed in 0.37.0 (see docs/providers.md for a config example)
     #[command(hide = true)]
-    BenchmarkLocal {
-        /// Local benchmark scenario to run
-        #[arg(long, value_enum, default_value_t = LocalBenchmarkKind::ListOutput)]
-        benchmark: LocalBenchmarkKind,
-
-        /// Number of synthetic objects to write
-        #[arg(long, default_value_t = 10_000)]
-        objects: usize,
-
-        /// Objects per synthetic batch
-        #[arg(long, default_value_t = 1_000)]
-        batch_size: usize,
-
-        /// Number of distinct key prefixes
-        #[arg(long, default_value_t = 128)]
-        prefixes: usize,
-
-        /// Number of synthetic producer tasks sending into the data-map channel
-        #[arg(long, default_value_t = 1)]
-        producers: usize,
-
-        /// Synthetic diff data shape for diff-output benchmarks
-        #[arg(long, value_enum, default_value_t = LocalDiffShape::Mixed)]
-        diff_shape: LocalDiffShape,
-
-        /// Local output path to benchmark
-        #[arg(long, value_enum, default_value_t = ListOutputFormat::Parquet)]
-        output_format: ListOutputFormat,
-
-        /// Emit JSON report
-        #[arg(long)]
-        json: bool,
-
-        /// Write JSON report to this path
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Keep generated local Parquet/KS artifacts
-        #[arg(long)]
-        keep_artifacts: bool,
+    InitConfig {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
+}
+
+/// The parsed command line with every command's options in one place, as
+/// the rest of `main` reads them. Options a command does not take keep their
+/// defaults.
+struct Cli {
+    cmd: Commands,
+    config: Option<String>,
+    prefix: String,
+    threads: Option<usize>,
+    concurrency: Option<usize>,
+    hints_file: Option<String>,
+    filter: Option<String>,
+    log: bool,
+    endpoint: Option<String>,
+    output_log_file: Option<String>,
+    output_ks_file: Option<String>,
+    output_parquet_file: Option<String>,
+    compression: Option<String>,
+    compression_level: Option<u32>,
+    output_dir: Option<String>,
+    resume: bool,
+    no_auto_hints: bool,
+    delimiter: String,
+    max_keys: Option<i32>,
+    start_after: Option<String>,
+    continuation_token: Option<String>,
+    profile: Option<String>,
+    addressing_style: Option<String>,
+    trace_compat: Option<String>,
+    agent: bool,
+    dry_run: bool,
+    plan_json: Option<String>,
+    run_manifest: Option<String>,
+    summary_only: bool,
+    /// Deprecated spellings used on this command line, for a warning.
+    deprecated: Vec<&'static str>,
+}
+
+impl Cli {
+    fn from_args(args: CliArgs) -> Self {
+        let GlobalArgs {
+            config,
+            provider,
+            endpoint,
+            addressing_style,
+        } = args.global;
+        let mut cli = Cli {
+            cmd: args.cmd,
+            config,
+            prefix: String::new(),
+            threads: None,
+            concurrency: None,
+            hints_file: None,
+            filter: None,
+            log: false,
+            endpoint,
+            output_log_file: None,
+            output_ks_file: None,
+            output_parquet_file: None,
+            compression: None,
+            compression_level: None,
+            output_dir: None,
+            resume: false,
+            no_auto_hints: false,
+            delimiter: String::new(),
+            max_keys: None,
+            start_after: None,
+            continuation_token: None,
+            profile: provider,
+            addressing_style,
+            trace_compat: None,
+            agent: false,
+            dry_run: false,
+            plan_json: None,
+            run_manifest: None,
+            summary_only: false,
+            deprecated: Vec::new(),
+        };
+        let mut groups = None;
+        match &mut cli.cmd {
+            Commands::List {
+                output_format,
+                resume,
+                hints_file,
+                continuation_token,
+                summary_only,
+                source,
+                output,
+                tuning,
+                automation,
+                ..
+            } => {
+                if *summary_only {
+                    cli.deprecated
+                        .push("--summary-only (use --output-format summary)");
+                    if *output_format == ListOutputFormat::Parquet {
+                        *output_format = ListOutputFormat::Summary;
+                    }
+                }
+                cli.summary_only = *summary_only || *output_format == ListOutputFormat::Summary;
+                cli.resume = *resume;
+                cli.hints_file = hints_file.clone();
+                if continuation_token.is_some() {
+                    cli.deprecated
+                        .push("--continuation-token (use --resume or --start-after)");
+                }
+                cli.continuation_token = continuation_token.clone();
+                groups = Some((
+                    source.clone(),
+                    output.clone(),
+                    tuning.clone(),
+                    automation.clone(),
+                ));
+            }
+            Commands::Diff {
+                source,
+                output,
+                tuning,
+                automation,
+                ..
+            } => {
+                groups = Some((
+                    source.clone(),
+                    output.clone(),
+                    tuning.clone(),
+                    automation.clone(),
+                ));
+            }
+            Commands::CompatProbe {
+                prefix,
+                log,
+                dry_run,
+                agent,
+                trace_compat,
+                debug_s3,
+                ..
+            } => {
+                cli.prefix = prefix.clone();
+                cli.log = *log;
+                cli.dry_run = *dry_run;
+                cli.agent = *agent;
+                cli.trace_compat = trace_compat.clone();
+                if *debug_s3 {
+                    cli.deprecated.push("--debug-s3 (use --trace-compat -)");
+                    cli.trace_compat.get_or_insert_with(|| "-".to_string());
+                }
+            }
+            Commands::Doctor {
+                json,
+                hints_file,
+                filter,
+                output_dir,
+                output_parquet_file,
+                trace_compat,
+                output_ks_file,
+                output_log_file,
+                agent,
+                ..
+            } => {
+                *json |= *agent;
+                cli.agent = *agent;
+                cli.hints_file = hints_file.clone();
+                cli.filter = filter.clone();
+                cli.output_dir = output_dir.clone();
+                cli.output_parquet_file = output_parquet_file.clone();
+                cli.output_ks_file = output_ks_file.clone();
+                cli.output_log_file = output_log_file.clone();
+                cli.trace_compat = trace_compat.clone();
+            }
+            Commands::ManifestSummary { json, agent, .. } => {
+                *json |= *agent;
+                cli.agent = *agent;
+            }
+            _ => {}
+        }
+        if let Some((source, output, tuning, automation)) = groups {
+            cli.prefix = source.prefix;
+            cli.delimiter = source.delimiter;
+            cli.start_after = source.start_after;
+            cli.filter = source.filter;
+            cli.output_dir = output.output_dir;
+            cli.output_parquet_file = output.output_parquet_file;
+            cli.compression = output.compression;
+            cli.log = output.log;
+            if output.output_ks_file.is_some() {
+                cli.deprecated
+                    .push("--output-ks-file (the KeySpace file follows --output-parquet-file)");
+            }
+            cli.output_ks_file = output.output_ks_file;
+            if output.output_log_file.is_some() {
+                cli.deprecated
+                    .push("--output-log-file (--log names the file after the outputs)");
+            }
+            cli.output_log_file = output.output_log_file;
+            cli.compression_level = output.compression_level;
+            cli.concurrency = tuning.concurrency;
+            cli.threads = tuning.threads;
+            cli.max_keys = tuning.max_keys;
+            cli.no_auto_hints = tuning.no_auto_hints;
+            cli.dry_run = automation.dry_run;
+            cli.agent = automation.agent;
+            cli.run_manifest = automation.run_manifest;
+            cli.trace_compat = automation.trace_compat;
+            if automation.plan_json.is_some() {
+                cli.deprecated.push("--plan-json (use --dry-run > file)");
+            }
+            cli.plan_json = automation.plan_json;
+            if automation.debug_s3 {
+                cli.deprecated.push("--debug-s3 (use --trace-compat -)");
+                cli.trace_compat.get_or_insert_with(|| "-".to_string());
+            }
+        }
+        cli
+    }
+}
+
+/// Move command options written before the command name behind it:
+/// `s3-turbo-list --output-dir out list --bucket b` was the documented
+/// spelling while every option was global, and scripts use it. Global
+/// (endpoint) options stay where they are; an option the command does not
+/// take is left in place for clap to reject.
+fn hoist_command_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let command = CliArgs::command();
+    let top_level: Vec<&clap::Arg> = command.get_arguments().collect();
+    let takes_value = |arg: &clap::Arg| arg.get_action().takes_values();
+    let find = |args: &[&clap::Arg], token: &str| -> Option<(bool, bool)> {
+        // (known, takes a separate value)
+        if let Some(long) = token.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            return args
+                .iter()
+                .find(|arg| {
+                    arg.get_long() == Some(name)
+                        || arg.get_all_aliases().is_some_and(|a| a.contains(&name))
+                })
+                .map(|arg| (true, takes_value(arg) && !inline));
+        }
+        let mut chars = token.strip_prefix('-')?.chars();
+        let short = chars.next()?;
+        args.iter()
+            .find(|arg| arg.get_short() == Some(short))
+            .map(|arg| (true, takes_value(arg) && chars.as_str().is_empty()))
+    };
+    let strs: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
+    // Find the command name, skipping option values.
+    let mut index = 1;
+    let mut command_at = None;
+    while index < strs.len() {
+        let token = strs[index].as_str();
+        if token == "--" {
+            break;
+        }
+        if let Some(sub) = command.find_subcommand(token) {
+            command_at = Some((index, sub));
+            break;
+        }
+        if token.starts_with('-') {
+            let all: Vec<&clap::Arg> = top_level
+                .iter()
+                .copied()
+                .chain(
+                    command
+                        .get_subcommands()
+                        .flat_map(|sub| sub.get_arguments()),
+                )
+                .collect();
+            if let Some((_, true)) = find(&all, token) {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    let Some((at, sub)) = command_at else {
+        return args;
+    };
+    let sub_args: Vec<&clap::Arg> = sub.get_arguments().collect();
+    let mut kept = vec![args[0].clone()];
+    let mut moved = Vec::new();
+    let mut index = 1;
+    while index < at {
+        let token = strs[index].as_str();
+        let global = find(&top_level, token);
+        let local = if global.is_none() {
+            find(&sub_args, token)
+        } else {
+            None
+        };
+        let (target, value) = match (global, local) {
+            (Some((_, value)), _) => (&mut kept, value),
+            (None, Some((_, value))) => (&mut moved, value),
+            (None, None) => (&mut kept, false),
+        };
+        target.push(args[index].clone());
+        if value && index + 1 < at {
+            index += 1;
+            target.push(args[index].clone());
+        }
+        index += 1;
+    }
+    kept.push(args[at].clone());
+    kept.extend(moved);
+    kept.extend(args[at + 1..].iter().cloned());
+    kept
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -338,6 +699,7 @@ enum ListOutputFormat {
     Parquet,
     Tsv,
     Ndjson,
+    Summary,
 }
 
 impl ListOutputFormat {
@@ -354,53 +716,8 @@ impl ListOutputFormat {
             Self::Parquet => "parquet",
             Self::Tsv => "tsv",
             Self::Ndjson => "ndjson",
+            Self::Summary => "summary",
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum LocalBenchmarkKind {
-    ListOutput,
-    DiffMap,
-    DiffOutput,
-}
-
-impl LocalBenchmarkKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ListOutput => "list-output",
-            Self::DiffMap => "diff-map",
-            Self::DiffOutput => "diff-output",
-        }
-    }
-}
-
-impl std::fmt::Display for LocalBenchmarkKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum LocalDiffShape {
-    Mixed,
-    AllEqual,
-    AllChanged,
-}
-
-impl LocalDiffShape {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Mixed => "mixed",
-            Self::AllEqual => "all-equal",
-            Self::AllChanged => "all-changed",
-        }
-    }
-}
-
-impl std::fmt::Display for LocalDiffShape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -415,8 +732,8 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
         match format {
             ListOutputFormat::Tsv => Self::Tsv,
             ListOutputFormat::Ndjson => Self::Ndjson,
-            ListOutputFormat::Parquet => {
-                unreachable!("parquet output does not use the text data-map sink")
+            ListOutputFormat::Parquet | ListOutputFormat::Summary => {
+                unreachable!("only tsv and ndjson use the text data-map sink")
             }
         }
     }
@@ -506,8 +823,45 @@ fn exit_doctor_check_error(check: &str, message: &str) -> ! {
     std::process::exit(agent::ExitCode::CliConfig.code());
 }
 
+/// Parse the command line. A usage error under `--agent` also prints the
+/// failed-run JSON, like every other failure before a run starts.
+fn parse_cli() -> Cli {
+    let argv = hoist_command_flags(std::env::args_os().collect());
+    match CliArgs::try_parse_from(&argv) {
+        Ok(args) => Cli::from_args(args),
+        Err(e) => {
+            use clap::error::ErrorKind;
+            let agent = argv.iter().any(|arg| arg == "--agent");
+            if agent && !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                let _ = e.print();
+                let _ = RUN_COMMAND.set(true);
+                let _ = AGENT_RUN.set(true);
+                let rendered = e.to_string();
+                let first = rendered.lines().next().unwrap_or_default();
+                run_failure_epilogue(
+                    agent::ExitCode::CliConfig,
+                    first.trim_start_matches("error: "),
+                );
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+            e.exit()
+        }
+    }
+}
+
 fn main() {
-    let mut cli = Cli::parse();
+    let mut cli = parse_cli();
+    if let Commands::InitConfig { .. } = cli.cmd {
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "init-config was removed in 0.37.0: a config file is only needed for settings \
+             the flags do not cover; see the example in docs/providers.md"
+                .to_string(),
+        );
+    }
+    for spelling in &cli.deprecated {
+        eprintln!("warning: deprecated option {}", spelling);
+    }
     // A diff without --target-region lists the target in --region. It used to
     // fall through to the SDK's ambient region (AWS_REGION / profile), so the
     // target was signed for another region than the plan showed (it showed
@@ -521,7 +875,6 @@ fn main() {
     {
         *target_region = region.clone();
     }
-    let cli = cli;
     let run_command = !cli.dry_run
         && matches!(
             cli.cmd,
@@ -547,28 +900,9 @@ fn main() {
             manifest_file,
             json,
             check,
+            ..
         } => {
-            run_manifest_summary(manifest_file, *json || cli.agent, *check);
-            return;
-        }
-        Commands::InitConfig {
-            profile,
-            output,
-            overwrite,
-            json,
-        } => {
-            if cli.dry_run {
-                // init-config only writes a local file; a "dry run" that
-                // wrote it anyway (as it did) is worse than a clear refusal.
-                exit_before_run(
-                    agent::ExitCode::CliConfig,
-                    format!(
-                        "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
-                        output
-                    ),
-                );
-            }
-            run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
+            run_manifest_summary(manifest_file, *json, *check);
             return;
         }
         Commands::Guide { topic } => {
@@ -583,21 +917,20 @@ fn main() {
         .unwrap_or_else(|e| exit_config_error(&format!("Config error: {}", e)));
 
     validate_addressing_style_command(&cli);
-    cfg.apply_cli_overrides(
-        cli.threads,
-        cli.concurrency,
-        cli.endpoint.as_deref(),
-        cli.addressing_style.as_deref(),
-        cli.profile.as_deref(),
-        cli.debug_s3,
-        cli.trace_compat.as_deref(),
-        cli.start_after.as_deref(),
-        cli.output_log_file.as_deref(),
-        cli.output_ks_file.as_deref(),
-        cli.output_parquet_file.as_deref(),
-        cli.compression.as_deref(),
-        cli.compression_level,
-    );
+    cfg.apply_cli_overrides(config::CliOverrides {
+        threads: cli.threads,
+        concurrency: cli.concurrency,
+        endpoint: cli.endpoint.as_deref(),
+        addressing_style: cli.addressing_style.as_deref(),
+        provider: cli.profile.as_deref(),
+        trace_compat: cli.trace_compat.as_deref(),
+        start_after: cli.start_after.as_deref(),
+        log_file: cli.output_log_file.as_deref(),
+        ks_file: cli.output_ks_file.as_deref(),
+        parquet_file: cli.output_parquet_file.as_deref(),
+        compression: cli.compression.as_deref(),
+        compression_level: cli.compression_level,
+    });
     // Recorded before the preset fills it in: a diff derives the target
     // side's endpoint from its own region only when the user gave none.
     // A misspelled profile (`mino`) applied no preset at all — no endpoint,
@@ -607,7 +940,7 @@ fn main() {
         && profiles::get_profile(name).is_none()
     {
         exit_config_error(&format!(
-            "--profile '{}' is not an endpoint compatibility preset; use one of: {} \
+            "--provider '{}' is not a provider preset; use one of: {} \
                  (credentials profiles go in AWS_PROFILE)",
             name,
             profiles::all_profiles()
@@ -618,148 +951,80 @@ fn main() {
         ));
     }
     let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
+    // A provider whose endpoint is built from the region (bos, oss, b2)
+    // fills in its default region when none is given — and the request must
+    // then be signed for that region, not the ambient AWS_REGION (it was:
+    // `--provider bos` alone signed for us-east-1 against the bj host).
+    if !endpoint_was_explicit
+        && let Some(profile) = cfg.s3.profile.as_deref().and_then(profiles::get_profile)
+        && profile.endpoint_template.is_some()
+        && let Some(default_region) = profile.default_region
+    {
+        fill_default_region(&mut cli.cmd, default_region);
+    }
+    let cli = cli;
     cfg.apply_profile_preset(command_region(&cli.cmd));
-    cfg.normalize_addressing_style();
     let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
     apply_output_dir_defaults(&cli, &mut cfg);
     apply_log_file_default(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
-    validate_summary_only_command(&cli);
-    validate_compat_probe_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
     validate_delimiter_hints_command(&cli);
-    validate_diff_hints_command(&cli);
-    validate_diff_resume_command(&cli);
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
     let config_source_warnings = config_source.warnings.clone();
 
-    match &cli.cmd {
-        Commands::Doctor {
-            json,
-            simple,
-            fix_suggestions,
-        } => {
-            // doctor absorbed the former hints-validate command: when a hints
-            // file is supplied it is linted and embedded in the report.
-            let hints = cli.hints_file.as_deref().map(|path| {
-                hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
-                    exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
-                })
+    if let Commands::Doctor { json, .. } = &cli.cmd {
+        // doctor absorbed the former hints-validate command: when a hints
+        // file is supplied it is linted and embedded in the report.
+        let hints = cli.hints_file.as_deref().map(|path| {
+            hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
+                exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
+            })
+        });
+        let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
+        // A filter that would fail the real run (exit 2) fails doctor too.
+        if let Some(filter_expr) = cli.filter.as_deref() {
+            let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
+                .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
+            {
+                Ok(_) => agent::DoctorCheck {
+                    name: "filter".to_string(),
+                    status: "ok".to_string(),
+                    message: format!("filter compiles: {}", filter_expr),
+                },
+                Err(e) => agent::DoctorCheck {
+                    name: "filter".to_string(),
+                    status: "error".to_string(),
+                    message: format!("filter does not compile: {}", e),
+                },
+            };
+            if check.status == "error" {
+                report.status = "error".to_string();
+            }
+            report.checks.push(check);
+        }
+        if *json {
+            println!("{}", agent::to_pretty_json(&report));
+        } else {
+            print_doctor_report(&report);
+        }
+        if report.status == "error" {
+            // An endpoint/profile error is the same setup failure a real
+            // run exits 3 on; any other error is a local config problem.
+            let setup_error = report
+                .checks
+                .iter()
+                .any(|check| check.name == "endpoint_url" && check.status == "error");
+            std::process::exit(if setup_error {
+                agent::ExitCode::ProviderSetup.code()
+            } else {
+                agent::ExitCode::CliConfig.code()
             });
-            let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
-            // A filter that would fail the real run (exit 2) fails doctor too.
-            if let Some(filter_expr) = cli.filter.as_deref() {
-                let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
-                    .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
-                {
-                    Ok(_) => agent::DoctorCheck {
-                        name: "filter".to_string(),
-                        status: "ok".to_string(),
-                        message: format!("filter compiles: {}", filter_expr),
-                    },
-                    Err(e) => agent::DoctorCheck {
-                        name: "filter".to_string(),
-                        status: "error".to_string(),
-                        message: format!("filter does not compile: {}", e),
-                    },
-                };
-                if check.status == "error" {
-                    report.status = "error".to_string();
-                }
-                report.checks.push(check);
-            }
-            if *json || cli.agent {
-                println!("{}", agent::to_pretty_json(&report));
-            } else if *simple {
-                print_doctor_simple(&report, *fix_suggestions);
-            } else {
-                println!("Doctor status: {}", report.status);
-                for check in &report.checks {
-                    println!("  {}: {} — {}", check.name, check.status, check.message);
-                }
-                print_doctor_config(&report);
-                if let Some(hints) = &report.hints {
-                    print_doctor_hints(hints);
-                }
-                if *fix_suggestions {
-                    print_doctor_suggestions(&report);
-                }
-            }
-            if report.status == "error" {
-                // An endpoint/profile error is the same setup failure a real
-                // run exits 3 on; any other error is a local config problem.
-                let setup_error = report
-                    .checks
-                    .iter()
-                    .any(|check| check.name == "endpoint_url" && check.status == "error");
-                std::process::exit(if setup_error {
-                    agent::ExitCode::ProviderSetup.code()
-                } else {
-                    agent::ExitCode::CliConfig.code()
-                });
-            }
-            return;
         }
-        Commands::BenchmarkLocal {
-            benchmark,
-            objects,
-            batch_size,
-            prefixes,
-            producers,
-            diff_shape,
-            output_format,
-            json,
-            output,
-            keep_artifacts,
-        } => {
-            let report = run_benchmark_local(
-                *benchmark,
-                *objects,
-                *batch_size,
-                *prefixes,
-                *producers,
-                *diff_shape,
-                *output_format,
-                *keep_artifacts,
-                &cfg,
-            );
-            if *json || output.is_some() {
-                let rendered = agent::to_pretty_json(&report);
-                if let Some(path) = output.as_deref()
-                    && let Err(e) = agent::write_json_file(path, &report)
-                {
-                    exit_before_run(
-                        agent::ExitCode::OutputWrite,
-                        format!("Benchmark write error: {}", e),
-                    );
-                }
-                if *json {
-                    println!("{}", rendered);
-                }
-            } else {
-                println!(
-                    "local benchmark: {} {} objects in {:.3}s ({:.0} objects/sec)",
-                    report.benchmark, report.objects, report.elapsed_secs, report.objects_per_sec
-                );
-                if let Some(path) = &report.parquet_file {
-                    println!("  parquet: {}", path);
-                }
-                if let Some(path) = &report.ks_file {
-                    println!("  ks:      {}", path);
-                }
-                if let Some(path) = &report.text_file {
-                    println!("  rows:    {}", path);
-                }
-                if !report.artifacts_kept {
-                    println!("  artifacts removed");
-                }
-            }
-            return;
-        }
-        _ => {}
+        return;
     }
 
     if cli.dry_run {
@@ -882,6 +1147,7 @@ fn main() {
             bucket,
             target_region,
             target_bucket,
+            ..
         } => (
             RunMode::BiDir,
             region.as_deref(),
@@ -890,45 +1156,28 @@ fn main() {
             Some(target_bucket.as_str()),
         ),
         Commands::CompatProbe {
-            endpoint_url,
             region,
             bucket,
-            addressing_style,
             output,
+            ..
         } => {
             // Same resolution as a listing run: the probe must exercise the
             // endpoint and addressing style the run would use, including
-            // values that come from the config file or the profile.
-            let endpoint_url = endpoint_url
-                .as_deref()
-                .or(cli.endpoint.as_deref())
-                .or(cfg.s3.endpoint_url.as_deref())
-                .unwrap_or_else(|| {
-                    exit_before_run(agent::ExitCode::CliConfig, "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
-                         or set s3.endpoint_url in the config".to_string());
-                })
-                .to_string();
-            let addressing_style = match addressing_style.as_deref() {
-                Some(style) => match style.parse::<config::AddressingStyle>() {
-                    Ok(parsed) => parsed.to_string(),
-                    Err(_) => {
-                        exit_before_run(
-                            agent::ExitCode::CliConfig,
-                            format!(
-                                "--addressing-style '{}' is not one of: path, virtual, auto",
-                                style
-                            ),
-                        );
-                    }
-                },
-                None => cfg.s3.addressing_style.to_string(),
-            };
+            // values that come from the config file or the provider.
+            let endpoint_url = cfg.s3.endpoint_url.clone().unwrap_or_else(|| {
+                exit_before_run(
+                    agent::ExitCode::CliConfig,
+                    "compat-probe requires an endpoint: pass --endpoint-url or --provider, \
+                     or set s3.endpoint_url in the config"
+                        .to_string(),
+                );
+            });
             run_compat_probe(
                 &endpoint_url,
-                region,
+                region.as_deref(),
                 bucket,
                 &listing_prefix(&cli),
-                &addressing_style,
+                &cfg.s3.addressing_style.to_string(),
                 output.as_deref(),
                 &cfg,
             );
@@ -942,9 +1191,6 @@ fn main() {
         }
         Commands::ManifestSummary { .. } | Commands::InitConfig { .. } | Commands::Guide { .. } => {
             unreachable!("local tooling commands are handled before config load")
-        }
-        Commands::BenchmarkLocal { .. } => {
-            unreachable!("benchmark-local is handled before runtime setup")
         }
     };
     let opt_prefix = if cli.prefix == "/" {
@@ -1151,7 +1397,7 @@ fn main() {
                 Some(bucket),
                 region,
                 endpoint,
-                cfg.s3.force_path_style,
+                cfg.s3.force_path_style(),
             ) {
                 match agent::env_proxy_for_url(&url) {
                     Some(proxy) => info!(
@@ -1166,7 +1412,7 @@ fn main() {
         // ── Create trace writer ──────────────────────────────
         use crate::trace::S3TraceWriter;
         let trace_writer: Option<Arc<dyn S3TraceWriter>> =
-            match trace::create_trace_writer_opt(cfg.s3.trace_compat.as_deref(), cfg.s3.debug_s3) {
+            match trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref()) {
                 Ok(writer) => writer.map(Arc::from),
                 Err(e) => {
                     error!("{}", e);
@@ -1220,7 +1466,7 @@ fn main() {
                 &sdk_config,
                 opt_region,
                 cfg.s3.endpoint_url.as_deref(),
-                cfg.s3.force_path_style,
+                cfg.s3.force_path_style(),
             );
             let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
             // Discovery can take many probe rounds on a slow endpoint; race it
@@ -1489,7 +1735,7 @@ fn main() {
                 opt_bucket,
                 opt_region,
                 cfg.s3.endpoint_url.as_deref(),
-                cfg.s3.force_path_style,
+                cfg.s3.force_path_style(),
                 &sdk_config,
                 &s3_cfg,
                 placeholder_tx.clone(),
@@ -1508,7 +1754,7 @@ fn main() {
                 target_bucket,
                 target_region,
                 diff_target_endpoint.as_deref(),
-                cfg.s3.force_path_style,
+                cfg.s3.force_path_style(),
                 &sdk_config,
                 &s3_cfg,
                 placeholder_tx,
@@ -1580,7 +1826,7 @@ fn main() {
                 opt_bucket,
                 opt_region,
                 cfg.s3.endpoint_url.as_deref(),
-                cfg.s3.force_path_style,
+                cfg.s3.force_path_style(),
                 &sdk_config,
                 &s3_cfg,
                 tx.expect("list mode allocates the streaming channel"),
@@ -1970,13 +2216,13 @@ fn main() {
 }
 
 fn generate_completions(shell: Shell) {
-    let mut cmd = Cli::command();
+    let mut cmd = CliArgs::command();
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
 fn generate_man_page() {
-    let cmd = Cli::command();
+    let cmd = CliArgs::command();
     let man = clap_mangen::Man::new(cmd);
     let mut buffer: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buffer) {
@@ -2006,22 +2252,21 @@ fn build_runtime_or_exit(worker_threads: usize) -> tokio::runtime::Runtime {
         })
 }
 
-fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: bool) {
-    match local_tools::init_config(output, profile, overwrite) {
-        Ok(report) => {
-            if json {
-                println!("{}", agent::to_pretty_json(&report));
-            } else {
-                print!("{}", local_tools::render_init_config_text(&report));
-            }
+/// Set the command's region (both sides of a diff) where none was given.
+fn fill_default_region(cmd: &mut Commands, default_region: &str) {
+    match cmd {
+        Commands::List { region, .. } | Commands::CompatProbe { region, .. } => {
+            region.get_or_insert_with(|| default_region.to_string());
         }
-        Err(e) => {
-            eprintln!("Init config failed: {}", e);
-            if json {
-                print_json_error(&e);
-            }
-            std::process::exit(agent::ExitCode::CliConfig.code());
+        Commands::Diff {
+            region,
+            target_region,
+            ..
+        } => {
+            region.get_or_insert_with(|| default_region.to_string());
+            target_region.get_or_insert_with(|| default_region.to_string());
         }
+        _ => {}
     }
 }
 
@@ -2120,6 +2365,7 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
             bucket,
             target_region,
             target_bucket,
+            ..
         } => {
             let stem = output_stem(
                 region.as_deref(),
@@ -2144,49 +2390,6 @@ fn apply_summary_only_output_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     if cli.summary_only {
         cfg.output.parquet_file = None;
         cfg.output.ks_file = None;
-    }
-}
-
-/// compat-probe runs a fixed set of probe requests and writes only its
-/// report: listing/output flags would be accepted and silently ignored.
-fn validate_compat_probe_command(cli: &Cli) {
-    if !matches!(cli.cmd, Commands::CompatProbe { .. }) {
-        return;
-    }
-    let ignored: Vec<&str> = [
-        ("--filter", cli.filter.is_some()),
-        ("--hints-file", cli.hints_file.is_some()),
-        ("--output-parquet-file", cli.output_parquet_file.is_some()),
-        ("--output-ks-file", cli.output_ks_file.is_some()),
-        ("--output-dir", cli.output_dir.is_some()),
-        ("--compression", cli.compression.is_some()),
-        ("--compression-level", cli.compression_level.is_some()),
-        ("--resume", cli.resume),
-        ("--no-auto-hints", cli.no_auto_hints),
-        ("--delimiter", !cli.delimiter.is_empty()),
-        ("--max-keys", cli.max_keys.is_some()),
-        ("--start-after", cli.start_after.is_some()),
-        ("--continuation-token", cli.continuation_token.is_some()),
-        ("--run-manifest", cli.run_manifest.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(flag, set)| set.then_some(flag))
-    .collect();
-    if !ignored.is_empty() {
-        exit_config_error(&format!(
-            "compat-probe does not use {}: it runs a fixed set of probe requests and writes \
-             only its report (--output / stdout)",
-            ignored.join(", ")
-        ));
-    }
-}
-
-fn validate_summary_only_command(cli: &Cli) {
-    if cli.summary_only && !matches!(cli.cmd, Commands::List { .. }) {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--summary-only is only supported with the list command".to_string(),
-        );
     }
 }
 
@@ -2308,10 +2511,7 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         );
     }
     let Commands::List { region, bucket, .. } = &cli.cmd else {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--continuation-token is only supported with the list command".to_string(),
-        );
+        return;
     };
     if cli.resume {
         exit_before_run(
@@ -2397,27 +2597,6 @@ fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
     }
 }
 
-fn validate_diff_hints_command(cli: &Cli) {
-    if !matches!(cli.cmd, Commands::Diff { .. }) {
-        return;
-    }
-    if cli.hints_file.is_some() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff".to_string(),
-        );
-    }
-}
-
-fn validate_diff_resume_command(cli: &Cli) {
-    if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff".to_string(),
-        );
-    }
-}
-
 fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
     let warnings = provider_setup_guardrail_warnings(cli, cfg);
     if let Some(error) = warnings.first() {
@@ -2487,19 +2666,15 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
                 ));
             }
         }
-        Commands::CompatProbe { endpoint_url, .. } => {
-            let effective = endpoint_url
-                .as_deref()
-                .or(cli.endpoint.as_deref())
-                .or(cfg.s3.endpoint_url.as_deref());
-            if effective.is_none() {
+        Commands::CompatProbe { .. } => {
+            if cfg.s3.endpoint_url.is_none() {
                 warnings.push(
-                    "compat-probe needs an endpoint: pass --endpoint-url (or --endpoint), or set \
+                    "compat-probe needs an endpoint: pass --endpoint-url or --provider, or set \
                      s3.endpoint_url in the config"
                         .to_string(),
                 );
             }
-            if let Some(endpoint) = effective
+            if let Some(endpoint) = cfg.s3.endpoint_url.as_deref()
                 && profiles::endpoint_url_has_template_placeholder(endpoint)
             {
                 warnings.push(format!(
@@ -2797,7 +2972,7 @@ fn print_summary(metrics: &agent::MetricsSummary, delimiter: &str) {
     println!(
         "  bytes:    {} ({})",
         metrics.bytes_total,
-        human_bytes(metrics.bytes_total)
+        local_tools::human_bytes(metrics.bytes_total)
     );
     println!("  prefixes: {}", metrics.unique_prefixes);
     if !metrics.top_prefixes.is_empty() {
@@ -2812,717 +2987,46 @@ fn print_summary(metrics: &agent::MetricsSummary, delimiter: &str) {
                 },
                 prefix.objects,
                 prefix.bytes,
-                human_bytes(prefix.bytes)
+                local_tools::human_bytes(prefix.bytes)
             );
         }
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = UNITS[0];
-    for next_unit in UNITS.iter().skip(1) {
-        if value < 1024.0 {
-            break;
-        }
-        value /= 1024.0;
-        unit = next_unit;
-    }
-    if unit == "B" {
-        format!("{} {}", bytes, unit)
-    } else {
-        format!("{:.2} {}", value, unit)
-    }
-}
-
-fn print_doctor_config(report: &agent::DoctorReport) {
-    let config = &report.resolved_config;
-    println!("Resolved config:");
-    println!(
-        "  config:       {}",
-        report.config_source.loaded_config.as_deref().unwrap_or("-")
-    );
-    println!("  threads:      {}", config.runtime.worker_threads);
-    println!("  concurrency:  {}", config.runtime.max_concurrency);
-    println!(
-        "  profile:      {}",
-        config.s3.profile.as_deref().unwrap_or("-")
-    );
-    println!(
-        "  endpoint:     {}",
-        config.s3.endpoint_url.as_deref().unwrap_or("-")
-    );
-    println!("  addressing:   {}", config.s3.addressing_style);
-    for warning in &report.config_source.warnings {
-        println!("  warning:      {}", warning);
-    }
-}
-
-fn print_doctor_simple(report: &agent::DoctorReport, fix_suggestions: bool) {
+/// One compact human format: a line per check, the resolved endpoint
+/// settings, and a next step for what is wrong.
+fn print_doctor_report(report: &agent::DoctorReport) {
     for check in &report.checks {
         let label = match check.status.as_str() {
-            "ok" => "OK",
-            "warn" => "WARN",
+            "ok" => "OK   ",
+            "warn" => "WARN ",
             "error" => "ERROR",
-            "skipped" => "SKIP",
-            _ => "INFO",
+            "skipped" => "SKIP ",
+            _ => "INFO ",
         };
         println!("{} {}: {}", label, check.name, check.message);
     }
-    if fix_suggestions {
-        print_doctor_suggestions(report);
-    }
-}
-
-fn print_doctor_suggestions(report: &agent::DoctorReport) {
-    for check in &report.checks {
-        match check.name.as_str() {
-            // Static keys, SSO/role variables and the like already give the
-            // SDK credentials; exporting a profile then points it elsewhere.
-            "aws_profile" if check.status == "warn" && !credential_environment_signal_present() => {
-                println!("NEXT export AWS_PROFILE=default");
-            }
-            "endpoint_url" if check.status == "error" => {
-                println!(
-                    "NEXT pass --endpoint-url <url>, or set s3.endpoint_url in {}",
-                    report
-                        .config_source
-                        .loaded_config
-                        .as_deref()
-                        .unwrap_or("s3-turbo-list.toml")
-                );
-            }
-            name if name.ends_with("_parent") && check.status == "error" => {
-                if let Some(path) = check
-                    .message
-                    .strip_prefix("parent directory does not exist: ")
-                {
-                    println!("NEXT mkdir -p {}", path);
-                }
-            }
-            "endpoint_profile" if check.status == "warn" => {
-                println!("NEXT s3-turbo-list guide <provider>");
-            }
-            _ => {}
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct LocalBenchmarkReport {
-    schema_version: &'static str,
-    tool_version: &'static str,
-    status: String,
-    benchmark: String,
-    network: String,
-    compression: String,
-    compression_level: u32,
-    output_format: String,
-    objects: usize,
-    batch_size: usize,
-    prefixes: usize,
-    producers: usize,
-    channel_capacity: usize,
-    producer_send_wait_secs: f64,
-    elapsed_secs: f64,
-    objects_per_sec: f64,
-    rows_per_sec: f64,
-    parquet_bytes_per_object: f64,
-    ks_bytes_per_object: f64,
-    text_bytes_per_object: f64,
-    output_bytes_per_object: f64,
-    parquet_mib_per_sec: f64,
-    text_mib_per_sec: f64,
-    output_mib_per_sec: f64,
-    artifact_dir: Option<String>,
-    parquet_file: Option<String>,
-    parquet_bytes: u64,
-    ks_file: Option<String>,
-    ks_bytes: u64,
-    text_file: Option<String>,
-    text_bytes: u64,
-    metrics: agent::MetricsSummary,
-    artifacts_kept: bool,
-}
-
-fn run_benchmark_local(
-    benchmark: LocalBenchmarkKind,
-    objects: usize,
-    batch_size: usize,
-    prefixes: usize,
-    producers: usize,
-    diff_shape: LocalDiffShape,
-    output_format: ListOutputFormat,
-    keep_artifacts: bool,
-    cfg: &S3TurboConfig,
-) -> LocalBenchmarkReport {
-    if matches!(
-        benchmark,
-        LocalBenchmarkKind::DiffMap | LocalBenchmarkKind::DiffOutput
-    ) {
-        return run_benchmark_local_diff(
-            benchmark,
-            objects,
-            batch_size,
-            prefixes,
-            diff_shape,
-            keep_artifacts,
-            cfg,
-        );
-    }
-
-    let objects = objects.max(1);
-    let batch_size = batch_size.max(1);
-    let prefixes = prefixes.max(1);
-    let producers = producers.max(1);
-    let suffix = format!(
-        "{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    let config = &report.resolved_config;
+    println!(
+        "Resolved: provider {}, endpoint {}, addressing {}, concurrency {}, threads {}",
+        config.s3.provider.as_deref().unwrap_or("-"),
+        config.s3.endpoint_url.as_deref().unwrap_or("-"),
+        config.s3.addressing_style,
+        config.runtime.max_concurrency,
+        config.runtime.worker_threads
     );
-    let artifact_dir = std::env::temp_dir().join(format!("s3-turbo-list-benchmark-{}", suffix));
-    std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
-        exit_before_run(
-            agent::ExitCode::OutputWrite,
-            format!(
-                "Benchmark setup error: failed to create {}: {}",
-                artifact_dir.display(),
-                e
-            ),
-        );
-    });
-    let parquet_file = artifact_dir.join("benchmark.parquet");
-    let ks_file = artifact_dir.join("benchmark.ks");
-    let text_file = match output_format {
-        ListOutputFormat::Tsv => Some(artifact_dir.join("benchmark.tsv")),
-        ListOutputFormat::Ndjson => Some(artifact_dir.join("benchmark.ndjson")),
-        ListOutputFormat::Parquet => None,
-    };
-
-    let quit = Arc::new(AtomicBool::new(false));
-    let g_state = core::GlobalState::new(quit, 2);
-    let started = Instant::now();
-    let output_config = cfg.output.clone();
-    let parquet_path = parquet_file.display().to_string();
-    let ks_path = ks_file.display().to_string();
-    let channel_capacity = cfg.channel.capacity;
-    let send_wait_nanos = Arc::new(AtomicU64::new(0));
-
-    let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
-
-    rt.block_on(async {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(core::ObjectKey, core::ObjectProps)>>(
-            channel_capacity,
-        );
-        let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
-        let data_map = match output_format {
-            ListOutputFormat::Parquet => {
-                let data_map_ks = ks_path.clone();
-                let data_map_parquet = parquet_path.clone();
-                let data_map_output_config = output_config.clone();
-                tokio::spawn(async move {
-                    data_map::data_map_task_list_streaming(
-                        data_map_ctx,
-                        &data_map_ks,
-                        &data_map_parquet,
-                        data_map_output_config,
-                    )
-                    .await;
-                })
-            }
-            ListOutputFormat::Tsv | ListOutputFormat::Ndjson => {
-                let text_path = text_file
-                    .as_ref()
-                    .expect("text benchmark output path")
-                    .clone();
-                tokio::spawn(async move {
-                    let file = match tokio::fs::File::create(&text_path).await {
-                        Ok(file) => file,
-                        Err(e) => {
-                            eprintln!(
-                                "Benchmark setup error: failed to create {}: {}",
-                                text_path.display(),
-                                e
-                            );
-                            data_map_ctx.g_state.inc_output_error();
-                            data_map_ctx.g_state.quit();
-                            return;
-                        }
-                    };
-                    let writer = tokio::io::BufWriter::new(file);
-                    data_map::data_map_task_list_text_writer(
-                        data_map_ctx,
-                        data_map::ListTextOutputFormat::from(output_format),
-                        writer,
-                    )
-                    .await;
-                })
-            }
-        };
-
-        let producer_state = g_state.clone();
-        let send_wait_nanos = Arc::clone(&send_wait_nanos);
-        let producer = tokio::spawn(async move {
-            producer_state.list_task_start(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
-            producer_state.wait_to_start().await;
-            let mut handles = Vec::with_capacity(producers);
-            for producer_index in 0..producers {
-                let tx = tx.clone();
-                let send_wait_nanos = Arc::clone(&send_wait_nanos);
-                let start = objects.saturating_mul(producer_index) / producers;
-                let end = objects.saturating_mul(producer_index + 1) / producers;
-                handles.push(tokio::spawn(async move {
-                    let mut sent = start;
-                    while sent < end {
-                        let take = (end - sent).min(batch_size);
-                        let mut batch = Vec::with_capacity(take);
-                        for offset in 0..take {
-                            let index = sent + offset;
-                            let prefix_index = index % prefixes;
-                            let key_text =
-                                format!("prefix-{}/object-{:012}.dat", prefix_index, index);
-                            let key = core::ObjectKey::from(key_text.as_str());
-                            let mut etag = [0u8; 16];
-                            etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                            etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
-                            let props = core::ObjectProps::new_open(
-                                core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
-                                1024 + (index % 4096) as u64,
-                                etag,
-                            );
-                            batch.push((key, props));
-                        }
-                        let send_started = Instant::now();
-                        if tx.send(batch).await.is_err() {
-                            break;
-                        }
-                        let waited = send_started.elapsed().as_nanos().min(u128::from(u64::MAX));
-                        send_wait_nanos.fetch_add(waited as u64, Ordering::Relaxed);
-                        sent += take;
-                    }
-                }));
-            }
-            drop(tx);
-            for handle in handles {
-                if let Err(e) = handle.await {
-                    eprintln!("Benchmark producer worker failed: {}", e);
-                    producer_state.inc_fatal_error();
-                }
-            }
-            producer_state.list_task_complete(core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE);
-        });
-
-        if let Err(e) = producer.await {
-            eprintln!("Benchmark producer task failed: {}", e);
-            g_state.inc_fatal_error();
-        }
-        if let Err(e) = data_map.await {
-            eprintln!("Benchmark data-map task failed: {}", e);
-            g_state.inc_fatal_error();
-        }
-    });
-    rt.shutdown_background();
-
-    let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
-    let producer_send_wait_secs = send_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
-    // A pooled run writes `.partN` files beside the base file; the report's
-    // size and throughput figures cover all of them.
-    let parquet_bytes = std::iter::once(parquet_file.display().to_string())
-        .chain(agent::parquet_part_paths(
-            &parquet_file.display().to_string(),
-            g_state.metrics_snapshot().data_output_files,
-        ))
-        .filter_map(|path| std::fs::metadata(path).ok())
-        .map(|m| m.len())
-        .sum::<u64>();
-    let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
-    let text_bytes = text_file
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let output_bytes = parquet_bytes
-        .saturating_add(ks_bytes)
-        .saturating_add(text_bytes);
-    let metrics: agent::MetricsSummary = g_state.metrics_snapshot().into();
-    let artifacts_kept = keep_artifacts;
-    let artifact_dir_summary = artifacts_kept.then(|| artifact_dir.display().to_string());
-    if !artifacts_kept {
-        let _ = std::fs::remove_dir_all(&artifact_dir);
+    for warning in &report.config_source.warnings {
+        println!("WARN  config: {}", warning);
     }
-
-    LocalBenchmarkReport {
-        schema_version: agent::AGENT_SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        status: if g_state.read_fatal_error() == 0 {
-            "ok".to_string()
-        } else {
-            "error".to_string()
-        },
-        benchmark: LocalBenchmarkKind::ListOutput.to_string(),
-        network: "none: synthetic local data only".to_string(),
-        compression: output_config.compression.clone(),
-        compression_level: output_config.compression_level,
-        output_format: output_format.to_string(),
-        objects,
-        batch_size,
-        prefixes,
-        producers,
-        channel_capacity,
-        producer_send_wait_secs,
-        elapsed_secs,
-        objects_per_sec: objects as f64 / elapsed_secs,
-        rows_per_sec: metrics.streamed_rows as f64 / elapsed_secs,
-        parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
-        ks_bytes_per_object: ks_bytes as f64 / objects as f64,
-        text_bytes_per_object: text_bytes as f64 / objects as f64,
-        output_bytes_per_object: output_bytes as f64 / objects as f64,
-        parquet_mib_per_sec: parquet_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
-        text_mib_per_sec: text_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
-        output_mib_per_sec: output_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
-        artifact_dir: artifact_dir_summary,
-        parquet_file: (output_format == ListOutputFormat::Parquet).then_some(parquet_path),
-        parquet_bytes,
-        ks_file: (output_format == ListOutputFormat::Parquet).then_some(ks_path),
-        ks_bytes,
-        text_file: text_file.as_ref().map(|path| path.display().to_string()),
-        text_bytes,
-        metrics,
-        artifacts_kept,
+    if let Some(hints) = &report.hints {
+        print_doctor_hints(hints);
     }
-}
-
-fn run_benchmark_local_diff(
-    benchmark: LocalBenchmarkKind,
-    objects: usize,
-    batch_size: usize,
-    prefixes: usize,
-    diff_shape: LocalDiffShape,
-    keep_artifacts: bool,
-    cfg: &S3TurboConfig,
-) -> LocalBenchmarkReport {
-    let objects = objects.max(1);
-    let batch_size = batch_size.max(1);
-    let prefixes = prefixes.max(1);
-    let started = Instant::now();
-
-    // DiffOutput writes real Parquet/KS artifacts; DiffMap measures the
-    // merge + row encoding against a null writer (no file IO).
-    let mut artifact_dir_summary = None;
-    let (artifact_dir, parquet_path, ks_path) = if benchmark == LocalBenchmarkKind::DiffOutput {
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let dir = std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-            exit_before_run(
-                agent::ExitCode::OutputWrite,
-                format!(
-                    "Benchmark setup error: failed to create {}: {}",
-                    dir.display(),
-                    e
-                ),
-            );
-        });
-        let parquet = dir.join("diff.parquet");
-        let ks = dir.join("diff.ks");
-        (Some(dir), Some(parquet), Some(ks))
-    } else {
-        (None, None, None)
-    };
-
-    let output_config = cfg.output.clone();
-    let channel_capacity = cfg.channel.capacity;
-    let mut parquet_rows = 0usize;
-    let mut ks_entries = 0usize;
-
-    let rt = build_runtime_or_exit(cfg.runtime.worker_threads);
-    let outcome = rt.block_on(async {
-        let (left_tx, left_rx) = tokio::sync::mpsc::channel::<
-            Vec<(core::ObjectKey, core::ObjectProps)>,
-        >(channel_capacity);
-        let (right_tx, right_rx) = tokio::sync::mpsc::channel::<
-            Vec<(core::ObjectKey, core::ObjectProps)>,
-        >(channel_capacity);
-
-        let producer = tokio::spawn(async move {
-            let mut sent = 0usize;
-            while sent < objects {
-                let take = (objects - sent).min(batch_size);
-                let (left, right) =
-                    synthetic_diff_batches(sent, take, prefixes, objects, benchmark, diff_shape);
-                if !left.is_empty() && left_tx.send(left).await.is_err() {
-                    return;
-                }
-                if !right.is_empty() && right_tx.send(right).await.is_err() {
-                    return;
-                }
-                sent += take;
-            }
-        });
-
-        let sides = data_map::DiffStreamSides {
-            left: vec![left_rx],
-            right: vec![right_rx],
-        };
-        let merged: Result<data_map::DiffMergeOutcome, String> =
-            if let (Some(parquet_path), Some(ks_path)) = (&parquet_path, &ks_path) {
-                let output = tokio::fs::File::create(parquet_path)
-                    .await
-                    .map_err(|e| format!("failed to create {}: {}", parquet_path.display(), e))?;
-                let writer = tokio::io::BufWriter::with_capacity(100 * 1_048_576, output);
-                let ks = ks_path.display().to_string();
-                let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
-                    writer,
-                    &ks,
-                    output_config.row_group_size,
-                    &output_config.compression,
-                    output_config.compression_level,
-                );
-                let outcome = data_map::run_diff_merge(sides, &mut parquet, || false).await?;
-                parquet_rows = parquet.total_rows();
-                ks_entries = outcome.write_ks(&ks).await?;
-                parquet.close().await?;
-                Ok(outcome)
-            } else {
-                let mut parquet = s3_turbo_list::utils::AsyncParquetOutput::new_with_options(
-                    tokio::io::sink(),
-                    "",
-                    output_config.row_group_size,
-                    &output_config.compression,
-                    output_config.compression_level,
-                );
-                let outcome = data_map::run_diff_merge(sides, &mut parquet, || false).await?;
-                parquet_rows = parquet.total_rows();
-                Ok(outcome)
-            };
-        let _ = producer.await;
-        merged
-    });
-    rt.shutdown_background();
-
-    let outcome = outcome.unwrap_or_else(|e| {
-        exit_before_run(
-            agent::ExitCode::OutputWrite,
-            format!("Benchmark output error: {}", e),
-        );
-    });
-
-    let mut parquet_bytes = 0u64;
-    let mut ks_bytes = 0u64;
-    let mut parquet_file = None;
-    let mut ks_file = None;
-    if let (Some(dir), Some(parquet_path), Some(ks_path)) = (&artifact_dir, &parquet_path, &ks_path)
-    {
-        parquet_bytes = std::fs::metadata(parquet_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        ks_bytes = std::fs::metadata(ks_path).map(|m| m.len()).unwrap_or(0);
-        parquet_file = Some(parquet_path.display().to_string());
-        ks_file = Some(ks_path.display().to_string());
-        if keep_artifacts {
-            artifact_dir_summary = Some(dir.display().to_string());
-        } else {
-            let _ = std::fs::remove_dir_all(dir);
-            parquet_file = None;
-            ks_file = None;
+    for check in &report.checks {
+        if check.name == "endpoint_url" && check.status == "error" {
+            println!("NEXT  pass --endpoint-url <url>, or set s3.endpoint_url in the config");
         }
     }
-
-    let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
-    let output_bytes = parquet_bytes.saturating_add(ks_bytes);
-    let metrics = agent::MetricsSummary {
-        fatal_errors: 0,
-        output_errors: 0,
-        stream_timeouts: 0,
-        s3_client_timeouts: 0,
-        s3_client_generic_errors: 0,
-        throttled_responses: 0,
-        http_error_statuses: Vec::new(),
-        received_batches: outcome.received_batches,
-        received_objects: outcome.received_objects,
-        streamed_rows: outcome.rows,
-        unique_prefixes: outcome.unique_prefixes(),
-        parquet_rows,
-        ks_entries,
-        bytes_total: outcome.bytes_total,
-        top_prefixes: Vec::new(),
-        summary_only: false,
-    };
-
-    LocalBenchmarkReport {
-        schema_version: agent::AGENT_SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        status: "ok".to_string(),
-        benchmark: benchmark.to_string(),
-        network: "none: synthetic local data only".to_string(),
-        compression: cfg.output.compression.clone(),
-        compression_level: cfg.output.compression_level,
-        output_format: benchmark.to_string(),
-        objects,
-        batch_size,
-        prefixes,
-        producers: 1,
-        channel_capacity: cfg.channel.capacity,
-        producer_send_wait_secs: 0.0,
-        elapsed_secs,
-        objects_per_sec: outcome.received_objects as f64 / elapsed_secs,
-        rows_per_sec: outcome.rows as f64 / elapsed_secs,
-        parquet_bytes_per_object: parquet_bytes as f64 / objects as f64,
-        ks_bytes_per_object: ks_bytes as f64 / objects as f64,
-        text_bytes_per_object: 0.0,
-        output_bytes_per_object: output_bytes as f64 / objects as f64,
-        parquet_mib_per_sec: parquet_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
-        text_mib_per_sec: 0.0,
-        output_mib_per_sec: output_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
-        artifact_dir: artifact_dir_summary,
-        parquet_file,
-        parquet_bytes,
-        ks_file,
-        ks_bytes,
-        text_file: None,
-        text_bytes: 0,
-        metrics,
-        artifacts_kept: keep_artifacts,
-    }
-}
-
-type SyntheticObjectBatch = Vec<(core::ObjectKey, core::ObjectProps)>;
-type SyntheticDiffBatches = (SyntheticObjectBatch, SyntheticObjectBatch);
-
-fn synthetic_diff_batches(
-    start: usize,
-    take: usize,
-    prefixes: usize,
-    total_objects: usize,
-    benchmark: LocalBenchmarkKind,
-    diff_shape: LocalDiffShape,
-) -> SyntheticDiffBatches {
-    let mut left = Vec::with_capacity(take);
-    let mut right = Vec::with_capacity(take);
-    for offset in 0..take {
-        let index = start + offset;
-        // Block-partitioned, zero-padded prefixes keep the synthetic key
-        // stream in S3 lexicographic order, as the diff merge requires.
-        let prefix_index = (index * prefixes) / total_objects.max(1);
-        let key_text = format!("prefix-{:06}/object-{:012}.dat", prefix_index, index);
-        let key = core::ObjectKey::from(key_text.as_str());
-        let mut etag = [0u8; 16];
-        etag[..8].copy_from_slice(&(index as u64).to_le_bytes());
-        etag[8..].copy_from_slice(&(prefix_index as u64).to_le_bytes());
-        etag[15] = etag[15].max(1);
-        let size = 1024 + (index % 4096) as u64;
-        if benchmark == LocalBenchmarkKind::DiffMap {
-            left.push((
-                key.clone(),
-                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, size, etag),
-            ));
-            right.push((
-                key,
-                core::ObjectProps::new_open(core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, size, etag),
-            ));
-            continue;
-        }
-
-        match diff_shape {
-            LocalDiffShape::AllEqual => {
-                left.push((
-                    key.clone(),
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                        size,
-                        etag,
-                    ),
-                ));
-                right.push((
-                    key,
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                        size,
-                        etag,
-                    ),
-                ));
-            }
-            LocalDiffShape::AllChanged => {
-                left.push((
-                    key.clone(),
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                        size,
-                        etag,
-                    ),
-                ));
-                etag[0] = etag[0].wrapping_add(1);
-                right.push((
-                    key,
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                        size + 1,
-                        etag,
-                    ),
-                ));
-            }
-            LocalDiffShape::Mixed => match index % 4 {
-                0 => {
-                    left.push((
-                        key.clone(),
-                        core::ObjectProps::new_open(
-                            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                            size,
-                            etag,
-                        ),
-                    ));
-                    right.push((
-                        key,
-                        core::ObjectProps::new_open(
-                            core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                            size,
-                            etag,
-                        ),
-                    ));
-                }
-                1 => left.push((
-                    key,
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                        size,
-                        etag,
-                    ),
-                )),
-                2 => right.push((
-                    key,
-                    core::ObjectProps::new_open(
-                        core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                        size,
-                        etag,
-                    ),
-                )),
-                _ => {
-                    left.push((
-                        key.clone(),
-                        core::ObjectProps::new_open(
-                            core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                            size,
-                            etag,
-                        ),
-                    ));
-                    etag[0] = etag[0].wrapping_add(1);
-                    right.push((
-                        key,
-                        core::ObjectProps::new_open(
-                            core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                            size + 1,
-                            etag,
-                        ),
-                    ));
-                }
-            },
-        }
-    }
-    (left, right)
+    println!("Doctor status: {}", report.status);
 }
 
 /// Output files the run would fail to create (exit 5), with the reason.
@@ -3760,10 +3264,7 @@ fn cli_config_overrides(cli: &Cli) -> Vec<String> {
         overrides.push("addressing_style".to_string());
     }
     if cli.profile.is_some() {
-        overrides.push("profile".to_string());
-    }
-    if cli.debug_s3 {
-        overrides.push("debug_s3".to_string());
+        overrides.push("provider".to_string());
     }
     if cli.trace_compat.is_some() {
         overrides.push("trace_compat".to_string());
@@ -3934,6 +3435,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             region,
             bucket,
             output_format,
+            ..
         } => (
             "list".to_string(),
             Some(bucket.clone()),
@@ -3947,6 +3449,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
             bucket,
             target_region,
             target_bucket,
+            ..
         } => (
             "diff".to_string(),
             Some(bucket.clone()),
@@ -3958,7 +3461,7 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         Commands::CompatProbe { region, bucket, .. } => (
             "compat-probe".to_string(),
             Some(bucket.clone()),
-            Some(region.clone()),
+            region.clone(),
             None,
             None,
             None,
@@ -3971,9 +3474,6 @@ fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::CommandInputS
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
         Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
         Commands::Man => ("man".to_string(), None, None, None, None, None),
-        Commands::BenchmarkLocal { .. } => {
-            ("benchmark-local".to_string(), None, None, None, None, None)
-        }
     };
 
     agent::CommandInputSummary {
@@ -4060,6 +3560,7 @@ fn planned_output_paths(
             bucket,
             target_region,
             target_bucket,
+            ..
         } => {
             let stem = output_stem_with_timestamp(
                 region.as_deref(),
@@ -4142,7 +3643,7 @@ async fn diff_side_boundaries(
         Err(_) => {}
     }
 
-    let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style);
+    let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style());
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
     // Race discovery against Ctrl-C / SIGTERM, as list mode does.
     let discovered = tokio::select! {
@@ -4270,7 +3771,7 @@ fn diff_target_endpoint(
 fn command_region(cmd: &Commands) -> Option<&str> {
     match cmd {
         Commands::List { region, .. } | Commands::Diff { region, .. } => region.as_deref(),
-        Commands::CompatProbe { region, .. } => Some(region.as_str()),
+        Commands::CompatProbe { region, .. } => region.as_deref(),
         _ => None,
     }
 }
@@ -4350,7 +3851,7 @@ fn load_hints(
 
 fn run_compat_probe(
     endpoint_url: &str,
-    region: &str,
+    region: Option<&str>,
     bucket: &str,
     prefix: &str,
     addressing_style: &str,

@@ -29,21 +29,6 @@ fn run_cli_without_aws_env(args: &[&str]) -> (i32, String, String) {
     (exit_code, stdout, stderr)
 }
 
-fn run_cli_with_aws_profile(args: &[&str], profile: &str) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    clear_aws_env(&mut cmd);
-    let output = cmd
-        .env("AWS_PROFILE", profile)
-        .args(args)
-        .output()
-        .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
-}
-
 fn clear_aws_env(cmd: &mut Command) {
     for name in [
         "AWS_PROFILE",
@@ -92,14 +77,27 @@ fn test_cli_help_top_level() {
 fn test_cli_help_list() {
     let (code, stdout, _stderr) = run_cli(&["list", "--help"]);
     assert_eq!(code, 0, "s3-turbo-list list --help should exit 0");
-    assert!(
-        stdout.contains("--bucket"),
-        "list help should contain '--bucket'"
-    );
-    assert!(
-        stdout.contains("recursive full-bucket listing"),
-        "list help should explain recursive delimiter usage"
-    );
+    assert!(stdout.contains("--bucket"), "{}", stdout);
+    assert!(stdout.contains("lists every key recursively"), "{}", stdout);
+    // Tuning knobs and deprecated spellings stay out of --help.
+    for hidden in [
+        "--threads",
+        "--max-keys",
+        "--no-auto-hints",
+        "--compression-level",
+        "--output-ks-file",
+        "--output-log-file",
+        "--plan-json",
+        "--debug-s3",
+        "--summary-only",
+        "--continuation-token",
+    ] {
+        assert!(!stdout.contains(hidden), "{} in {}", hidden, stdout);
+    }
+    // The local tools show only their own options, not the run flags.
+    let (code, stdout, _stderr) = run_cli(&["guide", "--help"]);
+    assert_eq!(code, 0);
+    assert!(!stdout.contains("--output-dir"), "{}", stdout);
 }
 
 #[test]
@@ -140,22 +138,17 @@ fn test_cli_help_agent_local_commands() {
     assert_eq!(code, 0, "doctor --help should exit 0");
     assert!(stdout.contains("--json"));
 
-    let (code, stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
-    assert_eq!(code, 0, "benchmark-local --help should exit 0");
-    assert!(stdout.contains("--objects"));
-    assert!(stdout.contains("--output-format"));
-
-    let (code, stdout, _stderr) = run_cli(&["init-config", "--help"]);
-    assert_eq!(code, 0, "init-config --help should exit 0");
-    assert!(stdout.contains("--overwrite"));
-
     let (code, stdout, _stderr) = run_cli(&["guide", "--help"]);
     assert_eq!(code, 0, "guide --help should exit 0");
-    assert!(stdout.contains("provider quickstart") || stdout.contains("recipe"));
+    assert!(stdout.contains("provider"));
 
     let (code, stdout, _stderr) = run_cli(&["manifest-summary", "--help"]);
     assert_eq!(code, 0, "manifest-summary --help should exit 0");
     assert!(stdout.contains("--json"));
+
+    // benchmark-local moved to `cargo run --example bench_local`.
+    let (code, _stdout, _stderr) = run_cli(&["benchmark-local", "--help"]);
+    assert_eq!(code, 2);
 }
 
 #[test]
@@ -174,119 +167,42 @@ fn test_cli_doctor_json_includes_resolved_config() {
 }
 
 #[test]
-fn test_cli_init_config_writes_and_requires_overwrite() {
+fn test_cli_init_config_was_removed_with_a_pointer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s3-turbo-list.toml");
-
-    let (code, stdout, stderr) = run_cli(&[
+    let (code, _stdout, stderr) = run_cli(&[
         "init-config",
         "--profile",
         "minio",
         "--output",
         path.to_str().unwrap(),
-        "--json",
     ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["profile"], "minio");
-    let rendered = std::fs::read_to_string(&path).unwrap();
-    assert!(rendered.contains("profile = \"minio\""));
-    assert!(rendered.contains("AWS_PROFILE"));
-
-    let r2_path = dir.path().join("r2.toml");
-    let (code, stdout, stderr) = run_cli(&[
-        "init-config",
-        "--profile",
-        "r2",
-        "--output",
-        r2_path.to_str().unwrap(),
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let rendered = std::fs::read_to_string(&r2_path).unwrap();
-    assert!(rendered.contains("profile = \"r2\""));
-    assert!(rendered.contains("addressing_style = \"path\""));
-    assert!(rendered.contains("force_path_style = true"));
-
-    let (code, _stdout, stderr) = run_cli(&["init-config", "--output", path.to_str().unwrap()]);
-    assert_ne!(code, 0);
-    assert!(stderr.contains("Output file exists"));
-
-    let (code, _stdout, stderr) = run_cli(&[
-        "init-config",
-        "--output",
-        path.to_str().unwrap(),
-        "--overwrite",
-    ]);
-    assert_eq!(code, 0, "stderr: {}", stderr);
+    assert_eq!(code, 2, "stderr: {}", stderr);
+    assert!(stderr.contains("init-config was removed"), "{}", stderr);
+    assert!(stderr.contains("docs/providers.md"), "{}", stderr);
+    assert!(!path.exists());
 }
 
 #[test]
 fn test_cli_guide_local_only() {
-    // Named recipes.
-    let (code, stdout, stderr) = run_cli(&["guide", "aws-basic"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("--dry-run"));
-    assert!(stdout.contains("--output-dir"));
-    assert!(stdout.contains("--delimiter ''"));
-
-    let (code, stdout, stderr) = run_cli(&["guide", "summary"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("--summary-only"));
-    assert!(stdout.contains("manifest-summary"));
-
-    let (code, stdout, stderr) = run_cli(&["guide", "pipe"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("--output-format tsv"));
-    assert!(stdout.contains("--output-format ndjson"));
-    assert!(stdout.contains("manifest-summary"));
-
-    let (code, stdout, stderr) = run_cli(&["guide", "filter"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("SOURCE.size > 1073741824"));
-    assert!(stdout.contains("SOURCE.last_modified"));
-    assert!(stdout.contains("Rejected before network"));
-
-    let (code, stdout, stderr) = run_cli(&["guide", "release-check"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("./scripts/check-release-env.sh"));
-    assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
-    assert!(stdout.contains("BUILD_MODE=clang"));
-    assert!(stdout.contains("Benchmark smoke checks"));
-    assert!(
-        stdout.contains("OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh")
-    );
-    assert!(stdout.contains("BIN=./target/release/s3-turbo-list"));
-    assert!(stdout.contains("gh workflow run release-assets.yml"));
-    assert!(stdout.contains("./scripts/verify-release-assets.sh"));
-    assert!(stdout.contains("do not contact S3-compatible cloud endpoints"));
-
-    let (code, stdout, stderr) = run_cli(&["guide", "diff-safe"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("Safe diff"));
-    assert!(stdout.contains("diff --bucket"));
-    assert!(stdout.contains("manifest-summary"));
-
-    // Provider topics dispatch to quickstarts.
-    let (code, stdout, stderr) = run_cli(&["guide", "r2"]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("AWS_PROFILE"));
-    assert!(stdout.contains("--profile r2"));
-    assert!(stdout.contains("--delimiter ''"));
-
-    // No topic prints the overview, which points back at guide topics.
+    // No topic prints the overview in the current command syntax.
     let (code, stdout, stderr) = run_cli(&["guide"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("First run"));
-    assert!(stdout.contains("--delimiter ''"));
-    assert!(stdout.contains("guide filter"));
-    assert!(stdout.contains("release-check"));
+    assert!(stdout.contains("list --bucket my-bucket"));
+    assert!(stdout.contains("--output-format summary"));
+    assert!(!stdout.contains("--delimiter ''"), "{}", stdout);
 
-    // index lists the recipe names.
-    let (code, stdout, stderr) = run_cli(&["guide", "index"]);
+    // Provider topics print a quickstart plus the preset's facts.
+    let (code, stdout, stderr) = run_cli(&["guide", "r2"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("Available recipes"));
-    assert!(stdout.contains("guide <name>"));
+    assert!(stdout.contains("AWS_PROFILE"));
+    assert!(stdout.contains("--provider r2"));
+
+    // The recipes are gone; an unknown topic names the valid ones.
+    let (code, _stdout, stderr) = run_cli(&["guide", "release-check"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("aws, minio"), "{}", stderr);
 }
 
 #[test]
@@ -321,19 +237,26 @@ fn test_cli_output_dir_dry_run_plans_paths_without_creating_dir() {
 }
 
 #[test]
-fn test_cli_doctor_simple_fix_suggestions() {
+fn test_cli_doctor_output_checks_agree_with_the_run() {
     let dir = tempfile::tempdir().unwrap();
+    // The run creates missing parent directories itself: not an error.
     let missing_parent = dir.path().join("missing").join("out.parquet");
     let (code, stdout, stderr) = run_cli(&[
         "--output-parquet-file",
         missing_parent.to_str().unwrap(),
         "doctor",
-        "--simple",
-        "--fix-suggestions",
+    ]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(!dir.path().join("missing").exists());
+    // An output path that is a directory fails the run: an error.
+    let (code, stdout, stderr) = run_cli(&[
+        "--output-parquet-file",
+        dir.path().to_str().unwrap(),
+        "doctor",
     ]);
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("ERROR output_parquet_parent"));
-    assert!(stdout.contains("NEXT mkdir -p"));
+    assert!(stdout.contains("output_parquet_parent"), "{}", stdout);
+    assert!(stdout.contains("is a directory"), "{}", stdout);
 }
 
 #[test]
@@ -353,20 +276,32 @@ fn test_cli_doctor_json_local_only_success() {
 }
 
 #[test]
-fn test_cli_doctor_warns_when_aws_profile_matches_endpoint_preset_name() {
-    let (code, stdout, stderr) = run_cli_with_aws_profile(&["doctor", "--json"], "bos");
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let checks = json["checks"].as_array().unwrap();
-    assert!(checks.iter().any(|check| {
-        check["name"] == "aws_profile_endpoint_preset_name"
-            && check["status"] == "warn"
-            && check["message"]
-                .as_str()
+fn test_cli_doctor_provider_and_legacy_profile_spelling() {
+    // --provider selects the preset; --profile is its hidden pre-0.37 alias,
+    // and an unset AWS_PROFILE is the normal case, not a warning.
+    for flag in ["--provider", "--profile"] {
+        let (code, stdout, stderr) = run_cli(&[
+            flag,
+            "minio",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "doctor",
+            "--json",
+        ]);
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["resolved_config"]["s3"]["provider"], "minio");
+        assert_eq!(json["resolved_config"]["s3"]["addressing_style"], "path");
+        assert!(
+            json["checks"]
+                .as_array()
                 .unwrap()
-                .contains("endpoint compatibility preset name")
-    }));
+                .iter()
+                .all(|check| check["status"] != "warn"),
+            "{}",
+            stdout
+        );
+    }
 }
 
 #[test]
@@ -383,19 +318,16 @@ fn test_cli_profiles_removed() {
 
 #[test]
 fn test_cli_guide_provider_shows_profile_facts() {
-    // `guide aws` prints the quickstart plus the endpoint-compatibility facts.
     let (code, stdout, stderr) = run_cli(&["guide", "aws"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("AWS quickstart"));
-    assert!(stdout.contains("Endpoint compatibility profile:"));
+    assert!(stdout.contains("aws quickstart"));
+    assert!(stdout.contains("Provider preset 'aws':"));
     assert!(stdout.contains("provider: AWS S3"));
-    assert!(stdout.contains("requires_explicit_endpoint: false"));
 
-    // Providers without a hand-written quickstart still print profile facts.
     let (code, stdout, stderr) = run_cli(&["guide", "oss"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("Endpoint compatibility profile:"));
     assert!(stdout.contains("Alibaba Cloud OSS"));
+    assert!(stdout.contains("(from --region)"));
 }
 
 #[test]
@@ -403,213 +335,12 @@ fn test_cli_completions_and_man_local_only() {
     let (code, stdout, stderr) = run_cli(&["completions", "bash"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("s3-turbo-list"));
-    assert!(stdout.contains("benchmark-local"));
+    assert!(stdout.contains("compat-probe"));
 
     let (code, stdout, stderr) = run_cli(&["man"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.contains("s3-turbo-list"));
     assert!(stdout.contains(".SH DESCRIPTION"));
-}
-
-#[test]
-fn test_cli_benchmark_local_json_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&[
-        "benchmark-local",
-        "--objects",
-        "32",
-        "--batch-size",
-        "8",
-        "--prefixes",
-        "4",
-        "--producers",
-        "2",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
-    assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["compression"], "zstd");
-    assert_eq!(json["compression_level"], 1);
-    assert_eq!(json["output_format"], "parquet");
-    assert_eq!(json["objects"], 32);
-    assert_eq!(json["producers"], 2);
-    assert!(json["channel_capacity"].as_u64().unwrap() > 0);
-    assert!(json["producer_send_wait_secs"].as_f64().unwrap() >= 0.0);
-    assert!(json["rows_per_sec"].as_f64().unwrap() > 0.0);
-    assert!(json["parquet_bytes_per_object"].as_f64().unwrap() > 0.0);
-    assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
-    assert!(json["parquet_mib_per_sec"].as_f64().unwrap() > 0.0);
-    assert!(json["output_mib_per_sec"].as_f64().unwrap() > 0.0);
-    assert_eq!(json["artifact_dir"], serde_json::Value::Null);
-    assert_eq!(json["metrics"]["received_objects"], 32);
-    assert_eq!(json["metrics"]["streamed_rows"], 32);
-    assert_eq!(json["metrics"]["parquet_rows"], 32);
-    assert_eq!(json["metrics"]["ks_entries"], 4);
-}
-
-#[test]
-fn test_cli_benchmark_local_ndjson_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&[
-        "benchmark-local",
-        "--objects",
-        "32",
-        "--batch-size",
-        "8",
-        "--prefixes",
-        "4",
-        "--output-format",
-        "ndjson",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["output_format"], "ndjson");
-    assert_eq!(json["parquet_file"], serde_json::Value::Null);
-    assert_eq!(json["ks_file"], serde_json::Value::Null);
-    assert!(json["text_bytes"].as_u64().unwrap() > 0);
-    assert!(json["text_bytes_per_object"].as_f64().unwrap() > 0.0);
-    assert!(json["text_mib_per_sec"].as_f64().unwrap() > 0.0);
-    assert_eq!(json["metrics"]["received_objects"], 32);
-    assert_eq!(json["metrics"]["streamed_rows"], 32);
-    assert_eq!(json["metrics"]["parquet_rows"], 0);
-    assert_eq!(json["metrics"]["ks_entries"], 0);
-}
-
-#[test]
-fn test_cli_benchmark_local_diff_map_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&[
-        "benchmark-local",
-        "--benchmark",
-        "diff-map",
-        "--objects",
-        "32",
-        "--batch-size",
-        "8",
-        "--prefixes",
-        "4",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["benchmark"], "diff-map");
-    assert_eq!(json["output_format"], "diff-map");
-    assert_eq!(json["objects"], 32);
-    assert_eq!(json["metrics"]["received_batches"], 8);
-    assert_eq!(json["metrics"]["received_objects"], 64);
-    assert_eq!(json["metrics"]["streamed_rows"], 32);
-    assert_eq!(json["metrics"]["unique_prefixes"], 4);
-    // diff-map measures the merge plus row encoding against a null writer.
-    assert_eq!(json["metrics"]["parquet_rows"], 32);
-    assert_eq!(json["parquet_file"], serde_json::Value::Null);
-    assert_eq!(json["text_file"], serde_json::Value::Null);
-    assert!(json["objects_per_sec"].as_f64().unwrap() > 0.0);
-}
-
-#[test]
-fn test_cli_benchmark_local_diff_output_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&[
-        "benchmark-local",
-        "--benchmark",
-        "diff-output",
-        "--objects",
-        "32",
-        "--batch-size",
-        "8",
-        "--prefixes",
-        "4",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["benchmark"], "diff-output");
-    assert_eq!(json["output_format"], "diff-output");
-    assert_eq!(json["objects"], 32);
-    assert_eq!(json["metrics"]["received_batches"], 8);
-    assert_eq!(json["metrics"]["received_objects"], 48);
-    assert_eq!(json["metrics"]["streamed_rows"], 32);
-    assert_eq!(json["metrics"]["unique_prefixes"], 4);
-    assert_eq!(json["metrics"]["parquet_rows"], 32);
-    assert_eq!(json["metrics"]["ks_entries"], 4);
-    assert_eq!(json["parquet_file"], serde_json::Value::Null);
-    assert_eq!(json["ks_file"], serde_json::Value::Null);
-    assert!(json["parquet_bytes"].as_u64().unwrap() > 0);
-    assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
-    assert!(json["output_mib_per_sec"].as_f64().unwrap() > 0.0);
-}
-
-#[test]
-fn test_cli_benchmark_local_diff_output_shapes_no_cloud() {
-    for (shape, expected_received_objects) in
-        [("mixed", 48), ("all-equal", 64), ("all-changed", 64)]
-    {
-        let (code, stdout, stderr) = run_cli(&[
-            "benchmark-local",
-            "--benchmark",
-            "diff-output",
-            "--diff-shape",
-            shape,
-            "--objects",
-            "32",
-            "--batch-size",
-            "8",
-            "--prefixes",
-            "4",
-            "--json",
-        ]);
-        assert_eq!(
-            code, 0,
-            "shape: {}\nstdout: {}\nstderr: {}",
-            shape, stdout, stderr
-        );
-
-        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(json["network"], "none: synthetic local data only");
-        assert_eq!(json["benchmark"], "diff-output");
-        assert_eq!(json["objects"], 32);
-        assert_eq!(
-            json["metrics"]["received_objects"],
-            expected_received_objects
-        );
-        assert_eq!(json["metrics"]["streamed_rows"], 32);
-        assert_eq!(json["metrics"]["unique_prefixes"], 4);
-        assert_eq!(json["metrics"]["parquet_rows"], 32);
-        assert_eq!(json["metrics"]["ks_entries"], 4);
-        assert!(json["output_bytes_per_object"].as_f64().unwrap() > 0.0);
-    }
-}
-
-#[test]
-fn test_cli_benchmark_local_honors_compression_flags_no_cloud() {
-    let (code, stdout, stderr) = run_cli(&[
-        "--compression",
-        "gzip",
-        "--compression-level",
-        "6",
-        "benchmark-local",
-        "--objects",
-        "32",
-        "--batch-size",
-        "8",
-        "--prefixes",
-        "4",
-        "--json",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["network"], "none: synthetic local data only");
-    assert_eq!(json["compression"], "gzip");
-    assert_eq!(json["compression_level"], 6);
-    assert_eq!(json["metrics"]["parquet_rows"], 32);
 }
 
 #[test]
@@ -690,7 +421,7 @@ worker_threads = 4
 
     let (code, stdout, stderr) = run_cli(&["--config", config_path.to_str().unwrap(), "doctor"]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stdout.contains("config:"));
+    assert!(stdout.contains("config_file"));
     assert!(stdout.contains(config_path.to_str().unwrap()));
 }
 
@@ -1133,7 +864,11 @@ fn test_cli_summary_only_rejects_diff() {
         "us-east-1",
     ]);
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("--summary-only is only supported with the list command"));
+    assert!(
+        stderr.contains("unexpected argument '--summary-only'"),
+        "{}",
+        stderr
+    );
 }
 
 #[test]
@@ -1238,7 +973,11 @@ fn test_cli_rejects_continuation_token_with_diff_or_hints() {
         "right",
     ]);
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("--continuation-token is only supported with the list command"));
+    assert!(
+        stderr.contains("unexpected argument '--continuation-token'"),
+        "{}",
+        stderr
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let hints = dir.path().join("hints.txt");
@@ -1293,9 +1032,12 @@ fn test_cli_rejects_diff_with_explicit_hints_file() {
     ]);
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("diff with --hints-file is unsupported by design"));
-    assert!(stderr.contains("unsupported by design"));
-    assert!(stderr.contains("cannot describe both sides"));
+    // diff has no --hints-file: clap rejects it as for any unknown option.
+    assert!(
+        stderr.contains("unexpected argument '--hints-file'"),
+        "{}",
+        stderr
+    );
     assert!(!stderr.contains("v0.2.x"));
 }
 
@@ -1312,9 +1054,11 @@ fn test_cli_rejects_diff_with_resume() {
     ]);
 
     assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("diff --resume is unsupported by design"));
-    assert!(stderr.contains("unsupported by design"));
-    assert!(stderr.contains("partial paired comparisons"));
+    assert!(
+        stderr.contains("unexpected argument '--resume'"),
+        "{}",
+        stderr
+    );
     assert!(!stderr.contains("v0.2.x"));
 }
 
@@ -2209,19 +1953,13 @@ fn test_cli_doctor_suggestions_respect_env_credentials() {
     let output = cmd
         .env("AWS_ACCESS_KEY_ID", "test-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "test-secret-key")
-        .args([
-            "--profile",
-            "minio",
-            "doctor",
-            "--simple",
-            "--fix-suggestions",
-        ])
+        .args(["--provider", "minio", "doctor"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{}", stdout);
     assert!(!stdout.contains("NEXT export AWS_PROFILE"), "{}", stdout);
-    assert!(stdout.contains("NEXT pass --endpoint-url"), "{}", stdout);
+    assert!(stdout.contains("pass --endpoint-url"), "{}", stdout);
 }
 
 #[test]

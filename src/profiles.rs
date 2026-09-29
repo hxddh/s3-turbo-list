@@ -214,7 +214,9 @@ pub fn apply_profile_preset(
     }
 
     let mut addressing_style_applied = false;
-    if cfg.s3.addressing_style == AddressingStyle::Auto
+    // Only a style nobody chose: an explicit `--addressing-style auto` (or a
+    // config file's) wins over the preset like any other explicit value.
+    if !cfg.s3.addressing_style_explicit
         && profile.recommended_addressing_style != AddressingStyle::Auto
     {
         cfg.s3.addressing_style = profile.recommended_addressing_style.clone();

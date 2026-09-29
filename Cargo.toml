@@ -47,9 +47,20 @@ toml = "1"
 dashmap = "6"
 dirs-next = "2"
 
+# `access(2)` for the dry run's output-writability check: mode bits say
+# read-only to a root user who can write anyway (containers, CI).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+# The output-pipeline benchmark (the former hidden `benchmark-local`
+# subcommand); its tests run with `cargo test`.
+[[example]]
+name = "bench_local"
+test = true
 
 # Release artifacts ship from `cargo build --release` (see the release workflow),
 # so optimize that profile for a lean, fast binary: strip symbols, enable

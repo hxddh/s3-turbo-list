@@ -25,6 +25,27 @@ pub enum ExitCode {
     Interrupted = 7,
 }
 
+/// `url` with any `user:password@` userinfo replaced: the command line is
+/// redacted, and the resolved config beside it must not print the same
+/// secret in full.
+pub fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let authority_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| scheme_end + i);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}{}@{}",
+            &url[..scheme_end],
+            REDACTED_ARG_VALUE,
+            &url[scheme_end + at + 1..]
+        ),
+        None => url.to_string(),
+    }
+}
+
 pub fn redacted_command_args() -> Vec<String> {
     redact_command_args(std::env::args())
 }
@@ -95,11 +116,15 @@ pub struct S3Summary {
     pub connect_timeout_secs: u64,
     pub operation_timeout_secs: u64,
     pub endpoint_url: Option<String>,
+    /// Deprecated (0.37): `addressing_style == "path"`.
     pub force_path_style: bool,
     pub addressing_style: String,
+    pub provider: Option<String>,
+    /// Deprecated (0.37): the same value as `provider`.
     pub profile: Option<String>,
     pub profile_known: bool,
     pub profile_warnings: Vec<String>,
+    /// Deprecated (0.37): `trace_compat == "-"`.
     pub debug_s3: bool,
     pub trace_compat: Option<String>,
     pub start_after: Option<String>,
@@ -151,11 +176,12 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
                 initial_backoff_secs: cfg.s3.initial_backoff_secs,
                 connect_timeout_secs: cfg.s3.connect_timeout_secs,
                 operation_timeout_secs: cfg.s3.operation_timeout_secs,
-                endpoint_url: cfg.s3.endpoint_url.clone(),
-                force_path_style: cfg.s3.force_path_style,
+                endpoint_url: cfg.s3.endpoint_url.as_deref().map(redact_url_userinfo),
+                force_path_style: cfg.s3.force_path_style(),
                 addressing_style: cfg.s3.addressing_style.to_string(),
+                provider: cfg.s3.profile.clone(),
                 profile: cfg.s3.profile.clone(),
-                debug_s3: cfg.s3.debug_s3,
+                debug_s3: cfg.s3.trace_compat.as_deref() == Some("-"),
                 trace_compat: cfg.s3.trace_compat.clone(),
                 start_after: cfg.s3.start_after.clone(),
             },
@@ -708,11 +734,8 @@ pub fn output_path_problem(path: &str) -> Option<String> {
     // An existing target is opened in place, so its own permissions decide,
     // not its directory's: `/dev/null` is writable although macOS's `/dev`
     // is mode 555.
-    if let Ok(meta) = std::fs::metadata(target) {
-        return meta
-            .permissions()
-            .readonly()
-            .then(|| format!("'{}' is read-only", path));
+    if target.exists() {
+        return (!writable(target)).then(|| format!("'{}' is not writable", path));
     }
     let mut ancestor = target
         .parent()
@@ -726,8 +749,11 @@ pub fn output_path_problem(path: &str) -> Option<String> {
                     ancestor.display()
                 ));
             }
-            Ok(meta) if meta.permissions().readonly() => {
-                return Some(format!("directory '{}' is read-only", ancestor.display()));
+            Ok(_) if !writable(ancestor) => {
+                return Some(format!(
+                    "directory '{}' is not writable",
+                    ancestor.display()
+                ));
             }
             Ok(_) => return None,
             Err(_) => ancestor = ancestor.parent().filter(|p| !p.as_os_str().is_empty())?,
@@ -743,8 +769,25 @@ fn output_parent(path: &str) -> Option<PathBuf> {
 }
 
 fn parent_writable(path: PathBuf) -> Option<bool> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(!metadata.permissions().readonly())
+    path.exists().then(|| writable(&path))
+}
+
+/// Whether this process may write `path` (a file, or a directory to create
+/// files in). Mode bits alone are wrong both ways: root writes a mode-444
+/// file, and an ACL can grant or deny what the bits say.
+#[cfg(unix)]
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn writable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// The `.partN` paths a pooled list run's extra writers streamed to, given the
@@ -820,8 +863,9 @@ fn summarize_artifact(kind: &str, path: &str) -> ArtifactSummary {
     }
 }
 
-fn sha256_file(path: &str) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+pub fn sha256_file(path: &str) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open '{}' for hashing: {}", path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -910,64 +954,31 @@ pub fn doctor_report(
         },
         None => DoctorCheck {
             name: "config_file".to_string(),
-            status: "warn".to_string(),
-            message: "no config file loaded (searched ./s3-turbo-list.toml and \
-                      ~/.s3-turbo-list.toml); built-in defaults apply — run init-config \
-                      for a starter config"
+            status: "ok".to_string(),
+            message: "no config file (searched ./s3-turbo-list.toml and \
+                      ~/.s3-turbo-list.toml); built-in defaults apply"
                 .to_string(),
         },
     });
+    // Credentials come from the SDK chain whether or not AWS_PROFILE is set:
+    // an unset AWS_PROFILE is the normal case, not a warning.
     checks.push(DoctorCheck {
         name: "aws_profile".to_string(),
-        status: if std::env::var("AWS_PROFILE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
-            "ok"
-        } else {
-            "warn"
-        }
-        .to_string(),
+        status: "ok".to_string(),
         message: std::env::var("AWS_PROFILE")
             .ok()
             .filter(|v| !v.is_empty())
             .map(|v| format!("AWS_PROFILE={}", v))
             .unwrap_or_else(|| {
-                "AWS_PROFILE is not set; the AWS SDK will use its default credential chain"
-                    .to_string()
+                "AWS_PROFILE is not set; the AWS SDK uses its default credential chain".to_string()
             }),
     });
-    if let Some(profile) = std::env::var("AWS_PROFILE")
-        .ok()
-        .filter(|value| profiles::is_endpoint_preset_name(value))
-    {
-        checks.push(DoctorCheck {
-            name: "aws_profile_endpoint_preset_name".to_string(),
-            status: "warn".to_string(),
-            message: format!(
-                "AWS_PROFILE={} also matches an endpoint compatibility preset name; verify this is your credentials profile, not a --profile value pasted into AWS_PROFILE",
-                profile
-            ),
-        });
-    }
     checks.push(DoctorCheck {
-        name: "endpoint_profile".to_string(),
-        status: match cfg.s3.profile.as_deref() {
-            Some(name) if profiles::get_profile(name).is_some() => "ok",
-            Some(_) => "warn",
-            None => "ok",
-        }
-        .to_string(),
-        message: match cfg.s3.profile.as_deref() {
-            Some(name) if profiles::get_profile(name).is_some() => {
-                format!("endpoint compatibility profile '{}' is known", name)
-            }
-            Some(name) => format!(
-                "endpoint compatibility profile '{}' is unknown; this is not an AWS credentials profile",
-                name
-            ),
-            None => "no endpoint compatibility profile selected".to_string(),
+        name: "provider".to_string(),
+        status: "ok".to_string(),
+        message: match cfg.s3.profile.as_deref().and_then(profiles::get_profile) {
+            Some(profile) => format!("provider preset '{}' ({})", profile.name, profile.provider),
+            None => "no provider preset; plain S3 settings apply".to_string(),
         },
     });
     checks.push(endpoint_url_check(cfg));
@@ -1072,7 +1083,7 @@ fn proxy_check(cfg: &S3TurboConfig) -> DoctorCheck {
                 "endpoint_url is still a template; proxy rules are checked once it is a real URL",
             );
         }
-        Some(e) if cfg.s3.force_path_style => e,
+        Some(e) if cfg.s3.force_path_style() => e,
         _ => {
             return skipped(
                 "the request host depends on the bucket and region (virtual-hosted or AWS \
@@ -1108,7 +1119,7 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
                 status: "error".to_string(),
                 message: format!(
                     "endpoint_url contains template placeholders and must be edited before a real run: {}",
-                    endpoint
+                    redact_url_userinfo(endpoint)
                 ),
             };
         }
@@ -1154,25 +1165,20 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
     }
 }
 
+/// The same test the dry run applies (`output_path_problem`): the run
+/// creates missing parent directories itself, and fails on a path that is a
+/// directory or under an unwritable or non-directory ancestor.
 fn parent_dir_check(name: &str, path: &str) -> DoctorCheck {
-    let parent = Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty());
-    match parent {
-        Some(parent) if !parent.exists() => DoctorCheck {
+    match output_path_problem(path) {
+        Some(problem) => DoctorCheck {
             name: name.to_string(),
             status: "error".to_string(),
-            message: format!("parent directory does not exist: {}", parent.display()),
-        },
-        Some(parent) => DoctorCheck {
-            name: name.to_string(),
-            status: "ok".to_string(),
-            message: format!("parent directory exists: {}", parent.display()),
+            message: format!("output '{}' cannot be created: {}", path, problem),
         },
         None => DoctorCheck {
             name: name.to_string(),
             status: "ok".to_string(),
-            message: "path is relative to current directory".to_string(),
+            message: format!("output '{}' can be created", path),
         },
     }
 }
@@ -1438,11 +1444,28 @@ mod tests {
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Opened in place: the read-only directory does not matter (macOS /dev).
         assert_eq!(super::output_path_problem(existing.to_str().unwrap()), None);
-        // A new file still needs a writable directory.
+        // Root writes regardless of mode bits, and so does the run: the check
+        // must agree with it (it used to block a run that would succeed).
+        let root = unsafe { libc::geteuid() } == 0;
         let fresh = ro.join("new.ks");
-        assert!(super::output_path_problem(fresh.to_str().unwrap()).is_some());
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o444)).unwrap();
-        assert!(super::output_path_problem(existing.to_str().unwrap()).is_some());
+        for path in [&fresh, &existing] {
+            assert_eq!(
+                super::output_path_problem(path.to_str().unwrap()).is_some(),
+                !root,
+                "{}",
+                path.display()
+            );
+        }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn redact_url_userinfo_hides_credentials_only() {
+        use super::redact_url_userinfo as r;
+        assert_eq!(r("http://u:pw@h:9000/x"), "http://<redacted>@h:9000/x");
+        assert_eq!(r("https://h.example/a@b"), "https://h.example/a@b");
+        assert_eq!(r("https://h.example"), "https://h.example");
+        assert_eq!(r("not a url"), "not a url");
     }
 }
