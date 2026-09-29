@@ -90,7 +90,7 @@ local S3 protocol mock lives in `tests/s3_mock_integration.rs` and never
 contacts real endpoints.
 
 Release builds on Ubuntu 20.04 arm64 may hit the `aws-lc-sys` / GCC 9
-memcmp issue; use the workarounds in `BUILD.md` (clang, GCC 10+, or no-ASM).
+memcmp issue; use the workarounds in `docs/releasing.md` (clang, GCC 10+, or no-ASM).
 
 ## Git Hygiene
 

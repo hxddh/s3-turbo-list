@@ -69,9 +69,14 @@ maintainer sign-off before any implementation work.
 - Prefer making the **default path** faster or smarter over adding an option.
   (Example: startup structural discovery replaced the need for a "run
   auto-hints first" step instead of adding a flag for it.)
-- Prefer removing or consolidating options over extending them.
-- Performance claims need numbers: a `benchmark-local` comparison or a real
-  endpoint measurement in the PR description.
+- Prefer removing or consolidating options over extending them.  Removals
+  follow hide-one-release-then-remove: the old spelling is hidden from
+  `--help` and keeps working with a deprecation warning for one release (and
+  a CHANGELOG `Deprecated` entry), then it is removed.
+- Performance claims need numbers: a local
+  `cargo run --release --example bench_local` comparison (see
+  [`docs/development.md`](docs/development.md)) or a real endpoint
+  measurement in the PR description.
 
 ## Code style
 

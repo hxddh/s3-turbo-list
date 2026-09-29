@@ -136,12 +136,12 @@ check_contains "CHANGELOG.md" "^## \\[${VERSION//./\\.}\\]" "CHANGELOG section f
 check_contains "Cargo.lock" "^version = \"${VERSION//./\\.}\"$" "Cargo.lock contains crate version $VERSION"
 check_contains "INSTALL.md" "s3-turbo-list-<version>-linux-x86_64" "INSTALL templated linux x86_64 asset"
 check_contains "INSTALL.md" "s3-turbo-list-<version>-linux-aarch64" "INSTALL templated linux aarch64 asset"
-check_contains "docs/build-release.md" "s3-turbo-list-<version>-linux-aarch64" "build-release templated linux aarch64 asset"
+check_contains "docs/releasing.md" "s3-turbo-list-<version>-linux-aarch64" "releasing templated linux aarch64 asset"
 check_contains "AGENTS.md" "latest git tag / GitHub Release" "AGENTS release source of truth"
 check_contains ".github/workflows/release-assets.yml" "Validate tag matches Cargo.toml version" "release workflow tag/version guard"
 check_not_contains ".github/workflows/release-assets.yml" "default: 'v[0-9]+\\.[0-9]+\\.[0-9]+'" "hard-coded workflow default tag"
 check_not_contains "INSTALL.md" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded INSTALL release asset names"
-check_not_contains "docs/build-release.md" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded build-release asset names"
+check_not_contains "docs/releasing.md" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded releasing asset names"
 
 if [ -x "scripts/verify-release-assets.sh" ]; then
   echo "ok:      release asset verifier executable"

@@ -8,15 +8,17 @@
 #   REGION        — left region (default: us-east-1)
 #   TARGET_REGION — right region (default: same as REGION)
 #   AWS_PROFILE   — AWS SDK credentials profile (optional)
-#   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
+#   ENDPOINT_URL  — custom S3 endpoint for both sides (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/diff-basic)
 #   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
 #
 # Parquet DiffFlag legend:
-#   0 — Equal     (same object in both buckets)
-#   1 — Left-only (only in LEFT_BUCKET)
+#   0 — Equal      (same object in both buckets)
+#   1 — Left-only  (only in LEFT_BUCKET)
 #   2 — Right-only (only in RIGHT_BUCKET)
-#   3 — Asterisk  (both buckets, but size/ETag differ)
+#   3 — Differs    (both buckets, but size/ETag differ)
+#
+# A failed diff removes its outputs: only trust them on exit 0.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -32,14 +34,14 @@ mkdir -p "$OUTDIR"
 echo "==> Diffing buckets"
 echo "    Left:  $LEFT_BUCKET  (region=$REGION)"
 echo "    Right: $RIGHT_BUCKET (region=$TARGET_REGION)"
-echo "    Output: $OUTDIR/diff.parquet"
+echo "    Output: $OUTDIR/diff.parquet (+ diff.ks)"
 
 set -- \
   diff \
-  --region "$REGION" \
   --bucket "$LEFT_BUCKET" \
-  --target-region "$TARGET_REGION" \
+  --region "$REGION" \
   --target-bucket "$RIGHT_BUCKET" \
+  --target-region "$TARGET_REGION" \
   --output-parquet-file "$OUTDIR/diff.parquet"
 
 if [ -n "${ENDPOINT_URL:-}" ]; then
@@ -49,10 +51,10 @@ fi
 $S3TL "$@"
 
 echo "==> Done.  Inspect with:"
-echo "    python examples/read-parquet.py $OUTDIR/diff.parquet"
+echo "    python3 examples/read-parquet.py $OUTDIR/diff.parquet"
 echo ""
 echo "    # Count by DiffFlag:"
-echo "    python -c \""
+echo "    python3 -c \""
 echo "import pandas as pd"
 echo "df = pd.read_parquet('$OUTDIR/diff.parquet')"
 echo "print(df['DiffFlag'].value_counts().sort_index())"

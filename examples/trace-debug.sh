@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# s3-turbo-list — trace + debug output example
+# s3-turbo-list — S3 request trace example
 # ---------------------------------------------------------------------------
+# --trace-compat FILE records every S3 API call as JSONL; --trace-compat -
+# writes the same events to stderr (it replaces the deprecated --debug-s3).
+# Field reference: docs/tuning.md, "Trace event fields".
+#
 # Required env vars:
 #   BUCKET        — S3 bucket name
 # Optional env vars:
-#   REGION        — AWS region (default: us-east-1)
+#   REGION        — region (default: us-east-1)
 #   AWS_PROFILE   — AWS SDK credentials profile (optional)
 #   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/trace-debug)
@@ -19,38 +23,38 @@ S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
 
 mkdir -p "$OUTDIR"
 
-echo "==> Listing with trace + debug output"
-echo "    Bucket:      $BUCKET"
-echo "    Trace:       $OUTDIR/trace.jsonl"
-echo "    Debug stderr: $OUTDIR/debug-stderr.log"
-echo "    Parquet:     $OUTDIR/trace-output.parquet"
+echo "==> Listing with an S3 request trace and a run log"
+echo "    Bucket:   $BUCKET"
+echo "    Trace:    $OUTDIR/trace.jsonl"
+echo "    Parquet:  $OUTDIR/trace-output.parquet (+ .ks, .log beside it)"
 
 # Build CLI args; conditionally include --endpoint-url.
 set -- \
   list \
-  --region "$REGION" \
   --bucket "$BUCKET" \
-  --debug-s3 \
+  --region "$REGION" \
+  --output-parquet-file "$OUTDIR/trace-output.parquet" \
   --trace-compat "$OUTDIR/trace.jsonl" \
-  --output-parquet-file "$OUTDIR/trace-output.parquet"
+  --log
 
 if [ -n "${ENDPOINT_URL:-}" ]; then
   set -- "$@" --endpoint-url "$ENDPOINT_URL"
 fi
 
-# Run and redirect stderr (debug output) to a log file.
-$S3TL "$@" 2>"$OUTDIR/debug-stderr.log"
+$S3TL "$@"
 
-echo "==> Done.  Inspect trace:"
+echo "==> Done.  Inspect the trace:"
+echo ""
+echo "    python3 examples/inspect-trace.py $OUTDIR/trace.jsonl"
 echo ""
 echo "    # HTTP status distribution:"
-echo "    cat $OUTDIR/trace.jsonl | jq -r .http_status | sort | uniq -c | sort -rn"
+echo "    jq -r .http_status $OUTDIR/trace.jsonl | sort | uniq -c | sort -rn"
 echo ""
 echo "    # Operations:"
-echo "    cat $OUTDIR/trace.jsonl | jq -r .operation | sort | uniq -c"
+echo "    jq -r .operation $OUTDIR/trace.jsonl | sort | uniq -c"
 echo ""
 echo "    # Events with start_after or continuation_token:"
-echo "    cat $OUTDIR/trace.jsonl | jq 'select(.start_after != null or .continuation_token != null)'"
+echo "    jq 'select(.start_after != null or .continuation_token != null)' $OUTDIR/trace.jsonl"
 echo ""
-echo "    # Full debug stderr:"
-echo "    less $OUTDIR/debug-stderr.log"
+echo "    # Run log:"
+echo "    less $OUTDIR/trace-output.log"

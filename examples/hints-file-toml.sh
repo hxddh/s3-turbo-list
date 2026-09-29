@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # s3-turbo-list — TOML hints file example
 # ---------------------------------------------------------------------------
-# TOML hints split a bucket into segments for parallel listing.  The parser
-# detects TOML structure automatically (boundaries = [...], table headers,
-# key=value assignments) and deserialises via toml::from_str.
+# Hints are optional: startup discovery and runtime splitting partition a
+# bucket automatically on every run.  A hints file pins exact segment
+# boundaries for repeated inventories (list only; diff does not take one).
 #
-# Plain text hints (one boundary per line) are also supported.  Malformed
-# TOML-looking hints are rejected before any S3 request is sent.
-#
+# The parser detects TOML structure automatically (boundaries = [...], table
+# headers, key=value assignments); plain text (one boundary per line) is also
+# accepted.  Malformed TOML-looking hints are rejected before any S3 request.
 # Valid key characters — spaces, +, /, %, Unicode — are preserved.
+#
+# The file is validated locally first with `doctor --hints-file` (no S3).
 #
 # Required env vars:
 #   BUCKET        — S3 bucket name
 # Optional env vars:
-#   REGION        — AWS region (default: us-east-1)
+#   REGION        — region (default: us-east-1)
 #   AWS_PROFILE   — AWS SDK credentials profile (optional)
 #   ENDPOINT_URL  — custom S3 endpoint (optional; omit for AWS)
 #   OUTDIR        — output directory (default: ./artifacts/hints-file-toml)
@@ -44,22 +46,20 @@ generated_at = "2026-05-14T12:00:00Z"
 TOML_EOF
 
 echo "==> Created hints file: $OUTDIR/hints.toml"
-echo "    Boundaries:"
-grep -A999 'boundaries = \[' "$OUTDIR/hints.toml" | grep '"' || true
+echo "==> Validating it locally (no S3 access)"
+$S3TL doctor --hints-file "$OUTDIR/hints.toml"
 
 echo ""
-echo "==> Listing with TOML hints file"
-echo "    Bucket:      $BUCKET"
-echo "    Output:      $OUTDIR/hints-output.parquet"
-echo "                $OUTDIR/hints-output.ks"
+echo "==> Listing with the TOML hints file"
+echo "    Bucket:  $BUCKET"
+echo "    Output:  $OUTDIR/hints-output.parquet (+ hints-output.ks)"
 
 set -- \
   list \
-  --region "$REGION" \
   --bucket "$BUCKET" \
+  --region "$REGION" \
   --hints-file "$OUTDIR/hints.toml" \
-  --output-parquet-file "$OUTDIR/hints-output.parquet" \
-  --output-ks-file "$OUTDIR/hints-output.ks"
+  --output-parquet-file "$OUTDIR/hints-output.parquet"
 
 if [ -n "${ENDPOINT_URL:-}" ]; then
   set -- "$@" --endpoint-url "$ENDPOINT_URL"
@@ -68,5 +68,5 @@ fi
 $S3TL "$@"
 
 echo "==> Done.  Inspect with:"
-echo "    python examples/read-parquet.py $OUTDIR/hints-output.parquet"
+echo "    python3 examples/read-parquet.py $OUTDIR/hints-output.parquet"
 echo "    cat $OUTDIR/hints-output.ks"
