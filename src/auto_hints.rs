@@ -187,8 +187,13 @@ where
 // segment set up front). This bisects the key range with single-key probes
 // before listing, producing exactly that: a sorted, contiguous,
 // non-overlapping partition whose boundaries are all real observed keys
-// (the same flat-cut logic runtime splitting uses), so the merge consumes
+// (the same flat-cut search runtime splitting uses), so the merge consumes
 // it in key order with no changes.
+
+/// Probes in flight at once across a bisection wave.  Each range's cut is
+/// usually a single probe, but an estimate of a range's high key fans out
+/// several per round.
+const FLAT_BISECT_MAX_IN_FLIGHT: usize = 64;
 
 /// Discover key-space boundaries for a flat namespace by recursively
 /// bisecting the key range. `probe(start_after)` returns the first key
@@ -196,10 +201,12 @@ where
 /// of all when `None`). Returns up to `target_boundaries` sorted boundaries;
 /// empty means an empty range or no cuttable structure (single segment).
 ///
-/// Each bisection level probes all of its ranges concurrently: the ranges are
-/// disjoint, so their cuts are independent. A serial walk paid one network
-/// round-trip per candidate probe (~100+ serial RTTs for a 64-boundary
-/// target); waves reduce that to ~log2(target) level latencies.
+/// Each cut lands near the middle of its range's keys (see `flat_cut`): the
+/// open-ended root range first estimates the namespace's high key, which
+/// later open-ended ranges reuse, and every bounded range cuts at the
+/// midpoint of its two real-key ends with a single probe.  Each bisection
+/// level probes all of its ranges concurrently: the ranges are disjoint, so
+/// their cuts are independent, and a wave costs about one round-trip.
 pub async fn discover_flat_boundaries<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
@@ -212,13 +219,25 @@ where
     if target_boundaries == 0 {
         return Vec::new();
     }
+    let permits = tokio::sync::Semaphore::new(FLAT_BISECT_MAX_IN_FLIGHT);
+    let probe = |start_after: Option<String>| {
+        let request = probe(start_after);
+        let permits = &permits;
+        async move {
+            let _permit = permits.acquire().await.ok();
+            request.await
+        }
+    };
     // Anchor on the first real key; an empty range yields no boundaries.
     let first = match probe(None).await {
         Ok(Some(key)) => key,
         _ => return Vec::new(),
     };
+    let cut_probe = |start_after: String| probe(Some(start_after));
 
     let mut boundaries: BTreeSet<String> = BTreeSet::new();
+    // Near-maximal real key of the namespace, once estimated.
+    let mut known_high: Option<String> = None;
     // Ranges still to bisect: (start_key, end_boundary). start_key is a real
     // observed key; end is an exclusive upper bound (None = open to the tail).
     let mut frontier: Vec<(String, Option<String>)> = vec![(first, None)];
@@ -227,46 +246,41 @@ where
         // remaining budget are dropped — the same early-stop the serial
         // walk applied, decided before the wave instead of during it.
         frontier.truncate(target_boundaries - boundaries.len());
-        let cuts = futures::future::join_all(
-            frontier
-                .iter()
-                .map(|(start, end)| find_flat_cut(prefix, start, end.as_deref(), &probe)),
-        )
+        let cuts = futures::future::join_all(frontier.iter().map(|(start, end)| {
+            crate::flat_cut::find_flat_cut(
+                prefix,
+                start,
+                end.as_deref(),
+                known_high.as_deref(),
+                &cut_probe,
+            )
+        }))
         .await;
         let mut next: Vec<(String, Option<String>)> = Vec::new();
-        for ((start, end), cut) in frontier.drain(..).zip(cuts) {
-            if let Some(cut) = cut {
-                boundaries.insert(cut.clone());
-                next.push((start, Some(cut.clone())));
-                next.push((cut, end));
+        for ((start, end), found) in frontier.drain(..).zip(cuts) {
+            let found = match found {
+                Ok(found) => found,
+                Err(e) => {
+                    log::debug!("Flat bisection probe failed after '{}': {}", start, e);
+                    continue;
+                }
+            };
+            if let Some(high) = found.high {
+                if known_high.as_ref().is_none_or(|k| high > *k) {
+                    known_high = Some(high);
+                }
+            }
+            if let Some(cut) = found.cut {
+                if cut > start && end.as_ref().is_none_or(|e| cut < *e) {
+                    boundaries.insert(cut.clone());
+                    next.push((start, Some(cut.clone())));
+                    next.push((cut, end));
+                }
             }
         }
         frontier = next;
     }
     boundaries.into_iter().take(target_boundaries).collect()
-}
-
-/// Find one real observed key strictly inside `(start, end)` using the same
-/// flat-cut candidate logic runtime splitting uses. Each candidate costs one
-/// single-key probe; the first observed key in range wins.
-async fn find_flat_cut<F, Fut>(
-    prefix: &str,
-    start: &str,
-    end: Option<&str>,
-    probe: &F,
-) -> Option<String>
-where
-    F: Fn(Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<String>, String>>,
-{
-    for candidate in crate::tasks_s3::flat_cut_candidates(start, prefix, end) {
-        if let Ok(Some(key)) = probe(Some(candidate)).await {
-            if key.as_str() > start && end.is_none_or(|e| key.as_str() < e) {
-                return Some(key);
-            }
-        }
-    }
-    None
 }
 
 /// Persist startup-discovered boundaries to the conventional hints cache
@@ -426,6 +440,42 @@ estimate_mode = "structural"
                 assert!(b > p, "boundaries must be strictly ascending");
             }
             prev = Some(b);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_balance_suffix_heavy_keys() {
+        // Long constant suffixes after a numeric run used to make every cut
+        // land on the key right after the range start (boundaries at
+        // obj-000000001, obj-000000002, … and one giant tail segment).
+        for shape in ["obj-{}.snappy.parquet", "data/part-{}-c000.snappy.parquet"] {
+            let keys: Vec<String> = (0..50_000)
+                .map(|i| shape.replace("{}", &format!("{:09}", i)))
+                .collect();
+            let target = 16;
+            let boundaries = run_flat(keys.clone(), "", target).await;
+            assert_eq!(boundaries.len(), target, "{shape}");
+            // Segment sizes: (start, b0], (b0, b1], …, (b_last, end].
+            let mut positions: Vec<usize> = boundaries
+                .iter()
+                .map(|b| keys.binary_search(b).expect("boundary is a real key"))
+                .collect();
+            positions.push(keys.len() - 1);
+            let mut prev = 0usize;
+            let largest = positions
+                .iter()
+                .map(|&p| {
+                    let size = p - prev;
+                    prev = p;
+                    size
+                })
+                .max()
+                .unwrap();
+            let ideal = keys.len() / (target + 1);
+            assert!(
+                largest <= ideal * 5 / 2,
+                "{shape}: largest segment {largest} keys, ideal {ideal}: {boundaries:?}"
+            );
         }
     }
 

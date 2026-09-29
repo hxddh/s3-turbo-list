@@ -3139,6 +3139,132 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     assert!(cache.contains("boundaries"), "{}", cache);
 }
 
+// Flat keys sharing a long constant suffix after a numeric run
+// (`obj-000000123.snappy.parquet`) used to defeat bisection: every candidate
+// bumped a character inside the suffix, so each cut landed on the key right
+// after the range start and the run listed one giant tail segment. Cuts must
+// now land near the middle of each range, giving balanced segments.
+#[test]
+fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
+    const KEYS: usize = 4000;
+    const PAGE: usize = 250;
+    let keys: Vec<String> = (0..KEYS)
+        .map(|i| format!("obj-{:09}.snappy.parquet", i))
+        .collect();
+
+    let all_keys = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let start_after = request
+            .query
+            .get("start-after")
+            .cloned()
+            .unwrap_or_default();
+        if request.query.get("delimiter").map(String::as_str) == Some("/") {
+            // Structural discovery: flat, and more pages to come.
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], true, Some("t")));
+        }
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PAGE)
+            .min(PAGE);
+        let start_idx = match request.query.get("continuation-token") {
+            Some(token) => token
+                .strip_prefix("off-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0),
+            None => all_keys.partition_point(|k| k.as_str() <= start_after.as_str()),
+        };
+        let page: Vec<&str> = all_keys[start_idx..]
+            .iter()
+            .take(max_keys)
+            .map(String::as_str)
+            .collect();
+        let next = start_idx + page.len();
+        let truncated = next < all_keys.len() && max_keys > 1;
+        let token = format!("off-{}", next);
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            max_keys as i32,
+            &page,
+            &[],
+            truncated,
+            truncated.then_some(token.as_str()),
+        ))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let parquet = dir.path().join("out.parquet");
+    write_fast_config(&config);
+    let args = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--concurrency".into(),
+        "8".into(),
+        "--output-parquet-file".into(),
+        parquet.display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    let mut listed = parquet_keys(&parquet);
+    listed.sort();
+    assert_eq!(listed, keys);
+
+    // One boundary per worker, every one a real key, strictly ascending.
+    let cache = dir.path().join("us-east-1_mock-bucket_hints.toml");
+    let boundaries = s3_turbo_list::hints::parse_hints_file(cache.to_str().unwrap())
+        .expect("startup hints cache written");
+    assert_eq!(boundaries.len(), 8, "{:?}", boundaries);
+    let mut positions: Vec<usize> = boundaries
+        .iter()
+        .map(|b| keys.binary_search(b).expect("boundary is a real key"))
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "{:?}",
+        boundaries
+    );
+    // Balanced: no segment holds more than ~2.5x its even share.
+    positions.push(KEYS - 1);
+    let mut prev = 0usize;
+    let largest = positions
+        .iter()
+        .map(|&p| {
+            let size = p - prev;
+            prev = p;
+            size
+        })
+        .max()
+        .unwrap();
+    let ideal = KEYS / (boundaries.len() + 1);
+    assert!(
+        largest <= ideal * 5 / 2,
+        "largest segment {} keys (ideal {}): {:?}",
+        largest,
+        ideal,
+        boundaries
+    );
+    // The cut search stays cheap: a bounded number of single-key probes.
+    let probes = server
+        .requests()
+        .iter()
+        .filter(|r| r.query.get("max-keys").map(String::as_str) == Some("1"))
+        .count();
+    assert!(probes <= 120, "{} bisection probes", probes);
+}
+
 // ── Resume boundary verification ────────────────────────────
 //
 // Completed segment indices are positional. A checkpoint carried over to a
