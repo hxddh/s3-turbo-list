@@ -23,9 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Cadence of periodic checkpoint-journal saves during a `--resume` run.
-const CHECKPOINT_SAVE_INTERVAL_SECS: u64 = 30;
-
 // ── CLI definition ─────────────────────────────────────────
 
 #[derive(Parser)]
@@ -108,7 +105,7 @@ struct Cli {
     // ── S3-compatible observability flags ─────────────────
     /// Delimiter for ListObjectsV2; the default '' is a recursive
     /// full-bucket listing, use --delimiter '/' for hierarchical
-    /// top-level listing
+    /// top-level listing (objects plus one row per CommonPrefix)
     #[arg(long, default_value = "", global = true)]
     delimiter: String,
 
@@ -256,9 +253,10 @@ enum Commands {
     },
 
     /// Print guidance without contacting S3: an overview when no topic is
-    /// given, a provider quickstart (aws/minio/r2/bos), or a named recipe
+    /// given, a provider quickstart (aws/minio/r2/bos) or profile facts
+    /// (b2/oss), or a named recipe
     Guide {
-        /// Topic: a provider (aws/minio/r2/bos), a recipe name (e.g.
+        /// Topic: a provider (aws/minio/r2/bos/b2/oss), a recipe name (e.g.
         /// large-bucket, filter, release-check), or `index` to list recipes
         topic: Option<String>,
     },
@@ -425,8 +423,40 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
 
 // ── Main ───────────────────────────────────────────────────
 
+/// Set when the command is `doctor --json` (or doctor under `--agent`), so the
+/// early config-validation exits still print a JSON report on stdout: an agent
+/// that asked for JSON must not get an empty stdout on the very failures
+/// doctor exists to diagnose.
+static DOCTOR_JSON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Exit 2 on a config/CLI validation error, in doctor's JSON shape when
+/// doctor's JSON output was requested.
+fn exit_config_error(message: &str) -> ! {
+    eprintln!("{}", message);
+    if DOCTOR_JSON.get().copied().unwrap_or(false) {
+        println!(
+            "{}",
+            agent::to_pretty_json(&serde_json::json!({
+                "schema_version": agent::AGENT_SCHEMA_VERSION,
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "status": "error",
+                "checks": [{
+                    "name": "config_parse",
+                    "status": "error",
+                    "message": message,
+                }],
+            }))
+        );
+    }
+    std::process::exit(agent::ExitCode::CliConfig.code());
+}
+
 fn main() {
     let cli = Cli::parse();
+    let _ = DOCTOR_JSON.set(
+        matches!(cli.cmd, Commands::Doctor { json: true, .. })
+            || (cli.agent && matches!(cli.cmd, Commands::Doctor { .. })),
+    );
 
     match &cli.cmd {
         Commands::Completions { shell } => {
@@ -451,6 +481,12 @@ fn main() {
             overwrite,
             json,
         } => {
+            if cli.dry_run {
+                // init-config only writes a local file; a "dry run" that
+                // wrote it anyway (as it did) is worse than a clear refusal.
+                eprintln!("init-config does not support --dry-run: it contacts nothing and only writes '{}'", output);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
         }
@@ -463,10 +499,7 @@ fn main() {
 
     // Load config.
     let (mut cfg, config_load) = S3TurboConfig::load_with_summary(cli.config.as_deref())
-        .unwrap_or_else(|e| {
-            eprintln!("Config error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
-        });
+        .unwrap_or_else(|e| exit_config_error(&format!("Config error: {}", e)));
 
     validate_addressing_style_command(&cli);
     cfg.apply_cli_overrides(
@@ -486,6 +519,23 @@ fn main() {
     );
     // Recorded before the preset fills it in: a diff derives the target
     // side's endpoint from its own region only when the user gave none.
+    // A misspelled profile (`mino`) applied no preset at all — no endpoint,
+    // no addressing style — and the run went to AWS. Like an unknown config
+    // key, it is a configuration error.
+    if let Some(name) = cfg.s3.profile.as_deref() {
+        if profiles::get_profile(name).is_none() {
+            exit_config_error(&format!(
+                "--profile '{}' is not an endpoint compatibility preset; use one of: {} \
+                 (credentials profiles go in AWS_PROFILE)",
+                name,
+                profiles::all_profiles()
+                    .iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
     cfg.apply_profile_preset(command_region(&cli.cmd));
     cfg.normalize_addressing_style();
@@ -494,6 +544,7 @@ fn main() {
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
     validate_summary_only_command(&cli);
+    validate_compat_probe_command(&cli);
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
@@ -516,7 +567,28 @@ fn main() {
                     std::process::exit(agent::ExitCode::CliConfig.code());
                 })
             });
-            let report = agent::doctor_report(&cfg, config_source.clone(), hints);
+            let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
+            // A filter that would fail the real run (exit 2) fails doctor too.
+            if let Some(filter_expr) = cli.filter.as_deref() {
+                let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
+                    .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
+                {
+                    Ok(_) => agent::DoctorCheck {
+                        name: "filter".to_string(),
+                        status: "ok".to_string(),
+                        message: format!("filter compiles: {}", filter_expr),
+                    },
+                    Err(e) => agent::DoctorCheck {
+                        name: "filter".to_string(),
+                        status: "error".to_string(),
+                        message: format!("filter does not compile: {}", e),
+                    },
+                };
+                if check.status == "error" {
+                    report.status = "error".to_string();
+                }
+                report.checks.push(check);
+            }
             if *json || cli.agent {
                 println!("{}", agent::to_pretty_json(&report));
             } else if *simple {
@@ -620,6 +692,13 @@ fn main() {
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
         }
+        let (planned_ks, planned_parquet, _) = planned_output_paths(&cli, &cfg);
+        validate_distinct_output_paths(
+            &cli,
+            &cfg,
+            planned_ks.as_deref(),
+            planned_parquet.as_deref(),
+        );
         let report = build_plan_report(
             &cli,
             &cfg,
@@ -635,6 +714,14 @@ fn main() {
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
         }
+        // An explicit hints file the run cannot load stops it with exit 2;
+        // so does the plan (still written above).
+        if let Some(path) = cli.hints_file.as_deref() {
+            if let Err(e) = hints::parse_hints_file(path) {
+                eprintln!("Hints file error: {}", e);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+        }
         // The plan must predict the run: a setup problem the run would stop
         // on with exit 3 fails the dry run the same way (plan still written).
         if let Some(error) = provider_setup_guardrail_warnings(&cli, &cfg).first() {
@@ -645,6 +732,7 @@ fn main() {
     }
 
     validate_provider_setup_or_exit(&cli, &cfg);
+    create_output_parents(&cli, &cfg);
 
     let mut run_warnings = config_source_warnings;
     run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
@@ -743,6 +831,7 @@ fn main() {
                 &endpoint_url,
                 region,
                 bucket,
+                &listing_prefix(&cli),
                 &addressing_style,
                 output.as_deref(),
                 &cfg,
@@ -796,7 +885,44 @@ fn main() {
         .parquet_file
         .clone()
         .unwrap_or_else(|| format!("{}.parquet", output_stem));
+    let writes_artifacts = list_writes_artifacts(&cli);
+    validate_distinct_output_paths(
+        &cli,
+        &cfg,
+        writes_artifacts.then_some(filename_ks.as_str()),
+        writes_artifacts.then_some(filename_output.as_str()),
+    );
     ensure_output_dir(&cli);
+    if writes_artifacts && mode == RunMode::List {
+        // A pooled run writes `<name>.partN.parquet` beside the base file. A
+        // part file left by an earlier, wider run of the same output path
+        // would be read with this run's set by anything that globs the stem
+        // (and the base file is being overwritten anyway), so remove it.
+        let stale = stale_parquet_parts(&filename_output);
+        let mut removed = 0usize;
+        for path in &stale {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "Output error: cannot remove stale part file '{}': {}",
+                        path, e
+                    );
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            }
+        }
+        if removed > 0 {
+            let warning = format!(
+                "removed {} stale Parquet part file(s) left by an earlier run of '{}' (e.g. '{}')",
+                removed, filename_output, stale[0]
+            );
+            if !cli.agent {
+                eprintln!("Warning: {}", warning);
+            }
+            run_warnings.push(warning);
+        }
+    }
 
     // Setup Ctrl-C handler
     let quit = Arc::new(AtomicBool::new(false));
@@ -826,7 +952,11 @@ fn main() {
     let resumed_segments_skipped: Option<usize> = rt.block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
         let checkpoint_path_opt = if cli.resume {
-            Some(checkpoint::checkpoint_path(opt_bucket, opt_region))
+            Some(checkpoint::checkpoint_path_for_prefix(
+                opt_bucket,
+                opt_region,
+                &opt_prefix,
+            ))
         } else {
             None
         };
@@ -846,7 +976,8 @@ fn main() {
                 "list"
             }),
             cli.filter.as_deref(),
-        );
+        )
+        .with_endpoint(cfg.s3.endpoint_url.as_deref());
 
         let checkpoint_journal = checkpoint_path_opt
             .as_deref()
@@ -1301,69 +1432,36 @@ fn main() {
         // The channel senders are moved into the list-task contexts, so each
         // channel closes when its side's task finishes.
 
-        // Wait for all tasks. Periodic checkpoint saves are driven by a
-        // ticker: `join_next` only returns when one of the few long-lived
-        // tasks (list/data_map/mon) finishes, so a save evaluated only on
-        // task completion would never run during a healthy listing run and
-        // a crash would lose all resume progress.
-        let mut checkpoint_tick = tokio::time::interval_at(
-            tokio::time::Instant::now()
-                + std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
-            std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
-        );
-        checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                joined = set.join_next() => {
-                    let Some(result) = joined else { break };
-                    if let Err(e) = result {
-                        if e.is_cancelled() {
-                            // Cancellation is expected during shutdown (Ctrl-C aborts
-                            // in-flight tasks); it is not a fatal error, so do not count
-                            // it — counting it inflates the run manifest's fatal_errors
-                            // on a clean interrupt and trips `manifest-summary --check`.
-                            info!("Task was cancelled (abort or shutdown)");
-                        } else {
-                            error!("Task panicked: {}", e);
-                            if let Ok(panic_msg) = e.try_into_panic() {
-                                let msg: String = panic_msg
-                                    .downcast_ref::<&str>()
-                                    .map(|s: &&str| s.to_string())
-                                    .or_else(|| panic_msg.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "<unknown panic>".to_string());
-                                error!("Task panic message: {}", msg);
-                            }
-                            // A genuine panic is a fatal failure — record it.
-                            g_state.inc_fatal_error();
-                        }
-                        g_state.quit();
+        // Wait for all tasks.  There are deliberately no periodic checkpoint
+        // saves: a segment counts as complete once its last batch is queued,
+        // while its rows may still sit in the channel, a row-group buffer or
+        // a BufWriter — and a Parquet file has no readable footer until it is
+        // closed.  A mid-run save therefore recorded segments whose rows a
+        // crash or a later write error would lose, and the next `--resume`
+        // skipped them for good.  The checkpoint is written only on the
+        // graceful-interrupt path below, after the outputs are finalized.
+        while let Some(result) = set.join_next().await {
+            if let Err(e) = result {
+                if e.is_cancelled() {
+                    // Cancellation is expected during shutdown (Ctrl-C aborts
+                    // in-flight tasks); it is not a fatal error, so do not count
+                    // it — counting it inflates the run manifest's fatal_errors
+                    // on a clean interrupt and trips `manifest-summary --check`.
+                    info!("Task was cancelled (abort or shutdown)");
+                } else {
+                    error!("Task panicked: {}", e);
+                    if let Ok(panic_msg) = e.try_into_panic() {
+                        let msg: String = panic_msg
+                            .downcast_ref::<&str>()
+                            .map(|s: &&str| s.to_string())
+                            .or_else(|| panic_msg.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<unknown panic>".to_string());
+                        error!("Task panic message: {}", msg);
                     }
+                    // A genuine panic is a fatal failure — record it.
+                    g_state.inc_fatal_error();
                 }
-                _ = checkpoint_tick.tick() => {
-                    let progress_metrics = g_state.metrics_snapshot();
-                    if cli.resume
-                        && g_state.all_list_tasks_is_running()
-                        && progress_metrics.fatal_errors == 0
-                        && progress_metrics.output_errors == 0
-                    {
-                        if let Some(ref cp_path) = checkpoint_path_opt {
-                            let completed = merged_completed_indices(
-                                checkpoint_journal.as_ref(),
-                                &left_checkpoint,
-                                right_checkpoint.as_ref(),
-                            );
-                            let journal = checkpoint::CheckpointJournal {
-                                bucket: opt_bucket.to_string(),
-                                prefix: opt_prefix.clone(),
-                                total_segments: original_hints_count,
-                                completed_indices: completed,
-                                last_updated: chrono::Local::now().to_rfc3339(),
-                                identity: Some(current_identity.clone()),
-                            };
-                            journal.save(cp_path);
-                        }
-                    }
-                }
+                g_state.quit();
             }
         }
 
@@ -1460,6 +1558,10 @@ fn main() {
     if let Some((_, summary)) = &first_fatal {
         run_warnings.push(format!("Listing failed: {}", summary));
     }
+    let first_output_error = g_state.first_output_error();
+    if let Some(message) = &first_output_error {
+        run_warnings.push(format!("Output failed: {}", message));
+    }
     let status = if exit_code == agent::ExitCode::Success {
         "success"
     } else if exit_code == agent::ExitCode::Interrupted {
@@ -1468,17 +1570,44 @@ fn main() {
         "failed"
     };
 
+    // The hints cache is an output of this run only when this run wrote it
+    // (startup discovery on a list run); a cache merely read is an input.
+    let run_started_system = std::time::SystemTime::now() - run_timer.elapsed();
+    let hints_written = (mode == RunMode::List)
+        .then(|| agent::conventional_hints_path_for_prefix(opt_bucket, opt_region, &opt_prefix))
+        .filter(|path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified >= run_started_system)
+        });
     let manifest_outputs = runtime_output_summary(
         &cli,
         &cfg,
         list_writes_artifacts(&cli).then_some(filename_ks.as_str()),
         list_writes_artifacts(&cli).then_some(filename_output.as_str()),
-    );
+    )
+    .with_hints(hints_written);
     // Artifact summaries re-read every output in full (SHA256, Parquet footer,
     // line counts) — minutes of tail latency on a multi-GB listing. Only pay
     // that when a manifest is actually emitted; the human "Wrote:" summary
     // needs just the paths.
     let manifest_emitted = cli.agent || cli.run_manifest.is_some();
+    let artifacts = if manifest_emitted {
+        agent::collect_artifacts(&manifest_outputs, output_files)
+    } else {
+        Vec::new()
+    };
+    let mut manifest_warnings = run_warnings.clone();
+    // A Parquet artifact whose footer cannot be read is not a listing anyone
+    // can consume; say so where agents look.
+    for artifact in &artifacts {
+        if artifact.kind == "parquet" && artifact.exists && artifact.parquet.is_none() {
+            manifest_warnings.push(format!(
+                "Parquet artifact '{}' has no readable footer; it is not a usable listing",
+                artifact.path
+            ));
+        }
+    }
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -1488,37 +1617,40 @@ fn main() {
         finished_at: chrono::Utc::now().to_rfc3339(),
         elapsed_secs: run_timer.elapsed().as_secs_f64(),
         command: agent::redacted_command_args(),
+        cwd: std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
         inputs: command_input_summary(&cli, &cfg),
-        artifacts: if manifest_emitted {
-            agent::collect_artifacts(&manifest_outputs, output_files)
-        } else {
-            Vec::new()
-        },
+        artifacts,
         outputs: manifest_outputs,
         config_source,
         metrics: metrics.into(),
         checkpoint: agent::checkpoint_plan(
             cli.resume,
-            cli.resume
-                .then(|| checkpoint::checkpoint_path(opt_bucket, opt_region)),
-            Some(&checkpoint::CheckpointIdentity::new(
-                opt_bucket,
-                opt_region,
-                &opt_prefix,
-                Some(&cli.delimiter),
-                cli.max_keys,
-                cfg.s3.profile.as_deref(),
-                Some(&cfg.s3.addressing_style.to_string()),
-                Some(if mode == RunMode::BiDir {
-                    "bidir"
-                } else {
-                    "list"
-                }),
-                cli.filter.as_deref(),
-            )),
+            cli.resume.then(|| {
+                checkpoint::checkpoint_path_for_prefix(opt_bucket, opt_region, &opt_prefix)
+            }),
+            Some(
+                &checkpoint::CheckpointIdentity::new(
+                    opt_bucket,
+                    opt_region,
+                    &opt_prefix,
+                    Some(&cli.delimiter),
+                    cli.max_keys,
+                    cfg.s3.profile.as_deref(),
+                    Some(&cfg.s3.addressing_style.to_string()),
+                    Some(if mode == RunMode::BiDir {
+                        "bidir"
+                    } else {
+                        "list"
+                    }),
+                    cli.filter.as_deref(),
+                )
+                .with_endpoint(cfg.s3.endpoint_url.as_deref()),
+            ),
             resumed_segments_skipped,
         ),
-        warnings: run_warnings.clone(),
+        warnings: manifest_warnings,
     };
 
     if let Some(path) = cli.run_manifest.as_deref() {
@@ -1544,7 +1676,10 @@ fn main() {
             (_, agent::ExitCode::Interrupted) => {
                 "interrupted; with --resume, a checkpoint may allow resuming".to_string()
             }
-            (_, agent::ExitCode::OutputWrite) => "an output write failed".to_string(),
+            (_, agent::ExitCode::OutputWrite) => first_output_error
+                .clone()
+                .map(|message| format!("output failed: {}", message))
+                .unwrap_or_else(|| "an output write failed".to_string()),
             (Some((_, summary)), _) => summary.clone(),
             (None, _) => "a listing segment failed".to_string(),
         };
@@ -1600,9 +1735,26 @@ fn run_init_config(profile: Option<&str>, output: &str, overwrite: bool, json: b
         }
         Err(e) => {
             eprintln!("Init config failed: {}", e);
+            if json {
+                print_json_error(&e);
+            }
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
+}
+
+/// The `--json` shape of a command that failed before producing its report:
+/// stdout stays machine-readable instead of empty.
+fn print_json_error(message: &str) {
+    println!(
+        "{}",
+        agent::to_pretty_json(&serde_json::json!({
+            "schema_version": agent::AGENT_SCHEMA_VERSION,
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "status": "error",
+            "error": message,
+        }))
+    );
 }
 
 fn run_guide(topic: Option<&str>) {
@@ -1630,6 +1782,9 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
         }
         Err(e) => {
             eprintln!("Manifest summary failed: {}", e);
+            if json {
+                print_json_error(&e);
+            }
             std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
@@ -1680,6 +1835,40 @@ fn apply_summary_only_output_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     if cli.summary_only {
         cfg.output.parquet_file = None;
         cfg.output.ks_file = None;
+    }
+}
+
+/// compat-probe runs a fixed set of probe requests and writes only its
+/// report: listing/output flags would be accepted and silently ignored.
+fn validate_compat_probe_command(cli: &Cli) {
+    if !matches!(cli.cmd, Commands::CompatProbe { .. }) {
+        return;
+    }
+    let ignored: Vec<&str> = [
+        ("--filter", cli.filter.is_some()),
+        ("--hints-file", cli.hints_file.is_some()),
+        ("--output-parquet-file", cli.output_parquet_file.is_some()),
+        ("--output-ks-file", cli.output_ks_file.is_some()),
+        ("--output-dir", cli.output_dir.is_some()),
+        ("--compression", cli.compression.is_some()),
+        ("--compression-level", cli.compression_level.is_some()),
+        ("--resume", cli.resume),
+        ("--no-auto-hints", cli.no_auto_hints),
+        ("--delimiter", !cli.delimiter.is_empty()),
+        ("--max-keys", cli.max_keys.is_some()),
+        ("--start-after", cli.start_after.is_some()),
+        ("--continuation-token", cli.continuation_token.is_some()),
+        ("--run-manifest", cli.run_manifest.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, set)| set.then_some(flag))
+    .collect();
+    if !ignored.is_empty() {
+        exit_config_error(&format!(
+            "compat-probe does not use {}: it runs a fixed set of probe requests and writes \
+             only its report (--output / stdout)",
+            ignored.join(", ")
+        ));
     }
 }
 
@@ -1743,34 +1932,30 @@ fn validate_runtime_values(cfg: &S3TurboConfig) {
     ];
     for (name, value) in checks {
         if value == 0 {
-            eprintln!("{} must be at least 1 (got {})", name, value);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_config_error(&format!("{} must be at least 1 (got {})", name, value));
         }
     }
     if cfg.s3.connect_timeout_secs == 0 {
-        eprintln!(
+        exit_config_error(&format!(
             "s3.connect_timeout_secs must be at least 1 (got {})",
             cfg.s3.connect_timeout_secs
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
     if !s3_turbo_list::utils::is_supported_compression(&cfg.output.compression) {
-        eprintln!(
+        exit_config_error(&format!(
             "output.compression '{}' is not supported; use one of: {}",
             cfg.output.compression,
             s3_turbo_list::utils::SUPPORTED_COMPRESSION.join(", ")
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
     if let Some(reason) = s3_turbo_list::utils::compression_setting_error(
         &cfg.output.compression,
         cfg.output.compression_level,
     ) {
-        eprintln!(
+        exit_config_error(&format!(
             "output.compression_level {} is not valid for '{}' (--compression-level): {}",
             cfg.output.compression_level, cfg.output.compression, reason
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
 }
 
@@ -1782,11 +1967,10 @@ fn validate_addressing_style_command(cli: &Cli) {
         return;
     };
     if style.parse::<config::AddressingStyle>().is_err() {
-        eprintln!(
+        exit_config_error(&format!(
             "--addressing-style '{}' is not one of: path, virtual, auto",
             style
-        );
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        ));
     }
 }
 
@@ -1897,17 +2081,77 @@ fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
     }
 }
 
+/// Whether a region resolves without the network: `AWS_REGION`,
+/// `AWS_DEFAULT_REGION`, or the AWS config file's profile. (The SDK's full
+/// chain also asks EC2 instance metadata, which a preflight cannot.)
+fn offline_region_resolves() -> bool {
+    let env_set = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
+    if env_set("AWS_REGION") || env_set("AWS_DEFAULT_REGION") {
+        return true;
+    }
+    use aws_config::meta::region::ProvideRegion;
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .ok()
+        .and_then(|rt| rt.block_on(aws_config::profile::ProfileFileRegionProvider::new().region()))
+        .is_some()
+}
+
+fn imds_disabled() -> bool {
+    std::env::var("AWS_EC2_METADATA_DISABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// The sides of a list/diff command that name no region of their own.
+fn sides_without_region(cli: &Cli) -> Vec<&'static str> {
+    match &cli.cmd {
+        Commands::List { region: None, .. } => vec!["--region"],
+        Commands::Diff {
+            region,
+            target_region,
+            ..
+        } => {
+            let mut sides = Vec::new();
+            if region.is_none() {
+                sides.push("--region");
+            }
+            if target_region.is_none() {
+                sides.push("--target-region");
+            }
+            sides
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     match &cli.cmd {
         Commands::List { .. } | Commands::Diff { .. } => {
             warnings.extend(profiles::endpoint_profile_guardrail_warnings(cfg));
+            // With instance metadata disabled the SDK has no other region
+            // source, so this is exactly the run's own "No AWS region
+            // resolved" failure, reported before any work.
+            let missing = sides_without_region(cli);
+            if !missing.is_empty() && imds_disabled() && !offline_region_resolves() {
+                warnings.push(format!(
+                    "no AWS region resolved for {}: pass it, or set AWS_REGION (or a region in \
+                     the AWS config profile)",
+                    missing.join(" / ")
+                ));
+            }
         }
         Commands::CompatProbe { endpoint_url, .. } => {
             let effective = endpoint_url
                 .as_deref()
                 .or(cli.endpoint.as_deref())
                 .or(cfg.s3.endpoint_url.as_deref());
+            if effective.is_none() {
+                warnings.push(
+                    "compat-probe needs an endpoint: pass --endpoint-url (or --endpoint), or set \
+                     s3.endpoint_url in the config"
+                        .to_string(),
+                );
+            }
             if let Some(endpoint) = effective {
                 if profiles::endpoint_url_has_template_placeholder(endpoint) {
                     warnings.push(format!(
@@ -1995,6 +2239,127 @@ fn output_stem_with_timestamp(
 
 fn sanitize_path_component(value: &str) -> String {
     agent::sanitize_path_component(value)
+}
+
+/// `<base>.partN.parquet` files that exist for `base`, in index order.
+fn stale_parquet_parts(base: &str) -> Vec<String> {
+    (1..s3_turbo_list::data_map::MAX_LIST_OUTPUT_WORKERS)
+        .map(|index| s3_turbo_list::data_map::part_path(base, index))
+        .filter(|path| std::path::Path::new(path).is_file())
+        .collect()
+}
+
+/// Every file a run writes must have its own path. Two outputs sharing one
+/// silently destroy each other — the KS file, written after the Parquet
+/// writers close, used to overwrite a Parquet file at the same path while the
+/// run reported success and `manifest-summary --check` passed. Paths are
+/// compared lexically after making them absolute; an existing non-regular
+/// file (e.g. `/dev/null`) may be shared.
+fn validate_distinct_output_paths(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+    ks: Option<&str>,
+    parquet: Option<&str>,
+) {
+    if !matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. }) {
+        return;
+    }
+    let mut outputs: Vec<(String, String)> = Vec::new();
+    if let Some(path) = parquet {
+        outputs.push(("--output-parquet-file".to_string(), path.to_string()));
+        if matches!(cli.cmd, Commands::List { .. }) {
+            for index in 1..s3_turbo_list::data_map::MAX_LIST_OUTPUT_WORKERS {
+                outputs.push((
+                    format!("Parquet part file {}", index),
+                    s3_turbo_list::data_map::part_path(path, index),
+                ));
+            }
+        }
+    }
+    let named = [
+        ("--output-ks-file", ks),
+        ("--output-log-file", cfg.output.log_file.as_deref()),
+        ("--trace-compat", cfg.s3.trace_compat.as_deref()),
+        ("--run-manifest", cli.run_manifest.as_deref()),
+        (
+            "--plan-json",
+            cli.plan_json.as_deref().filter(|_| cli.dry_run),
+        ),
+    ];
+    for (label, path) in named {
+        if let Some(path) = path {
+            outputs.push((label.to_string(), path.to_string()));
+        }
+    }
+    let key = |path: &str| -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(path);
+        if p.exists() && !p.is_file() {
+            return None; // devices and the like may be shared
+        }
+        let absolute = std::path::absolute(p).ok()?;
+        let mut normalized = std::path::PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other),
+            }
+        }
+        Some(normalized)
+    };
+    let mut seen: Vec<(std::path::PathBuf, &str, &str)> = Vec::new();
+    for (label, path) in &outputs {
+        let Some(k) = key(path) else { continue };
+        if let Some((_, other_label, other_path)) =
+            seen.iter().find(|(seen_key, _, _)| *seen_key == k)
+        {
+            eprintln!(
+                "{} '{}' and {} '{}' are the same file; every output needs its own path",
+                other_label, other_path, label, path
+            );
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+        seen.push((k, label, path));
+    }
+}
+
+/// Create the parent directories of explicit output paths, as `--output-dir`
+/// already does for its own. A missing parent used to surface only once the
+/// listing was done (exit 5, reason only in the log) — after the S3 requests
+/// had been paid for.
+fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
+    if !matches!(
+        cli.cmd,
+        Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
+    ) {
+        return;
+    }
+    let paths = [
+        cfg.output.parquet_file.as_deref(),
+        cfg.output.ks_file.as_deref(),
+        cfg.output.log_file.as_deref(),
+        cfg.s3.trace_compat.as_deref(),
+        cli.run_manifest.as_deref(),
+    ];
+    for path in paths.into_iter().flatten() {
+        let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        else {
+            continue;
+        };
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "Output error: cannot create directory '{}' for '{}': {}",
+                parent.display(),
+                path,
+                e
+            );
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
+    }
 }
 
 fn ensure_output_dir(cli: &Cli) {
@@ -2360,9 +2725,16 @@ fn run_benchmark_local(
 
     let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
     let producer_send_wait_secs = send_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
-    let parquet_bytes = std::fs::metadata(&parquet_file)
+    // A pooled run writes `.partN` files beside the base file; the report's
+    // size and throughput figures cover all of them.
+    let parquet_bytes = std::iter::once(parquet_file.display().to_string())
+        .chain(agent::parquet_part_paths(
+            &parquet_file.display().to_string(),
+            g_state.metrics_snapshot().data_output_files,
+        ))
+        .filter_map(|path| std::fs::metadata(path).ok())
         .map(|m| m.len())
-        .unwrap_or(0);
+        .sum::<u64>();
     let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
     let text_bytes = text_file
         .as_ref()
@@ -2763,7 +3135,9 @@ fn build_plan_report(
         .bucket
         .as_deref()
         .filter(|_| cli.resume)
-        .map(|bucket| checkpoint::checkpoint_path(bucket, inputs.region.as_deref()));
+        .map(|bucket| {
+            checkpoint::checkpoint_path_for_prefix(bucket, inputs.region.as_deref(), &inputs.prefix)
+        });
     let current_identity = inputs.bucket.as_deref().map(|bucket| {
         checkpoint::CheckpointIdentity::new(
             bucket,
@@ -2780,13 +3154,40 @@ fn build_plan_report(
             }),
             inputs.filter.as_deref(),
         )
+        .with_endpoint(cfg.s3.endpoint_url.as_deref())
     });
     let hints = if inputs.mode == "diff" {
-        agent::diff_per_side_hints_plan(
-            inputs.bucket.as_deref(),
-            inputs.region.as_deref(),
-            &inputs.prefix,
-        )
+        // Mirror diff_side_boundaries: these options leave each side as one
+        // serial segment (diff never splits at runtime).
+        let single = if cfg.s3.start_after.is_some() {
+            Some("single_chain")
+        } else if !cli.delimiter.is_empty() {
+            Some("delimiter_single_segment")
+        } else if cli.no_auto_hints {
+            Some("disabled_single_segment_fallback")
+        } else {
+            None
+        };
+        match single {
+            Some(source) => agent::HintsPlan {
+                source: source.to_string(),
+                path: None,
+                exists: false,
+                valid: None,
+                format: None,
+                boundary_count: None,
+                warnings: vec![
+                    "diff lists each side as one serial segment with these options; diff \
+                     does not split segments at runtime"
+                        .to_string(),
+                ],
+            },
+            None => agent::diff_per_side_hints_plan(
+                inputs.bucket.as_deref(),
+                inputs.region.as_deref(),
+                &inputs.prefix,
+            ),
+        }
     } else {
         agent::detect_hints_plan(agent::HintsPlanInputs {
             explicit_hints_file: cli.hints_file.as_deref(),
@@ -2800,6 +3201,26 @@ fn build_plan_report(
     };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = config_source.warnings.clone();
+    let missing_region = sides_without_region(cli);
+    if !missing_region.is_empty() && !imds_disabled() && !offline_region_resolves() {
+        warnings.push(format!(
+            "no region for {} from the command line, AWS_REGION or the AWS config profile; \
+             the run fails with exit 3 unless EC2 instance metadata supplies one",
+            missing_region.join(" / ")
+        ));
+    }
+    if let (Commands::List { .. }, Some(parquet)) = (&cli.cmd, outputs.parquet_file.as_deref()) {
+        let stale = stale_parquet_parts(parquet);
+        if !stale.is_empty() {
+            warnings.push(format!(
+                "{} Parquet part file(s) from an earlier run of '{}' exist (e.g. '{}'); \
+                 the run will remove them",
+                stale.len(),
+                parquet,
+                stale[0]
+            ));
+        }
+    }
     warnings.extend(runtime_guardrail_warnings(cli, cfg));
     if matches!(cli.cmd, Commands::CompatProbe { .. }) {
         warnings.push(
@@ -2819,12 +3240,12 @@ fn build_plan_report(
     // Only runs that can never fan out get this warning. A run without cached
     // hints still partitions (startup discovery, then runtime splitting), and
     // so does --no-auto-hints (runtime splitting alone).
-    if inputs.mode == "list"
-        && matches!(
-            hints.source.as_str(),
-            "single_chain" | "delimiter_single_segment"
-        )
-    {
+    let never_fans_out = matches!(
+        hints.source.as_str(),
+        "single_chain" | "delimiter_single_segment"
+    ) || (inputs.mode == "diff"
+        && hints.source == "disabled_single_segment_fallback");
+    if never_fans_out {
         warnings.push(
             "list is planned as a single ListObjectsV2 chain; --concurrency does not add parallelism to it"
                 .to_string(),
@@ -3449,6 +3870,7 @@ fn run_compat_probe(
     endpoint_url: &str,
     region: &str,
     bucket: &str,
+    prefix: &str,
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
@@ -3460,6 +3882,7 @@ fn run_compat_probe(
             endpoint_url,
             region,
             bucket,
+            prefix,
             addressing_style,
             output,
             cfg,

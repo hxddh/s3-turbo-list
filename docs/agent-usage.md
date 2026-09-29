@@ -32,8 +32,12 @@ includes `config_source`, which reports the explicit `--config` path when
 present, the config file actually loaded, the searched paths, the source kind
 (`explicit`, `workspace`, `home`, or `none`), and global CLI config overrides
 such as `compression` or `endpoint_url`.
-When an explicit `--config` path is missing, `config_source.warnings` reports
-that the command fell back to built-in defaults.
+An explicit `--config` path that does not exist is an error (exit `2`), for
+every command that loads config — including `doctor` and `--dry-run`.  It used
+to fall back to built-in defaults, which would list the same-named bucket on
+AWS instead of the configured endpoint.  `doctor --json` prints its JSON
+report (with a `config_parse` `error` check) on every config error, so stdout
+is never empty.
 
 `doctor --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
@@ -93,7 +97,15 @@ The plan JSON includes:
 `status` is `ok`, or `blocked` when a provider setup problem would stop the
 real run with exit code `3` (the reason is in `warnings`).  A blocked dry run
 still prints or writes the plan, then exits `3`, so the dry run predicts the
-run's exit class.
+run's exit class.  A missing region is `blocked` when the instance metadata
+service is disabled (`AWS_EC2_METADATA_DISABLED=true`) and neither the
+environment nor the AWS profile file names one; otherwise it is a warning,
+because the SDK may still resolve it from IMDS at run time.  Local input errors
+exit `2`, as they would in the real run: a filter that does not compile, or two
+outputs (Parquet and its `.partN` names, KS, log, trace, run manifest, plan
+JSON) that resolve to the same file, stop before a plan is printed; an explicit
+`--hints-file` that cannot be loaded exits `2` after the plan (whose `hints`
+section carries the parse error) is printed or written.
 
 `hints.source` for `list` says how the run will partition its key space:
 
@@ -137,14 +149,20 @@ than the checkpoint file: a run that lists its whole key space removes the
 checkpoint before exiting, so the file on disk cannot answer the question.
 
 For large buckets, agents should prefer the simple high-throughput path:
-run `list` directly with `-c 8 -T 4` as a conservative starting point.
+run `list` directly with the default concurrency: it is an upper bound the run
+settles below on its own, so pinning `-c` lower only caps a large bucket.
+Lower it only when the endpoint throttles (`metrics.throttled_responses`).
 Key-space partitioning is automatic — startup discovery probes the bucket
 structure and caches boundaries on the first run, and runtime splitting fans
 out long-tail segments — so no separate hints-generation step is needed.
 Empty delimiter is omitted from ListObjectsV2 requests, which keeps recursive
 listing compatible with providers that reject `delimiter=`.
 
-For `diff`, dry-run reports `hints.source = "diff_per_side_automatic"`.  Explicit
+For `diff`, dry-run reports `hints.source = "diff_per_side_automatic"`, or
+`single_chain` / `delimiter_single_segment` / `disabled_single_segment_fallback`
+when `--start-after`, `--delimiter` or `--no-auto-hints` leave each side as one
+serial segment (diff never splits at runtime, so these also carry the
+single-chain warning).  Explicit
 `diff --hints-file` exits with code `2` before any S3 request, but each side is
 still partitioned and listed in parallel — by cached or startup-discovered
 `CommonPrefixes`, or by an up-front single-key bisection when a side is flat.
@@ -235,8 +253,15 @@ exit code.  It checks the saved manifest status, exit code, fatal/output error
 counters, Parquet row equality when Parquet output applies, and recorded
 artifact paths on the local filesystem.  When the manifest includes artifact
 metadata, it also verifies current file size, SHA256, and Parquet row/schema
-metadata.  For `summary-only`, `tsv`, and `ndjson` manifests, Parquet row
-equality is reported as not applicable rather than a failure.
+metadata; a Parquet artifact recorded without that metadata (its footer was
+unreadable when the run ended) fails, and `artifact_parquet_rows_total`
+checks that the Parquet artifacts' row counts add up to
+`metrics.parquet_rows`.  For `summary-only`, `tsv`, and `ndjson` manifests,
+Parquet row equality is reported as not applicable rather than a failure.
+
+Relative artifact paths are resolved against the manifest's `cwd` (the
+working directory of the run), then the current directory, then the
+manifest's own directory, so `--check` works from wherever the agent runs it.
 
 With `--json`, the top-level `check` object gives agents stable pass/fail
 counts, artifact counts, and row/schema/exit-code status values without parsing
@@ -290,7 +315,7 @@ The `artifacts` array describes generated files:
 - `exists`
 - `size_bytes`
 - `sha256`
-- `line_count` for line-oriented files
+- `line_count` for line-oriented files (for KS, the number of CSV records)
 - `parquet.row_count`, `parquet.row_group_count`, and `parquet.schema_fields`
   for Parquet outputs
 

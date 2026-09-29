@@ -1,8 +1,6 @@
 use log::info;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,19 +30,15 @@ struct PrefixAggregate {
     bytes: u64,
 }
 
-type PrefixStats = HashMap<String, PrefixAggregate>;
+// foldhash: the map is keyed by per-object directory prefixes and hashed on
+// every run of rows, so a fast non-DoS-resistant hasher is appropriate (keys
+// come from our own listing, not from an adversarial client).
+type PrefixStats = HashMap<String, PrefixAggregate, foldhash::fast::RandomState>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListTextOutputFormat {
     Tsv,
     Ndjson,
-}
-
-#[derive(Serialize)]
-struct NdjsonRow<'a> {
-    k: &'a str,
-    s: u64,
-    m: u64,
 }
 
 /// Capacity for the coordinator→worker channels. A small bound matches the
@@ -112,8 +106,10 @@ fn output_should_grow(busy_fraction: f64, batches: usize, workers: usize, cap: u
 async fn route_batch(
     senders: &[tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>],
     rr: &mut usize,
+    prefix_stats: &mut PrefixStats,
     mut batch: Vec<(ObjectKey, ObjectProps)>,
 ) -> Result<(), ()> {
+    account_list_batch_prefixes(prefix_stats, &batch);
     let k = senders.len();
     for off in 0..k {
         let i = (*rr + off) % k;
@@ -129,6 +125,23 @@ async fn route_batch(
     let i = *rr % k;
     *rr = (i + 1) % k;
     senders[i].send(batch).await.map_err(|_| ())
+}
+
+/// Per-prefix KS accounting for a Parquet list batch, done once in the
+/// coordinator rather than in each writer: every writer used to keep its own
+/// full prefix map (the same hot prefixes duplicated N times) and finalize
+/// merged them. Counts only rows the writers will emit — the same
+/// `include_in_list_output` predicate they apply — so the KS file describes the
+/// Parquet artifact next to it. A writer failure fails the run, so counting
+/// before the write cannot publish a KS file for rows that never landed.
+fn account_list_batch_prefixes(prefix_stats: &mut PrefixStats, batch: &[(ObjectKey, ObjectProps)]) {
+    let mut folder = PrefixRunFolder::default();
+    for (key, props) in batch {
+        if props.include_in_list_output() && !props.is_common_prefix() {
+            folder.add(prefix_stats, key.prefix(), props.size());
+        }
+    }
+    folder.flush(prefix_stats);
 }
 
 /// Forward every batch the channel has already buffered to the workers.
@@ -152,10 +165,11 @@ async fn drain_buffered_batches(
     rx: &mut tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
     senders: &[tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>],
     rr: &mut usize,
+    prefix_stats: &mut PrefixStats,
 ) -> bool {
     close_and_drain_start(rx);
     while let Some(batch) = rx.recv().await {
-        if route_batch(senders, rr, batch).await.is_err() {
+        if route_batch(senders, rr, prefix_stats, batch).await.is_err() {
             return false;
         }
     }
@@ -192,7 +206,6 @@ pub fn part_path(base: &str, index: usize) -> String {
 
 /// Result returned by a single Parquet output worker.
 struct ListWorkerResult {
-    prefix_stats: PrefixStats,
     stats: ListStreamingStats,
     parquet_rows: usize,
     output_ok: bool,
@@ -208,7 +221,6 @@ async fn list_output_worker(
     g_state: core::GlobalState,
     busy_nanos: Arc<AtomicU64>,
 ) -> ListWorkerResult {
-    let mut prefix_stats: PrefixStats = HashMap::new();
     let mut stats = ListStreamingStats {
         received_batches: 0,
         received_objects: 0,
@@ -220,10 +232,9 @@ async fn list_output_worker(
     let output_file = match tokio::fs::File::create(&part_path).await {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to create output file {}: {}", part_path, e);
+            g_state.note_output_error(format!("cannot create output file {}: {}", part_path, e));
             g_state.inc_output_error();
             return ListWorkerResult {
-                prefix_stats,
                 stats,
                 parquet_rows: 0,
                 output_ok: false,
@@ -243,11 +254,10 @@ async fn list_output_worker(
         // Time the encode+compress so the coordinator can see when writers are
         // the bottleneck and add another.
         let work_start = Instant::now();
-        let result =
-            ingest_list_streaming_batch(&mut parquet, &mut prefix_stats, &mut stats, batch).await;
+        let result = ingest_list_streaming_batch(&mut parquet, &mut stats, batch).await;
         busy_nanos.fetch_add(work_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = result {
-            log::error!("{}", e);
+            g_state.note_output_error(format!("{}: {}", part_path, e));
             output_ok = false;
             g_state.inc_output_error();
             break;
@@ -257,13 +267,12 @@ async fn list_output_worker(
     // Capture the row count before close() consumes the writer.
     let parquet_rows = parquet.total_rows();
     if let Err(e) = parquet.close().await {
-        log::error!("{}", e);
+        g_state.note_output_error(format!("{}: {}", part_path, e));
         output_ok = false;
         g_state.inc_output_error();
     }
 
     ListWorkerResult {
-        prefix_stats,
         stats,
         parquet_rows,
         output_ok,
@@ -315,6 +324,9 @@ pub async fn data_map_task_list_streaming(
     let mut batch_window: usize = 0;
     let mut last_busy_nanos: u64 = 0;
     let mut last_grow_eval = Instant::now();
+    // KS prefix accounting lives here, not in the writers (see
+    // `account_list_batch_prefixes`).
+    let mut prefix_stats = PrefixStats::default();
 
     loop {
         let recv_result = ctx.data_map_channel.recv().await;
@@ -323,12 +335,16 @@ pub async fn data_map_task_list_streaming(
             Some(batch) => {
                 routed_batches += 1;
                 routed_objects += batch.len();
-                if route_batch(&senders, &mut rr, batch).await.is_err() {
+                if route_batch(&senders, &mut rr, &mut prefix_stats, batch)
+                    .await
+                    .is_err()
+                {
                     log::error!("Data Map Task — list streaming worker gone, finalizing output");
                     ctx.g_state.inc_output_error();
                     coordinator_finalize(
                         senders,
                         handles,
+                        prefix_stats,
                         &ctx.g_state,
                         filename_ks,
                         filename_output,
@@ -380,6 +396,7 @@ pub async fn data_map_task_list_streaming(
                 coordinator_finalize(
                     senders,
                     handles,
+                    prefix_stats,
                     &ctx.g_state,
                     filename_ks,
                     filename_output,
@@ -397,7 +414,14 @@ pub async fn data_map_task_list_streaming(
             // interrupt drops in-channel batches from segments the final
             // checkpoint save records as completed, and a later --resume
             // skips those segments — a silent hole in the combined output.
-            if !drain_buffered_batches(&mut ctx.data_map_channel, &senders, &mut rr).await {
+            if !drain_buffered_batches(
+                &mut ctx.data_map_channel,
+                &senders,
+                &mut rr,
+                &mut prefix_stats,
+            )
+            .await
+            {
                 log::error!("Data Map Task — list streaming worker gone, finalizing output");
                 ctx.g_state.inc_output_error();
             }
@@ -405,6 +429,7 @@ pub async fn data_map_task_list_streaming(
             coordinator_finalize(
                 senders,
                 handles,
+                prefix_stats,
                 &ctx.g_state,
                 filename_ks,
                 filename_output,
@@ -417,7 +442,14 @@ pub async fn data_map_task_list_streaming(
         } else if !ctx.all_list_tasks_is_running() {
             // Drained batches are forwarded straight to finalize; no further
             // pool growth on this path.
-            if !drain_buffered_batches(&mut ctx.data_map_channel, &senders, &mut rr).await {
+            if !drain_buffered_batches(
+                &mut ctx.data_map_channel,
+                &senders,
+                &mut rr,
+                &mut prefix_stats,
+            )
+            .await
+            {
                 log::error!("Data Map Task — list streaming worker gone, finalizing output");
                 ctx.g_state.inc_output_error();
             }
@@ -425,6 +457,7 @@ pub async fn data_map_task_list_streaming(
             coordinator_finalize(
                 senders,
                 handles,
+                prefix_stats,
                 &ctx.g_state,
                 filename_ks,
                 filename_output,
@@ -457,6 +490,7 @@ pub async fn data_map_task_list_streaming(
 async fn coordinator_finalize(
     senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>>,
     handles: Vec<tokio::task::JoinHandle<ListWorkerResult>>,
+    merged_prefix_stats: PrefixStats,
     g_state: &core::GlobalState,
     filename_ks: &str,
     filename_output: &str,
@@ -466,7 +500,6 @@ async fn coordinator_finalize(
     // Drop senders so each worker's rx.recv() returns None and it finalizes.
     drop(senders);
 
-    let mut merged_prefix_stats: PrefixStats = HashMap::new();
     let mut merged_stats = ListStreamingStats {
         received_batches: 0,
         received_objects: 0,
@@ -491,11 +524,6 @@ async fn coordinator_finalize(
                     .saturating_add(result.stats.bytes_total);
                 parquet_rows += result.parquet_rows;
                 output_ok &= result.output_ok;
-                for (prefix, agg) in result.prefix_stats {
-                    let entry = merged_prefix_stats.entry(prefix).or_default();
-                    entry.objects += agg.objects;
-                    entry.bytes = entry.bytes.saturating_add(agg.bytes);
-                }
             }
             Err(e) => {
                 log::error!("Data Map Task — list streaming worker join error: {}", e);
@@ -507,7 +535,7 @@ async fn coordinator_finalize(
     let ks_entries = match write_ks_counts(filename_ks, &merged_prefix_stats).await {
         Ok(count) => count,
         Err(e) => {
-            log::error!("{}", e);
+            g_state.note_output_error(format!("{}: {}", filename_ks, e));
             output_ok = false;
             0
         }
@@ -555,7 +583,7 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
 
     info!("Data Map Task — list summary-only started");
 
-    let mut prefix_stats: PrefixStats = HashMap::new();
+    let mut prefix_stats = PrefixStats::default();
     let started_at = Instant::now();
     let mut last_ts = epoch_secs();
     let mut stats = ListStreamingStats {
@@ -638,7 +666,7 @@ pub async fn data_map_task_list_text_writer<W>(
 
     info!("Data Map Task — list stdout {:?} started", format);
 
-    let mut prefix_stats: PrefixStats = HashMap::new();
+    let mut prefix_stats = PrefixStats::default();
     let started_at = Instant::now();
     let mut last_ts = epoch_secs();
     let mut stats = ListStreamingStats {
@@ -666,6 +694,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -700,6 +733,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -726,6 +764,11 @@ pub async fn data_map_task_list_text_writer<W>(
                     // otherwise reported zero rows for a run that wrote
                     // millions before the reader went away (`| head`).
                     record_list_stdout_metrics(&ctx.g_state, &prefix_stats, &stats);
+                    ctx.g_state.note_output_error(
+                        "writing rows to stdout failed (a closed pipe, e.g. `| head`, or a \
+                         full disk); the rows streamed before it are complete"
+                            .to_string(),
+                    );
                     ctx.g_state.inc_output_error();
                     ctx.complete();
                     ctx.quit();
@@ -758,31 +801,24 @@ pub async fn data_map_task_list_text_writer<W>(
 
 async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
-    prefix_stats: &mut PrefixStats,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
 ) -> Result<(), String> {
     stats.received_batches += 1;
     stats.received_objects += batch.len();
 
-    // Prefix/byte accounting covers only objects included in the output, so
-    // the KS file describes the Parquet artifact next to it and the manifest
-    // metrics agree across parquet/tsv/ndjson/summary-only runs (the stdout
-    // and summary paths always counted post-filter; this path counted every
-    // received object, so a `--filter` run reported different bytes_total
-    // and KS counts depending on the output format).
-    let mut folder = PrefixRunFolder::default();
+    // Byte accounting covers only objects included in the output so the
+    // manifest metrics agree across parquet/tsv/ndjson/summary-only runs; the
+    // matching KS prefix counts are kept by the coordinator.
     let written = parquet
-        .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
+        .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |_key, props| {
             let include = props.include_in_list_output();
             if include {
-                folder.add(prefix_stats, key.prefix(), props.size());
                 stats.bytes_total = stats.bytes_total.saturating_add(props.size());
             }
             include
         })
         .await?;
-    folder.flush(prefix_stats);
     stats.streamed_rows += written;
     Ok(())
 }
@@ -805,38 +841,21 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
             continue;
         }
 
-        folder.add(prefix_stats, key.prefix(), props.size());
+        if !props.is_common_prefix() {
+            folder.add(prefix_stats, key.prefix(), props.size());
+        }
         stats.streamed_rows += 1;
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
-        match format {
-            ListTextOutputFormat::Tsv => {
-                let key = tsv_escape(key.as_str());
-                if writeln!(
-                    &mut out,
-                    "{}\t{}\t{}",
-                    key,
-                    props.size(),
-                    props.last_modified()
-                )
-                .is_err()
-                {
-                    log::error!("TSV rendering error");
-                    return false;
-                }
-            }
-            ListTextOutputFormat::Ndjson => {
-                let row = NdjsonRow {
-                    k: key.as_str(),
-                    s: props.size(),
-                    m: props.last_modified(),
-                };
-                if let Err(e) = serde_json::to_writer(&mut out, &row) {
-                    log::error!("NDJSON serialization error for '{}': {}", key, e);
-                    return false;
-                }
-                out.push(b'\n');
-            }
+        if let Err(e) = render_text_row(
+            &mut out,
+            format,
+            key.as_str(),
+            props.size(),
+            props.last_modified(),
+        ) {
+            log::error!("NDJSON serialization error for '{}': {}", key, e);
+            return false;
         }
     }
 
@@ -858,6 +877,41 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     true
 }
 
+/// Render one stdout list row. Hand-rolled (no `fmt` machinery or per-row
+/// struct serialization) because it runs once per object on the stdout hot
+/// path; the bytes are identical to the former `writeln!("{}\t{}\t{}")` TSV
+/// and `serde_json` `{"k":..,"s":..,"m":..}` NDJSON renderings.
+fn render_text_row(
+    out: &mut Vec<u8>,
+    format: ListTextOutputFormat,
+    key: &str,
+    size: u64,
+    last_modified: u64,
+) -> Result<(), serde_json::Error> {
+    let mut ints = itoa::Buffer::new();
+    match format {
+        ListTextOutputFormat::Tsv => {
+            out.extend_from_slice(tsv_escape(key).as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(ints.format(size).as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(ints.format(last_modified).as_bytes());
+            out.push(b'\n');
+        }
+        ListTextOutputFormat::Ndjson => {
+            // Only the key needs JSON string escaping.
+            out.extend_from_slice(b"{\"k\":");
+            serde_json::to_writer(&mut *out, key)?;
+            out.extend_from_slice(b",\"s\":");
+            out.extend_from_slice(ints.format(size).as_bytes());
+            out.extend_from_slice(b",\"m\":");
+            out.extend_from_slice(ints.format(last_modified).as_bytes());
+            out.extend_from_slice(b"}\n");
+        }
+    }
+    Ok(())
+}
+
 fn ingest_list_summary_batch(
     prefix_stats: &mut PrefixStats,
     stats: &mut ListStreamingStats,
@@ -869,7 +923,9 @@ fn ingest_list_summary_batch(
     let mut folder = PrefixRunFolder::default();
     for (key, props) in batch {
         if props.include_in_list_output() {
-            folder.add(prefix_stats, key.prefix(), props.size());
+            if !props.is_common_prefix() {
+                folder.add(prefix_stats, key.prefix(), props.size());
+            }
             stats.streamed_rows += 1;
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
         }
@@ -975,7 +1031,7 @@ async fn finalize_list_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
     started_at: Instant,
 ) {
     if let Err(e) = writer.flush().await {
-        log::error!("Stdout flush error: {}", e);
+        g_state.note_output_error(format!("stdout flush failed: {}", e));
         g_state.inc_output_error();
     }
     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
@@ -1266,7 +1322,7 @@ impl DiffRowSink {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
-            prefix_stats: PrefixStats::new(),
+            prefix_stats: PrefixStats::default(),
             rows: 0,
             plus: 0,
             minus: 0,
@@ -1274,12 +1330,6 @@ impl DiffRowSink {
             equal: 0,
             ignored: 0,
         }
-    }
-
-    /// Record a merged key in the KS prefix counts (every merged key counts
-    /// once, including filter-ignored pairs, matching legacy KS output).
-    fn record_key(&mut self, key: &ObjectKey, size: u64) {
-        record_prefix_stat(&mut self.prefix_stats, key.prefix(), size);
     }
 
     async fn push(
@@ -1295,6 +1345,10 @@ impl DiffRowSink {
             OUTPUT_FLAG_ASTRISK => self.astrisk += 1,
             _ => self.equal += 1,
         }
+        // Prefix stats (KS file, bytes_total, unique/top prefixes) describe
+        // the rows written — as in list mode — not filter-ignored pairs, so
+        // the manifest's metrics agree with the Parquet artifact.
+        record_prefix_stat(&mut self.prefix_stats, key.prefix(), props.size());
         self.rows += 1;
         self.buf.push((key, props, flag));
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
@@ -1378,7 +1432,6 @@ async fn merge_diff_streams(
         match order {
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
-                sink.record_key(&key, props.size());
                 if core::ObjectProps::include_one_sided(&props) {
                     sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
                 } else {
@@ -1387,7 +1440,6 @@ async fn merge_diff_streams(
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
-                sink.record_key(&key, props.size());
                 if core::ObjectProps::include_one_sided(&props) {
                     sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
                 } else {
@@ -1397,7 +1449,6 @@ async fn merge_diff_streams(
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
                 let (_rkey, right_props) = right.buf.pop_front().expect("filled");
-                sink.record_key(&key, left_props.size());
                 match core::ObjectProps::classify_pair(&left_props, &right_props) {
                     Some(MatchResult::Astrisk) => {
                         sink.push(writer_tx, OUTPUT_FLAG_ASTRISK, key, left_props)
@@ -1411,6 +1462,17 @@ async fn merge_diff_streams(
                 }
             }
         }
+    }
+    // Both streams ended — but a side whose *last* segment failed also ends
+    // its stream (the failing task drops its sender after setting quit), so
+    // exhaustion is not proof of completion. Check once more, or the merge
+    // reports success over a side it never finished reading.
+    if aborted() {
+        return Err(
+            "run aborted while the last segment of a side was listing; a partial diff \
+             would classify unread keys as one-sided"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1524,7 +1586,10 @@ pub async fn data_map_task_diff_streaming(
     let output_file = match tokio::fs::File::create(filename_output).await {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to create output file {}: {}", filename_output, e);
+            g_state.note_output_error(format!(
+                "cannot create output file {}: {}",
+                filename_output, e
+            ));
             g_state.inc_output_error();
             g_state.data_map_task_complete();
             g_state.quit();
@@ -1566,7 +1631,7 @@ pub async fn data_map_task_diff_streaming(
         0
     };
     if let Err(e) = parquet.close().await {
-        log::error!("{}", e);
+        g_state.note_output_error(format!("{}: {}", filename_output, e));
         output_ok = false;
     }
     if !output_ok {
@@ -1627,7 +1692,53 @@ pub async fn data_map_task_diff_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{output_should_grow, part_path, OUTPUT_GROW_MIN_BATCHES};
+    use super::{
+        output_should_grow, part_path, render_text_row, ListTextOutputFormat,
+        OUTPUT_GROW_MIN_BATCHES,
+    };
+
+    const AWKWARD_KEYS: &[&str] = &[
+        "a/plain",
+        "b/tab\there",
+        "c/quote\"q",
+        "d/back\\slash",
+        "e/uni-中文-é",
+        "f/nl\nx\rx",
+        "h/ctl\u{1}x\u{7f}",
+        "i/emoji-😀",
+        "k/\u{2028}ls",
+        "",
+    ];
+
+    #[test]
+    fn text_rows_match_the_formatted_renderings_byte_for_byte() {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            k: &'a str,
+            s: u64,
+            m: u64,
+        }
+        for key in AWKWARD_KEYS {
+            for (size, mtime) in [(0, 0), (1, 1_767_225_600), (u64::MAX, u64::MAX)] {
+                let mut ndjson = Vec::new();
+                render_text_row(&mut ndjson, ListTextOutputFormat::Ndjson, key, size, mtime)
+                    .unwrap();
+                let mut want = serde_json::to_vec(&Row {
+                    k: key,
+                    s: size,
+                    m: mtime,
+                })
+                .unwrap();
+                want.push(b'\n');
+                assert_eq!(ndjson, want, "ndjson row for {key:?}");
+
+                let mut tsv = Vec::new();
+                render_text_row(&mut tsv, ListTextOutputFormat::Tsv, key, size, mtime).unwrap();
+                let want = format!("{}\t{}\t{}\n", super::tsv_escape(key), size, mtime);
+                assert_eq!(tsv, want.as_bytes(), "tsv row for {key:?}");
+            }
+        }
+    }
 
     #[test]
     fn output_governor_grows_only_when_writers_busy_and_below_cap() {

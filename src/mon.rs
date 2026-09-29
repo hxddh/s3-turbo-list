@@ -34,7 +34,7 @@ pub async fn mon_task(ctx: MonContext) {
         if last_heartbeat.is_some_and(|at| {
             at.elapsed() < Duration::from_secs(DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS)
         }) {
-            tokio::time::sleep(MON_POLL_INTERVAL).await;
+            wait_for_state_change(&ctx).await;
             continue;
         }
         last_heartbeat = Some(Instant::now());
@@ -56,6 +56,16 @@ pub async fn mon_task(ctx: MonContext) {
             );
         }
 
-        tokio::time::sleep(MON_POLL_INTERVAL).await;
+        wait_for_state_change(&ctx).await;
+    }
+}
+
+/// Sleep one poll interval, or less when a task completes or the run quits.
+/// The interval stays as the fallback for state changes that do not notify
+/// (e.g. the Ctrl-C handler setting the quit flag directly).
+async fn wait_for_state_change(ctx: &MonContext) {
+    tokio::select! {
+        _ = tokio::time::sleep(MON_POLL_INTERVAL) => {}
+        _ = ctx.g_state.state_notify.notified() => {}
     }
 }

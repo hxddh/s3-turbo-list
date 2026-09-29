@@ -2825,7 +2825,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3-turbo-list"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2843,8 +2843,10 @@ dependencies = [
  "dashmap",
  "dirs-next",
  "env_logger",
+ "foldhash 0.2.0",
  "futures",
  "hex",
+ "itoa",
  "log",
  "parquet",
  "serde",

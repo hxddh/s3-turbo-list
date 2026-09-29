@@ -342,6 +342,10 @@ pub struct RunManifest {
     pub finished_at: String,
     pub elapsed_secs: f64,
     pub command: Vec<String>,
+    /// Working directory of the run. Artifact paths are recorded as given,
+    /// so relative ones are relative to this — `manifest-summary --check`
+    /// resolves them against it from wherever it is invoked.
+    pub cwd: String,
     pub inputs: CommandInputSummary,
     pub outputs: OutputPathSummary,
     pub config_source: ConfigSourceSummary,
@@ -620,6 +624,7 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
             // Added to the identity in 0.30.0; this list is what the manifest
             // reports as the verified set, and it was left behind.
             "filter".to_string(),
+            "endpoint_url".to_string(),
         ],
         resumed_segments_skipped: None,
     }
@@ -757,9 +762,13 @@ fn summarize_artifact(kind: &str, path: &str) -> ArtifactSummary {
         exists,
         size_bytes: std::fs::metadata(path).ok().map(|m| m.len()),
         sha256: sha256_file(path).ok(),
-        line_count: matches!(kind, "ks" | "trace" | "log" | "hints")
-            .then(|| line_count(path).ok())
-            .flatten(),
+        line_count: match kind {
+            // KS is CSV: a quoted prefix may itself contain a newline, so
+            // count records, not newline bytes — it must equal ks_entries.
+            "ks" => csv_record_count(path).ok(),
+            "trace" | "log" | "hints" => line_count(path).ok(),
+            _ => None,
+        },
         parquet: (kind == "parquet")
             .then(|| parquet_summary(path).ok())
             .flatten(),
@@ -778,6 +787,21 @@ fn sha256_file(path: &str) -> Result<String, String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Records in an RFC 4180 CSV file: newlines outside double quotes.
+fn csv_record_count(path: &str) -> Result<usize, String> {
+    let content = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut in_quotes = false;
+    let mut records = 0usize;
+    for byte in content {
+        match byte {
+            b'"' => in_quotes = !in_quotes, // "" toggles twice: net no-op
+            b'\n' if !in_quotes => records += 1,
+            _ => {}
+        }
+    }
+    Ok(records)
 }
 
 fn line_count(path: &str) -> Result<usize, String> {
@@ -828,19 +852,24 @@ pub fn doctor_report(
         status: "ok".to_string(),
         message: "resolved configuration is valid TOML/CLI state".to_string(),
     });
-    checks.push(DoctorCheck {
-        name: "config_file".to_string(),
-        status: if Path::new("./s3-turbo-list.toml").exists() {
-            "ok"
-        } else {
-            "warn"
-        }
-        .to_string(),
-        message: if Path::new("./s3-turbo-list.toml").exists() {
-            "local s3-turbo-list.toml exists".to_string()
-        } else {
-            "local s3-turbo-list.toml not found; run init-config if you want a starter config"
-                .to_string()
+    // Report the config the command actually loaded (explicit --config,
+    // workspace or home), not just whether ./s3-turbo-list.toml exists.
+    checks.push(match config_source.loaded_config.as_deref() {
+        Some(path) => DoctorCheck {
+            name: "config_file".to_string(),
+            status: "ok".to_string(),
+            message: format!(
+                "loaded {} config {}",
+                config_source.loaded_config_kind, path
+            ),
+        },
+        None => DoctorCheck {
+            name: "config_file".to_string(),
+            status: "warn".to_string(),
+            message: "no config file loaded (searched ./s3-turbo-list.toml and \
+                      ~/.s3-turbo-list.toml); built-in defaults apply — run init-config \
+                      for a starter config"
+                .to_string(),
         },
     });
     checks.push(DoctorCheck {

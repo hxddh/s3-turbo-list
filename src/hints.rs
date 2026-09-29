@@ -186,6 +186,22 @@ pub(crate) fn looks_like_toml_hints(content: &str) -> bool {
         }
     }
 
+    // `key = [`, `key = "`, `key = {`: a TOML assignment by intent, whatever
+    // the key. Routing it to the plain parser read a broken TOML file as
+    // boundaries (`garbage = [` became a boundary). Plain partition-style keys
+    // (`dt=2026-05-23/`) never have such a value.
+    let toml_intent = trimmed.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            let key = key.trim();
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && value.trim_start().starts_with(['[', '"', '{'])
+        })
+    });
+    if toml_intent {
+        return true;
+    }
+
     let non_blank = trimmed.lines().filter(|l| !l.trim().is_empty()).count();
     toml_kv_count >= non_blank / 2 && known_field
 }
@@ -410,6 +426,13 @@ mod tests {
     #[test]
     fn test_does_not_look_like_toml_plain_keys() {
         assert!(!looks_like_toml_hints("alpha/\nbeta/\ngamma/\n"));
+    }
+
+    #[test]
+    fn test_broken_toml_is_not_read_as_plain_boundaries() {
+        assert!(looks_like_toml_hints("garbage = [\n"));
+        let (_dir, path) = write_tmp("garbage = [\n");
+        assert!(parse_hints_file(&path).is_err());
     }
 
     #[test]

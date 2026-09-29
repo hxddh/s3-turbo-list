@@ -51,7 +51,10 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket \
 ```
 
 Listing is recursive by default. Use `--delimiter '/'` for a hierarchical
-listing (top-level objects plus `CommonPrefixes`). Preview any run without
+listing: the objects at that level plus one row per `CommonPrefix` ("folder"),
+whose `Key` ends with the delimiter and whose `Size`/`LastModified` are 0 and
+`ETag` empty. Folder rows count in `streamed_rows` but not in the KS object
+counts or `bytes_total`. Preview any run without
 contacting S3 by adding `--dry-run --agent`. `guide` prints command examples,
 `init-config` writes a starter config, and `completions`/`man` generate shell
 completions and a man page.
@@ -82,13 +85,19 @@ The Parquet schema is five columns:
 | `DiffFlag` | `UInt8` | `0` equal, `1` left-only, `2` right-only, `3` differs. |
 
 In list mode every row carries `DiffFlag = 0`. The companion `.ks` file is a
-two-column CSV of prefix and object count.
+two-column CSV of prefix and object count; the prefix is the key's directory
+with its trailing `/` (as S3 writes a CommonPrefix), and `""` for top-level
+keys.
 
 Parquet output parallelizes itself: on a fast (non-rate-limited) store and a
 multi-core machine, when one writer can't keep up it automatically scales to
-several writers, each streaming a part-file (`<name>.part1.parquet`, …) — read
-the directory with pandas/duckdb/pyarrow. On a rate-limited store it stays a
-single file. No flag; details in [`docs/tuning.md`](docs/tuning.md).
+several writers, each streaming a part-file (`<name>.part1.parquet`, …) beside
+`<name>.parquet`. Read the base file plus its parts — the run manifest lists
+each one as a `parquet` artifact, or glob `<name>*.parquet` — rather than the
+whole directory, which also holds the `.ks` CSV and other runs' files. A run
+removes stale part files an earlier run of the same path left behind. On a
+rate-limited store it stays a single file. No flag; details in
+[`docs/tuning.md`](docs/tuning.md).
 
 ```python
 import pyarrow.parquet as pq
@@ -118,7 +127,8 @@ expression under `inputs.filter`.
 s3-turbo-list --filter 'SOURCE.size > 1073741824' \
   list --region us-east-2 --bucket my-bucket
 s3-turbo-list --filter 'SOURCE.size != TARGET.size' \
-  diff --bucket left-bucket --target-bucket right-bucket
+  diff --bucket left-bucket --region us-east-1 \
+  --target-bucket right-bucket --target-region us-east-1
 ```
 
 ## Performance
@@ -166,14 +176,21 @@ diff. `--hints-file` and `--resume` are rejected for diff.
 ## Checkpoint / resume
 
 ```bash
-s3-turbo-list list --region us-east-2 --bucket my-bucket            # interrupted…
+s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # interrupted (Ctrl-C / SIGTERM)…
 s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
 ```
 
-Progress is saved every 30 seconds and on graceful shutdown. The checkpoint
-identity covers bucket, region, prefix, delimiter, max-keys, addressing style,
-profile, mode, filter, and the key-space boundary set itself (count and
-fingerprint) — completed segments are recorded by index, so a checkpoint is
+Checkpoints are only kept by `--resume` runs, so pass it on the first run too.
+Progress is saved when the run is interrupted gracefully (Ctrl-C or SIGTERM),
+after the outputs are finalized. There are no mid-run saves: until an output
+file is closed its rows are not durable, so a crash (or a failed write) leaves
+the previous checkpoint unchanged and the next `--resume` lists those segments
+again rather than skipping rows that were never written. Checkpoint files are
+named per bucket, region and prefix, so `--resume` jobs over different
+prefixes do not interfere. The checkpoint
+identity covers bucket, region, endpoint, prefix, delimiter, max-keys,
+addressing style, profile, mode, filter, and the key-space boundary set itself
+(count and fingerprint) — completed segments are recorded by index, so a checkpoint is
 discarded with a warning unless the boundaries it was written against are the
 ones this run resolved.
 
@@ -195,7 +212,7 @@ defaults for common providers — they never touch credentials. Use
 `AWS_PROFILE` for credentials; `--profile` selects an *endpoint* preset only.
 
 ```bash
-s3-turbo-list guide oss              # quickstart + endpoint-compatibility facts
+s3-turbo-list guide oss              # endpoint-compatibility facts
 
 # Region-derived endpoints need no --endpoint-url:
 s3-turbo-list --profile oss list --region oss-cn-beijing --bucket my-bucket

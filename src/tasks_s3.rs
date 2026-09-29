@@ -921,6 +921,8 @@ async fn flat_list(
 
     let mut stream = request.into_paginator().send();
     let mut next_start = start_after.to_string();
+    let emit_common_prefixes = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
+        && !ctx.delimiter.as_deref().unwrap_or("").is_empty();
     let mut is_ended = false;
     let mut page_count: u32 = 0;
     let mut object_count: usize = 0;
@@ -1082,6 +1084,30 @@ async fn flat_list(
                     props.set_dir(ctx.dir);
                     batch.push((obj_key.into(), props));
                     object_count = object_count.saturating_add(1);
+                }
+
+                // A hierarchical (--delimiter) list run exists to show what
+                // is at this level, "folders" included: emit each
+                // CommonPrefix as a row (Key = the prefix, Size 0, no ETag),
+                // merged into key order with the page's objects. They used
+                // to be counted for the trace and dropped, so a bucket of
+                // only folders listed as empty. (Diff compares objects, so it
+                // does not emit them.)
+                if emit_common_prefixes {
+                    let prefixes: Vec<(ObjectKey, ObjectProps)> = objects
+                        .common_prefixes
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|cp| cp.prefix)
+                        .filter(|cp| {
+                            !is_ended && until.as_deref().is_none_or(|end| cp.as_str() <= end)
+                        })
+                        .map(|cp| (cp.into(), ObjectProps::new_common_prefix(ctx.dir)))
+                        .collect();
+                    if !prefixes.is_empty() {
+                        let objects_part = std::mem::take(&mut batch);
+                        batch = merge_by_key(objects_part, prefixes);
+                    }
                 }
 
                 // Remember the last processed key for resume-on-error.
@@ -1406,7 +1432,7 @@ fn handle_sdk_error(
                 None,
                 None,
                 retryable,
-                false,
+                !retryable,
                 None,
             );
 
@@ -1439,8 +1465,10 @@ fn handle_sdk_error(
                 None,
                 None,
                 None,
-                false,
-                false,
+                // Classified as ERROR_S3_CLIENT_GENERIC below, which the
+                // segment loop retries; the trace must say the same.
+                is_retryable(ERROR_S3_CLIENT_GENERIC),
+                !is_retryable(ERROR_S3_CLIENT_GENERIC),
                 None,
             );
 
@@ -1454,6 +1482,27 @@ fn handle_sdk_error(
 }
 
 // ── Helpers ────────────────────────────────────────────────
+
+/// Merge two key-ordered row lists into one key-ordered list.
+fn merge_by_key(
+    left: Vec<(ObjectKey, ObjectProps)>,
+    right: Vec<(ObjectKey, ObjectProps)>,
+) -> Vec<(ObjectKey, ObjectProps)> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    loop {
+        let take_left = match (left.peek(), right.peek()) {
+            (Some(l), Some(r)) => l.0.as_str() <= r.0.as_str(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_left { left.next() } else { right.next() };
+        merged.extend(next);
+    }
+    merged
+}
 
 fn epoch_secs() -> u64 {
     SystemTime::now()

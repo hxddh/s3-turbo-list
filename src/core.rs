@@ -23,6 +23,8 @@ const OBJECT_PROPS_FLAG_DIR_LEFT: u8 = 0b1000_0000;
 const OBJECT_PROPS_FLAG_DIR_RIGHT: u8 = 0b0100_0000;
 const OBJECT_PROPS_FLAG_DIR_BOTH: u8 = 0b1100_0000;
 pub(crate) const OBJECT_PROPS_FLAG_DIFF_MODE: u8 = 0b0010_0000;
+/// A `--delimiter` run's CommonPrefix, emitted as a row: not an object.
+const OBJECT_PROPS_FLAG_COMMON_PREFIX: u8 = 0b0000_0010;
 
 const OBJECT_PROPS_STATUS_OPEN: u8 = 0xFF;
 #[cfg(test)]
@@ -91,9 +93,13 @@ impl ObjectKey {
         }
     }
 
-    /// Borrow just the `prefix` portion of this key. Top-level objects use `"/"` as prefix.
+    /// The key's directory prefix as S3 writes a CommonPrefix: everything up
+    /// to and including the last `/`, or `""` for a top-level key.  This is
+    /// the KS file's prefix column.  (It used to drop the trailing `/` and
+    /// use `"/"` for the root, which made the root indistinguishable from the
+    /// directory of `//x`, and `/x` land under `""`.)
     pub fn prefix(&self) -> &str {
-        self.0.rsplit_once('/').map_or("/", |(p, _)| p)
+        self.0.rfind('/').map_or("", |pos| &self.0[..=pos])
     }
 
     pub fn encode(prefix: &ObjectPrefix, name: &ObjectName) -> Self {
@@ -165,6 +171,17 @@ impl ObjectProps {
     pub fn set_dir(&mut self, dir: u8) {
         self.flags |= dir;
     }
+
+    /// Row for a CommonPrefix (a "folder") in a `--delimiter` listing: size
+    /// and LastModified 0, no ETag. Counted as a row, not as an object.
+    pub fn new_common_prefix(dir: u8) -> Self {
+        let mut props = Self::new_open(dir, 0, [0; 16]);
+        props.flags |= OBJECT_PROPS_FLAG_COMMON_PREFIX;
+        props
+    }
+    pub fn is_common_prefix(&self) -> bool {
+        self.flags & OBJECT_PROPS_FLAG_COMMON_PREFIX != 0
+    }
     pub fn is_diff_mode(&self) -> bool {
         (self.flags & OBJECT_PROPS_FLAG_DIFF_MODE) == OBJECT_PROPS_FLAG_DIFF_MODE
     }
@@ -216,6 +233,9 @@ impl ObjectProps {
 
     pub(crate) fn write_etag_to_buffer<'a>(&self, buf: &'a mut [u8; 43]) -> &'a str {
         const HEX: &[u8; 16] = b"0123456789abcdef";
+        if self.is_common_prefix() {
+            return "";
+        }
 
         let mut pos = 0usize;
         for byte in self.etag_md5 {
@@ -419,6 +439,12 @@ pub struct GlobalState {
     pub fatal_error_count: Arc<AtomicUsize>,
     /// The first listing error that ended the run: (errno, one-line summary).
     pub first_fatal_error: Arc<Mutex<Option<(u8, String)>>>,
+    /// The first output failure's description, for the manifest and stderr.
+    pub first_output_error: Arc<Mutex<Option<String>>>,
+    /// Signalled whenever a task completes or the run quits, so the monitor
+    /// exits at once instead of on its next poll (which held every small run
+    /// open for up to a full poll interval).
+    pub state_notify: Arc<tokio::sync::Notify>,
     pub output_error_count: Arc<AtomicUsize>,
     pub data_received_batches: Arc<AtomicUsize>,
     pub data_received_objects: Arc<AtomicUsize>,
@@ -489,6 +515,8 @@ impl GlobalState {
             throttled_count: Arc::new(AtomicUsize::new(0)),
             fatal_error_count: Arc::new(AtomicUsize::new(0)),
             first_fatal_error: Arc::new(Mutex::new(None)),
+            first_output_error: Arc::new(Mutex::new(None)),
+            state_notify: Arc::new(tokio::sync::Notify::new()),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data_received_batches: Arc::new(AtomicUsize::new(0)),
             data_received_objects: Arc::new(AtomicUsize::new(0)),
@@ -545,6 +573,18 @@ impl GlobalState {
         if first.is_none() {
             *first = Some((errno, summary));
         }
+    }
+    /// Log an output failure and keep the first one's description. Does not
+    /// count it: callers already decide when a failure is an output error.
+    pub fn note_output_error(&self, message: String) {
+        log::error!("{}", message);
+        let mut first = self.first_output_error.lock().unwrap();
+        if first.is_none() {
+            *first = Some(message);
+        }
+    }
+    pub fn first_output_error(&self) -> Option<String> {
+        self.first_output_error.lock().unwrap().clone()
     }
     pub fn first_fatal_error(&self) -> Option<(u8, String)> {
         self.first_fatal_error.lock().unwrap().clone()
@@ -625,12 +665,14 @@ impl GlobalState {
     }
     fn complete(&self, mask: usize) {
         self.state.fetch_and(!mask, Ordering::SeqCst);
+        self.state_notify.notify_one();
     }
     pub fn is_running(&self, mask: usize) -> bool {
         self.state.load(Ordering::SeqCst) & mask != 0
     }
     pub fn quit(&self) {
         self.quit.store(true, Ordering::SeqCst);
+        self.state_notify.notify_one();
     }
     pub fn is_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
@@ -1083,7 +1125,7 @@ mod tests {
         let key = ObjectKey::from("test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "/");
-        assert_eq!(key.prefix(), "/");
+        assert_eq!(key.prefix(), "");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "test.jpg");
@@ -1094,10 +1136,19 @@ mod tests {
         let key = ObjectKey::from("a/b/c/test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "a/b/c");
-        assert_eq!(key.prefix(), "a/b/c");
+        assert_eq!(key.prefix(), "a/b/c/");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "a/b/c/test.jpg");
+    }
+
+    #[test]
+    fn test_object_key_prefix_is_unambiguous() {
+        let prefixes: Vec<String> = ["x", "/x", "//x", "a/x", "a//x"]
+            .iter()
+            .map(|raw| ObjectKey::from(*raw).prefix().to_string())
+            .collect();
+        assert_eq!(prefixes, vec!["", "/", "//", "a/", "a//"]);
     }
 
     #[test]

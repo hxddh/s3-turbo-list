@@ -63,6 +63,10 @@ pub struct ManifestOutputSummary {
 pub struct ManifestArtifactSummary {
     pub kind: String,
     pub path: String,
+    /// `path` resolved against the run's recorded `cwd` (older manifests:
+    /// the current directory, then the manifest's directory).
+    #[serde(skip)]
+    pub resolved_path: String,
     pub exists: bool,
     pub size_bytes: Option<u64>,
     pub sha256: Option<String>,
@@ -95,8 +99,19 @@ pub fn init_config(
     profile: Option<&str>,
     overwrite: bool,
 ) -> Result<InitConfigReport, String> {
-    ensure_can_write(output, overwrite)?;
     let profile_name = profile.unwrap_or("aws").to_lowercase();
+    if profiles::get_profile(&profile_name).is_none() {
+        return Err(format!(
+            "'{}' is not an endpoint compatibility profile; use one of: {}",
+            profile_name,
+            profiles::all_profiles()
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    ensure_can_write(output, overwrite)?;
     let warnings = init_config_warnings(&profile_name);
     let rendered = init_config_template(&profile_name);
     if let Some(parent) = Path::new(output)
@@ -131,9 +146,17 @@ pub fn manifest_summary(
         .map_err(|e| format!("failed to read manifest '{}': {}", path, e))?;
     let value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("failed to parse manifest '{}': {}", path, e))?;
-    let metrics = value
-        .get("metrics")
-        .ok_or_else(|| format!("manifest '{}' does not contain metrics", path))?;
+    let metrics = value.get("metrics").ok_or_else(|| {
+        if value.get("network").is_some() && value.get("hints").is_some() {
+            format!(
+                "'{}' is a --dry-run plan, not a run manifest; pass the file written by \
+                 --run-manifest after a real run",
+                path
+            )
+        } else {
+            format!("manifest '{}' does not contain metrics", path)
+        }
+    })?;
 
     let streamed_rows = json_u64(metrics, "streamed_rows");
     let parquet_rows = json_u64(metrics, "parquet_rows");
@@ -151,6 +174,26 @@ pub fn manifest_summary(
     let exit_code = value.get("exit_code").and_then(|v| v.as_i64());
     let fatal_errors = json_u64(metrics, "fatal_errors");
     let output_errors = json_u64(metrics, "output_errors");
+    // Relative artifact paths are relative to the run's working directory,
+    // not to wherever --check happens to be invoked.
+    let run_cwd = json_string(&value, "cwd").filter(|dir| !dir.is_empty());
+    let manifest_dir = Path::new(path).parent().map(Path::to_path_buf);
+    let resolve = |artifact_path: &str| -> String {
+        let p = Path::new(artifact_path);
+        if artifact_path.is_empty() || p.is_absolute() {
+            return artifact_path.to_string();
+        }
+        if let Some(cwd) = run_cwd.as_deref() {
+            return Path::new(cwd).join(p).display().to_string();
+        }
+        if p.exists() {
+            return artifact_path.to_string();
+        }
+        match manifest_dir.as_deref() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(p).display().to_string(),
+            _ => artifact_path.to_string(),
+        }
+    };
     let artifacts: Vec<ManifestArtifactSummary> = value
         .get("artifacts")
         .and_then(|v| v.as_array())
@@ -160,6 +203,7 @@ pub fn manifest_summary(
                 .map(|item| ManifestArtifactSummary {
                     kind: json_string(item, "kind").unwrap_or_default(),
                     path: json_string(item, "path").unwrap_or_default(),
+                    resolved_path: resolve(&json_string(item, "path").unwrap_or_default()),
                     exists: item
                         .get("exists")
                         .and_then(|v| v.as_bool())
@@ -397,6 +441,26 @@ fn manifest_checks(
     });
 
     if manifest_row_check_applies(output_format, summary_only) {
+        // The artifacts must hold the rows the metrics claim. Comparing two
+        // in-memory counters (below) cannot catch a short or missing file.
+        let artifact_rows: i64 = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "parquet")
+            .filter_map(|artifact| artifact.parquet_row_count)
+            .sum();
+        checks.push(ManifestCheck {
+            name: "artifact_parquet_rows_total".to_string(),
+            status: if artifact_rows == parquet_rows as i64 {
+                "ok"
+            } else {
+                "fail"
+            }
+            .to_string(),
+            message: format!(
+                "sum of recorded Parquet artifact rows={} metrics.parquet_rows={}",
+                artifact_rows, parquet_rows
+            ),
+        });
         checks.push(ManifestCheck {
             name: "parquet_rows_match_streamed_rows".to_string(),
             status: if parquet_rows == streamed_rows {
@@ -453,7 +517,8 @@ fn manifest_checks(
         } else {
             format!("{}#{}", artifact.kind, occurrence)
         };
-        let current_exists = !artifact.path.is_empty() && Path::new(&artifact.path).exists();
+        let current_exists =
+            !artifact.resolved_path.is_empty() && Path::new(&artifact.resolved_path).exists();
         checks.push(ManifestCheck {
             name: format!("artifact_exists:{}", label),
             status: if current_exists { "ok" } else { "fail" }.to_string(),
@@ -468,7 +533,9 @@ fn manifest_checks(
         }
 
         if let Some(recorded_size) = artifact.size_bytes {
-            let current_size = std::fs::metadata(&artifact.path).ok().map(|m| m.len());
+            let current_size = std::fs::metadata(&artifact.resolved_path)
+                .ok()
+                .map(|m| m.len());
             checks.push(ManifestCheck {
                 name: format!("artifact_size:{}", label),
                 status: if current_size == Some(recorded_size) {
@@ -489,7 +556,7 @@ fn manifest_checks(
         }
 
         if let Some(recorded_sha256) = artifact.sha256.as_deref() {
-            let current_sha256 = sha256_file(&artifact.path).ok();
+            let current_sha256 = sha256_file(&artifact.resolved_path).ok();
             checks.push(ManifestCheck {
                 name: format!("artifact_sha256:{}", label),
                 status: if current_sha256.as_deref() == Some(recorded_sha256) {
@@ -507,10 +574,28 @@ fn manifest_checks(
             });
         }
 
+        // The writer recorded no Parquet metadata for this file: its footer
+        // was unreadable when the manifest was written. Skipping it — as
+        // --check used to — passed a file that is not a listing at all.
+        if artifact.kind == "parquet"
+            && artifact.parquet_row_count.is_none()
+            && artifact.parquet_schema_fields.is_empty()
+        {
+            checks.push(ManifestCheck {
+                name: format!("artifact_parquet_metadata:{}", label),
+                status: "fail".to_string(),
+                message: format!(
+                    "{} has no recorded Parquet metadata (unreadable footer when the run ended)",
+                    artifact.path
+                ),
+            });
+            continue;
+        }
+
         if artifact.kind == "parquet"
             && (artifact.parquet_row_count.is_some() || !artifact.parquet_schema_fields.is_empty())
         {
-            match current_parquet_summary(&artifact.path) {
+            match current_parquet_summary(&artifact.resolved_path) {
                 Ok(current) => {
                     if let Some(recorded_rows) = artifact.parquet_row_count {
                         checks.push(ManifestCheck {
@@ -585,7 +670,9 @@ pub fn render_init_config_text(report: &InitConfigReport) -> String {
     out.push_str(&format!("  Profile:         {}\n", report.profile));
     out.push_str(&format!("  Output:          {}\n", report.output));
     out.push_str("Next:\n");
-    out.push_str("  s3-turbo-list doctor --simple\n");
+    out.push_str("  s3-turbo-list --config ");
+    out.push_str(&report.output);
+    out.push_str(" doctor --simple\n");
     out.push_str("  s3-turbo-list --dry-run --agent --config ");
     out.push_str(&report.output);
     out.push_str(" --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1\n");
@@ -819,7 +906,7 @@ Run: s3-turbo-list guide <name>
   s3-turbo-list --filter 'SOURCE.last_modified >= 1715700000' --delimiter '' list --bucket my-bucket --region us-east-1
 
   # Diff-only: keep rows where source and target sizes differ
-  s3-turbo-list --filter 'SOURCE.size != TARGET.size' diff --bucket left-bucket --target-bucket right-bucket
+  s3-turbo-list --filter 'SOURCE.size != TARGET.size' diff --bucket left-bucket --region us-east-1 --target-bucket right-bucket --target-region us-east-1
 
 Allowed: SOURCE/TARGET size and last_modified numeric comparisons, arithmetic, &&, ||, !.
 Rejected before network: functions, methods, strings, arrays, maps, indexing, statements, large/deep expressions.
@@ -1008,14 +1095,18 @@ fn init_config_warnings(profile: &str) -> Vec<String> {
 }
 
 fn init_config_template(profile: &str) -> String {
+    // Only endpoints the user must supply are written live. A region-
+    // templated profile (bos, b2, oss) derives its endpoint from --region;
+    // writing the template with a `<region>` placeholder blocked every run
+    // until the line was deleted, so it is a comment instead.
     let endpoint = match profile {
         "minio" => "http://127.0.0.1:9000",
         "r2" => "https://<account-id>.r2.cloudflarestorage.com",
-        "b2" => "https://s3.<region>.backblazeb2.com",
-        "oss" => "https://oss-<region>.aliyuncs.com",
-        "bos" => "https://s3.<region>.bcebos.com",
         _ => "",
     };
+    let derived_endpoint = profiles::get_profile(profile)
+        .and_then(|p| p.endpoint_template)
+        .map(|template| template.replace("{region}", "<region>"));
     let (addressing, force_path) = if let Some(profile) = profiles::get_profile(profile) {
         let addressing = profile.recommended_addressing_style.to_string();
         let force_path = matches!(
@@ -1026,7 +1117,13 @@ fn init_config_template(profile: &str) -> String {
     } else {
         ("auto".to_string(), "false".to_string())
     };
-    let endpoint_line = if endpoint.is_empty() {
+    let endpoint_line = if let Some(derived) = derived_endpoint.filter(|_| endpoint.is_empty()) {
+        format!(
+            "# endpoint_url is derived from --region as {}; set it only to override\n\
+             # endpoint_url = \"{}\"",
+            derived, derived
+        )
+    } else if endpoint.is_empty() {
         "# endpoint_url = \"https://s3.amazonaws.com\"".to_string()
     } else {
         format!("endpoint_url = \"{}\"", endpoint)
