@@ -441,6 +441,10 @@ pub struct GlobalState {
     pub first_fatal_error: Arc<Mutex<Option<(u8, String)>>>,
     /// The first output failure's description, for the manifest and stderr.
     pub first_output_error: Arc<Mutex<Option<String>>>,
+    /// Signalled whenever a task completes or the run quits, so the monitor
+    /// exits at once instead of on its next poll (which held every small run
+    /// open for up to a full poll interval).
+    pub state_notify: Arc<tokio::sync::Notify>,
     pub output_error_count: Arc<AtomicUsize>,
     pub data_received_batches: Arc<AtomicUsize>,
     pub data_received_objects: Arc<AtomicUsize>,
@@ -512,6 +516,7 @@ impl GlobalState {
             fatal_error_count: Arc::new(AtomicUsize::new(0)),
             first_fatal_error: Arc::new(Mutex::new(None)),
             first_output_error: Arc::new(Mutex::new(None)),
+            state_notify: Arc::new(tokio::sync::Notify::new()),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data_received_batches: Arc::new(AtomicUsize::new(0)),
             data_received_objects: Arc::new(AtomicUsize::new(0)),
@@ -660,12 +665,14 @@ impl GlobalState {
     }
     fn complete(&self, mask: usize) {
         self.state.fetch_and(!mask, Ordering::SeqCst);
+        self.state_notify.notify_one();
     }
     pub fn is_running(&self, mask: usize) -> bool {
         self.state.load(Ordering::SeqCst) & mask != 0
     }
     pub fn quit(&self) {
         self.quit.store(true, Ordering::SeqCst);
+        self.state_notify.notify_one();
     }
     pub fn is_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
