@@ -272,7 +272,10 @@ impl ObjectProps {
         if self.is_diff_mode() {
             return false;
         }
-        if let Some(filter) = OBJECT_FILTER.get() {
+        // `--filter` selects objects; a folder row (Size and LastModified 0)
+        // is not one, and a size or date predicate would otherwise drop every
+        // folder — the empty-listing symptom folder rows exist to prevent.
+        if let Some(filter) = OBJECT_FILTER.get().filter(|_| !self.is_common_prefix()) {
             if filter.evaluate(self, None) == Some(false) {
                 return false;
             }
@@ -327,44 +330,62 @@ impl ObjectProps {
     }
 }
 
+/// Seconds since the epoch as stored in `LastModified`. Timestamps before
+/// 1970 (Go-based stores send the zero time `0001-01-01T00:00:00Z`) clamp to
+/// 0: the old `as u64` cast wrapped them to ~1.8e19, which filters on
+/// `last_modified` could not compare, so both `>` and `<` kept every row.
+pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
+    secs.max(0) as u64
+}
+
+/// Parse an S3 ETag (`"<32 hex>"` or `"<32 hex>-<parts>"`) into MD5 bytes and
+/// a part count. Anything else is "not available" (all zeros, 0 parts), which
+/// diff reports as a difference. Decoding goes through a scratch buffer:
+/// `hex::decode_to_slice` writes as it goes and stops at the first bad
+/// character, so decoding in place left a partial digest that two different
+/// malformed ETags could share — and diff then called them equal. A bad part
+/// count used to fall back to the single-part reading of the same digest,
+/// with the same effect.
+pub(crate) fn parse_etag_bytes(etag: &str) -> ([u8; 16], u32) {
+    const UNAVAILABLE: ([u8; 16], u32) = ([0u8; 16], 0);
+    let raw = etag.as_bytes();
+    let mut md5 = [0u8; 16];
+    let Some(hex_span) = raw.get(1..33) else {
+        return UNAVAILABLE;
+    };
+    if raw.len() == 34 {
+        if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
+            return (md5, 0);
+        }
+    } else if raw.len() >= 36 && raw.get(33) == Some(&b'-') {
+        let parts = raw
+            .get(34..raw.len() - 1)
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(parts) = parts
+            && hex::decode_to_slice(hex_span, &mut md5).is_ok()
+        {
+            return (md5, parts);
+        }
+    }
+    UNAVAILABLE
+}
+
 impl From<&aws_sdk_s3::types::Object> for ObjectProps {
     fn from(item: &aws_sdk_s3::types::Object) -> Self {
-        let mut md5 = [0u8; 16];
         // Index the ETag as bytes, never as `str`. The value is whatever the
         // endpoint sent, and `&x[1..33]` panics when byte 1 lands inside a
         // multi-byte character — a panicking segment task used to be swallowed
         // by the reactor, so one malformed ETag silently dropped a whole key
         // range from the output. Byte slicing also skips a UTF-8 boundary
         // check that a 32-char hex span never needs.
-        let (etag_md5, etag_parts) = item.e_tag().map_or((md5, 0), |x| {
-            let raw = x.as_bytes();
-            if raw.len() == 34 {
-                if let Some(hex_span) = raw.get(1..33) {
-                    if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
-                        return (md5, 0);
-                    }
-                }
-            } else if raw.len() >= 36 && raw.get(33) == Some(&b'-') {
-                if let Some(hex_span) = raw.get(1..33) {
-                    if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
-                        if let Some(parts) = raw
-                            .get(34..raw.len() - 1)
-                            .and_then(|p| std::str::from_utf8(p).ok())
-                            .and_then(|p| p.parse::<u32>().ok())
-                        {
-                            return (md5, parts);
-                        }
-                    }
-                }
-            }
-            (md5, 0) // fallback: unparseable etag
-        });
+        let (etag_md5, etag_parts) = item.e_tag().map_or(([0u8; 16], 0), parse_etag_bytes);
         Self {
             flags: OBJECT_PROPS_FLAG_S3_GP_BUCKET,
             status: OBJECT_PROPS_STATUS_OPEN,
             pad: 0,
             etag_parts,
-            last_modified: item.last_modified().map_or(0, |x| x.secs() as u64),
+            last_modified: item.last_modified().map_or(0, |x| epoch_secs_u64(x.secs())),
             size: item.size().map_or(0, |x| x as u64),
             etag_md5,
         }
@@ -778,6 +799,9 @@ pub struct S3TaskContext {
     /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
     pub continuation_token: Option<String>,
     pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
+    /// Filled by the list reactor as it exits: the key ranges left unwritten,
+    /// for the checkpoint a graceful interrupt saves.
+    pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
 }
 
 impl S3TaskContext {
@@ -860,6 +884,7 @@ impl S3TaskContext {
             start_after: start_after.map(|s| s.to_string()),
             continuation_token: continuation_token.map(|s| s.to_string()),
             checkpoint_completed,
+            resume_progress: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1032,6 +1057,25 @@ impl KeySpaceHints {
         let v = Self::pairs_from_boundaries(hints);
         Self {
             inner: v,
+            inflight: HashMap::new(),
+            done: Vec::new(),
+        }
+    }
+
+    /// Segments for exactly the given ranges — a resume from a checkpoint
+    /// that recorded the unwritten key space (0.36+).
+    pub fn from_ranges(ranges: &[crate::checkpoint::ResumeRange]) -> Self {
+        let inner = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| KeySpacePair {
+                index,
+                start: range.start_after.clone(),
+                end: range.end.clone().filter(|end| !end.is_empty()),
+            })
+            .collect();
+        Self {
+            inner,
             inflight: HashMap::new(),
             done: Vec::new(),
         }
@@ -1422,6 +1466,29 @@ mod tests {
             .size(1)
             .e_tag(etag)
             .build()
+    }
+
+    #[test]
+    fn test_malformed_etags_are_unavailable_not_partially_decoded() {
+        // Different malformed values used to decode to the same partial
+        // digest ("ab" then zeros) and compare equal in diff.
+        let z = ObjectProps::from(&object_with_etag(&format!("\"ab{}\"", "Z".repeat(30))));
+        let y = ObjectProps::from(&object_with_etag(&format!("\"ab{}\"", "Y".repeat(30))));
+        assert!(z.is_etag_not_avail());
+        assert!(y.is_etag_not_avail());
+        // A bad part count is not a single-part ETag of the same digest.
+        let digest = "d41d8cd98f00b204e9800998ecf8427e";
+        let bad_parts = ObjectProps::from(&object_with_etag(&format!("\"{}-x1\"", digest)));
+        assert!(bad_parts.is_etag_not_avail());
+    }
+
+    #[test]
+    fn test_pre_epoch_last_modified_clamps_to_zero() {
+        let object = aws_sdk_s3::types::Object::builder()
+            .key("k")
+            .last_modified(aws_sdk_s3::primitives::DateTime::from_secs(-62_135_596_800))
+            .build();
+        assert_eq!(ObjectProps::from(&object).last_modified(), 0);
     }
 
     #[test]

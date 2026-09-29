@@ -100,10 +100,14 @@ The plan JSON includes:
 - `file_conflicts`
 - `warnings`
 
-`status` is `ok`, or `blocked` when a provider setup problem would stop the
-real run with exit code `3` (the reason is in `warnings`).  A blocked dry run
-still prints or writes the plan, then exits `3`, so the dry run predicts the
-run's exit class.  A missing region is `blocked` when the instance metadata
+`status` is `ok`, or `blocked` when a problem would stop the real run: a
+provider setup problem (exit code `3`) or an output file it cannot create —
+a path under an existing file (e.g. `--output-dir` naming a file) or in a
+read-only directory (exit code `5`); the reason is in `warnings`.  A blocked
+dry run still prints or writes the plan, then exits with that code, so the dry
+run predicts the run's exit class.  An existing output file that the run would
+overwrite gets a warning, and a `--prefix` starting with `/` (which ordinary
+S3 keys never match) gets one too.  A missing region is `blocked` when the instance metadata
 service is disabled (`AWS_EC2_METADATA_DISABLED=true`) and neither the
 environment nor the AWS profile file names one; otherwise it is a warning,
 because the SDK may still resolve it from IMDS at run time.  Local input errors
@@ -146,10 +150,12 @@ segments, and identity match details.
 
 `checkpoint.resumed_segments_skipped` is the field to branch on after a
 resumed run.  `null` means the run did not resume; a number greater than zero
-means the run skipped that many segments because a checkpoint recorded them
-complete, so **its artifacts describe only the rest of the key space** — the
-remainder is in the output of the run that was interrupted, and the two must
-be combined.  Reusing one output path across both runs leaves only the second
+means a checkpoint recorded that many key ranges as already written (in whole
+or in part, by the interrupted run or a chain of earlier resumes), so **its
+artifacts describe only the rest of the key space** — the remainder is in the
+output of the interrupted run(s), and the outputs must be combined; together
+they hold every key exactly once.  A dry-run plan reports how many ranges a
+resume would list in `checkpoint.remaining_ranges`.  Reusing one output path across both runs leaves only the second
 run's half; the run also emits a warning saying so.  Read this field rather
 than the checkpoint file: a run that lists its whole key space removes the
 checkpoint before exiting, so the file on disk cannot answer the question.
@@ -293,8 +299,11 @@ Placeholder endpoints from starter configs, such as `<account-id>` or
 deterministic provider setup problems: real cloud-facing commands stop with
 exit code `3`, and so do `doctor` and `--dry-run` (plan `status: blocked`).
 
-For `diff` with a region-templated profile (`bos`, `b2`, `oss`) and no explicit
-endpoint, each side uses the profile's endpoint for its own region: the target
+`diff` without `--target-region` lists the target in `--region` (the plan's
+`inputs.target_region` shows it); it used to fall back to the ambient
+`AWS_REGION`.  For `diff` with a region-templated profile (`bos`, `b2`, `oss`)
+and no explicit endpoint, each side uses the profile's endpoint for its own
+region: the target
 side lists against the `--target-region` endpoint, which the dry-run plan names
 in `warnings`.  An explicit `--endpoint-url` / `s3.endpoint_url` applies to
 both sides.
@@ -345,9 +354,15 @@ total across the set.
 | 7 | Interrupted; checkpoint may be available |
 
 Agents should branch on exit codes first, then read `run.json` if it exists.
-Every non-zero exit also prints one `s3-turbo-list: run <status> (exit N): <reason>`
-line on stderr, and a failed listing records its first fatal error (S3 error
-code, HTTP status, message) in the manifest's `warnings`.  SIGTERM (as sent by
+Every non-zero exit of `list`, `diff` or `compat-probe` also prints one
+`s3-turbo-list: run <status> (exit N): <reason>` line on stderr — including a
+run that stops before listing (a filter that does not compile, no region, an
+output it cannot create), which under `--agent` also prints a minimal JSON
+result (`status`, `exit_code`, `error`) on stdout instead of a manifest.  A
+failed listing records its first fatal error (S3 error code, HTTP status,
+message) in the manifest's `warnings`; a diff side's failure (for example
+`AccessDenied` on the target bucket) exits with that side's class (`3` / `4`),
+not as an output failure.  SIGTERM (as sent by
 `timeout(1)` and most harnesses) is handled like Ctrl-C: exit 7, with the
 manifest and any checkpoint written.
 

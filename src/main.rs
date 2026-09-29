@@ -42,7 +42,8 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<String>,
 
-    /// Prefix to start listing from
+    /// Key prefix to list, e.g. `logs/2026/` (S3 keys do not start with '/';
+    /// the default "/" means the whole bucket)
     #[arg(short, long, default_value = "/", global = true)]
     prefix: String,
 
@@ -186,7 +187,7 @@ enum Commands {
         #[arg(long)]
         bucket: String,
 
-        /// Target AWS region
+        /// Target AWS region [default: --region]
         #[arg(long)]
         target_region: Option<String>,
 
@@ -432,6 +433,59 @@ static DOCTOR_JSON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// Exit 2 on a config/CLI validation error, in doctor's JSON shape when
 /// doctor's JSON output was requested.
 fn exit_config_error(message: &str) -> ! {
+    exit_doctor_check_error("config_parse", message)
+}
+
+/// Set once the command is a real `list` / `diff` / `compat-probe` run (not a
+/// dry run): its pre-run failures report like failed runs.
+static RUN_COMMAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// `--agent` on such a run: stdout carries a JSON result even when the run
+/// stops before listing.
+static AGENT_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Stop before (or instead of) listing with `code`. Every command prints the
+/// reason on stderr as before; a run command also prints the documented
+/// `s3-turbo-list: run failed (exit N): <reason>` line and, under `--agent`,
+/// a minimal JSON result on stdout — agents branch on those, and pre-run
+/// failures (a bad filter, no region, an uncreatable output) used to give
+/// neither.
+fn exit_before_run(code: agent::ExitCode, message: String) -> ! {
+    eprintln!("{}", message);
+    run_failure_epilogue(code, &message);
+    std::process::exit(code.code())
+}
+
+fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
+    if !RUN_COMMAND.get().copied().unwrap_or(false) {
+        return;
+    }
+    let reason = message
+        .lines()
+        .next()
+        .unwrap_or(message)
+        .trim_end_matches('.');
+    eprintln!(
+        "s3-turbo-list: run failed (exit {}): {}. Nothing was listed.",
+        code.code(),
+        reason
+    );
+    if AGENT_RUN.get().copied().unwrap_or(false) {
+        println!(
+            "{}",
+            agent::to_pretty_json(&serde_json::json!({
+                "schema_version": agent::AGENT_SCHEMA_VERSION,
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "status": "failed",
+                "exit_code": code.code(),
+                "error": message,
+            }))
+        );
+    }
+}
+
+/// Exit 2 on a local input error; `doctor --json` still prints its JSON
+/// report (one `error` check named `check`), so its stdout is never empty.
+fn exit_doctor_check_error(check: &str, message: &str) -> ! {
     eprintln!("{}", message);
     if DOCTOR_JSON.get().copied().unwrap_or(false) {
         println!(
@@ -441,18 +495,40 @@ fn exit_config_error(message: &str) -> ! {
                 "tool_version": env!("CARGO_PKG_VERSION"),
                 "status": "error",
                 "checks": [{
-                    "name": "config_parse",
+                    "name": check,
                     "status": "error",
                     "message": message,
                 }],
             }))
         );
     }
+    run_failure_epilogue(agent::ExitCode::CliConfig, message);
     std::process::exit(agent::ExitCode::CliConfig.code());
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // A diff without --target-region lists the target in --region. It used to
+    // fall through to the SDK's ambient region (AWS_REGION / profile), so the
+    // target was signed for another region than the plan showed (it showed
+    // none), and a region-templated profile kept the source's endpoint.
+    if let Commands::Diff {
+        region,
+        target_region,
+        ..
+    } = &mut cli.cmd
+        && target_region.is_none()
+    {
+        *target_region = region.clone();
+    }
+    let cli = cli;
+    let run_command = !cli.dry_run
+        && matches!(
+            cli.cmd,
+            Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
+        );
+    let _ = RUN_COMMAND.set(run_command);
+    let _ = AGENT_RUN.set(run_command && cli.agent);
     let _ = DOCTOR_JSON.set(
         matches!(cli.cmd, Commands::Doctor { json: true, .. })
             || (cli.agent && matches!(cli.cmd, Commands::Doctor { .. })),
@@ -484,11 +560,13 @@ fn main() {
             if cli.dry_run {
                 // init-config only writes a local file; a "dry run" that
                 // wrote it anyway (as it did) is worse than a clear refusal.
-                eprintln!(
-                    "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
-                    output
+                exit_before_run(
+                    agent::ExitCode::CliConfig,
+                    format!(
+                        "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
+                        output
+                    ),
                 );
-                std::process::exit(agent::ExitCode::CliConfig.code());
             }
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
             return;
@@ -544,6 +622,7 @@ fn main() {
     cfg.normalize_addressing_style();
     let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
     apply_output_dir_defaults(&cli, &mut cfg);
+    apply_log_file_default(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
     validate_summary_only_command(&cli);
@@ -551,6 +630,7 @@ fn main() {
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
+    validate_delimiter_hints_command(&cli);
     validate_diff_hints_command(&cli);
     validate_diff_resume_command(&cli);
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
@@ -566,8 +646,7 @@ fn main() {
             // file is supplied it is linted and embedded in the report.
             let hints = cli.hints_file.as_deref().map(|path| {
                 hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
-                    eprintln!("Hints validation failed: {}", e);
-                    std::process::exit(agent::ExitCode::CliConfig.code());
+                    exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
                 })
             });
             let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
@@ -652,8 +731,10 @@ fn main() {
                 if let Some(path) = output.as_deref()
                     && let Err(e) = agent::write_json_file(path, &report)
                 {
-                    eprintln!("Benchmark write error: {}", e);
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                    exit_before_run(
+                        agent::ExitCode::OutputWrite,
+                        format!("Benchmark write error: {}", e),
+                    );
                 }
                 if *json {
                     println!("{}", rendered);
@@ -691,8 +772,7 @@ fn main() {
                 RunMode::List
             };
             if let Err(e) = config::compile_filter_with_mode(filter_expr, &mode) {
-                eprintln!("Filter error: {}", e);
-                std::process::exit(agent::ExitCode::CliConfig.code());
+                exit_before_run(agent::ExitCode::CliConfig, format!("Filter error: {}", e));
             }
         }
         let (planned_ks, planned_parquet, _) = planned_output_paths(&cli, &cfg);
@@ -711,8 +791,10 @@ fn main() {
         if let Some(path) = cli.plan_json.as_deref()
             && let Err(e) = agent::write_json_file(path, &report)
         {
-            eprintln!("Plan write error: {}", e);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!("Plan write error: {}", e),
+            );
         }
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
@@ -722,14 +804,24 @@ fn main() {
         if let Some(path) = cli.hints_file.as_deref()
             && let Err(e) = hints::parse_hints_file(path)
         {
-            eprintln!("Hints file error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!("Hints file error: {}", e),
+            );
         }
         // The plan must predict the run: a setup problem the run would stop
         // on with exit 3 fails the dry run the same way (plan still written).
         if let Some(error) = provider_setup_guardrail_warnings(&cli, &cfg).first() {
-            eprintln!("Provider setup error: {}", error);
-            std::process::exit(agent::ExitCode::ProviderSetup.code());
+            exit_before_run(
+                agent::ExitCode::ProviderSetup,
+                format!("Provider setup error: {}", error),
+            );
+        }
+        if let Some(problem) = planned_output_problems(&report.outputs, &cli).first() {
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!("Output error: {}", problem),
+            );
         }
         return;
     }
@@ -762,8 +854,10 @@ fn main() {
             Err(e) => {
                 // An unwritable log path is an output failure, reported
                 // through the documented exit codes like every other one.
-                eprintln!("Failed to open log file '{}': {}", logfile_s, e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
+                exit_before_run(
+                    agent::ExitCode::OutputWrite,
+                    format!("Failed to open log file '{}': {}", logfile_s, e),
+                );
             }
         };
         env_logger::Builder::new()
@@ -810,22 +904,21 @@ fn main() {
                 .or(cli.endpoint.as_deref())
                 .or(cfg.s3.endpoint_url.as_deref())
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
-                         or set s3.endpoint_url in the config"
-                    );
-                    std::process::exit(agent::ExitCode::CliConfig.code());
+                    exit_before_run(agent::ExitCode::CliConfig, "compat-probe requires an endpoint: pass --endpoint-url (global) or --endpoint, \
+                         or set s3.endpoint_url in the config".to_string());
                 })
                 .to_string();
             let addressing_style = match addressing_style.as_deref() {
                 Some(style) => match style.parse::<config::AddressingStyle>() {
                     Ok(parsed) => parsed.to_string(),
                     Err(_) => {
-                        eprintln!(
-                            "--addressing-style '{}' is not one of: path, virtual, auto",
-                            style
+                        exit_before_run(
+                            agent::ExitCode::CliConfig,
+                            format!(
+                                "--addressing-style '{}' is not one of: path, virtual, auto",
+                                style
+                            ),
                         );
-                        std::process::exit(agent::ExitCode::CliConfig.code());
                     }
                 },
                 None => cfg.s3.addressing_style.to_string(),
@@ -863,8 +956,7 @@ fn main() {
     // Install filter if provided.
     if let Some(ref filter_expr) = cli.filter {
         if let Err(e) = config::install_filter(filter_expr, &mode) {
-            eprintln!("Filter error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(agent::ExitCode::CliConfig, format!("Filter error: {}", e));
         }
         info!("Filter installed: \"{}\"", filter_expr);
     }
@@ -877,6 +969,8 @@ fn main() {
         opt_bucket,
         opt_target_region.flatten(),
         opt_target_bucket,
+        &opt_prefix,
+        None,
     );
     let filename_ks = cfg
         .output
@@ -907,11 +1001,13 @@ fn main() {
             match std::fs::remove_file(path) {
                 Ok(()) => removed += 1,
                 Err(e) => {
-                    eprintln!(
-                        "Output error: cannot remove stale part file '{}': {}",
-                        path, e
+                    exit_before_run(
+                        agent::ExitCode::OutputWrite,
+                        format!(
+                            "Output error: cannot remove stale part file '{}': {}",
+                            path, e
+                        ),
                     );
-                    std::process::exit(agent::ExitCode::OutputWrite.code());
                 }
             }
         }
@@ -936,8 +1032,10 @@ fn main() {
         q.store(true, Ordering::SeqCst);
         i.store(true, Ordering::SeqCst);
     }) {
-        eprintln!("Failed to set ctrl-c signal handler: {}", e);
-        std::process::exit(agent::ExitCode::InternalError.code());
+        exit_before_run(
+            agent::ExitCode::InternalError,
+            format!("Failed to set ctrl-c signal handler: {}", e),
+        );
     }
 
     let g_state = core::GlobalState::new(quit, g_tasks_count);
@@ -952,7 +1050,8 @@ fn main() {
     // The async block yields what the run learned about resuming: the manifest
     // is built after it, and a completed run has already removed its
     // checkpoint, so the file on disk can no longer answer this.
-    let resumed_segments_skipped: Option<usize> = rt.block_on(async {
+    let (resumed_segments_skipped, checkpoint_note): (Option<usize>, Option<String>) = rt
+        .block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
         let checkpoint_path_opt = if cli.resume {
             Some(checkpoint::checkpoint_path_for_prefix(
@@ -986,33 +1085,15 @@ fn main() {
             .as_deref()
             .and_then(|p| checkpoint::CheckpointJournal::load_and_verify(p, &current_identity));
 
-        // Segments this run will not list because the checkpoint records them
-        // complete. Captured here rather than re-read at manifest time: a run
-        // that finishes removes its checkpoint, so the file on disk at the end
-        // says nothing about whether this run resumed.
+        // A checkpoint that recorded the unwritten key ranges (0.36+) is
+        // resumed by listing exactly those ranges; hints, startup discovery
+        // and segment indices play no part.
+        let resume_ranges: Option<Vec<checkpoint::ResumeRange>> = checkpoint_journal
+            .as_ref()
+            .and_then(|cj| cj.remaining.clone());
+        // What this run skipped because a checkpoint records it listed —
+        // computed below, once the checkpoint has survived verification.
         let mut resumed_segments_skipped: Option<usize> = None;
-        if let Some(ref cj) = checkpoint_journal {
-            let skipped = cj.completed_indices.len();
-            resumed_segments_skipped = Some(skipped);
-            info!(
-                "Resuming checkpoint: {} of {} segments completed",
-                skipped, cj.total_segments
-            );
-            if skipped > 0 {
-                // The output of a resumed run covers only the segments it
-                // listed. Saying so is the difference between "combine this
-                // with the interrupted run's output" and a file that silently
-                // omits whatever the earlier run already wrote — which is what
-                // happens when both runs are pointed at one output path.
-                run_warnings.push(format!(
-                    "Resuming from checkpoint: {} of {} segments are already recorded complete \
-                     and will not be listed again, so this run's output covers only the \
-                     remaining key space. Combine it with the output of the interrupted run; \
-                     writing both to the same path leaves only this run's half.",
-                    skipped, cj.total_segments
-                ));
-            }
-        }
 
         let g_state = g_state.clone();
         let mut set = tokio::task::JoinSet::new();
@@ -1027,13 +1108,10 @@ fn main() {
         let side_without_region =
             opt_region.is_none() || opt_target_region.is_some_and(|r| r.is_none());
         if side_without_region && sdk_config.region().is_none() {
-            eprintln!(
-                "No AWS region resolved{}: pass --region{} or set AWS_REGION \
+            exit_before_run(agent::ExitCode::ProviderSetup, format!("No AWS region resolved{}: pass --region{} or set AWS_REGION \
                  (or a region in the AWS profile).",
                 if opt_region.is_none() { "" } else { " for the diff target" },
-                if opt_region.is_none() { "" } else { " / --target-region" },
-            );
-            std::process::exit(agent::ExitCode::ProviderSetup.code());
+                if opt_region.is_none() { "" } else { " / --target-region" },));
         }
 
         // List mode streams over one channel; diff builds per-segment
@@ -1102,7 +1180,9 @@ fn main() {
         // their start with the CLI key and list overlapping ranges, so the
         // cached-hints load is skipped just like startup discovery below.
         // (--hints-file plus --start-after is rejected at CLI validation.)
-        let ks_list: Vec<String> = if cfg.s3.start_after.is_some() {
+        let ks_list: Vec<String> = if resume_ranges.is_some() {
+            Vec::new()
+        } else if cfg.s3.start_after.is_some() {
             info!(
                 "--start-after is single-chain: skipping cached hints and listing as one segment"
             );
@@ -1127,6 +1207,7 @@ fn main() {
         // through the existing cache path.
         let mut ks_list = ks_list;
         if ks_list.is_empty()
+            && resume_ranges.is_none()
             && mode == RunMode::List
             && !cli.no_auto_hints
             && cli.hints_file.is_none()
@@ -1142,48 +1223,60 @@ fn main() {
                 cfg.s3.force_path_style,
             );
             let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
-            let discovery = auto_hints::discover_startup_boundaries(
-                &probe_client,
-                opt_bucket,
-                &opt_prefix,
-                target_boundaries,
-                cfg.s3.operation_timeout_secs,
-            )
-            .await;
-            // Flat namespace: no CommonPrefix structure, which previously
-            // meant starting as a single segment and relying on runtime
-            // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
-            // Bisect the key range with single-key probes instead — the same
-            // partitioner diff sides use — so the first run starts at full
-            // concurrency. The boundaries land in the same cache below.
-            let boundaries = if !discovery.boundaries.is_empty() {
-                discovery.boundaries
-            } else if discovery.is_single_page_listing(cli.max_keys) {
-                // The discovery probe's page was not truncated and held no
-                // CommonPrefixes, and this run's page size returns those keys
-                // in one request too: the whole listing is a single page.
-                // Bisecting it would cost several probes per cut to partition
-                // work the single segment finishes in one request, and would
-                // cache boundaries that pin that shape for later runs.
-                info!(
-                    "Startup discovery found a single-page listing — using single-segment listing"
-                );
-                Vec::new()
-            } else {
-                info!("Startup discovery found no prefix structure — bisecting flat key space");
-                // Runtime splitting still covers this run, so one boundary per
-                // worker is enough; spare boundaries would only cost probes.
-                let flat_target = concurrency.clamp(1, 64);
-                discover_flat_boundaries_via_client(
-                    &probe_client,
-                    opt_bucket,
-                    &opt_prefix,
-                    flat_target,
-                    cfg.s3.operation_timeout_secs,
-                )
-                .await
+            // Discovery can take many probe rounds on a slow endpoint; race it
+            // against Ctrl-C / SIGTERM so an interrupt stops it at once (the
+            // run then exits 7 without caching half-discovered boundaries).
+            let discovered = tokio::select! {
+                boundaries = async {
+                    let discovery = auto_hints::discover_startup_boundaries(
+                        &probe_client,
+                        opt_bucket,
+                        &opt_prefix,
+                        target_boundaries,
+                        cfg.s3.operation_timeout_secs,
+                    )
+                    .await;
+                    // Flat namespace: no CommonPrefix structure, which previously
+                    // meant starting as a single segment and relying on runtime
+                    // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
+                    // Bisect the key range with single-key probes instead — the same
+                    // partitioner diff sides use — so the first run starts at full
+                    // concurrency. The boundaries land in the same cache below.
+                    if !discovery.boundaries.is_empty() {
+                        discovery.boundaries
+                    } else if discovery.is_single_page_listing(cli.max_keys) {
+                        // The discovery probe's page was not truncated and held no
+                        // CommonPrefixes, and this run's page size returns those keys
+                        // in one request too: the whole listing is a single page.
+                        // Bisecting it would cost several probes per cut to partition
+                        // work the single segment finishes in one request, and would
+                        // cache boundaries that pin that shape for later runs.
+                        info!(
+                            "Startup discovery found a single-page listing — using single-segment listing"
+                        );
+                        Vec::new()
+                    } else {
+                        info!("Startup discovery found no prefix structure — bisecting flat key space");
+                        // Runtime splitting still covers this run, so one boundary per
+                        // worker is enough; spare boundaries would only cost probes.
+                        let flat_target = concurrency.clamp(1, 64);
+                        discover_flat_boundaries_via_client(
+                            &probe_client,
+                            opt_bucket,
+                            &opt_prefix,
+                            flat_target,
+                            cfg.s3.operation_timeout_secs,
+                        )
+                        .await
+                    }
+                } => Some(boundaries),
+                _ = quit_requested(&g_state) => None,
             };
-            if boundaries.is_empty() {
+            let interrupted_discovery = discovered.is_none();
+            let boundaries = discovered.unwrap_or_default();
+            if interrupted_discovery {
+                info!("Interrupted during startup discovery; no boundaries cached");
+            } else if boundaries.is_empty() {
                 info!(
                     "Startup discovery found no cuttable key space — using single-segment listing"
                 );
@@ -1212,14 +1305,73 @@ fn main() {
         // Discard a resume journal whose segment set does not match the
         // current hints — completed indices are positional, so a mismatch
         // would skip the wrong segments and silently drop keys.
-        let checkpoint_journal =
-            checkpoint_journal.filter(|cj| cj.verify_segments(&ks_list, original_hints_count));
+        let checkpoint_journal = checkpoint_journal.filter(|cj| {
+            cj.remaining.is_some() || cj.verify_segments(&ks_list, original_hints_count)
+        });
         // The checkpoint records progress against *this* boundary set; the
         // fingerprint is what a later --resume verifies it against.
         let current_identity = current_identity.with_boundaries(&ks_list);
 
         // Filter out completed segments when resuming.
-        let hints = if let Some(ref cj) = checkpoint_journal {
+        // Segments this run will not list because the checkpoint records them
+        // listed. Captured here rather than re-read at manifest time: a run
+        // that finishes removes its checkpoint, so the file on disk at the end
+        // says nothing about whether this run resumed. Computed after the
+        // verification above — a discarded checkpoint skips nothing.
+        if let Some(ref cj) = checkpoint_journal {
+            let (skipped, warning) = match &cj.remaining {
+                Some(ranges) => {
+                    let listed = cj.listed_ranges.unwrap_or(0);
+                    info!(
+                        "Resuming checkpoint: {} key range(s) left to list",
+                        ranges.len()
+                    );
+                    (
+                        listed,
+                        format!(
+                            "Resuming from checkpoint: the key space earlier runs already wrote \
+                             ({} range(s), in whole or in part) will not be listed again; this run \
+                             lists the {} remaining range(s), so its output covers only the rest \
+                             of the key space. Combine it with the output of the interrupted \
+                             run(s); writing both to the same path leaves only this run's part.",
+                            listed,
+                            ranges.len()
+                        ),
+                    )
+                }
+                None => {
+                    let skipped = cj.completed_indices.len();
+                    info!(
+                        "Resuming checkpoint: {} of {} segments completed",
+                        skipped, cj.total_segments
+                    );
+                    (
+                        skipped,
+                        format!(
+                            "Resuming from checkpoint: {} of {} segments are already recorded \
+                             complete and will not be listed again, so this run's output covers \
+                             only the remaining key space. Combine it with the output of the \
+                             interrupted run; writing both to the same path leaves only this \
+                             run's half.",
+                            skipped, cj.total_segments
+                        ),
+                    )
+                }
+            };
+            resumed_segments_skipped = Some(skipped);
+            if skipped > 0 {
+                // The runtime warnings were printed before the checkpoint was
+                // read, so this one goes to stderr here or it never does.
+                if !cli.agent {
+                    print_runtime_warnings(std::slice::from_ref(&warning));
+                }
+                run_warnings.push(warning);
+            }
+        }
+
+        let hints = if let Some(ranges) = resume_ranges.as_deref() {
+            core::KeySpaceHints::from_ranges(ranges)
+        } else if let Some(ref cj) = checkpoint_journal {
             let filtered =
                 core::KeySpaceHints::new_uncompleted_from(&ks_list, &cj.completed_indices);
             info!(
@@ -1250,6 +1402,9 @@ fn main() {
         let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = None;
+        // The list reactor's report of the key ranges it left unwritten.
+        let mut resume_slot: Option<Arc<std::sync::Mutex<Option<checkpoint::ResumeProgress>>>> =
+            None;
         let s3_cfg = cfg.s3.clone();
         let output_config = cfg.output.clone();
         let filename_ks_for_task = filename_ks.clone();
@@ -1280,6 +1435,7 @@ fn main() {
                         &cfg,
                         &cli,
                         &sdk_config,
+                        &g_state,
                     )
                     .await;
                     let right = diff_side_boundaries(
@@ -1290,6 +1446,7 @@ fn main() {
                         &cfg,
                         &cli,
                         &sdk_config,
+                        &g_state,
                     )
                     .await;
                     (left, right)
@@ -1303,6 +1460,7 @@ fn main() {
                             &cfg,
                             &cli,
                             &sdk_config,
+                            &g_state,
                         ),
                         diff_side_boundaries(
                             target_bucket,
@@ -1312,6 +1470,7 @@ fn main() {
                             &cfg,
                             &cli,
                             &sdk_config,
+                            &g_state,
                         ),
                     )
                 };
@@ -1427,6 +1586,7 @@ fn main() {
                 cli.continuation_token.as_deref(),
                 left_checkpoint.clone(),
             );
+            resume_slot = Some(task_ctx.resume_progress.clone());
             set.spawn(async move {
                 tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
             });
@@ -1505,24 +1665,34 @@ fn main() {
             }
         }
 
-        // ── Final checkpoint save on successful completion ─
+        // ── Final checkpoint save / removal ────────────────
+        // What the exit line should say about resuming; `None` when this run
+        // did not use --resume.
+        let mut checkpoint_note: Option<String> = None;
         if cli.resume
-            && let Some(ref cp_path) = checkpoint_path_opt {
-                let final_metrics = g_state.metrics_snapshot();
-                let run_was_interrupted = interrupted.load(Ordering::SeqCst);
-                if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
-                    info!(
-                        "Skipping final checkpoint save because run failed before producing reliable output"
-                    );
-                } else if !run_was_interrupted {
-                    // The run listed its whole key space, so there is no resume
-                    // point left. Saving one anyway was not merely redundant:
-                    // runtime-split segments record no progress, so the journal
-                    // claimed only *some* segments were done, nothing removed
-                    // it, and the next ordinary `--resume` invocation skipped
-                    // the recorded segments and wrote an output covering only
-                    // the remainder — reported as success, because the manifest
-                    // honestly described its own short artifact.
+            && let Some(ref cp_path) = checkpoint_path_opt
+        {
+            let final_metrics = g_state.metrics_snapshot();
+            let run_was_interrupted = interrupted.load(Ordering::SeqCst);
+            // Another job's checkpoint that shares this file name (same
+            // bucket, region and prefix; another endpoint, filter or page
+            // size) is neither removed nor overwritten.
+            let may_replace =
+                checkpoint::CheckpointJournal::may_replace(cp_path, &current_identity);
+            if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
+                info!(
+                    "Skipping final checkpoint save because run failed before producing reliable output"
+                );
+            } else if !run_was_interrupted {
+                // The run listed its whole key space, so there is no resume
+                // point left. Saving one anyway was not merely redundant: the
+                // next ordinary `--resume` invocation would skip the recorded
+                // ranges and write an output covering only the remainder —
+                // reported as success, because the manifest honestly
+                // described its own short artifact.
+                if !may_replace {
+                    info!("Leaving checkpoint {} of another run in place", cp_path);
+                } else {
                     match std::fs::remove_file(cp_path) {
                         Ok(()) => info!(
                             "Run completed the whole key space — removed checkpoint {}",
@@ -1531,18 +1701,37 @@ fn main() {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => warn!(
                             "Run completed but its checkpoint {} could not be removed ({}). \
-                             A later --resume would skip the segments it records; delete it \
+                             A later --resume would skip the ranges it records; delete it \
                              before resuming.",
                             cp_path, e
                         ),
                     }
-                } else {
-                    let completed = merged_completed_indices(
-                        checkpoint_journal.as_ref(),
-                        &left_checkpoint,
-                        right_checkpoint.as_ref(),
-                    );
-                    if !completed.is_empty() {
+                }
+            } else if !may_replace {
+                let message = format!(
+                    "Checkpoint {} belongs to another run (different endpoint, filter or \
+                     page size) and was not overwritten; this run's progress was not saved, \
+                     so a --resume would list it again from the start",
+                    cp_path
+                );
+                warn!("{}", message);
+                run_warnings.push(message.clone());
+                checkpoint_note = Some(message);
+            } else {
+                let progress = resume_slot
+                    .as_ref()
+                    .and_then(|slot| slot.lock().unwrap().take());
+                match progress {
+                    Some(progress) => {
+                        let completed = merged_completed_indices(
+                            checkpoint_journal.as_ref(),
+                            &left_checkpoint,
+                            right_checkpoint.as_ref(),
+                        );
+                        let listed_before = checkpoint_journal.as_ref().map_or(0, |cj| {
+                            cj.listed_ranges.unwrap_or(cj.completed_indices.len())
+                        });
+                        let remaining_count = progress.remaining.len();
                         let journal = checkpoint::CheckpointJournal {
                             bucket: opt_bucket.to_string(),
                             prefix: opt_prefix.clone(),
@@ -1550,16 +1739,42 @@ fn main() {
                             completed_indices: completed,
                             last_updated: chrono::Local::now().to_rfc3339(),
                             identity: Some(current_identity.clone()),
+                            remaining: Some(progress.remaining),
+                            listed_ranges: Some(listed_before + progress.ranges_with_progress),
                         };
-                        journal.save(cp_path);
-                        info!(
-                            "Final checkpoint saved: {}/{} segments completed",
-                            journal.completed_indices.len(),
-                            journal.total_segments
-                        );
+                        match journal.save(cp_path) {
+                            Ok(()) => {
+                                info!(
+                                    "Final checkpoint saved: {} key range(s) left to list",
+                                    remaining_count
+                                );
+                                checkpoint_note = Some(format!(
+                                    "checkpoint {} saved; rerun with --resume to list the {} \
+                                     remaining range(s)",
+                                    cp_path, remaining_count
+                                ));
+                            }
+                            Err(e) => {
+                                let message = format!(
+                                    "{}; a --resume would list everything again",
+                                    e
+                                );
+                                run_warnings.push(message.clone());
+                                checkpoint_note = Some(message);
+                            }
+                        }
+                    }
+                    None => {
+                        let message =
+                            "no resume progress was recorded; a --resume would list everything \
+                             again"
+                                .to_string();
+                        warn!("{}", message);
+                        checkpoint_note = Some(message);
                     }
                 }
             }
+        }
 
         // ── Diff mode completion notice ────────────────────
         if mode == RunMode::BiDir {
@@ -1567,7 +1782,7 @@ fn main() {
         }
 
         info!("All tasks completed.");
-        resumed_segments_skipped
+        (resumed_segments_skipped, checkpoint_note)
     });
 
     rt.shutdown_background();
@@ -1695,13 +1910,15 @@ fn main() {
     if let Some(path) = cli.run_manifest.as_deref()
         && let Err(e) = agent::write_json_file(path, &manifest)
     {
-        eprintln!("Manifest write error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Manifest write error: {}", e),
+        );
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
     } else if exit_code == agent::ExitCode::Success && cli.summary_only {
-        print_summary(&manifest.metrics);
+        print_summary(&manifest.metrics, &cli.delimiter);
     } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
         // stdout is reserved for TSV/NDJSON rows.
     } else if exit_code == agent::ExitCode::Success {
@@ -1712,9 +1929,10 @@ fn main() {
         // run could end with empty stdout and stderr (the reason only in the
         // log file) while leaving partial artifacts behind.
         let reason = match (&first_fatal, exit_code) {
-            (_, agent::ExitCode::Interrupted) => {
-                "interrupted; with --resume, a checkpoint may allow resuming".to_string()
-            }
+            (_, agent::ExitCode::Interrupted) => match &checkpoint_note {
+                Some(note) => format!("interrupted; {}", note),
+                None => "interrupted (run with --resume to make a run resumable)".to_string(),
+            },
             (_, agent::ExitCode::OutputWrite) => first_output_error
                 .clone()
                 .map(|message| format!("output failed: {}", message))
@@ -1743,12 +1961,16 @@ fn generate_man_page() {
     let man = clap_mangen::Man::new(cmd);
     let mut buffer: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buffer) {
-        eprintln!("Man page generation error: {}", e);
-        std::process::exit(agent::ExitCode::InternalError.code());
+        exit_before_run(
+            agent::ExitCode::InternalError,
+            format!("Man page generation error: {}", e),
+        );
     }
     if let Err(e) = std::io::stdout().write_all(&buffer) {
-        eprintln!("Man page write error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Man page write error: {}", e),
+        );
     }
 }
 
@@ -1758,8 +1980,10 @@ fn build_runtime_or_exit(worker_threads: usize) -> tokio::runtime::Runtime {
         .worker_threads(worker_threads)
         .build()
         .unwrap_or_else(|e| {
-            eprintln!("Runtime initialization error: {}", e);
-            std::process::exit(agent::ExitCode::InternalError.code());
+            exit_before_run(
+                agent::ExitCode::InternalError,
+                format!("Runtime initialization error: {}", e),
+            );
         })
 }
 
@@ -1800,8 +2024,7 @@ fn run_guide(topic: Option<&str>) {
     match local_tools::render_guide(topic) {
         Ok(rendered) => print!("{}", rendered),
         Err(e) => {
-            eprintln!("Guide error: {}", e);
-            std::process::exit(agent::ExitCode::CliConfig.code());
+            exit_before_run(agent::ExitCode::CliConfig, format!("Guide error: {}", e));
         }
     }
 }
@@ -1829,6 +2052,25 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
     }
 }
 
+/// `--log` without `--output-log-file`: name the log file up front — inside
+/// `--output-dir` when one is given — so the plan, the manifest's `outputs`
+/// and its artifacts report it like every other output. It used to be named
+/// only when logging started, always in the working directory, and neither
+/// the plan nor the manifest knew it existed.
+fn apply_log_file_default(cli: &Cli, cfg: &mut S3TurboConfig) {
+    if !cli.log
+        || cfg.output.log_file.is_some()
+        || !matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
+    {
+        return;
+    }
+    let name = format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"));
+    cfg.output.log_file = Some(match cli.output_dir.as_deref() {
+        Some(dir) => format!("{}/{}", dir, name),
+        None => name,
+    });
+}
+
 fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     let Some(output_dir) = cli.output_dir.as_deref() else {
         return;
@@ -1839,7 +2081,14 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
 
     match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let stem = output_stem(region.as_deref(), bucket, None, None);
+            let stem = output_stem(
+                region.as_deref(),
+                bucket,
+                None,
+                None,
+                &listing_prefix(cli),
+                Some(output_dir),
+            );
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
             }
@@ -1858,6 +2107,8 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
                 bucket,
                 target_region.as_deref(),
                 Some(target_bucket.as_str()),
+                &listing_prefix(cli),
+                Some(output_dir),
             );
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
@@ -1913,8 +2164,10 @@ fn validate_compat_probe_command(cli: &Cli) {
 
 fn validate_summary_only_command(cli: &Cli) {
     if cli.summary_only && !matches!(cli.cmd, Commands::List { .. }) {
-        eprintln!("--summary-only is only supported with the list command");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--summary-only is only supported with the list command".to_string(),
+        );
     }
 }
 
@@ -1923,14 +2176,16 @@ fn validate_output_format_command(cli: &Cli) {
         return;
     };
     if cli.summary_only && format.writes_stdout_rows() {
-        eprintln!("--summary-only cannot be combined with --output-format tsv or ndjson");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--summary-only cannot be combined with --output-format tsv or ndjson".to_string(),
+        );
     }
     if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
-        eprintln!(
-            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
@@ -2028,28 +2283,35 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         return;
     };
     if token.trim().is_empty() {
-        eprintln!("--continuation-token cannot be empty");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be empty".to_string(),
+        );
     }
     let Commands::List { region, bucket, .. } = &cli.cmd else {
-        eprintln!("--continuation-token is only supported with the list command");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token is only supported with the list command".to_string(),
+        );
     };
     if cli.resume {
-        eprintln!(
-            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if cfg.s3.start_after.is_some() {
-        eprintln!("--continuation-token cannot be combined with --start-after");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--continuation-token cannot be combined with --start-after".to_string(),
+        );
     }
     if cli.hints_file.is_some() {
-        eprintln!(
+        exit_before_run(
+            agent::ExitCode::CliConfig,
             "--continuation-token is single-chain only and cannot be combined with --hints-file"
+                .to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if !cli.no_auto_hints {
         let hints_path = agent::conventional_hints_path_for_prefix(
@@ -2058,11 +2320,13 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
             &listing_prefix(cli),
         );
         if std::path::Path::new(&hints_path).exists() {
-            eprintln!(
-                "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
-                hints_path
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!(
+                    "--continuation-token is single-chain only, but conventional hints file '{}' exists; pass --no-auto-hints to ignore it",
+                    hints_path
+                ),
             );
-            std::process::exit(agent::ExitCode::CliConfig.code());
         }
     }
 }
@@ -2072,6 +2336,24 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
 /// ranges, duplicating output rows. Reject explicit multi-segment inputs; the
 /// conventional hints cache is skipped at load time (with a log line) instead
 /// of erroring, because startup discovery writes it automatically on first run.
+/// A `--delimiter` listing is one hierarchical segment: CommonPrefixes are not
+/// bounded by a segment's key range, so boundaries from `--hints-file` made
+/// neighbouring segments drop or repeat folder rows. Runtime splitting and the
+/// hints cache were already off for delimiter runs; the explicit file was the
+/// remaining way in.
+fn validate_delimiter_hints_command(cli: &Cli) {
+    if matches!(cli.cmd, Commands::List { .. })
+        && !cli.delimiter.is_empty()
+        && cli.hints_file.is_some()
+    {
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--delimiter lists one hierarchical segment and cannot be combined with --hints-file"
+                .to_string(),
+        );
+    }
+}
+
 fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
     if cfg.s3.start_after.is_none() {
         return;
@@ -2082,14 +2364,17 @@ fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
         return;
     }
     if cli.resume {
-        eprintln!(
-            "--start-after cannot be combined with --resume; checkpoint segments describe the full key space and would mis-resume a partial-range listing"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--start-after cannot be combined with --resume; checkpoint segments describe the full key space and would mis-resume a partial-range listing".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if cli.hints_file.is_some() {
-        eprintln!("--start-after is single-chain only and cannot be combined with --hints-file");
-        std::process::exit(agent::ExitCode::CliConfig.code());
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "--start-after is single-chain only and cannot be combined with --hints-file"
+                .to_string(),
+        );
     }
 }
 
@@ -2098,27 +2383,29 @@ fn validate_diff_hints_command(cli: &Cli) {
         return;
     }
     if cli.hints_file.is_some() {
-        eprintln!(
-            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "diff with --hints-file is unsupported by design: diff partitions each side automatically and an explicit shared hints file cannot describe both sides; remove --hints-file to run diff".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
 fn validate_diff_resume_command(cli: &Cli) {
     if cli.resume && matches!(cli.cmd, Commands::Diff { .. }) {
-        eprintln!(
-            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff"
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            "diff --resume is unsupported by design: diff does not checkpoint partial paired comparisons; remove --resume to run diff".to_string(),
         );
-        std::process::exit(agent::ExitCode::CliConfig.code());
     }
 }
 
 fn validate_provider_setup_or_exit(cli: &Cli, cfg: &S3TurboConfig) {
     let warnings = provider_setup_guardrail_warnings(cli, cfg);
     if let Some(error) = warnings.first() {
-        eprintln!("Provider setup error: {}", error);
-        std::process::exit(agent::ExitCode::ProviderSetup.code());
+        exit_before_run(
+            agent::ExitCode::ProviderSetup,
+            format!("Provider setup error: {}", error),
+        );
     }
 }
 
@@ -2240,20 +2527,45 @@ fn list_writes_artifacts(cli: &Cli) -> bool {
         .unwrap_or(true)
 }
 
+/// Auto-generated output stem for this run, unique in `dir` (the output
+/// directory, or the working directory): a stem whose `.parquet` or `.ks`
+/// already exists gets a `_N` suffix instead of overwriting another run's
+/// files — two runs started in the same second used to share one name, and
+/// the second silently replaced the first's artifacts while both reported
+/// success.
 fn output_stem(
     region: Option<&str>,
     bucket: &str,
     target_region: Option<&str>,
     target_bucket: Option<&str>,
+    prefix: &str,
+    dir: Option<&str>,
 ) -> String {
     let now = Local::now().format("%Y%m%d%H%M%S");
-    output_stem_with_timestamp(
+    let stem = output_stem_with_timestamp(
         region,
         bucket,
         target_region,
         target_bucket,
+        prefix,
         &now.to_string(),
-    )
+    );
+    let taken = |candidate: &str| {
+        [".parquet", ".ks"].iter().any(|ext| {
+            let name = format!("{}{}", candidate, ext);
+            match dir {
+                Some(dir) => std::path::Path::new(dir).join(name).exists(),
+                None => std::path::Path::new(&name).exists(),
+            }
+        })
+    };
+    if !taken(&stem) {
+        return stem;
+    }
+    (1..)
+        .map(|n| format!("{}_{}", stem, n))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused suffix exists")
 }
 
 fn output_stem_with_timestamp(
@@ -2261,6 +2573,7 @@ fn output_stem_with_timestamp(
     bucket: &str,
     target_region: Option<&str>,
     target_bucket: Option<&str>,
+    prefix: &str,
     timestamp: &str,
 ) -> String {
     let mut parts = Vec::new();
@@ -2273,6 +2586,13 @@ fn output_stem_with_timestamp(
     }
     if let Some(target_bucket) = target_bucket {
         parts.push(sanitize_path_component(target_bucket));
+    }
+    // Runs over different prefixes of one bucket get different names (the
+    // hints cache and checkpoint are keyed the same way): parallel per-prefix
+    // runs started in the same second used to overwrite each other.
+    if !prefix.is_empty() {
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+        parts.push(format!("p{}", &digest[..8]));
     }
     parts.push(timestamp.to_string());
     parts.join("_")
@@ -2356,11 +2676,13 @@ fn validate_distinct_output_paths(
         if let Some((_, other_label, other_path)) =
             seen.iter().find(|(seen_key, _, _)| *seen_key == k)
         {
-            eprintln!(
-                "{} '{}' and {} '{}' are the same file; every output needs its own path",
-                other_label, other_path, label, path
+            exit_before_run(
+                agent::ExitCode::CliConfig,
+                format!(
+                    "{} '{}' and {} '{}' are the same file; every output needs its own path",
+                    other_label, other_path, label, path
+                ),
             );
-            std::process::exit(agent::ExitCode::CliConfig.code());
         }
         seen.push((k, label, path));
     }
@@ -2392,13 +2714,15 @@ fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
             continue;
         };
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "Output error: cannot create directory '{}' for '{}': {}",
-                parent.display(),
-                path,
-                e
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!(
+                    "Output error: cannot create directory '{}' for '{}': {}",
+                    parent.display(),
+                    path,
+                    e
+                ),
             );
-            std::process::exit(agent::ExitCode::OutputWrite.code());
         }
     }
 }
@@ -2410,8 +2734,10 @@ fn ensure_output_dir(cli: &Cli) {
     if let Some(dir) = cli.output_dir.as_deref()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
-        eprintln!("Output directory error: failed to create '{}': {}", dir, e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Output directory error: failed to create '{}': {}", dir, e),
+        );
     }
 }
 
@@ -2437,9 +2763,18 @@ fn print_wrote_summary(outputs: &agent::OutputPathSummary, output_files: usize) 
     }
 }
 
-fn print_summary(metrics: &agent::MetricsSummary) {
+fn print_summary(metrics: &agent::MetricsSummary, delimiter: &str) {
     println!("Summary:");
-    println!("  objects:  {}", metrics.streamed_rows);
+    if delimiter.is_empty() {
+        println!("  objects:  {}", metrics.streamed_rows);
+    } else {
+        // A --delimiter listing also emits one row per folder (CommonPrefix),
+        // which is not an object; bytes and prefixes count objects only.
+        println!(
+            "  rows:     {} (objects and '{}' folders)",
+            metrics.streamed_rows, delimiter
+        );
+    }
     println!(
         "  bytes:    {} ({})",
         metrics.bytes_total,
@@ -2451,7 +2786,11 @@ fn print_summary(metrics: &agent::MetricsSummary) {
         for prefix in metrics.top_prefixes.iter().take(10) {
             println!(
                 "  {}  objects={} bytes={} ({})",
-                prefix.prefix,
+                if prefix.prefix.is_empty() {
+                    "\"\" (root)"
+                } else {
+                    prefix.prefix.as_str()
+                },
                 prefix.objects,
                 prefix.bytes,
                 human_bytes(prefix.bytes)
@@ -2625,12 +2964,14 @@ fn run_benchmark_local(
     );
     let artifact_dir = std::env::temp_dir().join(format!("s3-turbo-list-benchmark-{}", suffix));
     std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
-        eprintln!(
-            "Benchmark setup error: failed to create {}: {}",
-            artifact_dir.display(),
-            e
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!(
+                "Benchmark setup error: failed to create {}: {}",
+                artifact_dir.display(),
+                e
+            ),
         );
-        std::process::exit(agent::ExitCode::OutputWrite.code());
     });
     let parquet_file = artifact_dir.join("benchmark.parquet");
     let ks_file = artifact_dir.join("benchmark.ks");
@@ -2858,12 +3199,14 @@ fn run_benchmark_local_diff(
         );
         let dir = std::env::temp_dir().join(format!("s3-turbo-list-diff-benchmark-{}", suffix));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-            eprintln!(
-                "Benchmark setup error: failed to create {}: {}",
-                dir.display(),
-                e
+            exit_before_run(
+                agent::ExitCode::OutputWrite,
+                format!(
+                    "Benchmark setup error: failed to create {}: {}",
+                    dir.display(),
+                    e
+                ),
             );
-            std::process::exit(agent::ExitCode::OutputWrite.code());
         });
         let parquet = dir.join("diff.parquet");
         let ks = dir.join("diff.ks");
@@ -2943,8 +3286,10 @@ fn run_benchmark_local_diff(
     rt.shutdown_background();
 
     let outcome = outcome.unwrap_or_else(|e| {
-        eprintln!("Benchmark output error: {}", e);
-        std::process::exit(agent::ExitCode::OutputWrite.code());
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Benchmark output error: {}", e),
+        );
     });
 
     let mut parquet_bytes = 0u64;
@@ -3161,6 +3506,28 @@ fn synthetic_diff_batches(
     (left, right)
 }
 
+/// Output files the run would fail to create (exit 5), with the reason.
+fn planned_output_problems(outputs: &agent::OutputPathSummary, cli: &Cli) -> Vec<String> {
+    [
+        outputs.parquet_file.as_deref(),
+        outputs.ks_file.as_deref(),
+        outputs.log_file.as_deref(),
+        outputs.trace_compat.as_deref(),
+        cli.run_manifest.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|path| {
+        agent::output_path_problem(path).map(|problem| {
+            format!(
+                "output '{}' cannot be created: {}; the run would exit 5",
+                path, problem
+            )
+        })
+    })
+    .collect()
+}
+
 fn build_plan_report(
     cli: &Cli,
     cfg: &S3TurboConfig,
@@ -3311,12 +3678,30 @@ fn build_plan_report(
         );
     }
 
+    let output_problems = planned_output_problems(&outputs, cli);
+    for path in [
+        outputs.parquet_file.as_deref(),
+        outputs.ks_file.as_deref(),
+        outputs.log_file.as_deref(),
+        outputs.trace_compat.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if std::path::Path::new(path).is_file() {
+            warnings.push(format!("output '{}' exists and will be overwritten", path));
+        }
+    }
+    let output_blocked = !output_problems.is_empty();
+    warnings.extend(output_problems);
+
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
-        // `blocked`: a provider setup problem that stops the real run with
-        // exit 3 (the reason is in `warnings`); the dry run exits 3 too.
-        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() {
+        // `blocked`: a problem that stops the real run — a provider setup
+        // problem (exit 3) or an output it cannot create (exit 5); the reason
+        // is in `warnings` and the dry run exits with the same code.
+        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() && !output_blocked {
             "ok"
         } else {
             "blocked"
@@ -3387,6 +3772,20 @@ fn cli_config_overrides(cli: &Cli) -> Vec<String> {
 
 fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
+    // Only the exact default "/" means the whole bucket. A path-style
+    // "/logs/" is a literal prefix that S3 keys (which rarely start with a
+    // slash) do not match, so the run listed nothing and exited 0.
+    if cli.prefix != "/"
+        && cli.prefix.starts_with('/')
+        && matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
+    {
+        warnings.push(format!(
+            "--prefix '{}' starts with '/', and S3 keys rarely do; this lists only keys that \
+             literally begin with '/'. Did you mean '{}'?",
+            cli.prefix,
+            cli.prefix.trim_start_matches('/')
+        ));
+    }
     if matches!(
         cli.cmd,
         Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
@@ -3617,7 +4016,14 @@ fn planned_output_paths(
     let now = Local::now().format("%Y%m%d%H%M%S").to_string();
     match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let stem = output_stem_with_timestamp(region.as_deref(), bucket, None, None, &now);
+            let stem = output_stem_with_timestamp(
+                region.as_deref(),
+                bucket,
+                None,
+                None,
+                &listing_prefix(cli),
+                &now,
+            );
             let ks = cfg
                 .output
                 .ks_file
@@ -3641,6 +4047,7 @@ fn planned_output_paths(
                 bucket,
                 target_region.as_deref(),
                 Some(target_bucket),
+                &listing_prefix(cli),
                 &now,
             );
             let ks = cfg
@@ -3679,6 +4086,15 @@ fn diff_segment_channels(segments: usize) -> (Vec<SegmentBatchSender>, Vec<Segme
         .unzip()
 }
 
+/// Resolves once the run has been asked to stop (Ctrl-C / SIGTERM set the
+/// quit flag). Startup discovery races against it: its probe rounds run
+/// before any segment task exists, so nothing else would notice the signal.
+async fn quit_requested(g_state: &core::GlobalState) {
+    while !g_state.is_quit() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Key-space boundaries for one diff side: cached hints when present,
 /// otherwise startup structural discovery (cached for future runs). The
 /// same automatic sources as list mode; explicit --hints-file remains
@@ -3692,6 +4108,7 @@ async fn diff_side_boundaries(
     cfg: &S3TurboConfig,
     cli: &Cli,
     sdk_config: &aws_config::SdkConfig,
+    g_state: &core::GlobalState,
 ) -> Vec<String> {
     if cli.no_auto_hints || !cli.delimiter.is_empty() || cfg.s3.start_after.is_some() {
         return Vec::new();
@@ -3708,37 +4125,46 @@ async fn diff_side_boundaries(
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style);
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
-    let discovery = auto_hints::discover_startup_boundaries(
-        &client,
-        bucket,
-        prefix,
-        target,
-        cfg.s3.operation_timeout_secs,
-    )
-    .await;
-    let boundaries = if !discovery.boundaries.is_empty() {
-        discovery.boundaries
-    } else if discovery.is_single_page_listing(cli.max_keys) {
-        // Single-page side: nothing to partition, and the probes would cost
-        // more requests than the listing.
-        Vec::new()
-    } else {
-        // Flat namespace: structural discovery found no CommonPrefixes, so the
-        // side would otherwise list as one serial segment. Bisect the key range
-        // with single-key probes so it lists in parallel. The target is smaller
-        // than structural discovery's: each cut is a one-time up-front probe,
-        // and only `max_concurrency` segments run at once, so spare boundaries
-        // beyond that would just cost probes without adding parallelism. Diff
-        // has no runtime splitting to fall back on, so it keeps a floor.
-        let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-        discover_flat_boundaries_via_client(
-            &client,
-            bucket,
-            prefix,
-            flat_target,
-            cfg.s3.operation_timeout_secs,
-        )
-        .await
+    // Race discovery against Ctrl-C / SIGTERM, as list mode does.
+    let discovered = tokio::select! {
+        boundaries = async {
+            let discovery = auto_hints::discover_startup_boundaries(
+                &client,
+                bucket,
+                prefix,
+                target,
+                cfg.s3.operation_timeout_secs,
+            )
+            .await;
+        if !discovery.boundaries.is_empty() {
+                discovery.boundaries
+            } else if discovery.is_single_page_listing(cli.max_keys) {
+                // Single-page side: nothing to partition, and the probes would cost
+                // more requests than the listing.
+                Vec::new()
+            } else {
+                // Flat namespace: structural discovery found no CommonPrefixes, so the
+                // side would otherwise list as one serial segment. Bisect the key range
+                // with single-key probes so it lists in parallel. The target is smaller
+                // than structural discovery's: each cut is a one-time up-front probe,
+                // and only `max_concurrency` segments run at once, so spare boundaries
+                // beyond that would just cost probes without adding parallelism. Diff
+                // has no runtime splitting to fall back on, so it keeps a floor.
+                let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
+                discover_flat_boundaries_via_client(
+                    &client,
+                    bucket,
+                    prefix,
+                    flat_target,
+                    cfg.s3.operation_timeout_secs,
+                )
+                .await
+            }
+        } => Some(boundaries),
+        _ = quit_requested(g_state) => None,
+    };
+    let Some(boundaries) = discovered else {
+        return Vec::new();
     };
     if !boundaries.is_empty()
         && let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries)
@@ -3928,8 +4354,10 @@ fn run_compat_probe(
         {
             Ok(report) => report,
             Err(e) => {
-                eprintln!("Compat-probe output error: {}", e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
+                exit_before_run(
+                    agent::ExitCode::OutputWrite,
+                    format!("Compat-probe output error: {}", e),
+                );
             }
         }
     });

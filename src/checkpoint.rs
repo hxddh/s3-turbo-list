@@ -148,6 +148,27 @@ impl CheckpointIdentity {
 
 // ── CheckpointJournal ─────────────────────────────────────
 
+/// A key range still to be listed: keys after `start_after` (exclusive, ""
+/// for the start of the listing prefix) up to and including `end` (`None`:
+/// the end of the listing prefix). The same bounds a segment task uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRange {
+    pub start_after: String,
+    #[serde(default)]
+    pub end: Option<String>,
+}
+
+/// What a list run's reactor knows at exit about the key space it did not
+/// finish: published for the final checkpoint save.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeProgress {
+    /// Ranges not yet written (unstarted segments, pending split children,
+    /// and in-flight segments cut at their last durably sent key).
+    pub remaining: Vec<ResumeRange>,
+    /// Ranges this run listed in whole or in part.
+    pub ranges_with_progress: usize,
+}
+
 /// Lightweight journal tracking which KeySpace segments are complete.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointJournal {
@@ -160,6 +181,18 @@ pub struct CheckpointJournal {
     /// Absent in legacy checkpoints (pre-identity-hardening).
     #[serde(default)]
     pub identity: Option<CheckpointIdentity>,
+    /// Exactly the key ranges not yet written, cut at each segment's last
+    /// durably written key (0.36+). When present, a resume lists these ranges
+    /// and nothing else — no segment index or boundary set is involved. The
+    /// index form above could only skip *whole* unsplit segments, so an
+    /// interrupted run's partly listed and runtime-split segments were listed
+    /// again from their start, and the combined output carried duplicates.
+    #[serde(default)]
+    pub remaining: Option<Vec<ResumeRange>>,
+    /// How many key ranges earlier runs listed in whole or in part, summed
+    /// across a chain of resumes (reported as `resumed_segments_skipped`).
+    #[serde(default)]
+    pub listed_ranges: Option<usize>,
 }
 
 impl CheckpointJournal {
@@ -281,13 +314,38 @@ impl CheckpointJournal {
     /// Written to a sibling temp file and renamed into place, so a crash or
     /// a full disk mid-write leaves the previous checkpoint intact instead of
     /// a truncated one.
-    pub fn save(&self, path: &str) {
+    ///
+    /// Returns the error so the caller can say so: a run that exits
+    /// "interrupted — a checkpoint may allow resuming" while none was written
+    /// sends the next `--resume` back to the start without a word.
+    pub fn save(&self, path: &str) -> Result<(), String> {
         let toml_str = toml::to_string_pretty(self).expect("Failed to serialize checkpoint");
         let tmp = format!("{}.tmp", path);
         let result = std::fs::write(&tmp, &toml_str).and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = result {
             let _ = std::fs::remove_file(&tmp);
             log::warn!("Failed to write checkpoint {}: {}", path, e);
+            return Err(format!("could not write checkpoint {}: {}", path, e));
+        }
+        Ok(())
+    }
+
+    /// Whether the file at `path` may be replaced or removed by a run with
+    /// `current` identity: it is absent, unreadable, or belongs to this run.
+    /// A checkpoint of another job that shares the file name (same bucket,
+    /// region and prefix but another endpoint, filter or page size) is left
+    /// alone — finishing or interrupting this run used to delete or overwrite
+    /// that job's resume point.
+    pub fn may_replace(path: &str, current: &CheckpointIdentity) -> bool {
+        if !std::path::Path::new(path).exists() {
+            return true;
+        }
+        match Self::load(path) {
+            None => true,
+            Some(journal) => journal
+                .identity
+                .as_ref()
+                .is_none_or(|stored| !stored.is_legacy() && stored.diff(current).is_empty()),
         }
     }
 }
@@ -369,7 +427,38 @@ mod tests {
             completed_indices: vec![0, 2],
             last_updated: String::new(),
             identity: Some(identity),
+            remaining: None,
+            listed_ranges: None,
         }
+    }
+
+    #[test]
+    fn test_may_replace_only_absent_or_matching_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.toml");
+        let path_str = path.to_str().unwrap();
+        let identity = CheckpointIdentity::new(
+            "test-bucket",
+            Some("us-east-1"),
+            "",
+            Some(""),
+            None,
+            None,
+            Some("path"),
+            Some("list"),
+            None,
+        );
+        assert!(CheckpointJournal::may_replace(path_str, &identity));
+        make_journal(identity.clone()).save(path_str).unwrap();
+        assert!(CheckpointJournal::may_replace(path_str, &identity));
+        // Same file name, another job: another endpoint or another filter.
+        let other_endpoint = identity
+            .clone()
+            .with_endpoint(Some("http://127.0.0.1:9000"));
+        assert!(!CheckpointJournal::may_replace(path_str, &other_endpoint));
+        let mut other_filter = identity.clone();
+        other_filter.filter = Some("SOURCE.size > 0".to_string());
+        assert!(!CheckpointJournal::may_replace(path_str, &other_filter));
     }
 
     #[test]
@@ -430,7 +519,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let journal = make_journal(make_identity_with_filter(Some("SOURCE.size > 1000")));
-        journal.save(path_str);
+        journal.save(path_str).unwrap();
 
         let current = make_identity_with_filter(Some("SOURCE.size > 2000"));
         assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -539,7 +628,7 @@ mode = "list"
 
         let id = make_identity(Some("/"), Some(1000), None, None, Some("list"));
         let journal = make_journal(id.clone());
-        journal.save(path_str);
+        journal.save(path_str).unwrap();
 
         let loaded = CheckpointJournal::load_and_verify(path_str, &id);
         assert!(loaded.is_some());
@@ -554,7 +643,7 @@ mode = "list"
 
         let stored_id = make_identity(Some("/"), None, None, None, None);
         let journal = make_journal(stored_id);
-        journal.save(path_str);
+        journal.save(path_str).unwrap();
 
         let current_id = make_identity(Some("#"), None, None, None, None);
         let loaded = CheckpointJournal::load_and_verify(path_str, &current_id);
@@ -599,8 +688,10 @@ last_updated = "2026-01-01T00:00:00Z"
             completed_indices: vec![0, 2],
             last_updated: String::new(),
             identity: None,
+            remaining: None,
+            listed_ranges: None,
         };
-        journal.save(path_str);
+        journal.save(path_str).unwrap();
 
         let current_id = make_identity(Some("/"), None, None, None, None);
         let loaded = CheckpointJournal::load_and_verify(path_str, &current_id);

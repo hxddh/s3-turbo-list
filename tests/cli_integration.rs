@@ -2476,3 +2476,162 @@ fn test_cli_preflight_matches_run_for_probe_hints_and_local_tools() {
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("dry-run plan"));
 }
+
+#[test]
+fn test_cli_rejects_delimiter_with_hints_file() {
+    // CommonPrefixes are not bounded by a segment's range, so hint boundaries
+    // made delimiter runs drop or repeat folder rows.
+    let dir = tempfile::tempdir().unwrap();
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "b\n").unwrap();
+    let (code, _stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--delimiter",
+            "/",
+            "--hints-file",
+            hints.to_str().unwrap(),
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 2, "stderr: {}", stderr);
+    assert!(stderr.contains("--delimiter"), "stderr: {}", stderr);
+}
+
+#[test]
+fn test_dry_run_predicts_outputs_the_run_cannot_create() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("exist.parquet"), b"").unwrap();
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--output-dir",
+            "exist.parquet",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 5, "stderr: {}", stderr);
+    let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(plan["status"], "blocked");
+    // An existing explicit output is still fine, but the plan says it goes.
+    let (code, stdout, _stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--output-parquet-file",
+            "exist.parquet",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("will be overwritten"), "{}", stdout);
+}
+
+#[test]
+fn test_dry_run_plans_prefix_distinct_names_log_file_and_slash_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_for = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec!["--dry-run"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["list", "--bucket", "b", "--region", "us-east-1"]);
+        let (code, stdout, stderr) = run_cli_in_dir(&args, dir.path());
+        assert_eq!(code, 0, "stderr: {}", stderr);
+        serde_json::from_str(&stdout).unwrap()
+    };
+    // Different prefixes get different auto-generated names.
+    let a = plan_for(&["--prefix", "dir0/"]);
+    let b = plan_for(&["--prefix", "dir1/"]);
+    let name = |plan: &serde_json::Value| {
+        let path = plan["outputs"]["parquet_file"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        path.rsplit_once('_').unwrap().0.to_string()
+    };
+    assert_ne!(name(&a), name(&b));
+    // --log is named up front, inside --output-dir, and reported.
+    let logged = plan_for(&["--log", "--output-dir", "out"]);
+    assert!(
+        logged["outputs"]["log_file"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("out/turbo_list_")),
+        "{}",
+        logged["outputs"]
+    );
+    // A leading '/' matches no ordinary key; the plan says so.
+    let slashed = plan_for(&["--prefix", "/dir1/"]);
+    assert!(
+        slashed["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("Did you mean 'dir1/'")),
+        "{}",
+        slashed["warnings"]
+    );
+}
+
+#[test]
+fn test_diff_target_region_defaults_to_region() {
+    // It used to fall through to the ambient AWS_REGION, invisibly.
+    let (code, stdout, stderr) = run_cli(&[
+        "--dry-run",
+        "diff",
+        "--bucket",
+        "src",
+        "--region",
+        "us-west-2",
+        "--target-bucket",
+        "dst",
+    ]);
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(plan["inputs"]["target_region"], "us-west-2");
+}
+
+#[test]
+fn test_pre_run_failures_report_like_failed_runs() {
+    let (code, stdout, stderr) = run_cli(&[
+        "--agent",
+        "--filter",
+        "SOURCE.size >",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "us-east-1",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("s3-turbo-list: run failed (exit 2):"),
+        "stderr: {}",
+        stderr
+    );
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 2);
+}
+
+#[test]
+fn test_doctor_json_reports_an_unreadable_hints_file_as_json() {
+    let (code, stdout, _stderr) =
+        run_cli(&["--hints-file", "does-not-exist.txt", "doctor", "--json"]);
+    assert_eq!(code, 2);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["checks"][0]["name"], "hints");
+}

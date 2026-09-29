@@ -1,9 +1,10 @@
 use crate::core;
 use crate::core::{KeySpaceHints, ObjectKey, ObjectProps, S3TaskContext};
 use crate::error::*;
+use crate::list_page::{FastContentsInterceptor, ParsedPageSlot};
 use crate::trace::S3CompatEvent;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,11 @@ pub(crate) struct SegmentControl {
     probe_failures: AtomicU32,
     /// Segment gave part of its range away; checkpoint must not record it.
     was_split: AtomicBool,
+    /// Last key whose page reached the output channel (`None`: nothing yet).
+    /// Unlike `cursor` — recorded before the send, for split decisions — it
+    /// only ever covers rows the data map will write, so an interrupted run
+    /// can checkpoint "resume after this key" without losing a page.
+    sent: Mutex<Option<String>>,
 }
 
 impl SegmentControl {
@@ -100,6 +106,20 @@ impl SegmentControl {
             next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
             probe_failures: AtomicU32::new(0),
             was_split: AtomicBool::new(false),
+            sent: Mutex::new(None),
+        }
+    }
+
+    /// Every key up to `cursor` in this segment has been handed to the data
+    /// map (or filtered out): a resume may start after it.
+    fn record_sent(&self, cursor: &str) {
+        let mut guard = self.sent.lock().unwrap();
+        match guard.as_mut() {
+            Some(sent) => {
+                sent.clear();
+                sent.push_str(cursor);
+            }
+            None => *guard = Some(cursor.to_string()),
         }
     }
 
@@ -484,6 +504,10 @@ async fn flat_reactor_task(
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
     let mut set = tokio::task::JoinSet::new();
     let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+    // Where each in-flight segment started, for the resume ranges below.
+    let mut starts: HashMap<usize, String> = HashMap::new();
+    let mut unfinished: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+    let mut completed_pieces = 0usize;
     let mut pending_children: Vec<SplitRange> = Vec::new();
     // Children need indices no original segment uses: on a resume the set is
     // sparse, and a reused index would let a child's control replace its
@@ -501,7 +525,9 @@ async fn flat_reactor_task(
 
     loop {
         // Fill up to the concurrency limit: split children first, then hints.
-        while set.len() < flat_concurrency {
+        // Nothing new starts once the run is asked to stop — an interrupt
+        // during startup discovery used to be followed by a full first fill.
+        while set.len() < flat_concurrency && !ctx.is_quit() {
             let (index, start, end, checkpointable) = if let Some(child) = pending_children.pop() {
                 let index = next_child_index;
                 next_child_index += 1;
@@ -514,6 +540,7 @@ async fn flat_reactor_task(
 
             let control = Arc::new(SegmentControl::new(end));
             controls.insert(index, Arc::clone(&control));
+            starts.insert(index, start.clone());
             let task_ctx = ctx.clone();
             let start_prefix = start_prefix.to_string();
             let task_split_tx = allow_split.then(|| split_tx.clone());
@@ -556,6 +583,17 @@ async fn flat_reactor_task(
                     retired_pages += control
                         .as_ref()
                         .map_or(0, |c| c.pages.load(Ordering::Relaxed) as u64);
+                    if !outcome.completed {
+                        // An unfinished segment's range is not done; keep its
+                        // control for the resume ranges (not in `controls`,
+                        // which the split prober and governor treat as live).
+                        if let Some(control) = control.clone() {
+                            unfinished.insert(outcome.index, control);
+                        }
+                    } else {
+                        completed_pieces += 1;
+                        starts.remove(&outcome.index);
+                    }
                     if outcome.completed {
                         if outcome.checkpointable {
                             hints.finish(outcome.index);
@@ -642,12 +680,83 @@ async fn flat_reactor_task(
         // Handle global quit.
         if ctx.is_quit() {
             set.abort_all();
+            // Collect the aborted tasks so every segment's sent cursor is
+            // final before the resume ranges are computed; one that finished
+            // in the meantime has nothing left to list.
+            while let Some(joined) = set.join_next().await {
+                if let Ok(outcome) = joined
+                    && outcome.completed
+                {
+                    controls.remove(&outcome.index);
+                    starts.remove(&outcome.index);
+                    completed_pieces += 1;
+                }
+            }
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
         }
     }
 
+    controls.extend(unfinished);
+    *ctx.resume_progress.lock().unwrap() = Some(resume_progress(
+        &controls,
+        &starts,
+        pending_children,
+        &mut hints,
+        completed_pieces,
+    ));
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
+}
+
+/// The key ranges an exiting reactor leaves unwritten: in-flight or
+/// unfinished segments from their last sent key, split children not yet
+/// started, and hint segments never started. Empty when the listing finished.
+fn resume_progress(
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+    starts: &HashMap<usize, String>,
+    pending_children: Vec<SplitRange>,
+    hints: &mut core::KeySpaceHints,
+    completed_pieces: usize,
+) -> crate::checkpoint::ResumeProgress {
+    use crate::checkpoint::ResumeRange;
+    let mut remaining = Vec::new();
+    let mut ranges_with_progress = completed_pieces;
+    let mut indices: Vec<usize> = controls.keys().copied().collect();
+    indices.sort_unstable();
+    for index in indices {
+        let control = &controls[&index];
+        let sent = control.sent.lock().unwrap().clone();
+        if sent.is_some() {
+            ranges_with_progress += 1;
+        }
+        let start_after = sent.unwrap_or_else(|| starts.get(&index).cloned().unwrap_or_default());
+        let end = control.current_end();
+        // A segment whose last sent key reached its end has nothing left.
+        if end
+            .as_deref()
+            .is_some_and(|end| start_after.as_str() >= end)
+        {
+            continue;
+        }
+        remaining.push(ResumeRange { start_after, end });
+    }
+    for child in pending_children {
+        remaining.push(ResumeRange {
+            start_after: child.start,
+            end: child.end,
+        });
+    }
+    while let Some(pair) = hints.next() {
+        remaining.push(ResumeRange {
+            start_after: pair.start,
+            end: pair.end,
+        });
+    }
+    remaining.sort_by(|a, b| a.start_after.cmp(&b.start_after));
+    crate::checkpoint::ResumeProgress {
+        remaining,
+        ranges_with_progress,
+    }
 }
 
 /// Choose which in-flight segments to probe for a split this tick.  Returns
@@ -877,7 +986,7 @@ fn retry_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
     Duration::from_secs(initial_backoff_secs.saturating_mul(factor)).min(RETRY_BACKOFF_CAP)
 }
 
-// ── Single ListObjectsV2 paginator call ────────────────────
+// ── Single ListObjectsV2 continuation chain ────────────────
 
 async fn flat_list(
     ctx: &S3TaskContext,
@@ -899,10 +1008,6 @@ async fn flat_list(
     if !start_after.is_empty() {
         request = request.start_after(start_after);
     }
-    if let Some(token) = continuation_token {
-        request = request.continuation_token(token);
-    }
-
     if let Some(delim) = ctx
         .delimiter
         .as_deref()
@@ -919,7 +1024,16 @@ async fn flat_list(
         ctx.s3_bucket_name, prefix, start_after
     );
 
-    let mut stream = request.into_paginator().send();
+    // Pages are requested one at a time rather than through the SDK
+    // paginator, for two reasons.  The paginator ends the stream — which read
+    // here as "segment complete" — whenever a page carries no
+    // NextContinuationToken or repeats the one it was sent, even when the page
+    // says IsTruncated=true; a non-compliant endpoint then ended the run with
+    // exit 0 and silently short output.  And each request carries its own
+    // `FastContentsInterceptor`, which parses the page's `<Contents>` directly
+    // (see `list_page`) instead of through the SDK's per-object deserializer.
+    // Later pages keep `start_after` alongside the token, as the paginator did.
+    let mut page_token: Option<String> = continuation_token.map(str::to_string);
     let mut next_start = start_after.to_string();
     let emit_common_prefixes = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && !ctx.delimiter.as_deref().unwrap_or("").is_empty();
@@ -932,7 +1046,16 @@ async fn flat_list(
     loop {
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let page_start = Instant::now();
-        let res = timeout_at(Instant::now() + timeout_dur, stream.next()).await;
+        let mut page_request = request.clone();
+        if let Some(token) = page_token.as_deref() {
+            page_request = page_request.continuation_token(token);
+        }
+        let parsed_slot = ParsedPageSlot::default();
+        let send = page_request
+            .customize()
+            .interceptor(FastContentsInterceptor::new(parsed_slot.clone()))
+            .send();
+        let res = timeout_at(Instant::now() + timeout_dur, send).await;
         let latency_ms = page_start.elapsed().as_millis() as u64;
 
         match res {
@@ -971,34 +1094,7 @@ async fn flat_list(
                     next_start,
                 ));
             }
-            Ok(None) => {
-                // Pagination complete — emit final trace event.
-                emit_trace_compat(
-                    ctx,
-                    "ListObjectsV2",
-                    prefix,
-                    start_after,
-                    continuation_token,
-                    retry_attempt,
-                    latency_ms,
-                    200,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    Some(0),
-                    Some(0),
-                    Some(0),
-                    None,
-                    None,
-                    false,
-                    false,
-                    None,
-                );
-                break;
-            }
-            Ok(Some(Err(sdk_err))) => {
+            Ok(Err(sdk_err)) => {
                 error!("S3 API error: {:?}", sdk_err);
                 return handle_sdk_error(
                     sdk_err,
@@ -1011,14 +1107,17 @@ async fn flat_list(
                     latency_ms,
                 );
             }
-            Ok(Some(Ok(response))) => {
-                let objects = response;
+            Ok(Ok(response)) => {
+                let mut objects = response;
+                // Rows the fast path parsed; `None` means this page fell back
+                // to the SDK's own `Contents`.
+                let parsed = parsed_slot.take();
 
                 // Extract pagination metadata for trace.
-                let is_truncated = objects.is_truncated().unwrap_or(false);
+                let is_truncated_reported = objects.is_truncated();
+                let is_truncated = is_truncated_reported.unwrap_or(false);
                 let next_token = objects.next_continuation_token().map(|t| t.to_string());
                 let key_count_opt = objects.key_count();
-                let contents_count = objects.contents().len() as i32;
                 let cp_count = objects.common_prefixes().len() as i32;
                 common_prefixes_count =
                     common_prefixes_count.saturating_add(objects.common_prefixes().len());
@@ -1029,62 +1128,80 @@ async fn flat_list(
                     .map(str::to_string);
 
                 // Emit trace event for this page.
-                emit_trace_compat(
-                    ctx,
-                    "ListObjectsV2",
-                    prefix,
-                    start_after,
-                    continuation_token,
-                    retry_attempt,
-                    latency_ms,
-                    200,
-                    None,
-                    None,
-                    None,
-                    is_truncated,
-                    next_token.as_deref(),
-                    key_count_opt,
-                    Some(contents_count),
-                    Some(cp_count),
-                    objects.contents().first().and_then(|o| o.key()),
-                    objects.contents().last().and_then(|o| o.key()),
-                    false,
-                    false,
-                    None,
-                );
+                let emit_page = |contents_count: usize, first: Option<&str>, last: Option<&str>| {
+                    emit_trace_compat(
+                        ctx,
+                        "ListObjectsV2",
+                        prefix,
+                        start_after,
+                        continuation_token,
+                        retry_attempt,
+                        latency_ms,
+                        200,
+                        None,
+                        None,
+                        None,
+                        is_truncated,
+                        next_token.as_deref(),
+                        key_count_opt,
+                        Some(contents_count as i32),
+                        Some(cp_count),
+                        first,
+                        last,
+                        false,
+                        false,
+                        None,
+                    )
+                };
+                match &parsed {
+                    Some(rows) => emit_page(
+                        rows.len(),
+                        rows.first().map(|(key, _)| key.as_str()),
+                        rows.last().map(|(key, _)| key.as_str()),
+                    ),
+                    None => emit_page(
+                        objects.contents().len(),
+                        objects.contents().first().and_then(|o| o.key()),
+                        objects.contents().last().and_then(|o| o.key()),
+                    ),
+                }
 
                 // The segment boundary is re-read each page so a runtime
                 // split (which shrinks end_before) takes effect immediately.
                 let until = control.current_end();
 
-                // Consume the page contents so each key's String moves into
-                // the batch instead of being copied — zero per-object key
-                // allocation on the ingest hot path.
-                let contents = objects.contents.unwrap_or_default();
-                let mut batch: Vec<(ObjectKey, ObjectProps)> = Vec::with_capacity(contents.len());
+                // Either path moves each key's String into the batch; the
+                // fast path's rows already are the batch.
+                let mut batch: Vec<(ObjectKey, ObjectProps)> = match parsed {
+                    Some(rows) => rows,
+                    None => objects
+                        .contents
+                        .take()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|mut obj| {
+                            let key = obj.key.take()?;
+                            let props: ObjectProps = (&obj).into();
+                            Some((ObjectKey::from(key), props))
+                        })
+                        .collect(),
+                };
 
-                for mut obj in contents {
-                    let Some(obj_key) = obj.key.take() else {
-                        continue;
-                    };
-
-                    // Segment ranges are (start_after, end_before].  The next
-                    // segment starts with start_after=end_before, so excluding
-                    // equality here would drop a real object whose key equals
-                    // the boundary.
-                    if let Some(end) = until.as_deref() {
-                        if end < obj_key.as_str() {
-                            debug!("Segment boundary reached at key: {}", obj_key);
-                            is_ended = true;
-                            break;
-                        }
+                // Segment ranges are (start_after, end_before].  The next
+                // segment starts with start_after=end_before, so excluding
+                // equality here would drop a real object whose key equals
+                // the boundary.
+                if let Some(end) = until.as_deref() {
+                    if let Some(cut) = batch.iter().position(|(key, _)| end < key.as_str()) {
+                        debug!("Segment boundary reached at key: {}", batch[cut].0);
+                        batch.truncate(cut);
+                        is_ended = true;
                     }
-
-                    let mut props: ObjectProps = (&obj).into();
-                    props.set_dir(ctx.dir);
-                    batch.push((obj_key.into(), props));
-                    object_count = object_count.saturating_add(1);
                 }
+                for (_, props) in batch.iter_mut() {
+                    props.set_dir(ctx.dir);
+                }
+                object_count = object_count.saturating_add(batch.len());
 
                 // A hierarchical (--delimiter) list run exists to show what
                 // is at this level, "folders" included: emit each
@@ -1161,12 +1278,80 @@ async fn flat_list(
                         ));
                     }
                 }
+                if !next_start.is_empty() {
+                    control.record_sent(&next_start);
+                }
 
                 page_count = page_count.saturating_add(1);
 
                 if is_ended {
                     break;
                 }
+
+                // Next page, or the end of the listing.  A fresh, non-empty
+                // token continues the chain (as the paginator did, whatever
+                // IsTruncated says).  Without one the listing ends — unless
+                // the endpoint said there is more: IsTruncated=true with no
+                // usable token, or the token it was just sent handed back
+                // (not explicitly IsTruncated=false), is a truncated page that
+                // cannot be followed.  That must not pass for completion: fail
+                // the attempt at the last key seen, so the retry loop resumes
+                // with start-after — refunding the budget while it advances,
+                // failing the run if the endpoint is stuck.
+                let next_token = next_token.filter(|token| !token.is_empty());
+                let repeated = next_token.is_some() && next_token == page_token;
+                if !repeated && next_token.is_some() {
+                    page_token = next_token;
+                    continue;
+                }
+                let unfollowable = if repeated {
+                    is_truncated_reported != Some(false)
+                } else {
+                    is_truncated_reported == Some(true)
+                };
+                if unfollowable {
+                    let reason = if repeated {
+                        "repeated the continuation token it was sent"
+                    } else {
+                        "reported IsTruncated=true without a NextContinuationToken"
+                    };
+                    warn!(
+                        "Segment {}: ListObjectsV2 {}; resuming after '{}' with start-after",
+                        segment_index, reason, next_start
+                    );
+                    return Err(FlatRuntimeError::new(
+                        ERROR_S3_CLIENT_GENERIC,
+                        format!("truncated ListObjectsV2 page: endpoint {}", reason),
+                        next_start,
+                    ));
+                }
+
+                // Pagination complete — emit final trace event (the record
+                // the paginator's end of stream used to produce).
+                emit_trace_compat(
+                    ctx,
+                    "ListObjectsV2",
+                    prefix,
+                    start_after,
+                    continuation_token,
+                    retry_attempt,
+                    0,
+                    200,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                );
+                break;
             }
         }
     }

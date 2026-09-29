@@ -178,21 +178,32 @@ pub fn manifest_summary(
     // not to wherever --check happens to be invoked.
     let run_cwd = json_string(&value, "cwd").filter(|dir| !dir.is_empty());
     let manifest_dir = Path::new(path).parent().map(Path::to_path_buf);
+    // First existing candidate wins: the run's working directory, then the
+    // current directory, then the manifest's own directory (a run directory
+    // copied or moved elsewhere). The cwd candidate used to be returned
+    // unconditionally, so a moved run failed every artifact check.
     let resolve = |artifact_path: &str| -> String {
         let p = Path::new(artifact_path);
         if artifact_path.is_empty() || p.is_absolute() {
             return artifact_path.to_string();
         }
+        let mut candidates = Vec::new();
         if let Some(cwd) = run_cwd.as_deref() {
-            return Path::new(cwd).join(p).display().to_string();
+            candidates.push(Path::new(cwd).join(p));
         }
-        if p.exists() {
-            return artifact_path.to_string();
+        candidates.push(p.to_path_buf());
+        if let Some(dir) = manifest_dir
+            .as_deref()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            candidates.push(dir.join(p));
         }
-        match manifest_dir.as_deref() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.join(p).display().to_string(),
-            _ => artifact_path.to_string(),
-        }
+        candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .unwrap_or(&candidates[0])
+            .display()
+            .to_string()
     };
     let artifacts: Vec<ManifestArtifactSummary> = value
         .get("artifacts")
@@ -349,9 +360,24 @@ fn manifest_check_summary(
         row_check: manifest_check_status(checks, "parquet_rows_match_streamed_rows"),
         // One entry per Parquet artifact (a pooled run writes several), so the
         // summary reports the worst of them rather than whichever came first.
-        parquet_schema_check: manifest_check_worst(checks, "artifact_parquet_schema:parquet"),
+        // A missing or unreadable Parquet artifact has no schema to compare;
+        // that is a failure of this check, not "not applicable".
+        parquet_schema_check: worst_status(
+            manifest_check_worst(checks, "artifact_parquet_schema:parquet"),
+            manifest_check_worst(checks, "artifact_parquet_metadata:parquet"),
+        ),
         exit_code_check: manifest_check_status(checks, "exit_code"),
     }
+}
+
+fn worst_status(a: String, b: String) -> String {
+    let rank = |s: &str| match s {
+        "fail" => 3,
+        "warn" => 2,
+        "ok" => 1,
+        _ => 0,
+    };
+    if rank(&b) > rank(&a) { b } else { a }
 }
 
 /// Worst status across `name` and its `name#N` siblings: `fail` beats `warn`
@@ -528,6 +554,17 @@ fn manifest_checks(
             ),
         });
 
+        if verify_artifacts && !current_exists && artifact.kind == "parquet" {
+            // Nothing to compare the recorded schema against.
+            checks.push(ManifestCheck {
+                name: format!("artifact_parquet_metadata:{}", label),
+                status: "fail".to_string(),
+                message: format!(
+                    "{} is missing; its schema cannot be verified",
+                    artifact.path
+                ),
+            });
+        }
         if !verify_artifacts || !current_exists {
             continue;
         }
@@ -675,7 +712,10 @@ pub fn render_init_config_text(report: &InitConfigReport) -> String {
     out.push_str(" doctor --simple\n");
     out.push_str("  s3-turbo-list --dry-run --agent --config ");
     out.push_str(&report.output);
-    out.push_str(" --output-dir out --delimiter '' list --bucket my-bucket --region us-east-1\n");
+    out.push_str(&format!(
+        " --output-dir out --delimiter '' list --bucket my-bucket --region {}\n",
+        crate::profiles::example_region(&report.profile)
+    ));
     append_warnings_and_recommendations(&mut out, &report.warnings, &[]);
     out
 }
@@ -694,7 +734,24 @@ pub fn render_manifest_summary_text(report: &ManifestSummaryReport) -> String {
     if let Some(format) = &report.output_format {
         out.push_str(&format!("  Output format: {}\n", format));
     }
-    out.push_str(&format!("  Objects:      {}\n", report.streamed_rows));
+    // streamed_rows counts every row written, which for a --delimiter run
+    // includes one row per folder (CommonPrefix) — not objects.
+    let delimited = report
+        .command
+        .windows(2)
+        .any(|pair| pair[0] == "--delimiter" && !pair[1].is_empty())
+        || report.command.iter().any(|arg| {
+            arg.strip_prefix("--delimiter=")
+                .is_some_and(|v| !v.is_empty())
+        });
+    if delimited {
+        out.push_str(&format!(
+            "  Rows:         {} (objects and folders)\n",
+            report.streamed_rows
+        ));
+    } else {
+        out.push_str(&format!("  Objects:      {}\n", report.streamed_rows));
+    }
     out.push_str(&format!(
         "  Bytes:        {} ({})\n",
         report.bytes_total,

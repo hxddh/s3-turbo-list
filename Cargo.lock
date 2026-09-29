@@ -2765,7 +2765,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3-turbo-list"
-version = "0.35.1"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2775,6 +2775,8 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
@@ -2787,9 +2789,11 @@ dependencies = [
  "futures",
  "hex",
  "http 1.5.0",
+ "http-body 1.1.0",
  "hyper-util",
  "itoa",
  "log",
+ "memchr",
  "parquet",
  "serde",
  "serde_json",

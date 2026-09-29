@@ -141,12 +141,16 @@ impl MockS3Server {
                         let concurrency = Arc::clone(&thread_concurrency);
                         let panic_slot = Arc::clone(&thread_panic);
                         workers.push(thread::spawn(move || {
-                            concurrency.enter();
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    handle_connection(stream, seq, &requests, handler.as_ref())
+                                    handle_connection(
+                                        stream,
+                                        seq,
+                                        &requests,
+                                        handler.as_ref(),
+                                        &concurrency,
+                                    )
                                 }));
-                            concurrency.leave();
                             if let Err(payload) = result {
                                 let message = payload
                                     .downcast_ref::<&str>()
@@ -218,6 +222,7 @@ fn handle_connection(
     sequence: usize,
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
     handler: &(dyn Fn(RecordedRequest, usize) -> MockResponse + Send + Sync),
+    concurrency: &ServedConcurrency,
 ) {
     // The listener is non-blocking, and on macOS (BSD) an accepted socket
     // inherits O_NONBLOCK. A read that raced ahead of the client's bytes then
@@ -230,7 +235,13 @@ fn handle_connection(
         return;
     };
     requests.lock().unwrap().push(request.clone());
+    // Count a request as in flight only while its response is being
+    // produced. Counting the whole connection thread let a strictly serial
+    // client overlap itself: it sends the next request as soon as it has the
+    // previous response, possibly before that connection's thread returned.
+    concurrency.enter();
     let response = handler(request, sequence);
+    concurrency.leave();
     if response.drop_connection {
         let _ = stream.shutdown(std::net::Shutdown::Both);
         return;
@@ -5094,6 +5105,331 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
     let keys: Vec<&str> = rows.iter().map(|r| r["k"].as_str().unwrap()).collect();
     assert_eq!(keys, vec!["dir0/", "dir1/", "dir2/"]);
     assert!(rows.iter().all(|r| r["s"] == 0 && r["m"] == 0));
+
+    // `--filter` selects objects, not folders: a size predicate must not
+    // drop the folder rows (Size 0) and bring the empty listing back.
+    let mut filtered = vec!["--filter".to_string(), "SOURCE.size > 0".to_string()];
+    filtered.extend(args.iter().cloned());
+    let (code, stdout, stderr) = run_cli(&filtered, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(stdout.lines().count(), 3, "stdout: {}", stdout);
+}
+
+#[test]
+fn local_mock_manifest_check_follows_a_moved_run_directory() {
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["a/1.txt", "b/2.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let run_dir = root.path().join("run1");
+    std::fs::create_dir(&run_dir).unwrap();
+    let config = run_dir.join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "--output-parquet-file",
+        "out.parquet",
+        "--output-ks-file",
+        "out.ks",
+        "--run-manifest",
+        "run.json",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, _stdout, stderr) = run_cli(&args, &run_dir);
+    assert_eq!(code, 0, "stderr: {}", stderr);
+
+    // The run directory moves; the manifest's recorded cwd no longer exists.
+    let moved = root.path().join("moved");
+    std::fs::rename(&run_dir, &moved).unwrap();
+    let check: Vec<String> = ["manifest-summary", "run.json", "--check", "--json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (code, stdout, stderr) = run_cli(&check, &moved);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["check"]["parquet_schema_check"], "ok");
+
+    // A missing Parquet artifact fails the schema check rather than reading
+    // "not applicable".
+    std::fs::remove_file(moved.join("out.parquet")).unwrap();
+    let (code, stdout, _stderr) = run_cli(&check, &moved);
+    assert_eq!(code, 6);
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["check"]["parquet_schema_check"], "fail");
+}
+
+#[test]
+fn local_mock_diff_side_access_denied_exits_3_with_the_s3_reason() {
+    // A side's AccessDenied aborts the merge; that used to be counted as an
+    // output failure, so the run exited 5 "an output write failed".
+    let server = MockS3Server::start(|request, _sequence| {
+        if request.path.starts_with("/dst") {
+            MockResponse::error(403, "AccessDenied", "Access Denied")
+        } else {
+            MockResponse::ok_xml(list_bucket_xml(
+                "",
+                1000,
+                &["a/1.txt", "b/2.txt"],
+                &[],
+                false,
+                None,
+            ))
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "--output-parquet-file",
+        "diff.parquet",
+        "diff",
+        "--bucket",
+        "src",
+        "--region",
+        "us-east-1",
+        "--target-bucket",
+        "dst",
+        "--target-region",
+        "us-east-1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("AccessDenied"), "stderr: {}", stderr);
+    assert!(!dir.path().join("diff.parquet").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
+    // The checkpoint used to record only whole, unsplit segments, while an
+    // interrupt still wrote the rows of partly listed ones — so `--resume`
+    // listed those again from their start and the documented "combine both
+    // outputs" produced duplicates. It now records the unwritten ranges.
+    let keys: Vec<String> = (0..6000).map(|i| format!("k{:05}", i)).collect();
+    let served = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        thread::sleep(Duration::from_millis(40));
+        let after = request
+            .query
+            .get("continuation-token")
+            .or_else(|| request.query.get("start-after"))
+            .cloned()
+            .unwrap_or_default();
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let page: Vec<&str> = served
+            .iter()
+            .filter(|k| k.as_str() > after.as_str())
+            .take(max_keys + 1)
+            .map(String::as_str)
+            .collect();
+        let truncated = page.len() > max_keys;
+        let page = &page[..page.len().min(max_keys)];
+        let token = truncated.then(|| page.last().unwrap().to_string());
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            max_keys as i32,
+            page,
+            &[],
+            truncated,
+            token.as_deref(),
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "k01500\nk03000\nk04500\n").unwrap();
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--resume",
+        "--max-keys",
+        "50",
+        "-c",
+        "4",
+        "--hints-file",
+        hints.to_str().unwrap(),
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "tsv",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    let child = command
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Interrupt once the listing is well under way (not on a timer, which a
+    // slow CI runner could hit before any page or a fast one after the last).
+    let waited = std::time::Instant::now();
+    while server.requests().len() < 20 && waited.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let first = child.wait_with_output().unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_rows = String::from_utf8(first.stdout).unwrap();
+    assert!(
+        first_rows.lines().count() < keys.len(),
+        "the first run must be interrupted mid-listing"
+    );
+
+    let (code, second_rows, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    // The partial-output warning reaches stderr, not only the manifest.
+    assert!(
+        stderr.contains("Resuming from checkpoint"),
+        "stderr: {}",
+        stderr
+    );
+
+    let mut listed: Vec<&str> = first_rows
+        .lines()
+        .chain(second_rows.lines())
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    let total = listed.len();
+    listed.sort_unstable();
+    listed.dedup();
+    assert_eq!(total, listed.len(), "resume produced duplicate rows");
+    assert_eq!(listed, keys.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
+    // Every probe is slow and the key space looks flat and endless, so
+    // startup discovery would run dozens of probe rounds. An interrupt used
+    // to be ignored until discovery finished (a minute here) and was then
+    // followed by a full first fill of segment tasks.
+    let server = MockS3Server::start(|_request, _sequence| {
+        thread::sleep(Duration::from_millis(1500));
+        MockResponse::ok_xml(list_bucket_xml("", 1, &["k0000"], &[], true, Some("t1")))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    let mut child = command
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--endpoint-url",
+            &server.endpoint(),
+            "--addressing-style",
+            "path",
+            "--summary-only",
+            "list",
+            "--bucket",
+            "mock-bucket",
+            "--region",
+            "us-east-1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("run did not stop within 20s of SIGINT");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, Some(7));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let cached: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_hints.toml"))
+        .collect();
+    assert!(
+        cached.is_empty(),
+        "interrupted discovery must not cache boundaries"
+    );
 }
 
 #[test]
@@ -5271,4 +5607,125 @@ fn local_mock_doctor_skips_the_proxy_check_when_the_host_depends_on_the_bucket()
             .expect("proxy check");
         assert_eq!(check["status"], "skipped", "{}", check);
     }
+}
+
+// ── Truncated pages without a followable token ─────────────
+//
+// A page that says IsTruncated=true but gives no usable NextContinuationToken,
+// or hands back the token it was just sent, is not the end of the listing.
+// The SDK paginator used to end the stream there, and the run exited 0 with
+// the rest of the range silently missing. Such a page now fails the attempt
+// at the last key seen, so the retry loop resumes with start-after.
+
+const GUARD_KEYS: [&str; 6] = ["k1", "k2", "k3", "k4", "k5", "k6"];
+
+/// Keys after `start_after`, at most two per page, and whether more remain.
+fn guard_page(start_after: Option<&str>) -> (Vec<&'static str>, bool) {
+    let rest: Vec<&str> = GUARD_KEYS
+        .iter()
+        .copied()
+        .filter(|key| start_after.is_none_or(|after| *key > after))
+        .collect();
+    let page: Vec<&str> = rest.iter().copied().take(2).collect();
+    (page, rest.len() > 2)
+}
+
+fn guard_list_args(server: &MockS3Server, dir: &std::path::Path) -> Vec<String> {
+    let config = dir.join("config.toml");
+    write_fast_config(&config);
+    vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--output-parquet-file".into(),
+        dir.join("out.parquet").display().to_string(),
+        "--output-ks-file".into(),
+        dir.join("out.ks").display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ]
+}
+
+#[test]
+fn local_mock_truncated_page_without_token_resumes_with_start_after() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert!(!request.query.contains_key("continuation-token"));
+        let (page, more) = guard_page(request.query.get("start-after").map(String::as_str));
+        // IsTruncated=true while keys remain, but never a token.
+        MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&dir.path().join("out.parquet")), GUARD_KEYS);
+
+    let start_afters: Vec<Option<String>> = server
+        .requests()
+        .iter()
+        .map(|r| r.query.get("start-after").cloned())
+        .collect();
+    assert_eq!(
+        start_afters,
+        vec![None, Some("k2".to_string()), Some("k4".to_string())]
+    );
+}
+
+#[test]
+fn local_mock_repeated_continuation_token_resumes_with_start_after() {
+    let server = MockS3Server::start(|request, _sequence| {
+        match request.query.get("continuation-token").map(String::as_str) {
+            // The first page hands out a token; following it returns the
+            // next page but repeats the same token, still truncated.
+            Some("t1") => {
+                let (page, more) = guard_page(Some("k2"));
+                MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, Some("t1")))
+            }
+            Some(other) => MockResponse::error(400, "InvalidToken", other),
+            None => {
+                let start_after = request.query.get("start-after").map(String::as_str);
+                let (page, more) = guard_page(start_after);
+                let token = (start_after.is_none() && more).then_some("t1");
+                MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, token))
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // Previously 4 of 6: the paginator stopped at the repeated token.
+    assert_eq!(parquet_keys(&dir.path().join("out.parquet")), GUARD_KEYS);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.query.get("start-after").map(String::as_str) == Some("k4")),
+        "the retry must resume after the last key listed: {:#?}",
+        server.requests()
+    );
+}
+
+#[test]
+fn local_mock_truncated_page_that_never_advances_fails_the_run() {
+    let requests_served = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&requests_served);
+    let server = MockS3Server::start(move |_request, _sequence| {
+        served.fetch_add(1, Ordering::SeqCst);
+        // Ignores start-after: always the first page, truncated, no token.
+        MockResponse::ok_xml(list_bucket_xml("", 2, &["k1", "k2"], &[], true, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // One advancing attempt, then max_attempts (3) that make no progress.
+    assert_eq!(requests_served.load(Ordering::SeqCst), 4);
 }

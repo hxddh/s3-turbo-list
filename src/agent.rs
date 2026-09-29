@@ -225,6 +225,9 @@ pub struct CheckpointPlan {
     pub identity_mismatches: Vec<String>,
     pub completed_segments: Option<usize>,
     pub total_segments: Option<usize>,
+    /// Key ranges a resume would list (checkpoints written by 0.36+, which
+    /// record the unwritten key space instead of completed segment indices).
+    pub remaining_ranges: Option<usize>,
     pub identity_fields: Vec<String>,
     /// Segments this run skipped because a checkpoint recorded them complete.
     /// `None` when the run did not resume; `Some(n)` with `n > 0` means the
@@ -612,6 +615,7 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
         identity_mismatches: Vec::new(),
         completed_segments: None,
         total_segments: None,
+        remaining_ranges: None,
         identity_fields: vec![
             "bucket".to_string(),
             "region".to_string(),
@@ -651,6 +655,7 @@ pub fn checkpoint_plan(
             plan.valid = Some(true);
             plan.completed_segments = Some(journal.completed_indices.len());
             plan.total_segments = Some(journal.total_segments);
+            plan.remaining_ranges = journal.remaining.as_ref().map(Vec::len);
             if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
                 let mismatches = stored.diff(current);
                 plan.identity_matches = Some(mismatches.is_empty());
@@ -688,6 +693,46 @@ pub fn output_conflicts(outputs: &OutputPathSummary) -> Vec<FileConflict> {
         parent_writable: output_parent(path).and_then(parent_writable),
     })
     .collect()
+}
+
+/// Why the real run could not create an output file at `path`, if it could
+/// not: the path is a directory, or its nearest existing ancestor is a file or
+/// a read-only directory (e.g. `--output-dir` pointing at an existing file, or
+/// a path under /proc). Checked without touching the filesystem, so a dry run
+/// predicts the exit-5 the run would hit when creating the file.
+pub fn output_path_problem(path: &str) -> Option<String> {
+    let target = Path::new(path);
+    if target.is_dir() {
+        return Some(format!("'{}' is a directory", path));
+    }
+    // An existing target is opened in place, so its own permissions decide,
+    // not its directory's: `/dev/null` is writable although macOS's `/dev`
+    // is mode 555.
+    if let Ok(meta) = std::fs::metadata(target) {
+        return meta
+            .permissions()
+            .readonly()
+            .then(|| format!("'{}' is read-only", path));
+    }
+    let mut ancestor = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    loop {
+        match std::fs::metadata(ancestor) {
+            Ok(meta) if !meta.is_dir() => {
+                return Some(format!(
+                    "'{}' exists and is not a directory",
+                    ancestor.display()
+                ));
+            }
+            Ok(meta) if meta.permissions().readonly() => {
+                return Some(format!("directory '{}' is read-only", ancestor.display()));
+            }
+            Ok(_) => return None,
+            Err(_) => ancestor = ancestor.parent().filter(|p| !p.as_os_str().is_empty())?,
+        }
+    }
 }
 
 fn output_parent(path: &str) -> Option<PathBuf> {
@@ -1379,5 +1424,25 @@ mod tests {
         let args = redact_command_args(["s3-turbo-list", "list", "--continuation-token"]);
 
         assert_eq!(args, vec!["s3-turbo-list", "list", "--continuation-token"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_path_problem_judges_an_existing_target_by_its_own_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let existing = ro.join("out.ks");
+        std::fs::write(&existing, b"").unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Opened in place: the read-only directory does not matter (macOS /dev).
+        assert_eq!(super::output_path_problem(existing.to_str().unwrap()), None);
+        // A new file still needs a writable directory.
+        let fresh = ro.join("new.ks");
+        assert!(super::output_path_problem(fresh.to_str().unwrap()).is_some());
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(super::output_path_problem(existing.to_str().unwrap()).is_some());
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

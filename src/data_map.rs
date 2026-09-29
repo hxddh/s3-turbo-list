@@ -831,6 +831,11 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     let mut out = Vec::with_capacity(batch.len().saturating_mul(96).min(1024 * 1024));
     let mut folder = PrefixRunFolder::default();
+    // Counted into `stats` only once the batch is written: a reader that
+    // closed the pipe (`| head`) used to leave the manifest claiming the
+    // rows of the batch that failed to write.
+    let mut rows = 0usize;
+    let mut bytes = 0u64;
 
     for (key, props) in batch {
         if !props.include_in_list_output() {
@@ -840,8 +845,8 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         if !props.is_common_prefix() {
             folder.add(prefix_stats, key.prefix(), props.size());
         }
-        stats.streamed_rows += 1;
-        stats.bytes_total = stats.bytes_total.saturating_add(props.size());
+        rows += 1;
+        bytes = bytes.saturating_add(props.size());
 
         if let Err(e) = render_text_row(
             &mut out,
@@ -870,6 +875,8 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     }
 
+    stats.streamed_rows += rows;
+    stats.bytes_total = stats.bytes_total.saturating_add(bytes);
     true
 }
 
@@ -948,15 +955,6 @@ fn tsv_escape(value: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(escaped)
-}
-
-fn record_prefix_stat(prefix_stats: &mut PrefixStats, prefix: &str, size: u64) {
-    let entry = match prefix_stats.get_mut(prefix) {
-        Some(entry) => entry,
-        None => prefix_stats.entry(prefix.to_string()).or_default(),
-    };
-    entry.objects += 1;
-    entry.bytes = entry.bytes.saturating_add(size);
 }
 
 /// Prefix accounting that coalesces runs of equal prefixes. Listing batches
@@ -1297,6 +1295,9 @@ impl DiffSideStream {
 struct DiffRowSink {
     buf: Vec<(ObjectKey, ObjectProps, u8)>,
     prefix_stats: PrefixStats,
+    // Merged rows arrive in key order, so consecutive rows share a prefix:
+    // fold runs instead of a hash lookup per row, as the list paths do.
+    prefix_run: PrefixRunFolder,
     rows: usize,
     plus: usize,
     minus: usize,
@@ -1319,6 +1320,7 @@ impl DiffRowSink {
         Self {
             buf: Vec::new(),
             prefix_stats: PrefixStats::default(),
+            prefix_run: PrefixRunFolder::default(),
             rows: 0,
             plus: 0,
             minus: 0,
@@ -1344,7 +1346,8 @@ impl DiffRowSink {
         // Prefix stats (KS file, bytes_total, unique/top prefixes) describe
         // the rows written — as in list mode — not filter-ignored pairs, so
         // the manifest's metrics agree with the Parquet artifact.
-        record_prefix_stat(&mut self.prefix_stats, key.prefix(), props.size());
+        self.prefix_run
+            .add(&mut self.prefix_stats, key.prefix(), props.size());
         self.rows += 1;
         self.buf.push((key, props, flag));
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
@@ -1358,6 +1361,7 @@ impl DiffRowSink {
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     ) -> Result<(), String> {
+        self.prefix_run.flush(&mut self.prefix_stats);
         if !self.buf.is_empty() {
             let batch = std::mem::take(&mut self.buf);
             send_to_writer(writer_tx, batch).await?;
@@ -1595,7 +1599,7 @@ pub async fn data_map_task_diff_streaming(
     let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
         buf_writer,
-        filename_ks,
+        filename_output,
         output_config.row_group_size,
         &output_config.compression,
         output_config.compression_level,
@@ -1608,7 +1612,17 @@ pub async fn data_map_task_diff_streaming(
         Ok(outcome) => Some(outcome),
         Err(e) => {
             log::error!("Diff merge failed: {}", e);
-            output_ok = false;
+            // A merge stopped because the run is quitting — a side failed
+            // (AccessDenied, retries exhausted) or the run was interrupted —
+            // is explained by that fatal error or interrupt; counting it as an
+            // output failure made a side's AccessDenied exit 5 "output write
+            // failed" instead of 3 with the S3 reason. Anything else (an
+            // ordering violation, a write error) is an output failure with
+            // this message as its reason.
+            if !g_state.is_quit() {
+                g_state.note_output_error(format!("diff merge failed: {}", e));
+                output_ok = false;
+            }
             None
         }
     };
@@ -1619,6 +1633,7 @@ pub async fn data_map_task_diff_streaming(
             Ok(count) => count,
             Err(e) => {
                 log::error!("{}", e);
+                g_state.note_output_error(format!("{}: {}", filename_ks, e));
                 output_ok = false;
                 0
             }

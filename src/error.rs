@@ -295,8 +295,16 @@ pub fn service_error_errno(code: Option<&str>, http_status: u16) -> u8 {
     match s3_error_code_to_errno(code) {
         ERROR_UNKNOWN => match http_status {
             429 => ERROR_TOO_MANY_REQUESTS,
-            503 => ERROR_SERVICE_UNAVAILABLE,
-            500 | 502 | 504 => ERROR_INTERNAL_ERROR,
+            // 408 (request timeout) and 503 come from the endpoint or a proxy
+            // in front of it and pass on retry.
+            408 | 503 => ERROR_SERVICE_UNAVAILABLE,
+            // 501/505 say the request itself is unsupported; retrying cannot
+            // help. Every other 5xx without an S3 code — 500/502/504, 507, and
+            // the CDN range 520-524 in front of R2 or MinIO — is a
+            // server-side failure worth retrying, not a reason to end the run
+            // on first sight.
+            501 | 505 => ERROR_UNKNOWN,
+            500..=599 => ERROR_INTERNAL_ERROR,
             _ => ERROR_UNKNOWN,
         },
         errno => errno,
@@ -325,8 +333,11 @@ mod tests {
             ERROR_TOO_MANY_REQUESTS
         );
         assert!(is_throttle(service_error_errno(None, 429)));
-        for status in [500, 502, 503, 504] {
-            assert!(is_retryable(service_error_errno(None, status)));
+        for status in [408, 500, 502, 503, 504, 507, 520, 522, 524] {
+            assert!(is_retryable(service_error_errno(None, status)), "{status}");
+        }
+        for status in [501, 505] {
+            assert!(!is_retryable(service_error_errno(None, status)), "{status}");
         }
         // Anything else stays unknown and fatal.
         assert_eq!(service_error_errno(Some("Weird"), 400), ERROR_UNKNOWN);

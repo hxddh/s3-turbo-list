@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-09-29
+
+### Performance
+- **ListObjectsV2 pages are parsed directly.** About 80% of listing CPU was
+  the AWS SDK deserializing each page's `<Contents>` (plus a second pass it
+  makes to check for an error document). The listing path now parses the
+  Contents elements itself in one forward pass and hands the SDK the page
+  without them; signing, errors, pagination tokens and CommonPrefixes stay
+  with the SDK. Anything unusual in a page (CDATA, comments, namespaces,
+  unknown entities, values the SDK would reject, …) falls back to the SDK
+  for that page. Output is byte-identical. On a local 1M-object benchmark:
+  CPU 9.1 s → 3.1 s, wall 2.9 s → 1.1 s. See
+  `docs/validation-results/listobjectsv2-fast-contents-parser-20260929.md`.
+
+### Changed
+- **Resume lists exactly the unwritten key ranges.** Checkpoints record the
+  ranges not yet written — each unfinished segment, including runtime-split
+  ones, cut at its last key whose rows reached the output — and `--resume`
+  lists those ranges and nothing else. An interrupted run's output and its
+  resumed run's output now hold every key exactly once; before, partly listed
+  and split segments were listed again from their start and the combined
+  output carried duplicates. `checkpoint.resumed_segments_skipped` counts the
+  ranges earlier runs listed, and the dry-run plan reports
+  `checkpoint.remaining_ranges`. Checkpoints written by older versions are
+  still honoured.
+- **Auto-generated output names include a hash of `--prefix`**, and a name
+  already taken gets a `_N` suffix: parallel runs over different prefixes
+  started in the same second wrote the same file and both reported success.
+- **`diff` without `--target-region` lists the target in `--region`**
+  instead of the ambient `AWS_REGION`, and the plan shows it.
+- **`--delimiter` with `--hints-file` is rejected** (exit 2): folder rows are
+  not bounded by a segment's range, so hint boundaries dropped or repeated
+  them.
+- **`--log` writes its file into `--output-dir`** when one is given, and the
+  plan and manifest report it (it was written to the working directory and
+  reported nowhere).
+- `--summary-only` and `manifest-summary` label `--delimiter` counts as rows
+  (objects and folders).
+
+### Fixed
+- **A truncated page without a usable continuation token no longer ends a
+  segment as complete.** The SDK paginator stopped quietly when an endpoint
+  sent `IsTruncated=true` with no token, or repeated the token it was sent, and
+  the run exited 0 with part of the listing. Such a page now retries from the
+  last key seen; an endpoint that never advances exhausts the retry budget
+  and fails the run.
+- **Malformed ETags are "not available"** instead of a partly decoded digest
+  that two different values could share (diff called them equal); a bad
+  multipart part count no longer reads as a single-part ETag.
+- LastModified before 1970 (Go-based stores' zero time) clamps to 0 instead of
+  wrapping to ~1.8e19, which made every `last_modified` filter keep all rows.
+- `--filter` no longer drops `--delimiter` folder rows.
+- A diff side's `AccessDenied` or retry exhaustion exits 3 / 4 with the S3
+  reason, not 5 "an output write failed"; real diff write and KS failures
+  state their reason.
+- Ctrl-C / SIGTERM during startup discovery stops the run at once (it waited
+  out every probe round) without caching half-discovered boundaries.
+- A codeless 408 or 5xx (other than 501/505) is retried instead of ending the
+  run on first sight — e.g. a CDN's 520-524 in front of R2 or MinIO.
+- Hints caches are sorted and deduplicated on every path, and an empty TOML
+  boundary is an error; either used to overlap segments and list keys twice.
+- The resumed-run "output covers only the rest of the key space" warning is
+  printed on stderr (it only reached the manifest), and is computed after the
+  checkpoint is verified — a discarded checkpoint no longer claims a resume.
+- A checkpoint of another job that shares the file name (same bucket, region
+  and prefix; another endpoint, filter or page size) is never removed or
+  overwritten; a failed checkpoint write is reported, and the interrupted exit
+  line says whether a checkpoint was saved.
+- The dry run predicts outputs the run cannot create (`blocked`, exit 5) and
+  warns about files it would overwrite; a `--prefix` starting with `/` gets a
+  warning.
+- Run commands that stop before listing print the standard
+  `s3-turbo-list: run failed (exit N): …` line and, under `--agent`, a JSON
+  result; `doctor --json` reports an unreadable `--hints-file` as JSON.
+- `manifest-summary --check` falls back to the current and manifest
+  directories when the run directory moved, and a missing Parquet artifact
+  fails the schema check instead of reading "not applicable".
+- `init-config`'s example command uses a real region for bos, r2, b2 and oss;
+  stdout rows are counted only once written.
+
 ## [0.35.1] - 2026-09-29
 
 ### Internal
