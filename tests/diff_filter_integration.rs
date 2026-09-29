@@ -16,7 +16,7 @@ use s3_turbo_list::core::{
     ObjectKey, ObjectProps, RunMode, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
     S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
 };
-use s3_turbo_list::data_map::{run_diff_merge, DiffMergeOutcome, DiffStreamSides};
+use s3_turbo_list::data_map::{DiffMergeOutcome, DiffStreamSides, run_diff_merge};
 use s3_turbo_list::utils::AsyncParquetOutput;
 
 type Batch = Vec<(ObjectKey, ObjectProps)>;

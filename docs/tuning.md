@@ -184,7 +184,11 @@ whether the 200 response is really an `<Error>` document, and that check
 UTF-8-validates and tokenizes the whole page a second time.  It is well under a
 page's network round-trip, so it only shows on an unthrottled local store, and
 avoiding it would mean replacing the SDK's response parser, which this project
-does not do.
+does not do.  The SDK is moving services to a new schema-based deserializer that
+does not make this pass; as of `aws-sdk-s3` 1.150 S3 is not yet on it (its
+generated `ListObjectsV2ResponseDeserializer` still calls
+`rest_xml_unwrapped_errors::body_is_error`).  Check that call when upgrading the
+SDK: once it is gone, the extra pass is gone with no change here.
 Streaming TSV/NDJSON to stdout and `diff` output stay single-writer by nature
 (one pipe / one file).  TSV/NDJSON rows arrive in segment-completion order, not
 key order; sort downstream if order matters.  Diff Parquet output is in key

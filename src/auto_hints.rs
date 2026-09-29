@@ -431,8 +431,8 @@ estimate_mode = "structural"
 
     #[tokio::test]
     async fn test_flat_boundaries_probe_waves_run_concurrently() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let keys: Vec<String> = (0..200).map(|i| format!("key{:04}", i)).collect();
         let in_flight = Arc::new(AtomicUsize::new(0));

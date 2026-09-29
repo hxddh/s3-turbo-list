@@ -253,7 +253,9 @@ fn test_cli_guide_local_only() {
     assert!(stdout.contains("cargo clippy --all-targets -- -D warnings"));
     assert!(stdout.contains("BUILD_MODE=clang"));
     assert!(stdout.contains("Benchmark smoke checks"));
-    assert!(stdout.contains("OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh"));
+    assert!(
+        stdout.contains("OBJECTS=1000 BATCH_SIZE=100 PREFIXES=16 ./scripts/benchmark-local.sh")
+    );
     assert!(stdout.contains("BIN=./target/release/s3-turbo-list"));
     assert!(stdout.contains("gh workflow run release-assets.yml"));
     assert!(stdout.contains("./scripts/verify-release-assets.sh"));
@@ -343,9 +345,11 @@ fn test_cli_doctor_json_local_only_success() {
     assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
     assert_eq!(json["status"], "ok");
     let checks = json["checks"].as_array().unwrap();
-    assert!(checks
-        .iter()
-        .any(|check| check["name"] == "network" && check["status"] == "skipped"));
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "network" && check["status"] == "skipped")
+    );
 }
 
 #[test]
@@ -616,10 +620,12 @@ fn test_cli_doctor_reports_zstd_default_no_cloud() {
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["resolved_config"]["output"]["compression"], "zstd");
     assert_eq!(json["resolved_config"]["output"]["compression_level"], 1);
-    assert!(!json["config_source"]["searched"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !json["config_source"]["searched"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         json["config_source"]["cli_overrides"]
             .as_array()
@@ -700,10 +706,12 @@ fn test_cli_doctor_rejects_missing_explicit_config_no_cloud() {
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["status"], "error");
     assert_eq!(json["checks"][0]["name"], "config_parse");
-    assert!(json["checks"][0]["message"]
-        .as_str()
-        .unwrap()
-        .contains("was not found"));
+    assert!(
+        json["checks"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("was not found")
+    );
 }
 
 #[test]
@@ -1166,14 +1174,16 @@ fn test_cli_dry_run_output_format_ndjson_plans_no_output_artifacts() {
     assert_eq!(json["outputs"]["ks_file"], serde_json::Value::Null);
     assert!(json["file_conflicts"].as_array().unwrap().is_empty());
     let warnings = json["warnings"].as_array().unwrap();
-    assert!(warnings.iter().any(|item| item
-        .as_str()
-        .unwrap()
-        .contains("--output-format tsv/ndjson streams list rows to stdout")));
-    assert!(warnings.iter().any(|item| item
-        .as_str()
-        .unwrap()
-        .contains("output path flags are ignored")));
+    assert!(warnings.iter().any(|item| {
+        item.as_str()
+            .unwrap()
+            .contains("--output-format tsv/ndjson streams list rows to stdout")
+    }));
+    assert!(warnings.iter().any(|item| {
+        item.as_str()
+            .unwrap()
+            .contains("output path flags are ignored")
+    }));
 }
 
 #[test]
@@ -1193,16 +1203,20 @@ fn test_cli_dry_run_continuation_token_is_single_chain_list() {
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["inputs"]["continuation_token"], "token-123");
-    assert!(json["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| { item.as_str().unwrap().contains("--continuation-token") }));
-    assert!(!json["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| { item.as_str().unwrap().contains("token-123") }));
+    assert!(
+        json["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item.as_str().unwrap().contains("--continuation-token") })
+    );
+    assert!(
+        !json["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item.as_str().unwrap().contains("token-123") })
+    );
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -1784,16 +1798,18 @@ estimate_mode = "full"
     assert_eq!(json["hints"]["source"], "diff_per_side_automatic");
     assert_eq!(json["hints"]["exists"], true);
     assert_eq!(json["hints"]["boundary_count"], 1);
-    assert!(json["hints"]["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| {
-            warning
-                .as_str()
-                .unwrap()
-                .contains("partitions each side automatically")
-        }));
+    assert!(
+        json["hints"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning
+                    .as_str()
+                    .unwrap()
+                    .contains("partitions each side automatically")
+            })
+    );
     assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -2284,39 +2300,43 @@ fn test_cli_diff_target_uses_its_own_region_endpoint() {
     .expect("target endpoint should be reported");
     assert!(warning.contains("https://s3.gz.bcebos.com"), "{}", warning);
     // An explicit endpoint is the user's choice for both sides.
-    assert!(target_warning(&[
-        "--profile",
-        "bos",
-        "--endpoint-url",
-        "https://s3.bj.bcebos.com",
-        "--dry-run",
-        "diff",
-        "--bucket",
-        "a",
-        "--region",
-        "bj",
-        "--target-bucket",
-        "c",
-        "--target-region",
-        "gz",
-    ])
-    .is_none());
+    assert!(
+        target_warning(&[
+            "--profile",
+            "bos",
+            "--endpoint-url",
+            "https://s3.bj.bcebos.com",
+            "--dry-run",
+            "diff",
+            "--bucket",
+            "a",
+            "--region",
+            "bj",
+            "--target-bucket",
+            "c",
+            "--target-region",
+            "gz",
+        ])
+        .is_none()
+    );
     // Same region on both sides: nothing to derive.
-    assert!(target_warning(&[
-        "--profile",
-        "bos",
-        "--dry-run",
-        "diff",
-        "--bucket",
-        "a",
-        "--region",
-        "bj",
-        "--target-bucket",
-        "c",
-        "--target-region",
-        "bj",
-    ])
-    .is_none());
+    assert!(
+        target_warning(&[
+            "--profile",
+            "bos",
+            "--dry-run",
+            "diff",
+            "--bucket",
+            "a",
+            "--region",
+            "bj",
+            "--target-bucket",
+            "c",
+            "--target-region",
+            "bj",
+        ])
+        .is_none()
+    );
 }
 
 #[test]

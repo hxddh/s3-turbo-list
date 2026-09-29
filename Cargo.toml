@@ -2,7 +2,7 @@
 [package]
 name = "s3-turbo-list"
 version = "0.35.0"
-edition = "2021"
+edition = "2024"
 authors = ["S3 Turbo List Contributors"]
 rust-version = "1.94.1"
 description = "High-performance concurrent Amazon S3 bucket listing with adaptive key-space partitioning"

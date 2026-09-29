@@ -1,4 +1,4 @@
-use crate::core::{ObjectFilter, ObjectProps, RunMode, OBJECT_FILTER};
+use crate::core::{OBJECT_FILTER, ObjectFilter, ObjectProps, RunMode};
 use crate::filter_expr::FilterExpr;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

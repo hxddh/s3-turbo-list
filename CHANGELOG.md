@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+- The crate uses Rust edition 2024. `cargo fix --edition` needed no source
+  changes; nested `if let` blocks became let-chains, and code is formatted with
+  the 2024 rustfmt style. No behaviour change.
+- `docs/tuning.md` names the SDK call to check on future SDK upgrades: when S3
+  moves to the SDK's schema-based deserializer, the extra per-page XML pass
+  disappears with no change here.
+
 ## [0.35.0] - 2026-09-29
 
 ### Changed

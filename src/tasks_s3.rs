@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{Instant, timeout_at};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentOutcome {

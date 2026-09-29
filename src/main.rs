@@ -484,7 +484,10 @@ fn main() {
             if cli.dry_run {
                 // init-config only writes a local file; a "dry run" that
                 // wrote it anyway (as it did) is worse than a clear refusal.
-                eprintln!("init-config does not support --dry-run: it contacts nothing and only writes '{}'", output);
+                eprintln!(
+                    "init-config does not support --dry-run: it contacts nothing and only writes '{}'",
+                    output
+                );
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
             run_init_config(profile.as_deref(), output, *overwrite, *json || cli.agent);
@@ -522,19 +525,19 @@ fn main() {
     // A misspelled profile (`mino`) applied no preset at all — no endpoint,
     // no addressing style — and the run went to AWS. Like an unknown config
     // key, it is a configuration error.
-    if let Some(name) = cfg.s3.profile.as_deref() {
-        if profiles::get_profile(name).is_none() {
-            exit_config_error(&format!(
-                "--profile '{}' is not an endpoint compatibility preset; use one of: {} \
+    if let Some(name) = cfg.s3.profile.as_deref()
+        && profiles::get_profile(name).is_none()
+    {
+        exit_config_error(&format!(
+            "--profile '{}' is not an endpoint compatibility preset; use one of: {} \
                  (credentials profiles go in AWS_PROFILE)",
-                name,
-                profiles::all_profiles()
-                    .iter()
-                    .map(|profile| profile.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+            name,
+            profiles::all_profiles()
+                .iter()
+                .map(|profile| profile.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
     cfg.apply_profile_preset(command_region(&cli.cmd));
@@ -646,11 +649,11 @@ fn main() {
             );
             if *json || output.is_some() {
                 let rendered = agent::to_pretty_json(&report);
-                if let Some(path) = output.as_deref() {
-                    if let Err(e) = agent::write_json_file(path, &report) {
-                        eprintln!("Benchmark write error: {}", e);
-                        std::process::exit(agent::ExitCode::OutputWrite.code());
-                    }
+                if let Some(path) = output.as_deref()
+                    && let Err(e) = agent::write_json_file(path, &report)
+                {
+                    eprintln!("Benchmark write error: {}", e);
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
                 }
                 if *json {
                     println!("{}", rendered);
@@ -705,22 +708,22 @@ fn main() {
             config_source.clone(),
             diff_target_endpoint.as_deref(),
         );
-        if let Some(path) = cli.plan_json.as_deref() {
-            if let Err(e) = agent::write_json_file(path, &report) {
-                eprintln!("Plan write error: {}", e);
-                std::process::exit(agent::ExitCode::OutputWrite.code());
-            }
+        if let Some(path) = cli.plan_json.as_deref()
+            && let Err(e) = agent::write_json_file(path, &report)
+        {
+            eprintln!("Plan write error: {}", e);
+            std::process::exit(agent::ExitCode::OutputWrite.code());
         }
         if cli.agent || cli.plan_json.is_none() {
             println!("{}", agent::to_pretty_json(&report));
         }
         // An explicit hints file the run cannot load stops it with exit 2;
         // so does the plan (still written above).
-        if let Some(path) = cli.hints_file.as_deref() {
-            if let Err(e) = hints::parse_hints_file(path) {
-                eprintln!("Hints file error: {}", e);
-                std::process::exit(agent::ExitCode::CliConfig.code());
-            }
+        if let Some(path) = cli.hints_file.as_deref()
+            && let Err(e) = hints::parse_hints_file(path)
+        {
+            eprintln!("Hints file error: {}", e);
+            std::process::exit(agent::ExitCode::CliConfig.code());
         }
         // The plan must predict the run: a setup problem the run would stop
         // on with exit 3 fails the dry run the same way (plan still written).
@@ -1503,8 +1506,8 @@ fn main() {
         }
 
         // ── Final checkpoint save on successful completion ─
-        if cli.resume {
-            if let Some(ref cp_path) = checkpoint_path_opt {
+        if cli.resume
+            && let Some(ref cp_path) = checkpoint_path_opt {
                 let final_metrics = g_state.metrics_snapshot();
                 let run_was_interrupted = interrupted.load(Ordering::SeqCst);
                 if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
@@ -1557,7 +1560,6 @@ fn main() {
                     }
                 }
             }
-        }
 
         // ── Diff mode completion notice ────────────────────
         if mode == RunMode::BiDir {
@@ -1690,11 +1692,11 @@ fn main() {
         warnings: manifest_warnings,
     };
 
-    if let Some(path) = cli.run_manifest.as_deref() {
-        if let Err(e) = agent::write_json_file(path, &manifest) {
-            eprintln!("Manifest write error: {}", e);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
-        }
+    if let Some(path) = cli.run_manifest.as_deref()
+        && let Err(e) = agent::write_json_file(path, &manifest)
+    {
+        eprintln!("Manifest write error: {}", e);
+        std::process::exit(agent::ExitCode::OutputWrite.code());
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
@@ -2034,7 +2036,9 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
         std::process::exit(agent::ExitCode::CliConfig.code());
     };
     if cli.resume {
-        eprintln!("--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both");
+        eprintln!(
+            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both"
+        );
         std::process::exit(agent::ExitCode::CliConfig.code());
     }
     if cfg.s3.start_after.is_some() {
@@ -2189,13 +2193,13 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
                         .to_string(),
                 );
             }
-            if let Some(endpoint) = effective {
-                if profiles::endpoint_url_has_template_placeholder(endpoint) {
-                    warnings.push(format!(
+            if let Some(endpoint) = effective
+                && profiles::endpoint_url_has_template_placeholder(endpoint)
+            {
+                warnings.push(format!(
                         "endpoint URL '{}' still contains template placeholders; replace values such as <account-id> or <region> before a real run",
                         endpoint
                     ));
-                }
             }
         }
         _ => {}
@@ -2403,11 +2407,11 @@ fn ensure_output_dir(cli: &Cli) {
     if cli.dry_run {
         return;
     }
-    if let Some(dir) = cli.output_dir.as_deref() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("Output directory error: failed to create '{}': {}", dir, e);
-            std::process::exit(agent::ExitCode::OutputWrite.code());
-        }
+    if let Some(dir) = cli.output_dir.as_deref()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("Output directory error: failed to create '{}': {}", dir, e);
+        std::process::exit(agent::ExitCode::OutputWrite.code());
     }
 }
 
@@ -3392,22 +3396,22 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
             .profile
             .as_deref()
             .filter(|name| profiles::is_endpoint_preset_name(name))
+            && !credential_environment_signal_present()
         {
-            if !credential_environment_signal_present() {
-                warnings.push(format!(
+            warnings.push(format!(
                     "--profile '{}' is an endpoint compatibility preset only; credentials still come from AWS_PROFILE or the AWS SDK default credential chain. If '{}' is also your credentials profile name, set AWS_PROFILE={}.",
                     profile, profile, profile
                 ));
-            }
         }
         warnings.extend(provider_setup_guardrail_warnings(cli, cfg));
         // A misspelled profile applies no preset at all — no endpoint
         // template, no addressing recommendation — and the run proceeds as if
         // none had been asked for. The plan already carries
         // `profile_known: false`; say so where an operator will read it.
-        if let Some(name) = cfg.s3.profile.as_deref() {
-            if profiles::get_profile(name).is_none() {
-                warnings.push(format!(
+        if let Some(name) = cfg.s3.profile.as_deref()
+            && profiles::get_profile(name).is_none()
+        {
+            warnings.push(format!(
                     "--profile '{}' matches no endpoint compatibility preset ({}); no endpoint or addressing defaults were applied",
                     name,
                     profiles::all_profiles()
@@ -3416,15 +3420,14 @@ fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
-            }
         }
-        if let Some(endpoint) = cfg.s3.endpoint_url.as_deref() {
-            if !endpoint_url_looks_usable(endpoint) {
-                warnings.push(format!(
+        if let Some(endpoint) = cfg.s3.endpoint_url.as_deref()
+            && !endpoint_url_looks_usable(endpoint)
+        {
+            warnings.push(format!(
                     "--endpoint-url '{}' has no scheme and host; the run will fail when it dispatches its first request",
                     endpoint
                 ));
-            }
         }
     }
     if cli.summary_only
@@ -3737,10 +3740,10 @@ async fn diff_side_boundaries(
         )
         .await
     };
-    if !boundaries.is_empty() {
-        if let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries) {
-            log::warn!("{}", e);
-        }
+    if !boundaries.is_empty()
+        && let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries)
+    {
+        log::warn!("{}", e);
     }
     boundaries
 }
@@ -3807,17 +3810,14 @@ fn diff_target_endpoint(
         target_region: Some(target_region),
         ..
     } = &cli.cmd
+        && !endpoint_was_explicit
+        && let Some(endpoint) = cfg
+            .s3
+            .profile
+            .as_deref()
+            .and_then(|profile| profiles::region_endpoint(profile, target_region))
     {
-        if !endpoint_was_explicit {
-            if let Some(endpoint) = cfg
-                .s3
-                .profile
-                .as_deref()
-                .and_then(|profile| profiles::region_endpoint(profile, target_region))
-            {
-                return Some(endpoint);
-            }
-        }
+        return Some(endpoint);
     }
     cfg.s3.endpoint_url.clone()
 }

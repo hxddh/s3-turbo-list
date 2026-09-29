@@ -577,11 +577,7 @@ fn probe_result_from<T, E: ProbeErrorMetadata + std::fmt::Debug>(
 }
 
 fn http_status_option(status: u16) -> Option<u16> {
-    if status != 0 {
-        Some(status)
-    } else {
-        None
-    }
+    if status != 0 { Some(status) } else { None }
 }
 
 fn diagnostic_for(
@@ -725,7 +721,7 @@ fn apply_response_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::{diagnostic_for, CompatProbeReport, ProbeTestResult};
+    use super::{CompatProbeReport, ProbeTestResult, diagnostic_for};
 
     fn result(status: &str) -> ProbeTestResult {
         ProbeTestResult {

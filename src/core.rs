@@ -3,12 +3,12 @@ use crate::stats::HttpStatusCodeTracker;
 use crate::trace::S3TraceWriter;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Barrier;
+use tokio::sync::mpsc;
 
 // ── Constants ──────────────────────────────────────────────
 
