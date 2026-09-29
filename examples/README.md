@@ -1,120 +1,64 @@
 # s3-turbo-list examples
 
-These scripts are **templates** — not validation scripts.  They demonstrate
-canonical invocation patterns for each supported use case.  Adapt them to
-your environment.
+These scripts are **templates**, not validation scripts: each shows one
+invocation pattern.  Adapt them to your environment.  For a first listing
+against AWS, MinIO, BOS, R2, B2, or OSS, use the quickstart that
+`s3-turbo-list guide <provider>` prints.
 
 ## Safety
 
-- No script deletes buckets or objects.
-- No script embeds credentials.
-- All bucket names must be supplied via environment variables.
-- Scripts print the command before executing it.
+- No script deletes buckets or objects, and none embeds credentials.
+- Bucket names come from environment variables.
+- `agent-dry-run.sh` is local-only; every other shell script contacts S3
+  (`agent-run-with-manifest.sh` refuses to unless `RUN_REAL_S3=1`).
 
 ## Prerequisites
 
 | Tool | Required | Notes |
 |---|---|---|
 | `cargo` or `s3-turbo-list` binary | **Required** | Set `S3_TURBO_LIST_BIN` to use a pre-built binary. |
-| `jq` | Optional | Useful for inspecting trace JSONL, but not required. |
-| Python 3 + `pandas` + `pyarrow` | Optional | Only needed for `read-parquet.py` and `inspect-trace.py`. |
-
-Install Python deps:
-```bash
-pip install pandas pyarrow
-```
+| `jq` | Optional | Handy for trace JSONL. |
+| Python 3 + `pandas` + `pyarrow` | Optional | Only for `read-parquet.py` (`pip install pandas pyarrow`). |
 
 ## Environment variables
 
-### `S3_TURBO_LIST_BIN`
-
-Path to the s3-turbo-list binary.  If unset, scripts fall back to
-`cargo run --`, which builds from source in the current workspace.
-
-```bash
-# Use a pre-built binary
-export S3_TURBO_LIST_BIN=/usr/local/bin/s3-turbo-list
-
-# Or build from source (default)
-unset S3_TURBO_LIST_BIN
-```
-
-### `OUTDIR`
-
-Output directory for artifacts.  Each script defaults to
-`./artifacts/<example-name>` if `OUTDIR` is unset.
-
-```bash
-export OUTDIR=/tmp/s3tl-examples/aws-basic
-```
-
-### `AWS_PROFILE`
-
-Use the standard AWS SDK environment variable for non-default credential
-profiles:
-
-```bash
-export AWS_PROFILE=my-aws-profile
-```
-
-The s3-turbo-list `--profile` flag is reserved for endpoint compatibility
-presets such as `minio`, `bos`, `r2`, `b2`, and `oss`.
+- `S3_TURBO_LIST_BIN` — path to the binary.  Unset, scripts use
+  `cargo run --`, which builds from source in the current workspace.
+- `OUTDIR` — output directory; each script defaults to
+  `./artifacts/<example-name>`.
+- `ENDPOINT_URL` — a custom S3 endpoint (omit for AWS); `PROVIDER` selects a
+  provider preset (`minio`, `bos`, `r2`, `b2`, `oss`) in the agent scripts.
+- `AWS_PROFILE` — the standard AWS SDK credentials profile.  s3-turbo-list's
+  `--provider` selects an endpoint preset only; it does not pick credentials.
 
 Listing is a recursive full-bucket inventory by default.  Pass
-`--delimiter '/'` for hierarchical listing that returns top-level objects
-plus `CommonPrefixes` only.
+`--delimiter '/'` for a hierarchical listing (top-level objects plus one row
+per `CommonPrefix`).
 
-## Recommended order
+## Suggested order
 
-1. Read [`README.md`](../README.md) first — understand the tool.
-2. Run local preflight helpers:
+1. Read the [README](../README.md) and run the local preflight:
    ```bash
-   s3-turbo-list doctor --simple
+   s3-turbo-list doctor
    s3-turbo-list guide
-   s3-turbo-list guide aws
+   ./examples/agent-dry-run.sh
    ```
-3. Run **MinIO** locally (no cloud credentials needed):
-   ```bash
-   # Start MinIO, create a bucket, then:
-   BUCKET=my-test-bucket ./examples/minio-basic-list.sh
-   ```
-4. Run **AWS S3** with an explicit bucket:
-   ```bash
-   BUCKET=my-bucket REGION=us-east-2 ./examples/aws-basic-list.sh
-   ```
-5. Run **BOS** (virtual-hosted by default, as recommended by BOS):
-   ```bash
-   BUCKET=my-bos-bucket ./examples/bos-basic-list.sh
-   ```
-6. Explore **diff**, **checkpoint/resume**, **trace**, and **hints**.
-7. For a local-only throughput check, run `./scripts/benchmark-local.sh`
-   from the repository root.  It uses synthetic data and does not contact S3.
-
-## BOS default guidance
-
-All BOS examples default to **virtual-hosted** addressing, following BOS
-official guidance.  Path-style is available only in the diagnostic example
-(`bos-path-style-diagnostic.sh`) and is clearly labeled as legacy/diagnostic
-mode — not the recommended default.
-
-BOS is fully S3 ListObjectsV2 compatible; hinted multi-segment listing and
-startup discovery run the same as on AWS S3.
+2. Explore **diff**, **checkpoint/resume**, **trace**, and **hints**.
+3. For a local-only throughput check, run `./scripts/benchmark-local.sh`
+   from the repository root (the `bench_local` example; synthetic data, no
+   S3 — see [`docs/development.md`](../docs/development.md)).
 
 ## File index
 
 | Script | Purpose | Output |
 |---|---|---|
-| `aws-basic-list.sh` | List an AWS S3 bucket | `.parquet`, `.ks` |
-| `minio-basic-list.sh` | List a MinIO bucket | `.parquet`, `.ks` |
-| `bos-basic-list.sh` | List a BOS bucket (virtual-hosted) | `.parquet`, `.ks` |
-| `bos-path-style-diagnostic.sh` | List a BOS bucket (path-style, diagnostic) | `.parquet`, `.ks` |
-| `trace-debug.sh` | List with trace JSONL + debug stderr | `.parquet`, `.ks`, `trace.jsonl`, `debug-stderr.log` |
+| `agent-dry-run.sh` | Local-only dry-run plan (`--dry-run > plan.json`) | `plan.json` |
+| `agent-run-with-manifest.sh` | List with a run manifest and trace; requires `RUN_REAL_S3=1` | `.parquet`, `.ks`, `run.json`, `trace.jsonl` |
+| `checkpoint-resume.sh` | Interrupt a listing, then `--resume` it | `.parquet`, `.ks` (two sets), `run.json` |
 | `diff-basic.sh` | Diff two buckets | `.parquet`, `.ks` |
-| `checkpoint-resume.sh` | List with checkpoint save and resume | `.parquet`, `.ks` |
-| `hints-file-toml.sh` | List with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
-| `validate-hints.sh` | Validate TOML or plain-text hints locally (`doctor --hints-file`) | stdout |
-| `agent-dry-run.sh` | Produce local-only agent plan JSON | `plan.json` |
-| `agent-run-with-manifest.sh` | Run list with manifest and trace outputs; requires `RUN_REAL_S3=1` | `.parquet`, `.ks`, `run.json`, `trace.jsonl` |
+| `hints-file-toml.sh` | Validate (`doctor --hints-file`) and list with a TOML hints file | `.parquet`, `.ks`, `hints.toml` |
+| `trace-debug.sh` | List with an S3 request trace and a run log | `.parquet`, `.ks`, `.log`, `trace.jsonl` |
 | `read-parquet.py` | Read a Parquet file with pandas | stdout |
 | `inspect-trace.py` | Summarize a trace JSONL file | stdout |
 | `read_manifest.py` | Summarize a run manifest | stdout |
+| `bench_local.rs` | Local synthetic output benchmark (`cargo run --release --example bench_local -- --help`) | JSON report |

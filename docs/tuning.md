@@ -11,20 +11,17 @@ enough segment boundaries to keep workers busy.
 
 Where boundaries come from, in precedence order:
 
-1. **Explicit `--hints-file`** — full control for repeated inventories.
-2. **Cached hints** at the conventional path, written by startup discovery on
-   a previous run: `<region>_<bucket>_hints.toml` for a whole-bucket run, or
-   `<region>_<bucket>_<prefix-hash>_hints.toml` when `--prefix` is set.
-   Boundaries only partition the range a run lists, so a cache generated
-   under one prefix is never reused for another (it is ignored with a
-   warning if found at the whole-bucket path).
-3. **Startup structural discovery** (recursive list runs — the default;
-   hierarchical `--delimiter '/'` runs skip it, and so does the cache
-   lookup) — a bounded set of delimiter probes (one ListObjectsV2 page each,
-   at most 3 levels deep) finds real `CommonPrefixes` boundaries at run start
-   and caches them at the conventional path.  Costs at most a second or two of
-   startup; first runs list in parallel with no prior steps.
-4. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
+1. **Explicit `--hints-file`** — pins exact boundaries for repeated
+   inventories.
+2. **Startup structural discovery** (recursive list runs — the default;
+   hierarchical `--delimiter '/'` runs skip it) — a bounded set of delimiter
+   probes (one ListObjectsV2 page each, at most 3 levels deep) finds real
+   `CommonPrefixes` boundaries at run start.  It runs on every run and costs
+   at most a second or two of startup, so first runs list in parallel with no
+   prior steps.  Nothing is cached: there is no hints file in the working
+   directory (0.37 removed the `<region>_<bucket>[_<hash>]_hints.toml`
+   cache).
+3. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
    namespace) and the listing spans more than one page, the key range is
    partitioned up front by single-key `max-keys=1` probes.  Each cut aims at
    the middle of its range: the candidate comes from the first position where
@@ -34,19 +31,26 @@ Where boundaries come from, in precedence order:
    `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
    estimates the namespace's highest key with a few concurrent probe rounds;
    after that each cut is usually one probe, and every bisection level probes
-   its ranges concurrently.  The boundaries are real observed keys and are
-   cached like structural ones.  List mode targets one boundary per worker,
-   since runtime splitting still covers mid-run skew.
-5. **Single segment** — listings that fit in one page (nothing to partition,
+   its ranges concurrently.  The boundaries are real observed keys.  List
+   mode targets one boundary per worker, since runtime splitting still
+   covers mid-run skew.
+4. **Single segment** — listings that fit in one page (nothing to partition,
    and probing would cost more requests than the listing), and runs with
-   `--no-auto-hints`, `--start-after`, `--continuation-token`, or
-   `--delimiter`.
+   `--start-after` (or the deprecated `--continuation-token`) or
+   `--delimiter`, which are never split.  `--no-auto-hints` (supported,
+   hidden from `--help`) also starts from one segment, which runtime
+   splitting still fans out.
 
-`diff` partitions each side the same way (cached hints, startup discovery, or
-bisection); because diff has no runtime splitting to fall back on, its
-bisection targets at least eight boundaries. Each side lists its segments
-concurrently; the segment set stays static (no runtime splitting) so the merge
-can consume segments in key order.
+The dry-run plan's `hints.source` names the choice: `explicit`,
+`startup_discovery`, `disabled_single_segment_fallback` (`--no-auto-hints`),
+`delimiter_single_segment`, or `single_chain` (`--start-after`); `diff` plans
+report `diff_per_side_automatic`.
+
+`diff` partitions each side the same way (startup discovery, or bisection);
+because diff has no runtime splitting to fall back on, its bisection targets
+at least eight boundaries. Each side lists its segments concurrently; the
+segment set stays static (no runtime splitting) so the merge can consume
+segments in key order.
 
 Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits
@@ -67,14 +71,16 @@ not oversubscribed past the point where more in-flight segments only add
 latency.  `--concurrency` is the upper bound; the effective fan-out settles at
 whatever lower number saturates the bucket, and reopens automatically if
 throughput climbs again (for example as long-tail segments finish and free
-slots).  Splitting never applies to `diff` (static segments by design),
-`--start-after`, or `--continuation-token` runs.  Split segments conservatively do not record
-checkpoint progress, so `--resume` re-lists the original segment.
+slots).  Splitting never applies to `diff` (static segments by design) or
+`--start-after` runs.  Split segments are checkpointed like any other: an
+interrupted run records the exact key ranges not yet written, including those
+of runtime-split children, and `--resume` lists only those ranges.
 
 **Defaults are designed to be the right choice**: `worker_threads` follows
 the machine's CPU count, and `--concurrency` only needs raising when a very
-large bucket on a fast network leaves workers idle.  Hand-tuning `-c`/`-T`
-is rarely worthwhile.
+large bucket on a fast network leaves workers idle.  Hand-tuning `-c`, or the
+`-T/--threads` option (supported, hidden from `--help`), is rarely
+worthwhile.
 
 Hints boundaries are lexicographic cut points, not directories.  A boundary
 may also be a real object key; it is treated as part of the preceding segment
@@ -83,7 +89,7 @@ as `logs/` are ordinary keys for correctness purposes.
 
 ## Hints files
 
-Two formats are accepted by `--hints-file` and the conventional cache path:
+`--hints-file` (list only; `diff` does not take it) accepts two formats:
 
 **Plain text** (one boundary per line):
 
@@ -93,8 +99,8 @@ beta/
 logs/
 ```
 
-**TOML** (written by startup discovery; `prefix` records the range the
-boundaries partition and is verified on load):
+**TOML** (the format earlier releases cached; an optional `prefix` records
+the range the boundaries partition and is verified on load):
 
 ```toml
 bucket = "my-bucket"
@@ -103,7 +109,7 @@ boundaries = ["alpha/", "beta/", "logs/"]
 generated_at = "2026-05-14T12:00:00Z"
 ```
 
-Older cache files may carry extra fields (such as `total_objects` or
+Older hints files may carry extra fields (such as `total_objects` or
 `scan_mode`); they are accepted and ignored on load.
 
 Validate a hints file locally (no S3 access) with `doctor --hints-file
@@ -219,7 +225,9 @@ namespace-prefixed element names, attributes on elements other than the root,
 non-UTF-8 input or characters XML forbids, an unknown entity or invalid
 character reference, nested markup inside a field, duplicate fields, a
 `<Contents>` without a `<Key>`, or a field value the SDK would reject.
-Discovery probes, split probes, and `compat-probe` stay on the plain SDK path.
+Runtime split probes use the fast parser too (their rows are dropped; only
+`CommonPrefixes` matter).  Startup discovery probes and `compat-probe` stay on
+the plain SDK path.
 
 Streaming TSV/NDJSON to stdout and `diff` output stay single-writer by nature
 (one pipe / one file).  TSV/NDJSON rows arrive in segment-completion order, not
@@ -228,8 +236,8 @@ order.
 
 ## Config File Settings
 
-Some advanced settings are easiest to keep in a TOML config file and pass with
-`--config`.  CLI flags take precedence for settings that have both forms.
+Some advanced settings are easiest to keep in a TOML config file passed with
+`--config`.  Command-line options take precedence where both exist.
 
 ```toml
 [s3]
@@ -253,15 +261,68 @@ capacity = 128
 
 Keys are checked: an unknown section or key (a typo such as
 `max_concurency`) fails config loading with exit code `2` and names the
-expected keys, instead of silently running on the default.
-
-CLI flags exist for common runtime controls such as `--threads`,
-`--concurrency`, `--endpoint-url`, `--profile`, `--addressing-style`,
-`--max-keys`, `--start-after`, and output file paths.
+expected keys, instead of silently running on the default.  The full key
+list, the search path, and a custom-endpoint example are in
+[`providers.md`](providers.md#config-file).
 
 ## Trace-Driven Inspection
 
 Long-tail segments are split at runtime automatically, so no offline
-rebalancing workflow is needed.  When you want the raw per-page and
-per-segment events for manual inspection, pass `--trace-compat trace.jsonl` to
-a run; the JSONL format is documented in [trace-reference.md](trace-reference.md).
+rebalancing workflow is needed.  For the raw per-page and per-segment events,
+pass `--trace-compat trace.jsonl` to a run (`--trace-compat -` writes to
+stderr; it replaces the deprecated `--debug-s3`).  `--trace-compat` combines
+with `--run-manifest`: use the manifest for final status and aggregate
+metrics, the trace for per-request endpoint behavior.
+
+```bash
+s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out \
+  --trace-compat trace.jsonl --run-manifest run.json
+
+jq -r .operation trace.jsonl | sort | uniq -c          # count by operation
+jq 'select(.s3_error_code != null)' trace.jsonl        # errors
+python3 examples/inspect-trace.py trace.jsonl          # summary
+```
+
+### Trace event fields
+
+Each line is one `S3CompatEvent`.  Optional fields (`?`) are omitted when
+absent.
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | ISO 8601 wall-clock time of the call. |
+| `operation` | string | S3 operation (e.g. `"ListObjectsV2"`, `"HeadBucket"`), or `"ListObjectsV2SegmentSummary"` for a completed segment. |
+| `profile` | string? | Provider preset name (e.g. `"bos"`, `"minio"`); the field keeps its pre-0.37 name. |
+| `endpoint_url` | string | Endpoint URL used for the request. |
+| `region` | string? | Region the request was signed for. |
+| `addressing_style` | string | `"path"`, `"virtual"`, or `"auto"`. |
+| `bucket` | string | Target bucket. |
+| `prefix` | string | Listing prefix. |
+| `delimiter` | string? | Delimiter sent with the request.  The listing default is `""` (recursive), which is omitted from requests and from the event; hierarchical runs and structural probes send `"/"`. |
+| `start_after` | string? | `start-after` parameter, if sent. |
+| `max_keys` | int? | `max-keys` parameter, if sent. |
+| `continuation_token` | string? | Continuation token sent. |
+| `http_status` | uint16 | HTTP response status. |
+| `s3_error_code` | string? | S3 error code (e.g. `"NoSuchBucket"`). |
+| `s3_error_message` | string? | Error message body. |
+| `request_id` | string? | `x-amz-request-id` or equivalent. |
+| `request_id_2` | string? | `x-amz-id-2` (extended request ID). |
+| `retry_attempt` | uint32 | Zero-indexed retry count. |
+| `latency_ms` | uint64 | Round-trip latency in milliseconds. |
+| `retryable` | bool | Whether the error is classified as retryable. |
+| `fatal` | bool | Whether the error is classified as fatal. |
+| `is_truncated` | bool | Whether the ListObjectsV2 response was truncated. |
+| `next_continuation_token` | string? | Continuation token for the next page. |
+| `key_count` | int? | `KeyCount` from the response. |
+| `contents_count` | int? | Number of `Contents` entries. |
+| `common_prefixes_count` | int? | Number of `CommonPrefixes` entries. |
+| `next_continuation_token_present` | bool? | Whether the response included a next continuation token. |
+| `first_key` | string? | First object key in the page. |
+| `last_key` | string? | Last object key in the page. |
+| `segment_index` | uint? | Segment index (segment summary events). |
+| `end_before` | string? | Upper segment boundary, when present. |
+| `segment_pages` | uint32? | Pages read by a completed segment. |
+| `segment_objects` | uint? | Objects emitted by a completed segment. |
+| `segment_common_prefixes` | uint? | CommonPrefixes seen by a completed segment. |
+| `ended_by` | string? | Segment completion reason, such as `"pagination"` or `"boundary"`. |
+| `truncated_raw_body` | string? | First 512 bytes of an error response body. |
