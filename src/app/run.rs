@@ -622,10 +622,8 @@ pub(crate) fn run() {
         // ── Startup structural discovery ─────────────────────
         // When no hints exist for a flat (delimiter='') list run, probe the
         // bucket's CommonPrefix structure once at startup so the first run
-        // lists in parallel with no prior step. The
-        // boundaries are persisted to the conventional hints cache, so
-        // subsequent runs (including --resume) reload identical segments
-        // through the existing cache path.
+        // lists in parallel with no prior step. A --resume run reads its
+        // segments from the checkpoint instead.
         let mut ks_list = ks_list;
         if ks_list.is_empty()
             && resume_ranges.is_none()
@@ -642,63 +640,19 @@ pub(crate) fn run() {
                 cfg.s3.endpoint_url.as_deref(),
                 cfg.s3.force_path_style(),
             );
-            let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
-            // Discovery can take many probe rounds on a slow endpoint; race it
-            // against Ctrl-C / SIGTERM so an interrupt stops it at once (the
-            // run then exits 7 without caching half-discovered boundaries).
-            let discovered = tokio::select! {
-                boundaries = async {
-                    let discovery = auto_hints::discover_startup_boundaries(
-                        &probe_client,
-                        opt_bucket,
-                        &opt_prefix,
-                        target_boundaries,
-                        cfg.s3.operation_timeout_secs,
-                    )
-                    .await;
-                    // Flat namespace: no CommonPrefix structure, which previously
-                    // meant starting as a single segment and relying on runtime
-                    // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
-                    // Bisect the key range with single-key probes instead — the same
-                    // partitioner diff sides use — so the first run starts at full
-                    // concurrency. The boundaries land in the same cache below.
-                    if !discovery.boundaries.is_empty() {
-                        refine_flat_leaves(
-                            &probe_client,
-                            opt_bucket,
-                            discovery,
-                            concurrency.clamp(1, 64),
-                            cfg.s3.operation_timeout_secs,
-                        )
-                        .await
-                    } else if discovery.is_single_page_listing(cli.max_keys) {
-                        // The discovery probe's page was not truncated and held no
-                        // CommonPrefixes, and this run's page size returns those keys
-                        // in one request too: the whole listing is a single page.
-                        // Bisecting it would cost several probes per cut to partition
-                        // work the single segment finishes in one request, and would
-                        // cache boundaries that pin that shape for later runs.
-                        info!(
-                            "Startup discovery found a single-page listing — using single-segment listing"
-                        );
-                        Vec::new()
-                    } else {
-                        info!("Startup discovery found no prefix structure — bisecting flat key space");
-                        // Runtime splitting still covers this run, so one boundary per
-                        // worker is enough; spare boundaries would only cost probes.
-                        let flat_target = concurrency.clamp(1, 64);
-                        discover_flat_boundaries_via_client(
-                            &probe_client,
-                            opt_bucket,
-                            &opt_prefix,
-                            flat_target,
-                            cfg.s3.operation_timeout_secs,
-                        )
-                        .await
-                    }
-                } => Some(boundaries),
-                _ = quit_requested(&g_state) => None,
-            };
+            // Runtime splitting still covers this run, so one flat boundary
+            // per worker is enough; spare boundaries would only cost probes.
+            let discovered = startup_boundaries(
+                &probe_client,
+                opt_bucket,
+                &opt_prefix,
+                &cfg,
+                cli.max_keys,
+                &g_state,
+                concurrency.saturating_mul(2).clamp(16, 512),
+                concurrency.clamp(1, 64),
+            )
+            .await;
             let interrupted_discovery = discovered.is_none();
             let boundaries = discovered.unwrap_or_default();
             if interrupted_discovery {
@@ -774,6 +728,32 @@ pub(crate) fn run() {
         let output_config = cfg.output.clone();
         let filename_ks_for_task = filename_ks.clone();
         let filename_output_for_task = filename_output.clone();
+        let addressing_style = cfg.s3.addressing_style.to_string();
+        // One listing side's task context; only the target and direction
+        // differ between the list task and the two diff sides.
+        let task_context = |bucket: &str,
+                            region: Option<&str>,
+                            endpoint: Option<&str>,
+                            data_map_channel,
+                            dir: u8| {
+            core::S3TaskContext::new(core::TaskContextParams {
+                bucket,
+                region,
+                endpoint,
+                force_path_style: cfg.s3.force_path_style(),
+                sdk_config: &sdk_config,
+                s3_config: &s3_cfg,
+                data_map_channel,
+                dir,
+                g_state: g_state.clone(),
+                trace_writer: trace_writer.clone(),
+                addressing_style: &addressing_style,
+                provider: cfg.s3.provider.as_deref(),
+                delimiter: Some(&cli.delimiter),
+                max_keys: cli.max_keys,
+                start_after: cfg.s3.start_after.as_deref(),
+            })
+        };
 
         if is_diff {
             drop(hints); // diff partitions each side independently below
@@ -783,62 +763,32 @@ pub(crate) fn run() {
             let target_bucket: &str =
                 opt_target_bucket.expect("target_bucket required for diff mode");
 
-            // Per-side boundaries from cached hints or startup discovery —
-            // the same automatic sources as list mode. Sides need not agree:
-            // each side only has to be a complete ordered partition of its
-            // own key space. The sides resolve concurrently — each can take
-            // many network round-trips — except in the degenerate self-diff
-            // case (same bucket and region), where both sides would race
-            // writing the same hints-cache file.
-            let (left_bounds, right_bounds) =
-                if opt_bucket == target_bucket && opt_region == target_region {
-                    let left = diff_side_boundaries(
-                        opt_bucket,
-                        opt_region,
-                        cfg.s3.endpoint_url.as_deref(),
-                        &opt_prefix,
-                        &cfg,
-                        &cli,
-                        &sdk_config,
-                        &g_state,
-                    )
-                    .await;
-                    let right = diff_side_boundaries(
-                        target_bucket,
-                        target_region,
-                        diff_target_endpoint.as_deref(),
-                        &opt_prefix,
-                        &cfg,
-                        &cli,
-                        &sdk_config,
-                        &g_state,
-                    )
-                    .await;
-                    (left, right)
-                } else {
-                    tokio::join!(
-                        diff_side_boundaries(
-                            opt_bucket,
-                            opt_region,
-                            cfg.s3.endpoint_url.as_deref(),
-                            &opt_prefix,
-                            &cfg,
-                            &cli,
-                            &sdk_config,
-                            &g_state,
-                        ),
-                        diff_side_boundaries(
-                            target_bucket,
-                            target_region,
-                            diff_target_endpoint.as_deref(),
-                            &opt_prefix,
-                            &cfg,
-                            &cli,
-                            &sdk_config,
-                            &g_state,
-                        ),
-                    )
-                };
+            // Per-side boundaries from startup discovery — the same automatic
+            // source as list mode. Sides need not agree: each side only has
+            // to be a complete ordered partition of its own key space. The
+            // sides resolve concurrently; each can take many round-trips.
+            let (left_bounds, right_bounds) = tokio::join!(
+                diff_side_boundaries(
+                    opt_bucket,
+                    opt_region,
+                    cfg.s3.endpoint_url.as_deref(),
+                    &opt_prefix,
+                    &cfg,
+                    &cli,
+                    &sdk_config,
+                    &g_state,
+                ),
+                diff_side_boundaries(
+                    target_bucket,
+                    target_region,
+                    diff_target_endpoint.as_deref(),
+                    &opt_prefix,
+                    &cfg,
+                    &cli,
+                    &sdk_config,
+                    &g_state,
+                ),
+            );
             info!(
                 "  diff segments: left {}, right {}",
                 left_bounds.len() + 1,
@@ -850,40 +800,20 @@ pub(crate) fn run() {
 
             // Base contexts; each segment task swaps in its own sender.
             let (placeholder_tx, _) = tokio::sync::mpsc::channel(1);
-            let left_ctx = core::S3TaskContext::new(core::TaskContextParams {
-                bucket: opt_bucket,
-                region: opt_region,
-                endpoint: cfg.s3.endpoint_url.as_deref(),
-                force_path_style: cfg.s3.force_path_style(),
-                sdk_config: &sdk_config,
-                s3_config: &s3_cfg,
-                data_map_channel: placeholder_tx.clone(),
-                dir: core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
-                g_state: g_state.clone(),
-                trace_writer: trace_writer.clone(),
-                addressing_style: &cfg.s3.addressing_style.to_string(),
-                provider: cfg.s3.provider.as_deref(),
-                delimiter: Some(&cli.delimiter),
-                max_keys: cli.max_keys,
-                start_after: cfg.s3.start_after.as_deref(),
-            });
-            let right_ctx = core::S3TaskContext::new(core::TaskContextParams {
-                bucket: target_bucket,
-                region: target_region,
-                endpoint: diff_target_endpoint.as_deref(),
-                force_path_style: cfg.s3.force_path_style(),
-                sdk_config: &sdk_config,
-                s3_config: &s3_cfg,
-                data_map_channel: placeholder_tx,
-                dir: core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
-                g_state: g_state.clone(),
-                trace_writer: trace_writer.clone(),
-                addressing_style: &cfg.s3.addressing_style.to_string(),
-                provider: cfg.s3.provider.as_deref(),
-                delimiter: Some(&cli.delimiter),
-                max_keys: cli.max_keys,
-                start_after: cfg.s3.start_after.as_deref(),
-            });
+            let left_ctx = task_context(
+                opt_bucket,
+                opt_region,
+                cfg.s3.endpoint_url.as_deref(),
+                placeholder_tx.clone(),
+                core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+            );
+            let right_ctx = task_context(
+                target_bucket,
+                target_region,
+                diff_target_endpoint.as_deref(),
+                placeholder_tx,
+                core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+            );
 
             let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
             let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
@@ -937,23 +867,13 @@ pub(crate) fn run() {
             });
         } else {
             let prefix = opt_prefix.clone();
-            let task_ctx = core::S3TaskContext::new(core::TaskContextParams {
-                bucket: opt_bucket,
-                region: opt_region,
-                endpoint: cfg.s3.endpoint_url.as_deref(),
-                force_path_style: cfg.s3.force_path_style(),
-                sdk_config: &sdk_config,
-                s3_config: &s3_cfg,
-                data_map_channel: tx.expect("list mode allocates the streaming channel"),
-                dir: core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
-                g_state: g_state.clone(),
-                trace_writer: trace_writer.clone(),
-                addressing_style: &cfg.s3.addressing_style.to_string(),
-                provider: cfg.s3.provider.as_deref(),
-                delimiter: Some(&cli.delimiter),
-                max_keys: cli.max_keys,
-                start_after: cfg.s3.start_after.as_deref(),
-            });
+            let task_ctx = task_context(
+                opt_bucket,
+                opt_region,
+                cfg.s3.endpoint_url.as_deref(),
+                tx.expect("list mode allocates the streaming channel"),
+                core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+            );
             resume_slot = Some(task_ctx.resume_progress.clone());
             set.spawn(async move {
                 tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
@@ -1326,13 +1246,6 @@ pub(crate) fn run() {
     }
 }
 
-/// Top-level hints loader: resolves hints from explicit file, the conventional
-/// startup-discovery cache, or falls back to empty (single-segment).
-///
-/// Priority:
-/// 1. `hints_file` (from `--hints-file` CLI flag) — always used first.
-/// 2. Auto-hints cache at `{region}_{bucket}_hints.toml` in CWD.
-/// 3. Single-segment fallback (empty vec).
 pub(crate) type SegmentBatchSender =
     tokio::sync::mpsc::Sender<Vec<(core::ObjectKey, core::ObjectProps)>>;
 
@@ -1375,53 +1288,68 @@ pub(crate) async fn diff_side_boundaries(
     }
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style());
-    let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
-    // Race discovery against Ctrl-C / SIGTERM, as list mode does.
-    let discovered = tokio::select! {
+    let concurrency = cfg.runtime.max_concurrency;
+    // Only `max_concurrency` segments run at once, so spare flat boundaries
+    // would cost probes without adding parallelism; diff has no runtime
+    // splitting to fall back on, so it keeps a floor of 8.
+    startup_boundaries(
+        &client,
+        bucket,
+        prefix,
+        cfg,
+        cli.max_keys,
+        g_state,
+        concurrency.saturating_mul(2).clamp(16, 512),
+        concurrency.clamp(8, 64),
+    )
+    .await
+    .unwrap_or_default()
+}
+
+/// Startup partitioning of one listing: structural discovery (up to
+/// `structural_target` CommonPrefix boundaries), flat leaves bisected when
+/// that finds too few, and single-key bisection of a flat namespace (up to
+/// `flat_target` boundaries). Raced against Ctrl-C / SIGTERM so an interrupt
+/// stops it at once: `None` then.
+#[allow(clippy::too_many_arguments)]
+async fn startup_boundaries(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    cfg: &S3TurboConfig,
+    max_keys: Option<i32>,
+    g_state: &core::GlobalState,
+    structural_target: usize,
+    flat_target: usize,
+) -> Option<Vec<String>> {
+    let timeout_secs = cfg.s3.operation_timeout_secs;
+    tokio::select! {
         boundaries = async {
             let discovery = auto_hints::discover_startup_boundaries(
-                &client,
+                client,
                 bucket,
                 prefix,
-                target,
-                cfg.s3.operation_timeout_secs,
+                structural_target,
+                timeout_secs,
             )
             .await;
-        if !discovery.boundaries.is_empty() {
-                refine_flat_leaves(
-                    &client,
-                    bucket,
-                    discovery,
-                    cfg.runtime.max_concurrency.clamp(8, 64),
-                    cfg.s3.operation_timeout_secs,
-                )
-                .await
-            } else if discovery.is_single_page_listing(cli.max_keys) {
-                // Single-page side: nothing to partition, and the probes would cost
-                // more requests than the listing.
+            if !discovery.boundaries.is_empty() {
+                refine_flat_leaves(client, bucket, discovery, flat_target, timeout_secs).await
+            } else if discovery.is_single_page_listing(max_keys) {
+                // The probe's page was not truncated and held no
+                // CommonPrefixes, and this run's page size returns those keys
+                // in one request too: bisecting would cost more requests than
+                // the listing.
+                info!("Startup discovery found a single-page listing — using single-segment listing");
                 Vec::new()
             } else {
-                // Flat namespace: structural discovery found no CommonPrefixes, so the
-                // side would otherwise list as one serial segment. Bisect the key range
-                // with single-key probes so it lists in parallel. The target is smaller
-                // than structural discovery's: each cut is a one-time up-front probe,
-                // and only `max_concurrency` segments run at once, so spare boundaries
-                // beyond that would just cost probes without adding parallelism. Diff
-                // has no runtime splitting to fall back on, so it keeps a floor.
-                let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-                discover_flat_boundaries_via_client(
-                    &client,
-                    bucket,
-                    prefix,
-                    flat_target,
-                    cfg.s3.operation_timeout_secs,
-                )
-                .await
+                info!("Startup discovery found no prefix structure — bisecting flat key space");
+                discover_flat_boundaries_via_client(client, bucket, prefix, flat_target, timeout_secs)
+                    .await
             }
         } => Some(boundaries),
         _ = quit_requested(g_state) => None,
-    };
-    discovered.unwrap_or_default()
+    }
 }
 
 /// Structural discovery found CommonPrefixes, but fewer boundaries than one
