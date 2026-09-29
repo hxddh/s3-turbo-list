@@ -168,11 +168,18 @@ extra writer streams to its own part-file (`<name>.part1.parquet`,
 flag — on a rate-limited store the writers idle, the pool stays at one writer,
 and the output is a single file exactly as before.
 
-When output does scale to multiple part-files, read them as a directory —
-pandas, duckdb, and pyarrow all read a directory of Parquet parts transparently
-(`pq.read_table("out/")`).  The companion `.ks` counts and all run metrics are
-merged across the parts into one set.  Streaming TSV/NDJSON to stdout and `diff`
-output stay single-writer by nature (one ordered stream / one pipe).
+When output does scale to multiple part-files, read the base file and its
+parts together — the run manifest lists each as a `parquet` artifact, or use a
+glob such as `duckdb.sql("SELECT * FROM 'out/name*.parquet'")` /
+`pq.ParquetDataset(glob.glob("out/name*.parquet"))`.  Do not read the whole
+output directory: it also holds the `.ks` CSV (not Parquet) and the files of
+any other run written there.  A run removes stale `.partN` files that an
+earlier, wider run of the same output path left behind.  The companion `.ks`
+counts and all run metrics are merged across the parts into one set.
+Streaming TSV/NDJSON to stdout and `diff` output stay single-writer by nature
+(one pipe / one file).  TSV/NDJSON rows arrive in segment-completion order, not
+key order; sort downstream if order matters.  Diff Parquet output is in key
+order.
 
 ## Config File Settings
 

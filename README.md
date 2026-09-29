@@ -82,13 +82,19 @@ The Parquet schema is five columns:
 | `DiffFlag` | `UInt8` | `0` equal, `1` left-only, `2` right-only, `3` differs. |
 
 In list mode every row carries `DiffFlag = 0`. The companion `.ks` file is a
-two-column CSV of prefix and object count.
+two-column CSV of prefix and object count; the prefix is the key's directory
+with its trailing `/` (as S3 writes a CommonPrefix), and `""` for top-level
+keys.
 
 Parquet output parallelizes itself: on a fast (non-rate-limited) store and a
 multi-core machine, when one writer can't keep up it automatically scales to
-several writers, each streaming a part-file (`<name>.part1.parquet`, …) — read
-the directory with pandas/duckdb/pyarrow. On a rate-limited store it stays a
-single file. No flag; details in [`docs/tuning.md`](docs/tuning.md).
+several writers, each streaming a part-file (`<name>.part1.parquet`, …) beside
+`<name>.parquet`. Read the base file plus its parts — the run manifest lists
+each one as a `parquet` artifact, or glob `<name>*.parquet` — rather than the
+whole directory, which also holds the `.ks` CSV and other runs' files. A run
+removes stale part files an earlier run of the same path left behind. On a
+rate-limited store it stays a single file. No flag; details in
+[`docs/tuning.md`](docs/tuning.md).
 
 ```python
 import pyarrow.parquet as pq

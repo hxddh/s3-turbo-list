@@ -63,6 +63,10 @@ pub struct ManifestOutputSummary {
 pub struct ManifestArtifactSummary {
     pub kind: String,
     pub path: String,
+    /// `path` resolved against the run's recorded `cwd` (older manifests:
+    /// the current directory, then the manifest's directory).
+    #[serde(skip)]
+    pub resolved_path: String,
     pub exists: bool,
     pub size_bytes: Option<u64>,
     pub sha256: Option<String>,
@@ -151,6 +155,26 @@ pub fn manifest_summary(
     let exit_code = value.get("exit_code").and_then(|v| v.as_i64());
     let fatal_errors = json_u64(metrics, "fatal_errors");
     let output_errors = json_u64(metrics, "output_errors");
+    // Relative artifact paths are relative to the run's working directory,
+    // not to wherever --check happens to be invoked.
+    let run_cwd = json_string(&value, "cwd").filter(|dir| !dir.is_empty());
+    let manifest_dir = Path::new(path).parent().map(Path::to_path_buf);
+    let resolve = |artifact_path: &str| -> String {
+        let p = Path::new(artifact_path);
+        if artifact_path.is_empty() || p.is_absolute() {
+            return artifact_path.to_string();
+        }
+        if let Some(cwd) = run_cwd.as_deref() {
+            return Path::new(cwd).join(p).display().to_string();
+        }
+        if p.exists() {
+            return artifact_path.to_string();
+        }
+        match manifest_dir.as_deref() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(p).display().to_string(),
+            _ => artifact_path.to_string(),
+        }
+    };
     let artifacts: Vec<ManifestArtifactSummary> = value
         .get("artifacts")
         .and_then(|v| v.as_array())
@@ -160,6 +184,7 @@ pub fn manifest_summary(
                 .map(|item| ManifestArtifactSummary {
                     kind: json_string(item, "kind").unwrap_or_default(),
                     path: json_string(item, "path").unwrap_or_default(),
+                    resolved_path: resolve(&json_string(item, "path").unwrap_or_default()),
                     exists: item
                         .get("exists")
                         .and_then(|v| v.as_bool())
@@ -397,6 +422,26 @@ fn manifest_checks(
     });
 
     if manifest_row_check_applies(output_format, summary_only) {
+        // The artifacts must hold the rows the metrics claim. Comparing two
+        // in-memory counters (below) cannot catch a short or missing file.
+        let artifact_rows: i64 = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "parquet")
+            .filter_map(|artifact| artifact.parquet_row_count)
+            .sum();
+        checks.push(ManifestCheck {
+            name: "artifact_parquet_rows_total".to_string(),
+            status: if artifact_rows == parquet_rows as i64 {
+                "ok"
+            } else {
+                "fail"
+            }
+            .to_string(),
+            message: format!(
+                "sum of recorded Parquet artifact rows={} metrics.parquet_rows={}",
+                artifact_rows, parquet_rows
+            ),
+        });
         checks.push(ManifestCheck {
             name: "parquet_rows_match_streamed_rows".to_string(),
             status: if parquet_rows == streamed_rows {
@@ -453,7 +498,8 @@ fn manifest_checks(
         } else {
             format!("{}#{}", artifact.kind, occurrence)
         };
-        let current_exists = !artifact.path.is_empty() && Path::new(&artifact.path).exists();
+        let current_exists =
+            !artifact.resolved_path.is_empty() && Path::new(&artifact.resolved_path).exists();
         checks.push(ManifestCheck {
             name: format!("artifact_exists:{}", label),
             status: if current_exists { "ok" } else { "fail" }.to_string(),
@@ -468,7 +514,9 @@ fn manifest_checks(
         }
 
         if let Some(recorded_size) = artifact.size_bytes {
-            let current_size = std::fs::metadata(&artifact.path).ok().map(|m| m.len());
+            let current_size = std::fs::metadata(&artifact.resolved_path)
+                .ok()
+                .map(|m| m.len());
             checks.push(ManifestCheck {
                 name: format!("artifact_size:{}", label),
                 status: if current_size == Some(recorded_size) {
@@ -489,7 +537,7 @@ fn manifest_checks(
         }
 
         if let Some(recorded_sha256) = artifact.sha256.as_deref() {
-            let current_sha256 = sha256_file(&artifact.path).ok();
+            let current_sha256 = sha256_file(&artifact.resolved_path).ok();
             checks.push(ManifestCheck {
                 name: format!("artifact_sha256:{}", label),
                 status: if current_sha256.as_deref() == Some(recorded_sha256) {
@@ -507,10 +555,28 @@ fn manifest_checks(
             });
         }
 
+        // The writer recorded no Parquet metadata for this file: its footer
+        // was unreadable when the manifest was written. Skipping it — as
+        // --check used to — passed a file that is not a listing at all.
+        if artifact.kind == "parquet"
+            && artifact.parquet_row_count.is_none()
+            && artifact.parquet_schema_fields.is_empty()
+        {
+            checks.push(ManifestCheck {
+                name: format!("artifact_parquet_metadata:{}", label),
+                status: "fail".to_string(),
+                message: format!(
+                    "{} has no recorded Parquet metadata (unreadable footer when the run ended)",
+                    artifact.path
+                ),
+            });
+            continue;
+        }
+
         if artifact.kind == "parquet"
             && (artifact.parquet_row_count.is_some() || !artifact.parquet_schema_fields.is_empty())
         {
-            match current_parquet_summary(&artifact.path) {
+            match current_parquet_summary(&artifact.resolved_path) {
                 Ok(current) => {
                     if let Some(recorded_rows) = artifact.parquet_row_count {
                         checks.push(ManifestCheck {

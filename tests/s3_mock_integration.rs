@@ -550,7 +550,7 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
         parquet_keys(&parquet),
         vec!["logs/a.txt", "logs/b.txt", "logs/c.txt"]
     );
-    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"logs\",\"3\"\n");
+    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"logs/\",\"3\"\n");
 
     let requests = server.requests();
     let list_requests: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
@@ -2795,7 +2795,7 @@ fn local_mock_filtered_list_ks_counts_only_included_objects() {
     // Only p/c.txt (size 102) passes the filter.
     assert_eq!(parquet_keys(&parquet), vec!["p/c.txt"]);
     // The KS counts must describe the Parquet artifact, not the raw listing.
-    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"p\",\"1\"\n");
+    assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"p/\",\"1\"\n");
 }
 
 // ── Fatal segment fails the run without inflating errors ────
@@ -4881,4 +4881,97 @@ fn local_mock_missing_region_fails_fast_without_requests() {
     assert!(stderr.contains("--region"), "stderr: {}", stderr);
     assert!(server.requests().is_empty());
     assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+#[test]
+fn local_mock_manifest_check_verifies_artifacts_against_metrics() {
+    let server = MockS3Server::start(|request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            request
+                .query
+                .get("prefix")
+                .map(String::as_str)
+                .unwrap_or(""),
+            1000,
+            &["logs/a.txt", "logs/b.txt", "logs/c.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let run_dir = dir.path().join("run1");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let config = run_dir.join("config.toml");
+    write_fast_config(&config);
+    // Relative output paths, as an agent would pass them.
+    let args: Vec<String> = [
+        "--config",
+        "config.toml",
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "--run-manifest",
+        "run.json",
+        "--output-dir",
+        "out",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, stdout, stderr) = run_cli(&args, &run_dir);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // --check from the parent directory resolves the run-relative artifact
+    // paths against the run's cwd (it used to report them missing, exit 6).
+    let check = |manifest: &std::path::Path| {
+        run_cli(
+            &[
+                "manifest-summary".to_string(),
+                manifest.display().to_string(),
+                "--check".to_string(),
+                "--json".to_string(),
+            ],
+            dir.path(),
+        )
+    };
+    let manifest = run_dir.join("run.json");
+    let (code, stdout, stderr) = check(&manifest);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+
+    // A manifest whose metrics claim more rows than its Parquet artifacts
+    // hold must fail: the two in-memory counters agree with each other.
+    let mut value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    value["metrics"]["parquet_rows"] = 4.into();
+    value["metrics"]["streamed_rows"] = 4.into();
+    let tampered = run_dir.join("tampered.json");
+    std::fs::write(&tampered, serde_json::to_string(&value).unwrap()).unwrap();
+    let (code, stdout, _) = check(&tampered);
+    assert_eq!(code, 6, "{}", stdout);
+    assert!(stdout.contains("artifact_parquet_rows_total"), "{}", stdout);
+
+    // A Parquet artifact recorded without metadata (unreadable footer) fails.
+    let mut value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    for artifact in value["artifacts"].as_array_mut().unwrap() {
+        if artifact["kind"] == "parquet" {
+            artifact["parquet"] = Value::Null;
+        }
+    }
+    std::fs::write(&tampered, serde_json::to_string(&value).unwrap()).unwrap();
+    let (code, stdout, _) = check(&tampered);
+    assert_eq!(code, 6, "{}", stdout);
+    assert!(
+        stdout.contains("no recorded Parquet metadata"),
+        "{}",
+        stdout
+    );
 }

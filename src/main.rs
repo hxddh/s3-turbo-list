@@ -617,6 +617,13 @@ fn main() {
                 std::process::exit(agent::ExitCode::CliConfig.code());
             }
         }
+        let (planned_ks, planned_parquet, _) = planned_output_paths(&cli, &cfg);
+        validate_distinct_output_paths(
+            &cli,
+            &cfg,
+            planned_ks.as_deref(),
+            planned_parquet.as_deref(),
+        );
         let report = build_plan_report(
             &cli,
             &cfg,
@@ -793,7 +800,44 @@ fn main() {
         .parquet_file
         .clone()
         .unwrap_or_else(|| format!("{}.parquet", output_stem));
+    let writes_artifacts = list_writes_artifacts(&cli);
+    validate_distinct_output_paths(
+        &cli,
+        &cfg,
+        writes_artifacts.then_some(filename_ks.as_str()),
+        writes_artifacts.then_some(filename_output.as_str()),
+    );
     ensure_output_dir(&cli);
+    if writes_artifacts && mode == RunMode::List {
+        // A pooled run writes `<name>.partN.parquet` beside the base file. A
+        // part file left by an earlier, wider run of the same output path
+        // would be read with this run's set by anything that globs the stem
+        // (and the base file is being overwritten anyway), so remove it.
+        let stale = stale_parquet_parts(&filename_output);
+        let mut removed = 0usize;
+        for path in &stale {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "Output error: cannot remove stale part file '{}': {}",
+                        path, e
+                    );
+                    std::process::exit(agent::ExitCode::OutputWrite.code());
+                }
+            }
+        }
+        if removed > 0 {
+            let warning = format!(
+                "removed {} stale Parquet part file(s) left by an earlier run of '{}' (e.g. '{}')",
+                removed, filename_output, stale[0]
+            );
+            if !cli.agent {
+                eprintln!("Warning: {}", warning);
+            }
+            run_warnings.push(warning);
+        }
+    }
 
     // Setup Ctrl-C handler
     let quit = Arc::new(AtomicBool::new(false));
@@ -1437,17 +1481,44 @@ fn main() {
         "failed"
     };
 
+    // The hints cache is an output of this run only when this run wrote it
+    // (startup discovery on a list run); a cache merely read is an input.
+    let run_started_system = std::time::SystemTime::now() - run_timer.elapsed();
+    let hints_written = (mode == RunMode::List)
+        .then(|| agent::conventional_hints_path_for_prefix(opt_bucket, opt_region, &opt_prefix))
+        .filter(|path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified >= run_started_system)
+        });
     let manifest_outputs = runtime_output_summary(
         &cli,
         &cfg,
         list_writes_artifacts(&cli).then_some(filename_ks.as_str()),
         list_writes_artifacts(&cli).then_some(filename_output.as_str()),
-    );
+    )
+    .with_hints(hints_written);
     // Artifact summaries re-read every output in full (SHA256, Parquet footer,
     // line counts) — minutes of tail latency on a multi-GB listing. Only pay
     // that when a manifest is actually emitted; the human "Wrote:" summary
     // needs just the paths.
     let manifest_emitted = cli.agent || cli.run_manifest.is_some();
+    let artifacts = if manifest_emitted {
+        agent::collect_artifacts(&manifest_outputs, output_files)
+    } else {
+        Vec::new()
+    };
+    let mut manifest_warnings = run_warnings.clone();
+    // A Parquet artifact whose footer cannot be read is not a listing anyone
+    // can consume; say so where agents look.
+    for artifact in &artifacts {
+        if artifact.kind == "parquet" && artifact.exists && artifact.parquet.is_none() {
+            manifest_warnings.push(format!(
+                "Parquet artifact '{}' has no readable footer; it is not a usable listing",
+                artifact.path
+            ));
+        }
+    }
     let manifest = agent::RunManifest {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -1457,12 +1528,11 @@ fn main() {
         finished_at: chrono::Utc::now().to_rfc3339(),
         elapsed_secs: run_timer.elapsed().as_secs_f64(),
         command: agent::redacted_command_args(),
+        cwd: std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
         inputs: command_input_summary(&cli, &cfg),
-        artifacts: if manifest_emitted {
-            agent::collect_artifacts(&manifest_outputs, output_files)
-        } else {
-            Vec::new()
-        },
+        artifacts,
         outputs: manifest_outputs,
         config_source,
         metrics: metrics.into(),
@@ -1491,7 +1561,7 @@ fn main() {
             ),
             resumed_segments_skipped,
         ),
-        warnings: run_warnings.clone(),
+        warnings: manifest_warnings,
     };
 
     if let Some(path) = cli.run_manifest.as_deref() {
@@ -1970,6 +2040,90 @@ fn sanitize_path_component(value: &str) -> String {
     agent::sanitize_path_component(value)
 }
 
+/// `<base>.partN.parquet` files that exist for `base`, in index order.
+fn stale_parquet_parts(base: &str) -> Vec<String> {
+    (1..s3_turbo_list::data_map::MAX_LIST_OUTPUT_WORKERS)
+        .map(|index| s3_turbo_list::data_map::part_path(base, index))
+        .filter(|path| std::path::Path::new(path).is_file())
+        .collect()
+}
+
+/// Every file a run writes must have its own path. Two outputs sharing one
+/// silently destroy each other — the KS file, written after the Parquet
+/// writers close, used to overwrite a Parquet file at the same path while the
+/// run reported success and `manifest-summary --check` passed. Paths are
+/// compared lexically after making them absolute; an existing non-regular
+/// file (e.g. `/dev/null`) may be shared.
+fn validate_distinct_output_paths(
+    cli: &Cli,
+    cfg: &S3TurboConfig,
+    ks: Option<&str>,
+    parquet: Option<&str>,
+) {
+    if !matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. }) {
+        return;
+    }
+    let mut outputs: Vec<(String, String)> = Vec::new();
+    if let Some(path) = parquet {
+        outputs.push(("--output-parquet-file".to_string(), path.to_string()));
+        if matches!(cli.cmd, Commands::List { .. }) {
+            for index in 1..s3_turbo_list::data_map::MAX_LIST_OUTPUT_WORKERS {
+                outputs.push((
+                    format!("Parquet part file {}", index),
+                    s3_turbo_list::data_map::part_path(path, index),
+                ));
+            }
+        }
+    }
+    let named = [
+        ("--output-ks-file", ks),
+        ("--output-log-file", cfg.output.log_file.as_deref()),
+        ("--trace-compat", cfg.s3.trace_compat.as_deref()),
+        ("--run-manifest", cli.run_manifest.as_deref()),
+        (
+            "--plan-json",
+            cli.plan_json.as_deref().filter(|_| cli.dry_run),
+        ),
+    ];
+    for (label, path) in named {
+        if let Some(path) = path {
+            outputs.push((label.to_string(), path.to_string()));
+        }
+    }
+    let key = |path: &str| -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(path);
+        if p.exists() && !p.is_file() {
+            return None; // devices and the like may be shared
+        }
+        let absolute = std::path::absolute(p).ok()?;
+        let mut normalized = std::path::PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other),
+            }
+        }
+        Some(normalized)
+    };
+    let mut seen: Vec<(std::path::PathBuf, &str, &str)> = Vec::new();
+    for (label, path) in &outputs {
+        let Some(k) = key(path) else { continue };
+        if let Some((_, other_label, other_path)) =
+            seen.iter().find(|(seen_key, _, _)| *seen_key == k)
+        {
+            eprintln!(
+                "{} '{}' and {} '{}' are the same file; every output needs its own path",
+                other_label, other_path, label, path
+            );
+            std::process::exit(agent::ExitCode::CliConfig.code());
+        }
+        seen.push((k, label, path));
+    }
+}
+
 fn ensure_output_dir(cli: &Cli) {
     if cli.dry_run {
         return;
@@ -2333,9 +2487,16 @@ fn run_benchmark_local(
 
     let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
     let producer_send_wait_secs = send_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
-    let parquet_bytes = std::fs::metadata(&parquet_file)
+    // A pooled run writes `.partN` files beside the base file; the report's
+    // size and throughput figures cover all of them.
+    let parquet_bytes = std::iter::once(parquet_file.display().to_string())
+        .chain(agent::parquet_part_paths(
+            &parquet_file.display().to_string(),
+            g_state.metrics_snapshot().data_output_files,
+        ))
+        .filter_map(|path| std::fs::metadata(path).ok())
         .map(|m| m.len())
-        .unwrap_or(0);
+        .sum::<u64>();
     let ks_bytes = std::fs::metadata(&ks_file).map(|m| m.len()).unwrap_or(0);
     let text_bytes = text_file
         .as_ref()
@@ -2776,6 +2937,18 @@ fn build_plan_report(
     };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = config_source.warnings.clone();
+    if let (Commands::List { .. }, Some(parquet)) = (&cli.cmd, outputs.parquet_file.as_deref()) {
+        let stale = stale_parquet_parts(parquet);
+        if !stale.is_empty() {
+            warnings.push(format!(
+                "{} Parquet part file(s) from an earlier run of '{}' exist (e.g. '{}'); \
+                 the run will remove them",
+                stale.len(),
+                parquet,
+                stale[0]
+            ));
+        }
+    }
     warnings.extend(runtime_guardrail_warnings(cli, cfg));
     if matches!(cli.cmd, Commands::CompatProbe { .. }) {
         warnings.push(

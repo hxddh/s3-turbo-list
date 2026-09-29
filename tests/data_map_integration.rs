@@ -273,7 +273,7 @@ async fn test_merge_writes_ks_counts() {
     let entries = outcome.write_ks(ks_path.to_str().unwrap()).await.unwrap();
     assert_eq!(entries, 2);
     let content = std::fs::read_to_string(&ks_path).unwrap();
-    assert_eq!(content, "\"a\",\"2\"\n\"b\",\"1\"\n");
+    assert_eq!(content, "\"a/\",\"2\"\n\"b/\",\"1\"\n");
 }
 
 // ── Quit-path drain (interrupt + --resume data-loss guard) ─────────────

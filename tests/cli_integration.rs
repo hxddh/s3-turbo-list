@@ -2325,3 +2325,60 @@ fn test_cli_diff_target_uses_its_own_region_endpoint() {
     ])
     .is_none());
 }
+
+#[test]
+fn test_cli_rejects_outputs_sharing_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = [
+        "--dry-run",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "us-east-1",
+    ];
+    let run = |extra: &[&str]| {
+        let mut args: Vec<&str> = extra.to_vec();
+        args.extend(base);
+        run_cli_in_dir(&args, dir.path())
+    };
+    // Parquet and KS at one path: the KS file used to overwrite the Parquet.
+    let (code, _, stderr) = run(&[
+        "--output-parquet-file",
+        "o/same",
+        "--output-ks-file",
+        "o/same",
+    ]);
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("same file"), "{}", stderr);
+    // A pooled part-file name counts too.
+    let (code, _, stderr) = run(&[
+        "--output-parquet-file",
+        "o/x.parquet",
+        "--output-ks-file",
+        "o/./x.part2.parquet",
+    ]);
+    assert_eq!(code, 2, "{}", stderr);
+    // Trace and log collide just the same.
+    let (code, _, _) = run(&["--trace-compat", "o/t", "--output-log-file", "o/t"]);
+    assert_eq!(code, 2);
+    // Devices may be shared.
+    let (code, _, stderr) = run(&[
+        "--output-ks-file",
+        "/dev/null",
+        "--trace-compat",
+        "/dev/null",
+    ]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    // Stale part files from an earlier run are announced in the plan.
+    std::fs::create_dir_all(dir.path().join("o")).unwrap();
+    std::fs::write(dir.path().join("o/x.part1.parquet"), b"stale").unwrap();
+    let (code, stdout, _) = run(&["--output-parquet-file", "o/x.parquet"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Parquet part file(s) from an earlier run"),
+        "{}",
+        stdout
+    );
+}

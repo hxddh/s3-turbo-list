@@ -91,9 +91,13 @@ impl ObjectKey {
         }
     }
 
-    /// Borrow just the `prefix` portion of this key. Top-level objects use `"/"` as prefix.
+    /// The key's directory prefix as S3 writes a CommonPrefix: everything up
+    /// to and including the last `/`, or `""` for a top-level key.  This is
+    /// the KS file's prefix column.  (It used to drop the trailing `/` and
+    /// use `"/"` for the root, which made the root indistinguishable from the
+    /// directory of `//x`, and `/x` land under `""`.)
     pub fn prefix(&self) -> &str {
-        self.0.rsplit_once('/').map_or("/", |(p, _)| p)
+        self.0.rfind('/').map_or("", |pos| &self.0[..=pos])
     }
 
     pub fn encode(prefix: &ObjectPrefix, name: &ObjectName) -> Self {
@@ -1083,7 +1087,7 @@ mod tests {
         let key = ObjectKey::from("test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "/");
-        assert_eq!(key.prefix(), "/");
+        assert_eq!(key.prefix(), "");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "test.jpg");
@@ -1094,10 +1098,19 @@ mod tests {
         let key = ObjectKey::from("a/b/c/test.jpg");
         let (prefix, name) = key.decode();
         assert_eq!(prefix, "a/b/c");
-        assert_eq!(key.prefix(), "a/b/c");
+        assert_eq!(key.prefix(), "a/b/c/");
         assert_eq!(name, "test.jpg");
         let rebuilt = ObjectKey::encode(&prefix, &name);
         assert_eq!(rebuilt.as_str(), "a/b/c/test.jpg");
+    }
+
+    #[test]
+    fn test_object_key_prefix_is_unambiguous() {
+        let prefixes: Vec<String> = ["x", "/x", "//x", "a/x", "a//x"]
+            .iter()
+            .map(|raw| ObjectKey::from(*raw).prefix().to_string())
+            .collect();
+        assert_eq!(prefixes, vec!["", "/", "//", "a/", "a//"]);
     }
 
     #[test]
