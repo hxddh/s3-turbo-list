@@ -1578,7 +1578,7 @@ fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
             .iter()
             .any(|value| value == "endpoint_url")
     );
-    assert_eq!(manifest_json["inputs"]["continuation_token"], "seed-token");
+    assert_eq!(manifest_json["inputs"]["continuation_token"], "<redacted>");
     assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
 }
 
