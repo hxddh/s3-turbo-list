@@ -2502,3 +2502,85 @@ fn test_cli_rejects_delimiter_with_hints_file() {
     assert_eq!(code, 2, "stderr: {}", stderr);
     assert!(stderr.contains("--delimiter"), "stderr: {}", stderr);
 }
+
+#[test]
+fn test_dry_run_predicts_outputs_the_run_cannot_create() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("exist.parquet"), b"").unwrap();
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--output-dir",
+            "exist.parquet",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 5, "stderr: {}", stderr);
+    let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(plan["status"], "blocked");
+    // An existing explicit output is still fine, but the plan says it goes.
+    let (code, stdout, _stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--output-parquet-file",
+            "exist.parquet",
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("will be overwritten"), "{}", stdout);
+}
+
+#[test]
+fn test_dry_run_plans_prefix_distinct_names_log_file_and_slash_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_for = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec!["--dry-run"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["list", "--bucket", "b", "--region", "us-east-1"]);
+        let (code, stdout, stderr) = run_cli_in_dir(&args, dir.path());
+        assert_eq!(code, 0, "stderr: {}", stderr);
+        serde_json::from_str(&stdout).unwrap()
+    };
+    // Different prefixes get different auto-generated names.
+    let a = plan_for(&["--prefix", "dir0/"]);
+    let b = plan_for(&["--prefix", "dir1/"]);
+    let name = |plan: &serde_json::Value| {
+        let path = plan["outputs"]["parquet_file"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        path.rsplit_once('_').unwrap().0.to_string()
+    };
+    assert_ne!(name(&a), name(&b));
+    // --log is named up front, inside --output-dir, and reported.
+    let logged = plan_for(&["--log", "--output-dir", "out"]);
+    assert!(
+        logged["outputs"]["log_file"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("out/turbo_list_")),
+        "{}",
+        logged["outputs"]
+    );
+    // A leading '/' matches no ordinary key; the plan says so.
+    let slashed = plan_for(&["--prefix", "/dir1/"]);
+    assert!(
+        slashed["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("Did you mean 'dir1/'")),
+        "{}",
+        slashed["warnings"]
+    );
+}

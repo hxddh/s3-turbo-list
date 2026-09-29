@@ -695,6 +695,40 @@ pub fn output_conflicts(outputs: &OutputPathSummary) -> Vec<FileConflict> {
     .collect()
 }
 
+/// Why the real run could not create an output file at `path`, if it could
+/// not: the path is a directory, or its nearest existing ancestor is a file or
+/// a read-only directory (e.g. `--output-dir` pointing at an existing file, or
+/// a path under /proc). Checked without touching the filesystem, so a dry run
+/// predicts the exit-5 the run would hit when creating the file.
+pub fn output_path_problem(path: &str) -> Option<String> {
+    let target = Path::new(path);
+    if target.is_dir() {
+        return Some(format!("'{}' is a directory", path));
+    }
+    let mut ancestor = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    loop {
+        match std::fs::metadata(ancestor) {
+            Ok(meta) if !meta.is_dir() => {
+                return Some(format!(
+                    "'{}' exists and is not a directory",
+                    ancestor.display()
+                ));
+            }
+            Ok(meta) if meta.permissions().readonly() => {
+                return Some(format!("directory '{}' is read-only", ancestor.display()));
+            }
+            Ok(_) => return None,
+            Err(_) => match ancestor.parent().filter(|p| !p.as_os_str().is_empty()) {
+                Some(up) => ancestor = up,
+                None => return None,
+            },
+        }
+    }
+}
+
 fn output_parent(path: &str) -> Option<PathBuf> {
     Path::new(path)
         .parent()

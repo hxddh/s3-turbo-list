@@ -64,6 +64,12 @@ Output files are auto-named:
 - `<region>_<bucket>_<timestamp>.parquet` — the object listing
 - `<region>_<bucket>_<timestamp>.ks` — per-prefix object counts (CSV)
 
+A `--prefix` run adds a short hash of the prefix (`…_<bucket>_p1a2b3c4d_<timestamp>`),
+so parallel runs over different prefixes never share a name, and a name
+already taken in the output directory gets a `_N` suffix rather than
+overwriting another run's files. `--log` writes `turbo_list_<timestamp>.log`
+into `--output-dir` when one is given.
+
 ## Output
 
 | Mode | Command | Writes |

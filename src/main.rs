@@ -42,7 +42,8 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<String>,
 
-    /// Prefix to start listing from
+    /// Key prefix to list, e.g. `logs/2026/` (S3 keys do not start with '/';
+    /// the default "/" means the whole bucket)
     #[arg(short, long, default_value = "/", global = true)]
     prefix: String,
 
@@ -544,6 +545,7 @@ fn main() {
     cfg.normalize_addressing_style();
     let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
     apply_output_dir_defaults(&cli, &mut cfg);
+    apply_log_file_default(&cli, &mut cfg);
     apply_summary_only_output_defaults(&cli, &mut cfg);
     validate_runtime_values(&cfg);
     validate_summary_only_command(&cli);
@@ -732,6 +734,10 @@ fn main() {
             eprintln!("Provider setup error: {}", error);
             std::process::exit(agent::ExitCode::ProviderSetup.code());
         }
+        if let Some(problem) = planned_output_problems(&report.outputs, &cli).first() {
+            eprintln!("Output error: {}", problem);
+            std::process::exit(agent::ExitCode::OutputWrite.code());
+        }
         return;
     }
 
@@ -878,6 +884,8 @@ fn main() {
         opt_bucket,
         opt_target_region.flatten(),
         opt_target_bucket,
+        &opt_prefix,
+        None,
     );
     let filename_ks = cfg
         .output
@@ -1951,6 +1959,25 @@ fn run_manifest_summary(manifest_file: &str, json: bool, check: bool) {
     }
 }
 
+/// `--log` without `--output-log-file`: name the log file up front — inside
+/// `--output-dir` when one is given — so the plan, the manifest's `outputs`
+/// and its artifacts report it like every other output. It used to be named
+/// only when logging started, always in the working directory, and neither
+/// the plan nor the manifest knew it existed.
+fn apply_log_file_default(cli: &Cli, cfg: &mut S3TurboConfig) {
+    if !cli.log
+        || cfg.output.log_file.is_some()
+        || !matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
+    {
+        return;
+    }
+    let name = format!("turbo_list_{}.log", Local::now().format("%Y%m%d%H%M%S"));
+    cfg.output.log_file = Some(match cli.output_dir.as_deref() {
+        Some(dir) => format!("{}/{}", dir, name),
+        None => name,
+    });
+}
+
 fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
     let Some(output_dir) = cli.output_dir.as_deref() else {
         return;
@@ -1961,7 +1988,14 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
 
     match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let stem = output_stem(region.as_deref(), bucket, None, None);
+            let stem = output_stem(
+                region.as_deref(),
+                bucket,
+                None,
+                None,
+                &listing_prefix(cli),
+                Some(output_dir),
+            );
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
             }
@@ -1980,6 +2014,8 @@ fn apply_output_dir_defaults(cli: &Cli, cfg: &mut S3TurboConfig) {
                 bucket,
                 target_region.as_deref(),
                 Some(target_bucket.as_str()),
+                &listing_prefix(cli),
+                Some(output_dir),
             );
             if cfg.output.parquet_file.is_none() {
                 cfg.output.parquet_file = Some(format!("{}/{}.parquet", output_dir, stem));
@@ -2379,20 +2415,45 @@ fn list_writes_artifacts(cli: &Cli) -> bool {
         .unwrap_or(true)
 }
 
+/// Auto-generated output stem for this run, unique in `dir` (the output
+/// directory, or the working directory): a stem whose `.parquet` or `.ks`
+/// already exists gets a `_N` suffix instead of overwriting another run's
+/// files — two runs started in the same second used to share one name, and
+/// the second silently replaced the first's artifacts while both reported
+/// success.
 fn output_stem(
     region: Option<&str>,
     bucket: &str,
     target_region: Option<&str>,
     target_bucket: Option<&str>,
+    prefix: &str,
+    dir: Option<&str>,
 ) -> String {
     let now = Local::now().format("%Y%m%d%H%M%S");
-    output_stem_with_timestamp(
+    let stem = output_stem_with_timestamp(
         region,
         bucket,
         target_region,
         target_bucket,
+        prefix,
         &now.to_string(),
-    )
+    );
+    let taken = |candidate: &str| {
+        [".parquet", ".ks"].iter().any(|ext| {
+            let name = format!("{}{}", candidate, ext);
+            match dir {
+                Some(dir) => std::path::Path::new(dir).join(name).exists(),
+                None => std::path::Path::new(&name).exists(),
+            }
+        })
+    };
+    if !taken(&stem) {
+        return stem;
+    }
+    (1..)
+        .map(|n| format!("{}_{}", stem, n))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused suffix exists")
 }
 
 fn output_stem_with_timestamp(
@@ -2400,6 +2461,7 @@ fn output_stem_with_timestamp(
     bucket: &str,
     target_region: Option<&str>,
     target_bucket: Option<&str>,
+    prefix: &str,
     timestamp: &str,
 ) -> String {
     let mut parts = Vec::new();
@@ -2412,6 +2474,13 @@ fn output_stem_with_timestamp(
     }
     if let Some(target_bucket) = target_bucket {
         parts.push(sanitize_path_component(target_bucket));
+    }
+    // Runs over different prefixes of one bucket get different names (the
+    // hints cache and checkpoint are keyed the same way): parallel per-prefix
+    // runs started in the same second used to overwrite each other.
+    if !prefix.is_empty() {
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+        parts.push(format!("p{}", &digest[..8]));
     }
     parts.push(timestamp.to_string());
     parts.join("_")
@@ -3300,6 +3369,28 @@ fn synthetic_diff_batches(
     (left, right)
 }
 
+/// Output files the run would fail to create (exit 5), with the reason.
+fn planned_output_problems(outputs: &agent::OutputPathSummary, cli: &Cli) -> Vec<String> {
+    [
+        outputs.parquet_file.as_deref(),
+        outputs.ks_file.as_deref(),
+        outputs.log_file.as_deref(),
+        outputs.trace_compat.as_deref(),
+        cli.run_manifest.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|path| {
+        agent::output_path_problem(path).map(|problem| {
+            format!(
+                "output '{}' cannot be created: {}; the run would exit 5",
+                path, problem
+            )
+        })
+    })
+    .collect()
+}
+
 fn build_plan_report(
     cli: &Cli,
     cfg: &S3TurboConfig,
@@ -3450,12 +3541,30 @@ fn build_plan_report(
         );
     }
 
+    let output_problems = planned_output_problems(&outputs, cli);
+    for path in [
+        outputs.parquet_file.as_deref(),
+        outputs.ks_file.as_deref(),
+        outputs.log_file.as_deref(),
+        outputs.trace_compat.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if std::path::Path::new(path).is_file() {
+            warnings.push(format!("output '{}' exists and will be overwritten", path));
+        }
+    }
+    let output_blocked = !output_problems.is_empty();
+    warnings.extend(output_problems);
+
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
-        // `blocked`: a provider setup problem that stops the real run with
-        // exit 3 (the reason is in `warnings`); the dry run exits 3 too.
-        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() {
+        // `blocked`: a problem that stops the real run — a provider setup
+        // problem (exit 3) or an output it cannot create (exit 5); the reason
+        // is in `warnings` and the dry run exits with the same code.
+        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() && !output_blocked {
             "ok"
         } else {
             "blocked"
@@ -3526,6 +3635,20 @@ fn cli_config_overrides(cli: &Cli) -> Vec<String> {
 
 fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
+    // Only the exact default "/" means the whole bucket. A path-style
+    // "/logs/" is a literal prefix that S3 keys (which rarely start with a
+    // slash) do not match, so the run listed nothing and exited 0.
+    if cli.prefix != "/"
+        && cli.prefix.starts_with('/')
+        && matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
+    {
+        warnings.push(format!(
+            "--prefix '{}' starts with '/', and S3 keys rarely do; this lists only keys that \
+             literally begin with '/'. Did you mean '{}'?",
+            cli.prefix,
+            cli.prefix.trim_start_matches('/')
+        ));
+    }
     if matches!(
         cli.cmd,
         Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
@@ -3756,7 +3879,14 @@ fn planned_output_paths(
     let now = Local::now().format("%Y%m%d%H%M%S").to_string();
     match &cli.cmd {
         Commands::List { region, bucket, .. } => {
-            let stem = output_stem_with_timestamp(region.as_deref(), bucket, None, None, &now);
+            let stem = output_stem_with_timestamp(
+                region.as_deref(),
+                bucket,
+                None,
+                None,
+                &listing_prefix(cli),
+                &now,
+            );
             let ks = cfg
                 .output
                 .ks_file
@@ -3780,6 +3910,7 @@ fn planned_output_paths(
                 bucket,
                 target_region.as_deref(),
                 Some(target_bucket),
+                &listing_prefix(cli),
                 &now,
             );
             let ks = cfg
