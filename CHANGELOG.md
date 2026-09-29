@@ -5,6 +5,98 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- The spellings deprecated in 0.37: `--profile` (use `--provider`),
+  `--summary-only` (`--output-format summary`), `--plan-json`
+  (`--dry-run > file`), `--debug-s3` (`--trace-compat -`),
+  `--continuation-token` (`--resume` or `--start-after`), and
+  `--output-ks-file` / `--output-log-file` (the KeySpace file is always
+  `<parquet stem>.ks`, the `--log` file `<name>.log`), including the hidden
+  `doctor` copies of the last two. Each is now a usage error (exit 2).
+- The `init-config` stub: it is an unknown subcommand (exit 2).
+- Plan and `doctor --json` fields `resolved_config.s3.{profile,
+  force_path_style, debug_s3}`, and plan/manifest fields
+  `checkpoint.{completed_segments, total_segments}`.
+- The trace writers' fan-out and no-op variants: the trace target is a
+  JSONL file or stderr (`trace_writer_for_target`).
+
+### Deprecated (removed in 0.39)
+These warned nowhere in 0.37. Each now prints `warning: deprecated …` on
+stderr (not under `--agent`) and is listed in the plan / manifest
+`warnings`, in `config_source.warnings` (config keys), or as a `deprecated`
+`doctor` check.
+- Options other than `--config`, `--provider`, `--endpoint-url` and
+  `--addressing-style` written before the command name
+  (`s3-turbo-list --output-dir out list …`): write them after it.
+- Config keys `s3.profile` (use `s3.provider`) and `s3.force_path_style`
+  (use `s3.addressing_style = "path"`).
+- `--endpoint` (use `--endpoint-url`), `doctor --agent` and
+  `manifest-summary --agent` (use `--json`), and the no-ops
+  `doctor --simple` and `doctor --fix-suggestions`.
+- JSON fields renamed to "provider": `inputs.profile` (use
+  `inputs.provider`), `resolved_config.s3.profile_known` /
+  `profile_warnings` (use `provider_known` / `provider_warnings`), the trace
+  field `profile` (use `provider`). `inputs.continuation_token` stays for
+  one release, always null.
+
+### Changed
+- **`--agent` keeps stderr quiet**, as documented: the stderr log is off
+  unless `RUST_LOG` is set (a `--log` file keeps its level), deprecation
+  warnings go to the JSON only, and a pre-run failure prints just the run
+  line. `compat-probe --agent` no longer traces to stderr by default.
+- **Plan `warnings` is empty in the normal case.** Dropped: the always-on
+  diff "--hints-file/--resume unsupported" note, the compat-probe "will
+  contact the endpoint" note, the tsv/ndjson and summary "writes no files"
+  notes (kept only when output path options are given and ignored), and the
+  `--delimiter ''` note unless the option was written out.
+- The provider is "provider" throughout: `inputs.provider`,
+  `resolved_config.s3.provider_known` / `provider_warnings`, the trace
+  field `provider`, and the checkpoint identity field `provider`
+  (checkpoints written by 0.37 with `profile` still load and resume). The
+  name is normalized to the preset's lowercase spelling, so `--provider BOS`
+  and a later `--provider bos --resume` are the same run. Messages that said
+  "profile" say "provider", and an unknown provider from the config file is
+  reported as `s3.provider in <file>`, not as `--provider`.
+- Every non-zero `list`/`diff`/`compat-probe` exit prints the run line, dry
+  runs included: `s3-turbo-list: run blocked (exit N): …` after a blocked
+  plan, `run failed` for a pre-plan error; the reason is no longer printed
+  twice. A blocked dry run under `--agent` prints only the plan.
+- `doctor --json` early exits (usage error, unreadable hints file, unknown
+  provider, config error) include `cwd`, and `config_source` /
+  `resolved_config` once the config is read.
+- compat-probe plans report `hints.source: not_applicable` and list the
+  `-o` report as `outputs.report_file`, which is checked (and flagged in
+  `file_conflicts`) like any other output before a request.
+- `guide <provider>` says `status: validated` or `status: documented
+  preset`, as the docs do.
+- `doctor` without a provider says requests go to AWS S3 instead of "no
+  explicit endpoint URL required by the provider preset".
+- The trace docs no longer claim every S3 call is traced: startup
+  discovery, bisection and split probes are not.
+
+### Fixed
+- Clustered short options before the command name (`-lc 5 list …`) failed
+  with "unrecognized subcommand '5'".
+- Usage-error JSON was routed on raw argv strings: `list --bucket doctor
+  --json` printed doctor JSON, and `--agent` anywhere (even after
+  `manifest-summary`) printed the run-failure JSON. The command is found
+  the way option hoisting finds it; only `list`/`diff`/`compat-probe` print
+  the run-failure JSON and only `doctor` the doctor JSON.
+- A dry run with an unreadable or invalid `--hints-file` printed
+  `status: ok` and `hints.valid: null` while exiting 2; the plan is
+  `blocked` with `hints.valid: false`.
+- compat-probe without an endpoint now names what to pass: the regional
+  `--endpoint-url https://s3.<region>.amazonaws.com` for AWS (or no
+  preset), `--region` for a region-derived preset.
+- A config file with both `s3.provider` and `s3.profile` failed with
+  serde's "duplicate field"; it now says to remove `s3.profile`.
+- `completions` advertised hidden options (deprecated spellings and
+  debugging knobs).
+- `diff --help` said `--start-after` cannot be combined with `--hints-file`
+  or `--resume`, which diff does not take.
+
 ## [0.37.0] - 2026-09-29
 
 This release simplifies the command line: options belong to the commands
