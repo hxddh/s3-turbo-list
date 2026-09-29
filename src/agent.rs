@@ -721,10 +721,7 @@ pub fn output_path_problem(path: &str) -> Option<String> {
                 return Some(format!("directory '{}' is read-only", ancestor.display()));
             }
             Ok(_) => return None,
-            Err(_) => match ancestor.parent().filter(|p| !p.as_os_str().is_empty()) {
-                Some(up) => ancestor = up,
-                None => return None,
-            },
+            Err(_) => ancestor = ancestor.parent().filter(|p| !p.as_os_str().is_empty())?,
         }
     }
 }

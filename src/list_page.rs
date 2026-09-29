@@ -318,10 +318,8 @@ fn unescape_into(s: &str, out: &mut String) -> Option<()> {
             entity => {
                 let (digits, radix) = if let Some(hex) = entity.strip_prefix("#x") {
                     (hex, 16)
-                } else if let Some(dec) = entity.strip_prefix('#') {
-                    (dec, 10)
                 } else {
-                    return None;
+                    (entity.strip_prefix('#')?, 10)
                 };
                 let code = u32::from_str_radix(digits, radix).ok()?;
                 out.push(char::from_u32(code)?);
