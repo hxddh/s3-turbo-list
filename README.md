@@ -51,7 +51,10 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket \
 ```
 
 Listing is recursive by default. Use `--delimiter '/'` for a hierarchical
-listing (top-level objects plus `CommonPrefixes`). Preview any run without
+listing: the objects at that level plus one row per `CommonPrefix` ("folder"),
+whose `Key` ends with the delimiter and whose `Size`/`LastModified` are 0 and
+`ETag` empty. Folder rows count in `streamed_rows` but not in the KS object
+counts or `bytes_total`. Preview any run without
 contacting S3 by adding `--dry-run --agent`. `guide` prints command examples,
 `init-config` writes a starter config, and `completions`/`man` generate shell
 completions and a man page.

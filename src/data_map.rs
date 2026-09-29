@@ -791,7 +791,9 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |key, props| {
             let include = props.include_in_list_output();
             if include {
-                folder.add(prefix_stats, key.prefix(), props.size());
+                if !props.is_common_prefix() {
+                    folder.add(prefix_stats, key.prefix(), props.size());
+                }
                 stats.bytes_total = stats.bytes_total.saturating_add(props.size());
             }
             include
@@ -820,7 +822,9 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
             continue;
         }
 
-        folder.add(prefix_stats, key.prefix(), props.size());
+        if !props.is_common_prefix() {
+            folder.add(prefix_stats, key.prefix(), props.size());
+        }
         stats.streamed_rows += 1;
         stats.bytes_total = stats.bytes_total.saturating_add(props.size());
 
@@ -884,7 +888,9 @@ fn ingest_list_summary_batch(
     let mut folder = PrefixRunFolder::default();
     for (key, props) in batch {
         if props.include_in_list_output() {
-            folder.add(prefix_stats, key.prefix(), props.size());
+            if !props.is_common_prefix() {
+                folder.add(prefix_stats, key.prefix(), props.size());
+            }
             stats.streamed_rows += 1;
             stats.bytes_total = stats.bytes_total.saturating_add(props.size());
         }

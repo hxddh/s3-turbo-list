@@ -546,9 +546,10 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
+    // The page's CommonPrefix is a row, merged in key order.
     assert_eq!(
         parquet_keys(&parquet),
-        vec!["logs/a.txt", "logs/b.txt", "logs/c.txt"]
+        vec!["logs/a.txt", "logs/b.txt", "logs/archive/", "logs/c.txt"]
     );
     assert_eq!(std::fs::read_to_string(&ks).unwrap(), "\"logs/\",\"3\"\n");
 
@@ -2952,7 +2953,8 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(parquet_keys(&parquet), vec!["zz.txt"]);
+    // CommonPrefixes are emitted as rows in a --delimiter run.
+    assert_eq!(parquet_keys(&parquet), vec!["cp1/", "cp2/", "zz.txt"]);
 
     let requests = server.requests();
     assert!(
@@ -3238,7 +3240,12 @@ generated_at = "2026-05-17T00:00:00Z"
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(parquet_keys(&parquet), vec!["top-level.txt".to_string()]);
+    // CommonPrefixes are emitted as rows in a --delimiter run (in the order
+    // this mock returns them).
+    assert_eq!(
+        parquet_keys(&parquet),
+        vec!["logs/", "data/", "top-level.txt"]
+    );
     // One request total: no cached segment fan-out.
     assert_eq!(
         server.requests().len(),
@@ -4977,4 +4984,55 @@ fn local_mock_manifest_check_verifies_artifacts_against_metrics() {
         "{}",
         stdout
     );
+}
+
+#[test]
+fn local_mock_delimiter_listing_of_only_folders_emits_them() {
+    // A bucket whose top level holds only "folders" used to list as empty.
+    let server = MockS3Server::start(|request, _sequence| {
+        assert_eq!(
+            request.query.get("delimiter").map(String::as_str),
+            Some("/")
+        );
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &[],
+            &["dir0/", "dir1/", "dir2/"],
+            false,
+            None,
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--delimiter",
+        "/",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "ndjson",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let rows: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let keys: Vec<&str> = rows.iter().map(|r| r["k"].as_str().unwrap()).collect();
+    assert_eq!(keys, vec!["dir0/", "dir1/", "dir2/"]);
+    assert!(rows.iter().all(|r| r["s"] == 0 && r["m"] == 0));
 }

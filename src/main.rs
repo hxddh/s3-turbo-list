@@ -105,7 +105,7 @@ struct Cli {
     // ── S3-compatible observability flags ─────────────────
     /// Delimiter for ListObjectsV2; the default '' is a recursive
     /// full-bucket listing, use --delimiter '/' for hierarchical
-    /// top-level listing
+    /// top-level listing (objects plus one row per CommonPrefix)
     #[arg(long, default_value = "", global = true)]
     delimiter: String,
 

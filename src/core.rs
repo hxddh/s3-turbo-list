@@ -23,6 +23,8 @@ const OBJECT_PROPS_FLAG_DIR_LEFT: u8 = 0b1000_0000;
 const OBJECT_PROPS_FLAG_DIR_RIGHT: u8 = 0b0100_0000;
 const OBJECT_PROPS_FLAG_DIR_BOTH: u8 = 0b1100_0000;
 pub(crate) const OBJECT_PROPS_FLAG_DIFF_MODE: u8 = 0b0010_0000;
+/// A `--delimiter` run's CommonPrefix, emitted as a row: not an object.
+const OBJECT_PROPS_FLAG_COMMON_PREFIX: u8 = 0b0000_0010;
 
 const OBJECT_PROPS_STATUS_OPEN: u8 = 0xFF;
 #[cfg(test)]
@@ -169,6 +171,17 @@ impl ObjectProps {
     pub fn set_dir(&mut self, dir: u8) {
         self.flags |= dir;
     }
+
+    /// Row for a CommonPrefix (a "folder") in a `--delimiter` listing: size
+    /// and LastModified 0, no ETag. Counted as a row, not as an object.
+    pub fn new_common_prefix(dir: u8) -> Self {
+        let mut props = Self::new_open(dir, 0, [0; 16]);
+        props.flags |= OBJECT_PROPS_FLAG_COMMON_PREFIX;
+        props
+    }
+    pub fn is_common_prefix(&self) -> bool {
+        self.flags & OBJECT_PROPS_FLAG_COMMON_PREFIX != 0
+    }
     pub fn is_diff_mode(&self) -> bool {
         (self.flags & OBJECT_PROPS_FLAG_DIFF_MODE) == OBJECT_PROPS_FLAG_DIFF_MODE
     }
@@ -220,6 +233,9 @@ impl ObjectProps {
 
     pub(crate) fn write_etag_to_buffer<'a>(&self, buf: &'a mut [u8; 43]) -> &'a str {
         const HEX: &[u8; 16] = b"0123456789abcdef";
+        if self.is_common_prefix() {
+            return "";
+        }
 
         let mut pos = 0usize;
         for byte in self.etag_md5 {
