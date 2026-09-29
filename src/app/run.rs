@@ -1417,18 +1417,26 @@ pub(crate) async fn refine_flat_leaves(
     if leaves.is_empty() || boundaries.len() >= flat_target {
         return boundaries;
     }
-    let per_leaf = (flat_target - boundaries.len()) / leaves.len();
-    if per_leaf == 0 {
-        return boundaries;
-    }
+    // Spread the remaining budget over the leaves; the first `extra` leaves
+    // take one more cut each, so the total reaches the target (and with more
+    // leaves than budget, the first ones still get a cut).
+    let budget = flat_target - boundaries.len();
+    let (per_leaf, extra) = (budget / leaves.len(), budget % leaves.len());
     info!(
         "Startup discovery found {} boundaries and {} flat prefix(es) — bisecting them",
         boundaries.len(),
         leaves.len()
     );
-    let found = futures::future::join_all(leaves.iter().map(|leaf| {
-        discover_flat_boundaries_via_client(client, bucket, leaf, per_leaf, timeout_secs)
-    }))
+    let found = futures::future::join_all(
+        leaves
+            .iter()
+            .enumerate()
+            .map(|(i, leaf)| (leaf, per_leaf + usize::from(i < extra)))
+            .filter(|(_, target)| *target > 0)
+            .map(|(leaf, target)| {
+                discover_flat_boundaries_via_client(client, bucket, leaf, target, timeout_secs)
+            }),
+    )
     .await;
     boundaries.extend(found.into_iter().flatten());
     boundaries.sort();
