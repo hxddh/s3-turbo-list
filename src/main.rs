@@ -953,7 +953,8 @@ fn main() {
     // The async block yields what the run learned about resuming: the manifest
     // is built after it, and a completed run has already removed its
     // checkpoint, so the file on disk can no longer answer this.
-    let resumed_segments_skipped: Option<usize> = rt.block_on(async {
+    let (resumed_segments_skipped, checkpoint_note): (Option<usize>, Option<String>) = rt
+        .block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
         let checkpoint_path_opt = if cli.resume {
             Some(checkpoint::checkpoint_path_for_prefix(
@@ -987,33 +988,15 @@ fn main() {
             .as_deref()
             .and_then(|p| checkpoint::CheckpointJournal::load_and_verify(p, &current_identity));
 
-        // Segments this run will not list because the checkpoint records them
-        // complete. Captured here rather than re-read at manifest time: a run
-        // that finishes removes its checkpoint, so the file on disk at the end
-        // says nothing about whether this run resumed.
+        // A checkpoint that recorded the unwritten key ranges (0.36+) is
+        // resumed by listing exactly those ranges; hints, startup discovery
+        // and segment indices play no part.
+        let resume_ranges: Option<Vec<checkpoint::ResumeRange>> = checkpoint_journal
+            .as_ref()
+            .and_then(|cj| cj.remaining.clone());
+        // What this run skipped because a checkpoint records it listed —
+        // computed below, once the checkpoint has survived verification.
         let mut resumed_segments_skipped: Option<usize> = None;
-        if let Some(ref cj) = checkpoint_journal {
-            let skipped = cj.completed_indices.len();
-            resumed_segments_skipped = Some(skipped);
-            info!(
-                "Resuming checkpoint: {} of {} segments completed",
-                skipped, cj.total_segments
-            );
-            if skipped > 0 {
-                // The output of a resumed run covers only the segments it
-                // listed. Saying so is the difference between "combine this
-                // with the interrupted run's output" and a file that silently
-                // omits whatever the earlier run already wrote — which is what
-                // happens when both runs are pointed at one output path.
-                run_warnings.push(format!(
-                    "Resuming from checkpoint: {} of {} segments are already recorded complete \
-                     and will not be listed again, so this run's output covers only the \
-                     remaining key space. Combine it with the output of the interrupted run; \
-                     writing both to the same path leaves only this run's half.",
-                    skipped, cj.total_segments
-                ));
-            }
-        }
 
         let g_state = g_state.clone();
         let mut set = tokio::task::JoinSet::new();
@@ -1103,7 +1086,9 @@ fn main() {
         // their start with the CLI key and list overlapping ranges, so the
         // cached-hints load is skipped just like startup discovery below.
         // (--hints-file plus --start-after is rejected at CLI validation.)
-        let ks_list: Vec<String> = if cfg.s3.start_after.is_some() {
+        let ks_list: Vec<String> = if resume_ranges.is_some() {
+            Vec::new()
+        } else if cfg.s3.start_after.is_some() {
             info!(
                 "--start-after is single-chain: skipping cached hints and listing as one segment"
             );
@@ -1128,6 +1113,7 @@ fn main() {
         // through the existing cache path.
         let mut ks_list = ks_list;
         if ks_list.is_empty()
+            && resume_ranges.is_none()
             && mode == RunMode::List
             && !cli.no_auto_hints
             && cli.hints_file.is_none()
@@ -1225,14 +1211,73 @@ fn main() {
         // Discard a resume journal whose segment set does not match the
         // current hints — completed indices are positional, so a mismatch
         // would skip the wrong segments and silently drop keys.
-        let checkpoint_journal =
-            checkpoint_journal.filter(|cj| cj.verify_segments(&ks_list, original_hints_count));
+        let checkpoint_journal = checkpoint_journal.filter(|cj| {
+            cj.remaining.is_some() || cj.verify_segments(&ks_list, original_hints_count)
+        });
         // The checkpoint records progress against *this* boundary set; the
         // fingerprint is what a later --resume verifies it against.
         let current_identity = current_identity.with_boundaries(&ks_list);
 
         // Filter out completed segments when resuming.
-        let hints = if let Some(ref cj) = checkpoint_journal {
+        // Segments this run will not list because the checkpoint records them
+        // listed. Captured here rather than re-read at manifest time: a run
+        // that finishes removes its checkpoint, so the file on disk at the end
+        // says nothing about whether this run resumed. Computed after the
+        // verification above — a discarded checkpoint skips nothing.
+        if let Some(ref cj) = checkpoint_journal {
+            let (skipped, warning) = match &cj.remaining {
+                Some(ranges) => {
+                    let listed = cj.listed_ranges.unwrap_or(0);
+                    info!(
+                        "Resuming checkpoint: {} key range(s) left to list",
+                        ranges.len()
+                    );
+                    (
+                        listed,
+                        format!(
+                            "Resuming from checkpoint: the key space earlier runs already wrote \
+                             ({} range(s), in whole or in part) will not be listed again; this run \
+                             lists the {} remaining range(s), so its output covers only the rest \
+                             of the key space. Combine it with the output of the interrupted \
+                             run(s); writing both to the same path leaves only this run's part.",
+                            listed,
+                            ranges.len()
+                        ),
+                    )
+                }
+                None => {
+                    let skipped = cj.completed_indices.len();
+                    info!(
+                        "Resuming checkpoint: {} of {} segments completed",
+                        skipped, cj.total_segments
+                    );
+                    (
+                        skipped,
+                        format!(
+                            "Resuming from checkpoint: {} of {} segments are already recorded \
+                             complete and will not be listed again, so this run's output covers \
+                             only the remaining key space. Combine it with the output of the \
+                             interrupted run; writing both to the same path leaves only this \
+                             run's half.",
+                            skipped, cj.total_segments
+                        ),
+                    )
+                }
+            };
+            resumed_segments_skipped = Some(skipped);
+            if skipped > 0 {
+                // The runtime warnings were printed before the checkpoint was
+                // read, so this one goes to stderr here or it never does.
+                if !cli.agent {
+                    print_runtime_warnings(std::slice::from_ref(&warning));
+                }
+                run_warnings.push(warning);
+            }
+        }
+
+        let hints = if let Some(ranges) = resume_ranges.as_deref() {
+            core::KeySpaceHints::from_ranges(ranges)
+        } else if let Some(ref cj) = checkpoint_journal {
             let filtered =
                 core::KeySpaceHints::new_uncompleted_from(&ks_list, &cj.completed_indices);
             info!(
@@ -1263,6 +1308,9 @@ fn main() {
         let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = None;
+        // The list reactor's report of the key ranges it left unwritten.
+        let mut resume_slot: Option<Arc<std::sync::Mutex<Option<checkpoint::ResumeProgress>>>> =
+            None;
         let s3_cfg = cfg.s3.clone();
         let output_config = cfg.output.clone();
         let filename_ks_for_task = filename_ks.clone();
@@ -1444,6 +1492,7 @@ fn main() {
                 cli.continuation_token.as_deref(),
                 left_checkpoint.clone(),
             );
+            resume_slot = Some(task_ctx.resume_progress.clone());
             set.spawn(async move {
                 tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
             });
@@ -1522,24 +1571,34 @@ fn main() {
             }
         }
 
-        // ── Final checkpoint save on successful completion ─
+        // ── Final checkpoint save / removal ────────────────
+        // What the exit line should say about resuming; `None` when this run
+        // did not use --resume.
+        let mut checkpoint_note: Option<String> = None;
         if cli.resume
-            && let Some(ref cp_path) = checkpoint_path_opt {
-                let final_metrics = g_state.metrics_snapshot();
-                let run_was_interrupted = interrupted.load(Ordering::SeqCst);
-                if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
-                    info!(
-                        "Skipping final checkpoint save because run failed before producing reliable output"
-                    );
-                } else if !run_was_interrupted {
-                    // The run listed its whole key space, so there is no resume
-                    // point left. Saving one anyway was not merely redundant:
-                    // runtime-split segments record no progress, so the journal
-                    // claimed only *some* segments were done, nothing removed
-                    // it, and the next ordinary `--resume` invocation skipped
-                    // the recorded segments and wrote an output covering only
-                    // the remainder — reported as success, because the manifest
-                    // honestly described its own short artifact.
+            && let Some(ref cp_path) = checkpoint_path_opt
+        {
+            let final_metrics = g_state.metrics_snapshot();
+            let run_was_interrupted = interrupted.load(Ordering::SeqCst);
+            // Another job's checkpoint that shares this file name (same
+            // bucket, region and prefix; another endpoint, filter or page
+            // size) is neither removed nor overwritten.
+            let may_replace =
+                checkpoint::CheckpointJournal::may_replace(cp_path, &current_identity);
+            if final_metrics.fatal_errors > 0 || final_metrics.output_errors > 0 {
+                info!(
+                    "Skipping final checkpoint save because run failed before producing reliable output"
+                );
+            } else if !run_was_interrupted {
+                // The run listed its whole key space, so there is no resume
+                // point left. Saving one anyway was not merely redundant: the
+                // next ordinary `--resume` invocation would skip the recorded
+                // ranges and write an output covering only the remainder —
+                // reported as success, because the manifest honestly
+                // described its own short artifact.
+                if !may_replace {
+                    info!("Leaving checkpoint {} of another run in place", cp_path);
+                } else {
                     match std::fs::remove_file(cp_path) {
                         Ok(()) => info!(
                             "Run completed the whole key space — removed checkpoint {}",
@@ -1548,18 +1607,37 @@ fn main() {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => warn!(
                             "Run completed but its checkpoint {} could not be removed ({}). \
-                             A later --resume would skip the segments it records; delete it \
+                             A later --resume would skip the ranges it records; delete it \
                              before resuming.",
                             cp_path, e
                         ),
                     }
-                } else {
-                    let completed = merged_completed_indices(
-                        checkpoint_journal.as_ref(),
-                        &left_checkpoint,
-                        right_checkpoint.as_ref(),
-                    );
-                    if !completed.is_empty() {
+                }
+            } else if !may_replace {
+                let message = format!(
+                    "Checkpoint {} belongs to another run (different endpoint, filter or \
+                     page size) and was not overwritten; this run's progress was not saved, \
+                     so a --resume would list it again from the start",
+                    cp_path
+                );
+                warn!("{}", message);
+                run_warnings.push(message.clone());
+                checkpoint_note = Some(message);
+            } else {
+                let progress = resume_slot
+                    .as_ref()
+                    .and_then(|slot| slot.lock().unwrap().take());
+                match progress {
+                    Some(progress) => {
+                        let completed = merged_completed_indices(
+                            checkpoint_journal.as_ref(),
+                            &left_checkpoint,
+                            right_checkpoint.as_ref(),
+                        );
+                        let listed_before = checkpoint_journal.as_ref().map_or(0, |cj| {
+                            cj.listed_ranges.unwrap_or(cj.completed_indices.len())
+                        });
+                        let remaining_count = progress.remaining.len();
                         let journal = checkpoint::CheckpointJournal {
                             bucket: opt_bucket.to_string(),
                             prefix: opt_prefix.clone(),
@@ -1567,16 +1645,42 @@ fn main() {
                             completed_indices: completed,
                             last_updated: chrono::Local::now().to_rfc3339(),
                             identity: Some(current_identity.clone()),
+                            remaining: Some(progress.remaining),
+                            listed_ranges: Some(listed_before + progress.ranges_with_progress),
                         };
-                        journal.save(cp_path);
-                        info!(
-                            "Final checkpoint saved: {}/{} segments completed",
-                            journal.completed_indices.len(),
-                            journal.total_segments
-                        );
+                        match journal.save(cp_path) {
+                            Ok(()) => {
+                                info!(
+                                    "Final checkpoint saved: {} key range(s) left to list",
+                                    remaining_count
+                                );
+                                checkpoint_note = Some(format!(
+                                    "checkpoint {} saved; rerun with --resume to list the {} \
+                                     remaining range(s)",
+                                    cp_path, remaining_count
+                                ));
+                            }
+                            Err(e) => {
+                                let message = format!(
+                                    "{}; a --resume would list everything again",
+                                    e
+                                );
+                                run_warnings.push(message.clone());
+                                checkpoint_note = Some(message);
+                            }
+                        }
+                    }
+                    None => {
+                        let message =
+                            "no resume progress was recorded; a --resume would list everything \
+                             again"
+                                .to_string();
+                        warn!("{}", message);
+                        checkpoint_note = Some(message);
                     }
                 }
             }
+        }
 
         // ── Diff mode completion notice ────────────────────
         if mode == RunMode::BiDir {
@@ -1584,7 +1688,7 @@ fn main() {
         }
 
         info!("All tasks completed.");
-        resumed_segments_skipped
+        (resumed_segments_skipped, checkpoint_note)
     });
 
     rt.shutdown_background();
@@ -1729,9 +1833,10 @@ fn main() {
         // run could end with empty stdout and stderr (the reason only in the
         // log file) while leaving partial artifacts behind.
         let reason = match (&first_fatal, exit_code) {
-            (_, agent::ExitCode::Interrupted) => {
-                "interrupted; with --resume, a checkpoint may allow resuming".to_string()
-            }
+            (_, agent::ExitCode::Interrupted) => match &checkpoint_note {
+                Some(note) => format!("interrupted; {}", note),
+                None => "interrupted (run with --resume to make a run resumable)".to_string(),
+            },
             (_, agent::ExitCode::OutputWrite) => first_output_error
                 .clone()
                 .map(|message| format!("output failed: {}", message))

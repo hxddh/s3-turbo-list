@@ -225,6 +225,9 @@ pub struct CheckpointPlan {
     pub identity_mismatches: Vec<String>,
     pub completed_segments: Option<usize>,
     pub total_segments: Option<usize>,
+    /// Key ranges a resume would list (checkpoints written by 0.36+, which
+    /// record the unwritten key space instead of completed segment indices).
+    pub remaining_ranges: Option<usize>,
     pub identity_fields: Vec<String>,
     /// Segments this run skipped because a checkpoint recorded them complete.
     /// `None` when the run did not resume; `Some(n)` with `n > 0` means the
@@ -612,6 +615,7 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
         identity_mismatches: Vec::new(),
         completed_segments: None,
         total_segments: None,
+        remaining_ranges: None,
         identity_fields: vec![
             "bucket".to_string(),
             "region".to_string(),
@@ -651,6 +655,7 @@ pub fn checkpoint_plan(
             plan.valid = Some(true);
             plan.completed_segments = Some(journal.completed_indices.len());
             plan.total_segments = Some(journal.total_segments);
+            plan.remaining_ranges = journal.remaining.as_ref().map(Vec::len);
             if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
                 let mismatches = stored.diff(current);
                 plan.identity_matches = Some(mismatches.is_empty());

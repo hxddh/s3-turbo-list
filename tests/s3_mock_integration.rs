@@ -5106,6 +5106,137 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
 
 #[cfg(unix)]
 #[test]
+fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
+    // The checkpoint used to record only whole, unsplit segments, while an
+    // interrupt still wrote the rows of partly listed ones — so `--resume`
+    // listed those again from their start and the documented "combine both
+    // outputs" produced duplicates. It now records the unwritten ranges.
+    let keys: Vec<String> = (0..6000).map(|i| format!("k{:05}", i)).collect();
+    let served = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        thread::sleep(Duration::from_millis(40));
+        let after = request
+            .query
+            .get("continuation-token")
+            .or_else(|| request.query.get("start-after"))
+            .cloned()
+            .unwrap_or_default();
+        let max_keys: usize = request
+            .query
+            .get("max-keys")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let page: Vec<&str> = served
+            .iter()
+            .filter(|k| k.as_str() > after.as_str())
+            .take(max_keys + 1)
+            .map(String::as_str)
+            .collect();
+        let truncated = page.len() > max_keys;
+        let page = &page[..page.len().min(max_keys)];
+        let token = truncated.then(|| page.last().unwrap().to_string());
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            max_keys as i32,
+            page,
+            &[],
+            truncated,
+            token.as_deref(),
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "k01500\nk03000\nk04500\n").unwrap();
+    let args: Vec<String> = [
+        "--config",
+        config.to_str().unwrap(),
+        "--endpoint-url",
+        &server.endpoint(),
+        "--addressing-style",
+        "path",
+        "--resume",
+        "--max-keys",
+        "50",
+        "-c",
+        "4",
+        "--hints-file",
+        hints.to_str().unwrap(),
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "tsv",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    let child = command
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Interrupt once the listing is well under way (not on a timer, which a
+    // slow CI runner could hit before any page or a fast one after the last).
+    let waited = std::time::Instant::now();
+    while server.requests().len() < 20 && waited.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let first = child.wait_with_output().unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_rows = String::from_utf8(first.stdout).unwrap();
+    assert!(
+        first_rows.lines().count() < keys.len(),
+        "the first run must be interrupted mid-listing"
+    );
+
+    let (code, second_rows, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    // The partial-output warning reaches stderr, not only the manifest.
+    assert!(
+        stderr.contains("Resuming from checkpoint"),
+        "stderr: {}",
+        stderr
+    );
+
+    let mut listed: Vec<&str> = first_rows
+        .lines()
+        .chain(second_rows.lines())
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    let total = listed.len();
+    listed.sort_unstable();
+    listed.dedup();
+    assert_eq!(total, listed.len(), "resume produced duplicate rows");
+    assert_eq!(listed, keys.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+#[cfg(unix)]
+#[test]
 fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
     // Every probe is slow and the key space looks flat and endless, so
     // startup discovery would run dozens of probe rounds. An interrupt used

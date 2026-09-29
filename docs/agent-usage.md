@@ -146,10 +146,12 @@ segments, and identity match details.
 
 `checkpoint.resumed_segments_skipped` is the field to branch on after a
 resumed run.  `null` means the run did not resume; a number greater than zero
-means the run skipped that many segments because a checkpoint recorded them
-complete, so **its artifacts describe only the rest of the key space** — the
-remainder is in the output of the run that was interrupted, and the two must
-be combined.  Reusing one output path across both runs leaves only the second
+means a checkpoint recorded that many key ranges as already written (in whole
+or in part, by the interrupted run or a chain of earlier resumes), so **its
+artifacts describe only the rest of the key space** — the remainder is in the
+output of the interrupted run(s), and the outputs must be combined; together
+they hold every key exactly once.  A dry-run plan reports how many ranges a
+resume would list in `checkpoint.remaining_ranges`.  Reusing one output path across both runs leaves only the second
 run's half; the run also emits a warning saying so.  Read this field rather
 than the checkpoint file: a run that lists its whole key space removes the
 checkpoint before exiting, so the file on disk cannot answer the question.

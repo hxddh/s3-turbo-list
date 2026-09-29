@@ -86,6 +86,11 @@ pub(crate) struct SegmentControl {
     probe_failures: AtomicU32,
     /// Segment gave part of its range away; checkpoint must not record it.
     was_split: AtomicBool,
+    /// Last key whose page reached the output channel (`None`: nothing yet).
+    /// Unlike `cursor` — recorded before the send, for split decisions — it
+    /// only ever covers rows the data map will write, so an interrupted run
+    /// can checkpoint "resume after this key" without losing a page.
+    sent: Mutex<Option<String>>,
 }
 
 impl SegmentControl {
@@ -100,6 +105,20 @@ impl SegmentControl {
             next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
             probe_failures: AtomicU32::new(0),
             was_split: AtomicBool::new(false),
+            sent: Mutex::new(None),
+        }
+    }
+
+    /// Every key up to `cursor` in this segment has been handed to the data
+    /// map (or filtered out): a resume may start after it.
+    fn record_sent(&self, cursor: &str) {
+        let mut guard = self.sent.lock().unwrap();
+        match guard.as_mut() {
+            Some(sent) => {
+                sent.clear();
+                sent.push_str(cursor);
+            }
+            None => *guard = Some(cursor.to_string()),
         }
     }
 
@@ -484,6 +503,10 @@ async fn flat_reactor_task(
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
     let mut set = tokio::task::JoinSet::new();
     let mut controls: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+    // Where each in-flight segment started, for the resume ranges below.
+    let mut starts: HashMap<usize, String> = HashMap::new();
+    let mut unfinished: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
+    let mut completed_pieces = 0usize;
     let mut pending_children: Vec<SplitRange> = Vec::new();
     // Children need indices no original segment uses: on a resume the set is
     // sparse, and a reused index would let a child's control replace its
@@ -516,6 +539,7 @@ async fn flat_reactor_task(
 
             let control = Arc::new(SegmentControl::new(end));
             controls.insert(index, Arc::clone(&control));
+            starts.insert(index, start.clone());
             let task_ctx = ctx.clone();
             let start_prefix = start_prefix.to_string();
             let task_split_tx = allow_split.then(|| split_tx.clone());
@@ -558,6 +582,17 @@ async fn flat_reactor_task(
                     retired_pages += control
                         .as_ref()
                         .map_or(0, |c| c.pages.load(Ordering::Relaxed) as u64);
+                    if !outcome.completed {
+                        // An unfinished segment's range is not done; keep its
+                        // control for the resume ranges (not in `controls`,
+                        // which the split prober and governor treat as live).
+                        if let Some(control) = control.clone() {
+                            unfinished.insert(outcome.index, control);
+                        }
+                    } else {
+                        completed_pieces += 1;
+                        starts.remove(&outcome.index);
+                    }
                     if outcome.completed {
                         if outcome.checkpointable {
                             hints.finish(outcome.index);
@@ -644,12 +679,83 @@ async fn flat_reactor_task(
         // Handle global quit.
         if ctx.is_quit() {
             set.abort_all();
+            // Collect the aborted tasks so every segment's sent cursor is
+            // final before the resume ranges are computed; one that finished
+            // in the meantime has nothing left to list.
+            while let Some(joined) = set.join_next().await {
+                if let Ok(outcome) = joined
+                    && outcome.completed
+                {
+                    controls.remove(&outcome.index);
+                    starts.remove(&outcome.index);
+                    completed_pieces += 1;
+                }
+            }
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
         }
     }
 
+    controls.extend(unfinished);
+    *ctx.resume_progress.lock().unwrap() = Some(resume_progress(
+        &controls,
+        &starts,
+        pending_children,
+        &mut hints,
+        completed_pieces,
+    ));
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
+}
+
+/// The key ranges an exiting reactor leaves unwritten: in-flight or
+/// unfinished segments from their last sent key, split children not yet
+/// started, and hint segments never started. Empty when the listing finished.
+fn resume_progress(
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+    starts: &HashMap<usize, String>,
+    pending_children: Vec<SplitRange>,
+    hints: &mut core::KeySpaceHints,
+    completed_pieces: usize,
+) -> crate::checkpoint::ResumeProgress {
+    use crate::checkpoint::ResumeRange;
+    let mut remaining = Vec::new();
+    let mut ranges_with_progress = completed_pieces;
+    let mut indices: Vec<usize> = controls.keys().copied().collect();
+    indices.sort_unstable();
+    for index in indices {
+        let control = &controls[&index];
+        let sent = control.sent.lock().unwrap().clone();
+        if sent.is_some() {
+            ranges_with_progress += 1;
+        }
+        let start_after = sent.unwrap_or_else(|| starts.get(&index).cloned().unwrap_or_default());
+        let end = control.current_end();
+        // A segment whose last sent key reached its end has nothing left.
+        if end
+            .as_deref()
+            .is_some_and(|end| start_after.as_str() >= end)
+        {
+            continue;
+        }
+        remaining.push(ResumeRange { start_after, end });
+    }
+    for child in pending_children {
+        remaining.push(ResumeRange {
+            start_after: child.start,
+            end: child.end,
+        });
+    }
+    while let Some(pair) = hints.next() {
+        remaining.push(ResumeRange {
+            start_after: pair.start,
+            end: pair.end,
+        });
+    }
+    remaining.sort_by(|a, b| a.start_after.cmp(&b.start_after));
+    crate::checkpoint::ResumeProgress {
+        remaining,
+        ranges_with_progress,
+    }
 }
 
 /// Choose which in-flight segments to probe for a split this tick.  Returns
@@ -1162,6 +1268,9 @@ async fn flat_list(
                             next_start,
                         ));
                     }
+                }
+                if !next_start.is_empty() {
+                    control.record_sent(&next_start);
                 }
 
                 page_count = page_count.saturating_add(1);

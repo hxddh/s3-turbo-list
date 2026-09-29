@@ -29,6 +29,8 @@ fn make_journal(identity: CheckpointIdentity, completed: Vec<usize>) -> Checkpoi
         completed_indices: completed,
         last_updated: String::new(),
         identity: Some(identity),
+        remaining: None,
+        listed_ranges: None,
     }
 }
 
@@ -48,7 +50,7 @@ fn test_identity_exact_match_accepts() {
         Some("list"),
     );
     let journal = make_journal(id.clone(), vec![0, 2]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let loaded = CheckpointJournal::load_and_verify(path_str, &id);
     assert!(loaded.is_some());
@@ -65,7 +67,7 @@ fn test_identity_delimiter_mismatch_rejects() {
 
     let stored = make_identity(Some("/"), None, None, None, None);
     let journal = make_journal(stored, vec![0]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(Some("#"), None, None, None, None);
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -79,7 +81,7 @@ fn test_identity_max_keys_mismatch_rejects() {
 
     let stored = make_identity(None, Some(100), None, None, None);
     let journal = make_journal(stored, vec![0]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(None, Some(500), None, None, None);
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -93,7 +95,7 @@ fn test_identity_profile_mismatch_rejects() {
 
     let stored = make_identity(None, None, Some("bos"), None, None);
     let journal = make_journal(stored, vec![0]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, Some("minio"), None, None);
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -107,7 +109,7 @@ fn test_identity_mode_mismatch_rejects() {
 
     let stored = make_identity(None, None, None, None, Some("list"));
     let journal = make_journal(stored, vec![0]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, None, None, Some("bidir"));
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -121,7 +123,7 @@ fn test_identity_addressing_style_mismatch_rejects() {
 
     let stored = make_identity(None, None, None, Some("path"), None);
     let journal = make_journal(stored, vec![0]);
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(None, None, None, Some("virtual"), None);
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -163,8 +165,10 @@ fn test_legacy_checkpoint_blank_identity_rejects() {
         completed_indices: vec![0, 2],
         last_updated: String::new(),
         identity: None,
+        remaining: None,
+        listed_ranges: None,
     };
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
 
     let current = make_identity(Some("/"), None, None, None, None);
     assert!(CheckpointJournal::load_and_verify(path_str, &current).is_none());
@@ -197,6 +201,8 @@ fn journal_for(boundaries: &[String], completed: Vec<usize>) -> CheckpointJourna
         completed_indices: completed,
         last_updated: String::new(),
         identity: Some(identity),
+        remaining: None,
+        listed_ranges: None,
     }
 }
 
@@ -243,6 +249,8 @@ fn test_checkpoint_without_boundary_digest_rejected() {
         completed_indices: vec![0],
         last_updated: String::new(),
         identity: Some(identity),
+        remaining: None,
+        listed_ranges: None,
     };
     assert!(!journal.verify_segments(&current, current.len() + 1));
 }
@@ -305,8 +313,10 @@ fn test_checkpoint_identity_includes_endpoint() {
         completed_indices: vec![0],
         last_updated: "now".into(),
         identity: Some(id(Some("http://x:9000"))),
+        remaining: None,
+        listed_ranges: None,
     };
-    journal.save(path_str);
+    journal.save(path_str).unwrap();
     // Saved atomically: no temp file left behind.
     assert!(!dir.path().join("cp.toml.tmp").exists());
     assert!(CheckpointJournal::load_and_verify(path_str, &id(Some("http://x:9000"))).is_some());

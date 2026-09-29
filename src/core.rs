@@ -799,6 +799,9 @@ pub struct S3TaskContext {
     /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
     pub continuation_token: Option<String>,
     pub checkpoint_completed: Arc<Mutex<Vec<usize>>>,
+    /// Filled by the list reactor as it exits: the key ranges left unwritten,
+    /// for the checkpoint a graceful interrupt saves.
+    pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
 }
 
 impl S3TaskContext {
@@ -881,6 +884,7 @@ impl S3TaskContext {
             start_after: start_after.map(|s| s.to_string()),
             continuation_token: continuation_token.map(|s| s.to_string()),
             checkpoint_completed,
+            resume_progress: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1053,6 +1057,25 @@ impl KeySpaceHints {
         let v = Self::pairs_from_boundaries(hints);
         Self {
             inner: v,
+            inflight: HashMap::new(),
+            done: Vec::new(),
+        }
+    }
+
+    /// Segments for exactly the given ranges — a resume from a checkpoint
+    /// that recorded the unwritten key space (0.36+).
+    pub fn from_ranges(ranges: &[crate::checkpoint::ResumeRange]) -> Self {
+        let inner = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| KeySpacePair {
+                index,
+                start: range.start_after.clone(),
+                end: range.end.clone().filter(|end| !end.is_empty()),
+            })
+            .collect();
+        Self {
+            inner,
             inflight: HashMap::new(),
             done: Vec::new(),
         }

@@ -182,26 +182,32 @@ s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
 
 Checkpoints are only kept by `--resume` runs, so pass it on the first run too.
 Progress is saved when the run is interrupted gracefully (Ctrl-C or SIGTERM),
-after the outputs are finalized. There are no mid-run saves: until an output
-file is closed its rows are not durable, so a crash (or a failed write) leaves
-the previous checkpoint unchanged and the next `--resume` lists those segments
-again rather than skipping rows that were never written. Checkpoint files are
-named per bucket, region and prefix, so `--resume` jobs over different
-prefixes do not interfere. The checkpoint
+after the outputs are finalized. The checkpoint records exactly the key ranges
+that were not yet written — each unfinished segment (including ones split at
+runtime) is cut at its last key whose rows reached the output — and the next
+`--resume` lists those ranges and nothing else, so the interrupted and resumed
+outputs together hold every key exactly once. There are no mid-run saves:
+until an output file is closed its rows are not durable, so a crash (or a
+failed write) leaves the previous checkpoint unchanged. If the checkpoint
+cannot be written, the run says so and the exit line does not promise a
+resume.
+
+Checkpoint files are named per bucket, region and prefix. The checkpoint
 identity covers bucket, region, endpoint, prefix, delimiter, max-keys,
-addressing style, profile, mode, filter, and the key-space boundary set itself
-(count and fingerprint) — completed segments are recorded by index, so a checkpoint is
-discarded with a warning unless the boundaries it was written against are the
-ones this run resolved.
+addressing style, profile, mode and filter; a checkpoint written for another
+identity is ignored with a warning, and is never deleted or overwritten by a
+run it does not belong to. Checkpoints written before 0.36 (which record
+completed segment indices) are still honoured, together with the boundary set
+they were written against.
 
-A run that lists its whole key space removes the checkpoint on the way out:
+A run that lists its whole key space removes its checkpoint on the way out:
 there is no resume point left, and leaving one behind meant the next
-`--resume` invocation skipped those segments and listed only the remainder.
+`--resume` invocation skipped those ranges and listed only the remainder.
 
-**A resumed run's output covers only the segments it listed.** The rest are in
+**A resumed run's output covers only the ranges it listed.** The rest are in
 the output of the run that was interrupted — combine the two. Pointing both
-runs at the same `--output-parquet-file` leaves only the second run's half.
-A resumed run says so on stderr, and the run manifest records the count under
+runs at the same `--output-parquet-file` leaves only the second run's part.
+A resumed run says so on stderr, and the run manifest records it under
 `checkpoint.resumed_segments_skipped`.
 
 ## Providers
