@@ -2,7 +2,7 @@ use crate::config::S3Config;
 use crate::stats::HttpStatusCodeTracker;
 use crate::trace::S3TraceWriter;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -81,6 +81,7 @@ impl ObjectKey {
 
     /// Consuming variant of [`decode`](Self::decode): reuses this key's
     /// allocation for the prefix, so only the name is newly allocated.
+    #[cfg(test)]
     pub fn into_decoded(self) -> (ObjectPrefix, ObjectName) {
         match self.0.rfind('/') {
             Some(pos) => {
@@ -185,12 +186,6 @@ impl ObjectProps {
     pub fn is_diff_mode(&self) -> bool {
         (self.flags & OBJECT_PROPS_FLAG_DIFF_MODE) == OBJECT_PROPS_FLAG_DIFF_MODE
     }
-    pub fn is_left(&self) -> bool {
-        (self.flags & OBJECT_PROPS_FLAG_DIR_LEFT) == OBJECT_PROPS_FLAG_DIR_LEFT
-    }
-    pub fn is_right(&self) -> bool {
-        (self.flags & OBJECT_PROPS_FLAG_DIR_RIGHT) == OBJECT_PROPS_FLAG_DIR_RIGHT
-    }
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -210,24 +205,12 @@ impl ObjectProps {
         (self.etag_md5, self.etag_parts)
     }
 
+    #[cfg(test)]
     pub fn etag_string(&self) -> String {
         if self.etag_parts == 0 {
             hex::encode(self.etag_md5)
         } else {
             format!("{}-{}", hex::encode(self.etag_md5), self.etag_parts)
-        }
-    }
-
-    pub fn append_etag_string(&self, out: &mut String) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        out.reserve(32 + usize::from(self.etag_parts != 0) * 11);
-        for byte in self.etag_md5 {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        if self.etag_parts != 0 {
-            let _ = std::fmt::Write::write_fmt(out, format_args!("-{}", self.etag_parts));
         }
     }
 
@@ -1024,10 +1007,6 @@ impl KeySpacePair {
             end: e,
         }
     }
-
-    pub fn to_task_input(&self) -> (&str, Option<&str>) {
-        (&self.start, self.end.as_deref())
-    }
 }
 
 pub struct KeySpaceHints {
@@ -1060,19 +1039,6 @@ impl KeySpaceHints {
             .collect();
         Self {
             inner,
-            inflight: HashMap::new(),
-            done: Vec::new(),
-        }
-    }
-
-    pub fn new_uncompleted_from(hints: &[String], completed_indices: &[usize]) -> Self {
-        let completed: HashSet<usize> = completed_indices.iter().copied().collect();
-        let v = Self::pairs_from_boundaries(hints)
-            .into_iter()
-            .filter(|pair| !completed.contains(&pair.index))
-            .collect();
-        Self {
-            inner: v,
             inflight: HashMap::new(),
             done: Vec::new(),
         }
@@ -1231,31 +1197,6 @@ mod tests {
         assert_eq!(p2.end, None);
 
         assert!(hints.next().is_none());
-    }
-
-    #[test]
-    fn test_key_space_hints_uncompleted_preserves_original_segment_starts() {
-        let boundaries = vec!["m/".to_string()];
-        let mut hints = KeySpaceHints::new_uncompleted_from(&boundaries, &[0]);
-        assert_eq!(hints.total_count(), 1);
-
-        let remaining = hints.next().unwrap();
-        assert_eq!(remaining.index, 1);
-        assert_eq!(remaining.start, "m/");
-        assert_eq!(remaining.end, None);
-        assert!(hints.next().is_none());
-    }
-
-    #[test]
-    fn test_key_space_hints_index_end_covers_sparse_resume_set() {
-        // Resume with segment 0 done: one segment left, but its index is 10.
-        // Fresh (split-child) indices must not collide with it.
-        let boundaries: Vec<String> = (0..10).map(|i| format!("k{i:02}/")).collect();
-        let completed: Vec<usize> = (0..10).collect();
-        let hints = KeySpaceHints::new_uncompleted_from(&boundaries, &completed);
-        assert_eq!(hints.total_count(), 1);
-        assert_eq!(hints.index_end(), 11);
-        assert_eq!(KeySpaceHints::new_from(&[]).index_end(), 1);
     }
 
     #[test]
