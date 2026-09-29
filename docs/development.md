@@ -137,7 +137,8 @@ It covers:
 
 - ListObjectsV2 pagination with `NextContinuationToken`.
 - Requests carrying `prefix`, `delimiter`, `max-keys`, `start-after`, and
-  `continuation-token`.
+  `continuation-token` (including servers that repeat or drop tokens, where
+  the run resumes with `start-after`).
 - XML responses with `Contents`, `CommonPrefixes`, and error bodies.
 - `compat-probe` behavior for `HeadBucket`, single-page list variants, and
   pagination.

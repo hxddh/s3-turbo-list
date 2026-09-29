@@ -563,6 +563,7 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--max-keys".into(),
         "2".into(),
         "--prefix".into(),
@@ -573,9 +574,6 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
         trace.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -671,7 +669,6 @@ fn local_mock_list_empty_delimiter_omits_request_parameter() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -681,13 +678,11 @@ fn local_mock_list_empty_delimiter_omits_request_parameter() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -750,7 +745,6 @@ fn local_mock_list_startup_discovery_splits_segments() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -760,13 +754,11 @@ fn local_mock_list_startup_discovery_splits_segments() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -883,7 +875,6 @@ fn local_mock_list_runtime_split_covers_long_tail() {
     let config = dir.path().join("config.toml");
     let hints = dir.path().join("hints.txt");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
     std::fs::write(&hints, "small/\n").unwrap();
 
@@ -894,6 +885,7 @@ fn local_mock_list_runtime_split_covers_long_tail() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "".into(),
         "--max-keys".into(),
@@ -902,9 +894,6 @@ fn local_mock_list_runtime_split_covers_long_tail() {
         hints.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1007,7 +996,6 @@ fn local_mock_list_flat_namespace_runtime_split() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -1017,6 +1005,7 @@ fn local_mock_list_flat_namespace_runtime_split() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         // Skip startup discovery (which now pre-partitions flat namespaces
         // too) so the run starts single-segment and the RUNTIME split path
         // is what fans out — the mechanism under test here.
@@ -1025,9 +1014,6 @@ fn local_mock_list_flat_namespace_runtime_split() {
         "2".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1104,11 +1090,12 @@ fn local_mock_summary_only_reports_metrics_without_outputs() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--max-keys".into(),
         "2".into(),
-        "--summary-only".into(),
+        "--output-format".into(),
+        "summary".into(),
         "--agent".into(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1116,6 +1103,10 @@ fn local_mock_summary_only_reports_metrics_without_outputs() {
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // --agent keeps stderr quiet: no log lines (unless RUST_LOG asks).
+    if std::env::var_os("RUST_LOG").is_none() {
+        assert!(stderr.is_empty(), "{}", stderr);
+    }
 
     let manifest: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(manifest["metrics"]["summary_only"], true);
@@ -1176,11 +1167,11 @@ fn local_mock_list_tsv_streams_rows_to_stdout_without_artifacts() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--max-keys".into(),
         "2".into(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1190,11 +1181,8 @@ fn local_mock_list_tsv_streams_rows_to_stdout_without_artifacts() {
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(
-        stderr.contains("--output-format tsv/ndjson streams list rows to stdout"),
-        "stderr should include pipe-output warning: {}",
-        stderr
-    );
+    // Streaming rows is what tsv means: no warning about it.
+    assert!(!stderr.contains("WARN "), "{}", stderr);
 
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines.len(), 3, "stdout should contain only TSV rows");
@@ -1321,9 +1309,9 @@ fn local_mock_list_ndjson_streams_parseable_rows_and_manifest_summary_reads_it()
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1409,180 +1397,6 @@ fn local_mock_list_stdout_formats_emit_no_blank_rows_for_empty_results() {
 }
 
 #[test]
-fn local_mock_token_retry_after_codeless_gateway_error_keeps_the_token() {
-    // First request: a 502 from a proxy in front of the endpoint — HTML body,
-    // no S3 error code. It must be retried (not fatal), and since no key was
-    // listed yet the retry must still carry the seed token: dropping it would
-    // restart at the top of the bucket and re-emit keys the token skipped.
-    let server = MockS3Server::start(|request, sequence| {
-        assert_eq!(
-            request.query.get("continuation-token").map(String::as_str),
-            Some("seed-token"),
-            "request {} lost the continuation token",
-            sequence
-        );
-        assert!(!request.query.contains_key("start-after"));
-        if sequence == 1 {
-            return MockResponse {
-                status: 502,
-                reason: "Bad Gateway",
-                body: "<html><body>502 Bad Gateway</body></html>".into(),
-                drop_connection: false,
-            };
-        }
-        MockResponse::ok_xml(list_bucket_xml(
-            "",
-            1000,
-            &["logs/resumed.txt"],
-            &[],
-            false,
-            None,
-        ))
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    write_fast_config(&config);
-
-    let args = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "--no-auto-hints".into(),
-        "--continuation-token".into(),
-        "seed-token".into(),
-        "list".into(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-        "--output-format".into(),
-        "ndjson".into(),
-    ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    let keys: Vec<String> = stdout
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap()["k"].to_string())
-        .collect();
-    assert_eq!(keys, vec!["\"logs/resumed.txt\"".to_string()]);
-    assert_eq!(server.requests().len(), 2, "stderr: {}", stderr);
-}
-
-#[test]
-fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
-    let server = MockS3Server::start(|request, _sequence| {
-        assert_eq!(request.method, "GET");
-        assert_eq!(
-            request.query.get("continuation-token").map(String::as_str),
-            Some("seed-token")
-        );
-        assert!(!request.query.contains_key("start-after"));
-        MockResponse::ok_xml(list_bucket_xml(
-            request
-                .query
-                .get("prefix")
-                .map(String::as_str)
-                .unwrap_or(""),
-            1000,
-            &["logs/resumed.txt"],
-            &[],
-            false,
-            None,
-        ))
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    let manifest = dir.path().join("run.json");
-    write_fast_config(&config);
-
-    let args = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "--no-auto-hints".into(),
-        "--continuation-token".into(),
-        "seed-token".into(),
-        "--run-manifest".into(),
-        manifest.display().to_string(),
-        "list".into(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-        "--output-format".into(),
-        "ndjson".into(),
-    ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
-    let rows: Vec<Value> = stdout
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["k"], "logs/resumed.txt");
-
-    let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0]
-            .query
-            .get("continuation-token")
-            .map(String::as_str),
-        Some("seed-token")
-    );
-
-    let manifest_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(
-        manifest_json["config_source"]["loaded_config"],
-        config.to_str().unwrap()
-    );
-    assert_eq!(
-        manifest_json["config_source"]["loaded_config_kind"],
-        "explicit"
-    );
-    assert!(
-        manifest_json["command"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "--endpoint-url")
-    );
-    assert!(
-        !manifest_json["command"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some(server.endpoint().as_str()))
-    );
-    assert!(
-        !manifest_json["command"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some("seed-token"))
-    );
-    assert!(
-        manifest_json["config_source"]["cli_overrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "endpoint_url")
-    );
-    assert_eq!(manifest_json["inputs"]["continuation_token"], "<redacted>");
-    assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
-}
-
-#[test]
 fn local_mock_compat_probe_covers_head_list_and_pagination() {
     let server = MockS3Server::start(|request, _sequence| match request.method.as_str() {
         "HEAD" => MockResponse::empty_ok(),
@@ -1638,7 +1452,7 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
         "--config".into(),
         config.display().to_string(),
         "compat-probe".into(),
-        "--endpoint".into(),
+        "--endpoint-url".into(),
         server.endpoint(),
         "--region".into(),
         "us-east-1".into(),
@@ -1687,7 +1501,7 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
         "--config".into(),
         config.display().to_string(),
         "compat-probe".into(),
-        "--endpoint".into(),
+        "--endpoint-url".into(),
         server.endpoint(),
         "--region".into(),
         "us-east-1".into(),
@@ -1756,9 +1570,9 @@ fn local_mock_compat_probe_uses_config_endpoint_style_and_trace() {
     let args = vec![
         "--config".into(),
         config.display().to_string(),
+        "compat-probe".into(),
         "--trace-compat".into(),
         trace.display().to_string(),
-        "compat-probe".into(),
         "--region".into(),
         "us-east-1".into(),
         "--bucket".into(),
@@ -1814,7 +1628,7 @@ fn local_mock_compat_probe_output_write_failure_exits_without_panic() {
         "--config".into(),
         config.display().to_string(),
         "compat-probe".into(),
-        "--endpoint".into(),
+        "--endpoint-url".into(),
         server.endpoint(),
         "--region".into(),
         "us-east-1".into(),
@@ -1828,8 +1642,16 @@ fn local_mock_compat_probe_output_write_failure_exits_without_panic() {
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 5, "stdout: {}\nstderr: {}", stdout, stderr);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("Compat-probe output error:"));
+    // The report path is checked with the other outputs, before any request.
+    assert!(stderr.contains("compat.json"), "{}", stderr);
+    assert!(stderr.contains("cannot be created"), "{}", stderr);
+    assert!(
+        stderr.contains("s3-turbo-list: run failed (exit 5)"),
+        "{}",
+        stderr
+    );
     assert!(!stderr.contains("panicked"));
+    assert!(server.requests().is_empty());
 }
 
 #[test]
@@ -1861,7 +1683,6 @@ fn local_mock_resume_keeps_original_segment_start_after() {
     let hints = dir.path().join("hints.toml");
     let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
     let parquet = dir.path().join("resume.parquet");
-    let ks = dir.path().join("resume.ks");
     write_fast_config(&config);
     std::fs::write(
         &hints,
@@ -1907,14 +1728,12 @@ endpoint_url = "{}"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--resume".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -1962,7 +1781,6 @@ fn local_mock_resume_does_not_mark_failed_segment_completed() {
     let hints = dir.path().join("hints.toml");
     let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
     let parquet = dir.path().join("failed-segment.parquet");
-    let ks = dir.path().join("failed-segment.ks");
     write_fast_config(&config);
     std::fs::write(
         &hints,
@@ -2001,14 +1819,12 @@ mode = "list"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--resume".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2052,7 +1868,6 @@ fn local_mock_resume_skips_final_checkpoint_when_output_write_fails() {
     let config = dir.path().join("config.toml");
     let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
     let bad_parquet_path = dir.path().join("parquet-is-directory");
-    let ks = dir.path().join("output-failure.ks");
     write_fast_config(&config);
     std::fs::create_dir(&bad_parquet_path).unwrap();
 
@@ -2063,13 +1878,11 @@ fn local_mock_resume_skips_final_checkpoint_when_output_write_fails() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--resume".into(),
         "--no-auto-hints".into(),
         "--output-parquet-file".into(),
         bad_parquet_path.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2137,7 +1950,6 @@ fn local_mock_resume_on_error_advances_without_key_count() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("resume-no-key-count.parquet");
-    let ks = dir.path().join("resume-no-key-count.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -2147,11 +1959,9 @@ fn local_mock_resume_on_error_advances_without_key_count() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2212,7 +2022,6 @@ fn local_mock_segment_boundary_key_is_not_dropped() {
     let config = dir.path().join("config.toml");
     let hints = dir.path().join("hints.toml");
     let parquet = dir.path().join("boundary.parquet");
-    let ks = dir.path().join("boundary.ks");
     write_fast_config(&config);
     std::fs::write(
         &hints,
@@ -2234,13 +2043,11 @@ estimate_mode = "full"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2293,7 +2100,6 @@ fn local_mock_multi_segment_boundaries_include_boundary_keys() {
     let config = dir.path().join("config.toml");
     let hints = dir.path().join("hints.toml");
     let parquet = dir.path().join("multi-boundary.parquet");
-    let ks = dir.path().join("multi-boundary.ks");
     write_fast_config(&config);
     std::fs::write(
         &hints,
@@ -2315,15 +2121,13 @@ estimate_mode = "full"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2364,7 +2168,6 @@ fn local_mock_no_auto_hints_skips_conventional_cache() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("no-auto.parquet");
-    let ks = dir.path().join("no-auto.ks");
     write_fast_config(&config);
     std::fs::write(
         dir.path().join("us-east-1_mock-bucket_hints.toml"),
@@ -2386,12 +2189,10 @@ estimate_mode = "full"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--no-auto-hints".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2453,7 +2254,6 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("diff.parquet");
-    let ks = dir.path().join("diff.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -2463,11 +2263,9 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "diff".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "diff".into(),
         "--bucket".into(),
         "left".into(),
         "--region".into(),
@@ -2549,7 +2347,6 @@ fn local_mock_diff_identical_sides_classify_all_equal() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("diff.parquet");
-    let ks = dir.path().join("diff.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -2559,11 +2356,9 @@ fn local_mock_diff_identical_sides_classify_all_equal() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "diff".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "diff".into(),
         "--bucket".into(),
         "left".into(),
         "--region".into(),
@@ -2616,7 +2411,6 @@ fn local_mock_sdk_retries_transient_list_error() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("retry.parquet");
-    let ks = dir.path().join("retry.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -2626,11 +2420,9 @@ fn local_mock_sdk_retries_transient_list_error() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2672,7 +2464,6 @@ fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
     // Conventional startup-discovery cache (cwd-relative), as written by a
     // previous run of the same bucket: two segments split at "m/".
@@ -2693,13 +2484,11 @@ generated_at = "2026-05-17T00:00:00Z"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--start-after".into(),
         "a.txt".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2748,11 +2537,11 @@ generated_at = "2026-05-17T00:00:00Z"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--start-after".into(),
         "a.txt".into(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2785,10 +2574,10 @@ fn local_mock_start_after_with_resume_is_rejected() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--resume".into(),
         "--start-after".into(),
         "a.txt".into(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2841,14 +2630,12 @@ fn local_mock_filtered_list_ks_counts_only_included_objects() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--no-auto-hints".into(),
         "--filter".into(),
         "SOURCE.size > 101".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2906,7 +2693,6 @@ fn local_mock_fatal_segment_counts_one_fatal_error() {
     let config = dir.path().join("config.toml");
     let hints = dir.path().join("hints.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     let manifest = dir.path().join("manifest.json");
     write_fast_config(&config);
     std::fs::write(
@@ -2926,15 +2712,13 @@ generated_at = "2026-05-17T00:00:00Z"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--hints-file".into(),
         hints.display().to_string(),
         "--run-manifest".into(),
         manifest.display().to_string(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -2993,7 +2777,6 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -3003,13 +2786,11 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "/".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3074,7 +2855,6 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -3084,13 +2864,11 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "8".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3197,11 +2975,11 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "8".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3294,7 +3072,6 @@ fn local_mock_delimiter_run_ignores_conventional_hints_cache() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
     // A cache left behind by an earlier recursive run of the same bucket.
     std::fs::write(
@@ -3314,13 +3091,11 @@ generated_at = "2026-05-17T00:00:00Z"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--delimiter".into(),
         "/".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3364,16 +3139,15 @@ fn run_expecting_output_write_failure(extra: &[&str]) {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
-        "--summary-only".into(),
-    ];
-    args.extend(extra.iter().map(|arg| arg.to_string()));
-    args.extend([
         "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
         "us-east-1".into(),
-    ]);
+        "--output-format".into(),
+        "summary".into(),
+    ];
+    args.extend(extra.iter().map(|arg| arg.to_string()));
 
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 5, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -3394,7 +3168,8 @@ fn local_mock_unwritable_trace_path_exits_output_write() {
 
 #[test]
 fn local_mock_unwritable_log_path_exits_output_write() {
-    run_expecting_output_write_failure(&["--output-log-file", "blocker/run.log"]);
+    // The --log file is named after the outputs, in --output-dir.
+    run_expecting_output_write_failure(&["--output-dir", "blocker", "--log"]);
 }
 
 // A listing that fits in one page has nothing to partition: bisecting it
@@ -3423,7 +3198,6 @@ fn local_mock_single_page_flat_listing_skips_bisection() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -3433,13 +3207,11 @@ fn local_mock_single_page_flat_listing_skips_bisection() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "16".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3520,7 +3292,6 @@ fn local_mock_small_max_keys_still_partitions_untruncated_listing() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -3530,15 +3301,13 @@ fn local_mock_small_max_keys_still_partitions_untruncated_listing() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "8".into(),
         "--max-keys".into(),
         "5".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3604,11 +3373,9 @@ fn local_mock_diff_with_failing_side_writes_no_diff_output() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "diff".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "diff".into(),
         "--bucket".into(),
         "left".into(),
         "--region".into(),
@@ -3708,7 +3475,6 @@ fn local_mock_list_serves_segments_concurrently() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         let parquet = dir.path().join("out.parquet");
-        let ks = dir.path().join("out.ks");
         write_fast_config(&config);
 
         let mut args: Vec<String> = vec![
@@ -3718,23 +3484,19 @@ fn local_mock_list_serves_segments_concurrently() {
             server.endpoint(),
             "--addressing-style".into(),
             "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "mock-bucket".into(),
+            "--region".into(),
+            "us-east-1".into(),
             "--concurrency".into(),
             "8".into(),
             "--max-keys".into(),
             PAGE.to_string(),
             "--output-parquet-file".into(),
             parquet.display().to_string(),
-            "--output-ks-file".into(),
-            ks.display().to_string(),
         ];
         args.extend(extra.iter().map(|arg| arg.to_string()));
-        args.extend([
-            "list".into(),
-            "--bucket".into(),
-            "mock-bucket".into(),
-            "--region".into(),
-            "us-east-1".into(),
-        ]);
 
         let started = std::time::Instant::now();
         let (code, stdout, stderr) = run_cli(&args, dir.path());
@@ -3827,15 +3589,13 @@ fn local_mock_diff_serves_both_sides_concurrently() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "diff".into(),
         "--concurrency".into(),
         "8".into(),
         "--max-keys".into(),
         PAGE.to_string(),
         "--output-parquet-file".into(),
         dir.path().join("d.parquet").display().to_string(),
-        "--output-ks-file".into(),
-        dir.path().join("d.ks").display().to_string(),
-        "diff".into(),
         "--bucket".into(),
         "left".into(),
         "--region".into(),
@@ -3879,7 +3639,6 @@ fn local_mock_small_run_exits_without_waiting_for_a_heartbeat() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
-    let ks = dir.path().join("out.ks");
     write_fast_config(&config);
 
     let args = vec![
@@ -3889,11 +3648,9 @@ fn local_mock_small_run_exits_without_waiting_for_a_heartbeat() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -3952,11 +3709,9 @@ fn local_mock_ks_output_escapes_keys_as_csv() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         dir.path().join("out.parquet").display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4061,7 +3816,6 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("etag.parquet");
-    let ks = dir.path().join("etag.ks");
     let manifest = dir.path().join("run.json");
     write_fast_config(&config);
 
@@ -4072,13 +3826,11 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4193,7 +3945,6 @@ fn paged_run_args(
     server: &MockS3Server,
     config: &std::path::Path,
     parquet: &std::path::Path,
-    ks: &std::path::Path,
     manifest: &std::path::Path,
 ) -> Vec<String> {
     vec![
@@ -4203,13 +3954,11 @@ fn paged_run_args(
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--output-parquet-file".into(),
         parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4240,11 +3989,10 @@ fn local_mock_retry_budget_is_refunded_by_progress() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("refund.parquet");
-    let ks = dir.path().join("refund.ks");
     let manifest = dir.path().join("run.json");
     write_fast_config(&config);
 
-    let args = paged_run_args(&server, &config, &parquet, &ks, &manifest);
+    let args = paged_run_args(&server, &config, &parquet, &manifest);
     let (code, stdout, stderr) = run_cli(&args, dir.path());
 
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
@@ -4299,11 +4047,10 @@ fn local_mock_retry_budget_still_exhausts_without_progress() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("stuck.parquet");
-    let ks = dir.path().join("stuck.ks");
     let manifest = dir.path().join("run.json");
     write_fast_config(&config);
 
-    let args = paged_run_args(&server, &config, &parquet, &ks, &manifest);
+    let args = paged_run_args(&server, &config, &parquet, &manifest);
     let (code, stdout, stderr) = run_cli(&args, dir.path());
 
     assert_ne!(
@@ -4416,12 +4163,12 @@ fn local_mock_successful_run_leaves_no_checkpoint() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "8".into(),
         "--resume".into(),
         "--output-parquet-file".into(),
         dir.path().join("out.parquet").display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4461,12 +4208,12 @@ fn local_mock_repeated_resume_runs_stay_complete() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--concurrency".into(),
         "8".into(),
         "--resume".into(),
         "--output-parquet-file".into(),
         dir.path().join("out.parquet").display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4554,6 +4301,7 @@ endpoint_url = "{}"
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--resume".into(),
         "--hints-file".into(),
         hints.display().to_string(),
@@ -4561,7 +4309,6 @@ endpoint_url = "{}"
         dir.path().join("resume.parquet").display().to_string(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
@@ -4677,6 +4424,11 @@ fn throttle_test_args(
         endpoint,
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
         "--output-parquet-file".into(),
         dir.join("out.parquet").display().to_string(),
     ];
@@ -4686,13 +4438,6 @@ fn throttle_test_args(
             path.display().to_string(),
         ]);
     }
-    args.extend(vec![
-        "list".to_string(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ]);
     args
 }
 
@@ -4794,15 +4539,16 @@ fn local_mock_access_denied_is_a_setup_error_that_explains_itself() {
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--no-auto-hints".into(),
         "--run-manifest".into(),
         manifest.display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),
         "us-east-1".into(),
-        "--summary-only".into(),
+        "--output-format".into(),
+        "summary".into(),
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     // Credentials/bucket problems are setup errors (3), not retryable network
@@ -4856,7 +4602,8 @@ fn local_mock_missing_region_fails_fast_without_requests() {
             "list",
             "--bucket",
             "mock-bucket",
-            "--summary-only",
+            "--output-format",
+            "summary",
         ])
         .output()
         .expect("run s3-turbo-list");
@@ -4896,12 +4643,12 @@ fn local_mock_manifest_check_verifies_artifacts_against_metrics() {
         &server.endpoint(),
         "--addressing-style",
         "path",
+        "list",
         "--no-auto-hints",
         "--run-manifest",
         "run.json",
         "--output-dir",
         "out",
-        "list",
         "--bucket",
         "mock-bucket",
         "--region",
@@ -4987,9 +4734,9 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
         &server.endpoint(),
         "--addressing-style",
         "path",
+        "list",
         "--delimiter",
         "/",
-        "list",
         "--bucket",
         "mock-bucket",
         "--region",
@@ -5012,8 +4759,8 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
 
     // `--filter` selects objects, not folders: a size predicate must not
     // drop the folder rows (Size 0) and bring the empty listing back.
-    let mut filtered = vec!["--filter".to_string(), "SOURCE.size > 0".to_string()];
-    filtered.extend(args.iter().cloned());
+    let mut filtered = args.clone();
+    filtered.extend(["--filter".to_string(), "SOURCE.size > 0".to_string()]);
     let (code, stdout, stderr) = run_cli(&filtered, dir.path());
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
     assert_eq!(stdout.lines().count(), 3, "stdout: {}", stdout);
@@ -5043,14 +4790,12 @@ fn local_mock_manifest_check_follows_a_moved_run_directory() {
         &server.endpoint(),
         "--addressing-style",
         "path",
+        "list",
         "--no-auto-hints",
         "--output-parquet-file",
         "out.parquet",
-        "--output-ks-file",
-        "out.ks",
         "--run-manifest",
         "run.json",
-        "list",
         "--bucket",
         "mock-bucket",
         "--region",
@@ -5111,10 +4856,10 @@ fn local_mock_diff_side_access_denied_exits_3_with_the_s3_reason() {
         &server.endpoint(),
         "--addressing-style",
         "path",
+        "diff",
         "--no-auto-hints",
         "--output-parquet-file",
         "diff.parquet",
-        "diff",
         "--bucket",
         "src",
         "--region",
@@ -5185,13 +4930,13 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
         &server.endpoint(),
         "--addressing-style",
         "path",
+        "list",
         "--max-keys",
         "50",
         "-c",
         "4",
         "--hints-file",
         hints.to_str().unwrap(),
-        "list",
         "--bucket",
         "mock-bucket",
         "--region",
@@ -5245,7 +4990,7 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
     // The first run was not started with --resume: an interrupted run saves
     // its checkpoint regardless, and the next run opts into reading it.
     let mut args = args;
-    args.insert(6, "--resume".to_string());
+    args.push("--resume".to_string());
     let (code, second_rows, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stderr: {}", stderr);
     // The partial-output warning reaches stderr, not only the manifest.
@@ -5298,8 +5043,9 @@ fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
             &server.endpoint(),
             "--addressing-style",
             "path",
-            "--summary-only",
             "list",
+            "--output-format",
+            "summary",
             "--bucket",
             "mock-bucket",
             "--region",
@@ -5365,8 +5111,8 @@ fn local_mock_list_routes_through_http_proxy_from_environment() {
         endpoint,
         "--addressing-style",
         "path",
-        "--no-auto-hints",
         "list",
+        "--no-auto-hints",
         "--bucket",
         "mock-bucket",
         "--region",
@@ -5547,12 +5293,10 @@ fn guard_list_args(server: &MockS3Server, dir: &std::path::Path) -> Vec<String> 
         server.endpoint(),
         "--addressing-style".into(),
         "path".into(),
+        "list".into(),
         "--no-auto-hints".into(),
         "--output-parquet-file".into(),
         dir.join("out.parquet").display().to_string(),
-        "--output-ks-file".into(),
-        dir.join("out.ks").display().to_string(),
-        "list".into(),
         "--bucket".into(),
         "mock-bucket".into(),
         "--region".into(),

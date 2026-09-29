@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # s3-turbo-list — S3 request trace example
 # ---------------------------------------------------------------------------
-# --trace-compat FILE records every S3 API call as JSONL; --trace-compat -
-# writes the same events to stderr (it replaces the deprecated --debug-s3).
+# --trace-compat FILE records every listing page request as JSONL (startup
+# discovery and split probes are not traced); --trace-compat - writes the
+# same events to stderr.
 # Field reference: docs/tuning.md, "Trace event fields".
 #
 # Required env vars:

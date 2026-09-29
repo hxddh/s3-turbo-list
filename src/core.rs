@@ -809,7 +809,8 @@ pub struct S3TaskContext {
     pub endpoint_url: String,
     pub region: Option<String>,
     pub addressing_style: String,
-    pub profile: Option<String>,
+    /// The provider preset, for trace events.
+    pub provider: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
     pub max_attempts: u32,
@@ -822,8 +823,6 @@ pub struct S3TaskContext {
     /// discovery are skipped when this is set, so exactly one segment exists
     /// and it starts after this key.
     pub start_after: Option<String>,
-    /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
-    pub continuation_token: Option<String>,
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
@@ -842,11 +841,10 @@ pub struct TaskContextParams<'a> {
     pub g_state: GlobalState,
     pub trace_writer: Option<Arc<dyn S3TraceWriter>>,
     pub addressing_style: &'a str,
-    pub profile: Option<&'a str>,
+    pub provider: Option<&'a str>,
     pub delimiter: Option<&'a str>,
     pub max_keys: Option<i32>,
     pub start_after: Option<&'a str>,
-    pub continuation_token: Option<&'a str>,
 }
 
 impl S3TaskContext {
@@ -902,14 +900,13 @@ impl S3TaskContext {
             endpoint_url: p.endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
             region: p.region.map(str::to_string),
             addressing_style: p.addressing_style.to_string(),
-            profile: p.profile.map(str::to_string),
+            provider: p.provider.map(str::to_string),
             delimiter: p.delimiter.map(str::to_string),
             max_keys: p.max_keys,
             max_attempts: p.s3_config.max_attempts.max(1),
             initial_backoff_secs: p.s3_config.initial_backoff_secs,
             operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
             start_after: p.start_after.map(str::to_string),
-            continuation_token: p.continuation_token.map(str::to_string),
             resume_progress: Arc::new(Mutex::new(None)),
         }
     }

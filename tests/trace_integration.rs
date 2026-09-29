@@ -1,6 +1,6 @@
 // Integration tests for S3CompatEvent JSONL roundtrip and truncated_raw_body fix.
 use s3_turbo_list::trace::{
-    JsonlTraceWriter, NoopTraceWriter, S3CompatEvent, S3TraceWriter, create_trace_writer,
+    JsonlTraceWriter, S3CompatEvent, S3TraceWriter, trace_writer_for_target,
 };
 
 // ── JSON roundtrip — all required fields present ──────────
@@ -15,7 +15,7 @@ fn test_trace_event_jsonl_roundtrip() {
     );
     event.region = Some("us-east-1".into());
     event.addressing_style = "virtual".into();
-    event.profile = Some("aws".into());
+    event.set_provider(Some("aws"));
     event.http_status = 200;
     event.retry_attempt = 1;
     event.latency_ms = 42;
@@ -37,6 +37,7 @@ fn test_trace_event_jsonl_roundtrip() {
     assert_eq!(parsed["latency_ms"], 42);
     assert_eq!(parsed["key_count"], 100);
     assert_eq!(parsed["region"], "us-east-1");
+    assert_eq!(parsed["provider"], "aws");
     assert_eq!(parsed["profile"], "aws");
     assert_eq!(parsed["is_truncated"], true);
     assert_eq!(parsed["next_continuation_token"], "token-xyz");
@@ -127,24 +128,15 @@ fn test_jsonl_writer_writes_lines() {
     }
 }
 
-// ── Noop writer is silent ─────────────────────────────────
+// ── trace_writer_for_target with file ─────────────────────
 
 #[test]
-fn test_noop_writer_is_silent() {
-    let writer = NoopTraceWriter;
-    let event = S3CompatEvent::new("HeadBucket", "http://x", "b", "/");
-    writer.write_event(event); // should not panic
-}
-
-// ── create_trace_writer with file ─────────────────────────
-
-#[test]
-fn test_create_trace_writer_with_file() {
+fn test_trace_writer_for_target_with_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("trace.jsonl");
     let path_str = path.to_str().unwrap();
 
-    let w = create_trace_writer(Some(path_str), false).unwrap();
+    let w = trace_writer_for_target(Some(path_str)).unwrap().unwrap();
 
     w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
 
@@ -153,16 +145,12 @@ fn test_create_trace_writer_with_file() {
     assert!(content.contains("\"operation\":\"X\""));
 }
 
-// ── create_trace_writer with debug_s3 ─────────────────────
+// ── trace_writer_for_target: stderr and none ─────────────
 
 #[test]
-fn test_create_trace_writer_debug_s3_combo() {
-    // Just verify no panic with both enabled.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("trace.jsonl");
-    let path_str = path.to_str().unwrap();
-
-    let w = create_trace_writer(Some(path_str), true).unwrap();
+fn test_trace_writer_for_target_stderr_and_none() {
+    assert!(trace_writer_for_target(None).unwrap().is_none());
+    let w = trace_writer_for_target(Some("-")).unwrap().unwrap();
     w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
     // No panic = success.
 }

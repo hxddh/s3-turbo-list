@@ -32,7 +32,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "aws",
             provider: "AWS S3",
-            status: "stable",
+            status: "validated",
             default_region: None,
             endpoint_template: None,
             default_endpoint_url: None,
@@ -45,7 +45,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "minio",
             provider: "MinIO",
-            status: "stable",
+            status: "validated",
             default_region: None,
             endpoint_template: None,
             default_endpoint_url: None,
@@ -58,7 +58,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "bos",
             provider: "Baidu BOS S3-compatible API",
-            status: "stable",
+            status: "validated",
             default_region: Some("bj"),
             endpoint_template: Some("https://s3.{region}.bcebos.com"),
             default_endpoint_url: None,
@@ -74,7 +74,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "r2",
             provider: "Cloudflare R2",
-            status: "documented",
+            status: "documented preset",
             default_region: Some("auto"),
             endpoint_template: None,
             default_endpoint_url: None,
@@ -89,7 +89,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "b2",
             provider: "Backblaze B2 S3-compatible API",
-            status: "documented",
+            status: "documented preset",
             default_region: None,
             endpoint_template: Some("https://s3.{region}.backblazeb2.com"),
             default_endpoint_url: None,
@@ -104,7 +104,7 @@ pub fn all_profiles() -> &'static [EndpointProfile] {
         EndpointProfile {
             name: "oss",
             provider: "Alibaba Cloud OSS S3-compatible API",
-            status: "documented",
+            status: "documented preset",
             default_region: None,
             endpoint_template: Some("https://{region}.aliyuncs.com"),
             default_endpoint_url: None,
@@ -135,18 +135,18 @@ pub fn is_endpoint_preset_name(name: &str) -> bool {
 pub fn endpoint_profile_guardrail_warnings(cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    if let Some(profile_name) = cfg.s3.profile.as_deref() {
+    if let Some(profile_name) = cfg.s3.provider.as_deref() {
         if let Some(profile) = get_profile(profile_name) {
             let endpoint = cfg.s3.endpoint_url.as_deref().map(str::trim);
             if endpoint.filter(|value| !value.is_empty()).is_none() {
                 if profile.requires_explicit_endpoint {
                     warnings.push(format!(
-                        "endpoint compatibility profile '{}' requires an explicit endpoint URL; pass --endpoint-url or set s3.endpoint_url in config",
+                        "provider '{}' requires an explicit endpoint URL; pass --endpoint-url or set s3.endpoint_url in config",
                         profile.name
                     ));
                 } else if profile.endpoint_template.is_some() && profile.default_region.is_none() {
                     warnings.push(format!(
-                        "endpoint compatibility profile '{}' derives its endpoint from the region; pass --region or --endpoint-url",
+                        "provider '{}' derives its endpoint from the region; pass --region or --endpoint-url",
                         profile.name
                     ));
                 }
@@ -188,14 +188,14 @@ pub fn apply_profile_preset(
     cfg: &mut S3TurboConfig,
     region: Option<&str>,
 ) -> Option<ProfileApplication> {
-    let name = cfg.s3.profile.clone()?;
+    let name = cfg.s3.provider.clone()?;
     let Some(profile) = get_profile(&name) else {
         return Some(ProfileApplication {
             name,
             known: false,
             endpoint_url_applied: false,
             addressing_style_applied: false,
-            warnings: vec!["unknown endpoint profile; no preset applied".to_string()],
+            warnings: vec!["unknown provider; no preset applied".to_string()],
         });
     };
 

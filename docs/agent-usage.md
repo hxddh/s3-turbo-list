@@ -8,8 +8,27 @@ themselves; this page is the contract.
 Options follow the command name
 (`s3-turbo-list list --bucket b --region r --output-dir out`).  Only
 `--config`, `--provider`, `--endpoint-url`, and `--addressing-style` are
-global and may appear on either side.  The pre-0.37 spelling with options
-before the command name is still accepted.
+global and may appear on either side.  The pre-0.37 spelling with other
+options before the command name is still accepted until 0.39, with a
+deprecation warning (see [Deprecations](#deprecations)).
+
+## Deprecations
+
+A deprecated spelling keeps working for one release and says so twice: a
+`warning: deprecated …; it will be removed in 0.39` line on stderr, and the
+same text (without `warning: `) in the JSON a consumer reads — the plan's
+and the manifest's `warnings`, `config_source.warnings` for config keys, and
+a `deprecated` `warn` check in `doctor`.  Under `--agent` the stderr line is
+left out (stderr stays quiet); the JSON still carries it.  Deprecated in
+0.38, removed in 0.39:
+
+- Options other than the global ones written before the command name
+  (`s3-turbo-list --output-dir out list …`): write them after it.
+- The config keys `s3.profile` (use `s3.provider`) and
+  `s3.force_path_style` (use `s3.addressing_style = "path"`).
+- `--endpoint` (use `--endpoint-url`), `doctor --agent` and
+  `manifest-summary --agent` (use `--json`), and the no-op
+  `doctor --simple` and `doctor --fix-suggestions`.
 
 ## No-cloud preflight
 
@@ -49,10 +68,15 @@ Exit codes: an endpoint problem that stops every real run (a preset that
 needs an explicit endpoint URL, or an endpoint with template placeholders) is
 an `error` check and exits `3`, the code the run would exit with; any other
 `error` check exits `2`.  `doctor --json` always prints JSON on stdout —
-including for a config error (a `config_parse` `error` check) and for a
-command-line usage error such as an unknown option (a `cli` `error` check),
-both exit `2`.  The human format is one compact list; the pre-0.37
-`--simple` and `--fix-suggestions` are accepted as no-ops.
+including for a config error (a `config_parse` `error` check), a hints file
+it cannot read (`hints`), and a command-line usage error such as an unknown
+option (`cli`), all exit `2`.  Such an early exit prints a shorter report:
+`schema_version`, `tool_version`, `status: "error"`, `cwd`, and `checks`
+holding the one `error` check, plus `config_source` and `resolved_config`
+once the config file has been read (a usage error or a config file that
+does not parse comes before that).  The message is also printed once on
+stderr.  The human format is one compact list; the pre-0.37 `--simple` and
+`--fix-suggestions` are deprecated no-ops.
 
 An explicit `--config` path that does not exist is an error (exit `2`) for
 every command that loads config, `doctor` and `--dry-run` included.
@@ -63,8 +87,8 @@ every command that loads config, `doctor` and `--dry-run` included.
 checkpoint identity, output parent directories, and file conflicts, and
 prints the plan JSON on stdout without creating files or making S3 requests.
 `--output-dir` is safe in a dry run: it plans paths but does not create the
-directory.  To keep the plan in a file, redirect stdout (this replaces the
-deprecated `--plan-json`):
+directory.  To keep the plan in a file, redirect stdout (`--plan-json` was
+removed in 0.38):
 
 ```bash
 s3-turbo-list list --bucket my-bucket --region us-east-1 \
@@ -75,19 +99,27 @@ Top-level fields: `schema_version`, `tool_version`, `status`, `command`,
 `network`, `inputs`, `outputs`, `config_source`, `resolved_config`, `hints`,
 `checkpoint`, `file_conflicts`, `warnings`.
 
-`status` is `ok`, or `blocked` when a problem would stop the real run: a
-provider setup problem (exit `3`) or an output the run cannot create — a
-path under an existing file, or in a read-only directory (exit `5`); the
-reason is in `warnings`.  A blocked plan is still printed, then the dry run
-exits with that code, so it predicts the run's exit class.  Writability is
+`status` is `ok`, or `blocked` when a problem would stop the real run: an
+explicit `--hints-file` it cannot load (exit `2`; `hints.valid: false`, the
+reason in `hints.warnings`), a provider setup problem (exit `3`) or an output
+the run cannot create — a path under an existing file, or in a read-only
+directory (exit `5`); the reason is in `warnings`.  A blocked plan is still
+printed, then the dry run exits with that code and prints
+`s3-turbo-list: run blocked (exit N): <reason>` on stderr, so it predicts
+the run's exit class.  `warnings` is empty in the normal case: it carries
+deprecations, problems, and notes about options that have no effect (such
+as an explicit `--delimiter ''`, or output paths with
+`--output-format summary`).  Writability is
 judged with `access(2)`, so it is right for root as well.  Warnings also flag
 an existing output file the run would overwrite, a `--prefix` starting with
 `/`, and a missing region (`blocked` when `AWS_EC2_METADATA_DISABLED=true`
 and nothing names a region; otherwise a warning, because IMDS may still
 supply one).  Local input errors exit `2` as in the real run: a filter that
 does not compile, or two outputs that resolve to the same file, stop before a
-plan is printed; an explicit `--hints-file` that cannot be loaded exits `2`
-after the plan (whose `hints` section carries the error).
+plan is printed (with the run line and, under `--agent`, the minimal JSON
+result below); an explicit `--hints-file` that cannot be loaded exits `2`
+after the plan (`status: blocked`, and the `hints` section carries the
+error).
 
 `network` is authoritative for dry-run behavior; it currently reads
 `none: dry-run only resolves local configuration and planned paths`.
@@ -102,6 +134,7 @@ after the plan (whose `hints` section carries the error).
 | `delimiter_single_segment` | A `--delimiter` run: one hierarchical segment, never split. |
 | `single_chain` | `--start-after`: one sequential chain, never split. |
 | `diff_per_side_automatic` | `diff`: each side partitioned up front and listed in parallel. |
+| `not_applicable` | `compat-probe`: a fixed set of probe requests, no partitioning. |
 
 For `diff`, `single_chain`, `delimiter_single_segment`, and
 `disabled_single_segment_fallback` leave each side one serial segment (diff
@@ -116,8 +149,13 @@ never splits at runtime), and carry the single-chain warning.
 | `path` | `<region>_<bucket>[_<prefix-hash>]_checkpoint.toml`, in `--output-dir` when given, else the working directory. |
 | `exists`, `valid`, `identity_matches`, `identity_mismatches` | State of the file at `path` and whether its identity matches this run. |
 | `remaining_ranges` | Key ranges a resume would list. |
-| `identity_fields` | The fields that make up the checkpoint identity. |
+| `identity_fields` | The fields that make up the checkpoint identity (`provider` was `profile` up to 0.37; checkpoints written by 0.37 still load, and the preset name compares case-insensitively). |
 | `resumed_segments_skipped` | See [Resumed runs](#resumed-runs). |
+
+`outputs` lists every file the run writes: `parquet_file`, `ks_file`,
+`hints_file`, `trace_compat`, `log_file`, and `report_file` (compat-probe's
+`-o` report; `null` otherwise).  `inputs.provider` and
+`resolved_config.s3.provider` hold the preset's canonical lowercase name.
 
 The `command` array preserves the invoked argument shape with sensitive
 values redacted (`--endpoint-url`, `--endpoint`, `--continuation-token`, and
@@ -128,11 +166,16 @@ Use `inputs`, `outputs`, and `config_source` for exact values.
 
 Kept for one release, then removed; do not branch on them:
 
-- `resolved_config.s3.profile` (same value as `provider`),
-  `resolved_config.s3.force_path_style` (`addressing_style == "path"`),
-  `resolved_config.s3.debug_s3` (`trace_compat == "-"`).
-- `checkpoint.completed_segments` and `checkpoint.total_segments` (always
-  `null`; checkpoints record key ranges — use `remaining_ranges`).
+- `inputs.profile` (same value as `inputs.provider`) and
+  `inputs.continuation_token` (always `null`: `--continuation-token` was
+  removed in 0.38).
+- `resolved_config.s3.profile_known` and `resolved_config.s3.profile_warnings`
+  (use `provider_known` and `provider_warnings`).
+- The trace event field `profile` (use `provider`).
+
+Removed in 0.38 (deprecated in 0.37): `resolved_config.s3.profile`,
+`resolved_config.s3.force_path_style`, `resolved_config.s3.debug_s3`, and
+`checkpoint.completed_segments` / `checkpoint.total_segments`.
 
 ## Run manifests
 
@@ -143,7 +186,10 @@ s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out --agen
 ```
 
 `--run-manifest` writes the manifest to a file; `--agent` prints it on stdout
-at the end and keeps stderr quiet.  The manifest includes `status`
+at the end and keeps stderr quiet: no warnings, no log lines (the stderr log
+filter is off unless `RUST_LOG` is set; a `--log` file keeps its normal
+level), only the final run line on a non-zero exit.  The manifest includes
+`status`
 (`success`, `failed`, or `interrupted`), `exit_code`, `started_at`,
 `finished_at`, `elapsed_secs`, `command` (redacted as in plans), `cwd`,
 `inputs`, `outputs`, `config_source`, `artifacts`, `metrics`, `checkpoint`,
@@ -228,12 +274,15 @@ checkpointing could hide left-only or right-only objects.
 | 7 | Interrupted; a checkpoint is saved for `list` runs |
 
 Branch on the exit code first, then read the manifest if it exists.  Every
-non-zero exit of `list`, `diff`, or `compat-probe` prints one
-`s3-turbo-list: run <status> (exit N): <reason>` line on stderr.  A run that
-stops before listing — a usage error such as an unknown or misplaced option,
-a filter that does not compile, no region, an output it cannot create —
-still prints, under `--agent`, a minimal JSON result on stdout instead of a
-manifest:
+non-zero exit of `list`, `diff`, or `compat-probe` — dry runs included —
+prints one `s3-turbo-list: run <status> (exit N): <reason>` line on stderr
+(`<status>` is `failed`, `interrupted`, or `blocked` for a dry run whose plan
+was printed).  A command-line usage error (unknown or misplaced option) is
+reported by the argument parser in its own format; it adds the run line only
+under `--agent`.  A run that stops before listing — a usage error, a filter
+that does not compile, no region, an output it cannot create — still
+prints, under `--agent`, a minimal JSON result on stdout instead of a
+manifest (a dry run whose plan was printed prints no second document):
 
 ```json
 {
@@ -268,9 +317,11 @@ with exit `2` — a local configuration error, not a provider failure.
 
 ## S3 API trace
 
-`--trace-compat trace.jsonl` records every S3 API call as JSONL — request
-IDs, HTTP status, S3 error codes, pagination metadata, retry details — and
-combines with `--run-manifest`.  `--trace-compat -` writes to stderr.  The
+`--trace-compat trace.jsonl` records every listing page request as JSONL —
+request IDs, HTTP status, S3 error codes, pagination metadata, retry details
+— plus one summary event per completed segment, and combines with
+`--run-manifest`.  Startup discovery, flat-namespace bisection, and runtime
+split probes are not traced.  `--trace-compat -` writes to stderr.  The
 field reference is in [tuning.md](tuning.md#trace-event-fields).
 
 ## Safety expectations

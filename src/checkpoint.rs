@@ -16,8 +16,10 @@ pub struct CheckpointIdentity {
     pub delimiter: Option<String>,
     #[serde(default)]
     pub max_keys: Option<i32>,
-    #[serde(default)]
-    pub profile: Option<String>,
+    /// The provider preset. Written as `profile` up to 0.37; those
+    /// checkpoints still load and resume.
+    #[serde(default, alias = "profile")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub addressing_style: Option<String>,
     #[serde(default)]
@@ -53,7 +55,7 @@ impl CheckpointIdentity {
         prefix: &str,
         delimiter: Option<&str>,
         max_keys: Option<i32>,
-        profile: Option<&str>,
+        provider: Option<&str>,
         addressing_style: Option<&str>,
         mode: Option<&str>,
         filter: Option<&str>,
@@ -64,7 +66,7 @@ impl CheckpointIdentity {
             prefix: prefix.to_string(),
             delimiter: delimiter.map(|d| d.to_string()),
             max_keys,
-            profile: profile.map(|p| p.to_string()),
+            provider: provider.map(|p| p.to_string()),
             addressing_style: addressing_style.map(|a| a.to_string()),
             mode: mode.map(|m| m.to_string()),
             filter: filter.map(|f| f.to_string()),
@@ -98,8 +100,14 @@ impl CheckpointIdentity {
         if self.max_keys != current.max_keys {
             mismatches.push("max_keys".into());
         }
-        if self.profile != current.profile {
-            mismatches.push("profile".into());
+        // Case-insensitive: 0.37 stored the preset name as typed (`BOS`);
+        // it is normalized to the canonical lowercase name now.
+        let same_provider = match (&self.provider, &current.provider) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (a, b) => a == b,
+        };
+        if !same_provider {
+            mismatches.push("provider".into());
         }
         if self.addressing_style != current.addressing_style {
             mismatches.push("addressing_style".into());
@@ -372,6 +380,43 @@ mod tests {
         let mut other = identity();
         other.prefix = "logs/".into();
         assert!(CheckpointJournal::load_and_verify(path_str, &other).is_none());
+    }
+
+    #[test]
+    fn test_checkpoint_written_by_037_with_profile_field_resumes() {
+        // 0.37 wrote the provider preset as `profile`, as typed on the
+        // command line; 0.38 names it `provider` and normalizes the case.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.toml");
+        std::fs::write(
+            &path,
+            "bucket = \"test-bucket\"\nprefix = \"\"\nlast_updated = \"\"\n\
+             listed_ranges = 1\n\n[identity]\nbucket = \"test-bucket\"\n\
+             region = \"us-east-1\"\nprefix = \"\"\ndelimiter = \"\"\nprofile = \"BOS\"\n\
+             addressing_style = \"path\"\nmode = \"list\"\n\n\
+             [[remaining]]\nstart_after = \"k\"\n",
+        )
+        .unwrap();
+        let mut current = identity();
+        current.provider = Some("bos".to_string());
+        let loaded = CheckpointJournal::load_and_verify(path.to_str().unwrap(), &current).unwrap();
+        assert_eq!(
+            loaded.identity.unwrap().provider.as_deref(),
+            Some("BOS"),
+            "the 0.37 `profile` field is read as the provider"
+        );
+        assert!(CheckpointJournal::may_replace(
+            path.to_str().unwrap(),
+            &current
+        ));
+        current.provider = Some("minio".to_string());
+        assert!(CheckpointJournal::load_and_verify(path.to_str().unwrap(), &current).is_none());
+        // Written back under the new name.
+        let mut saved = identity();
+        saved.provider = Some("bos".to_string());
+        let text = toml::to_string(&saved).unwrap();
+        assert!(text.contains("provider = \"bos\""), "{}", text);
+        assert!(!text.contains("profile"), "{}", text);
     }
 
     #[test]

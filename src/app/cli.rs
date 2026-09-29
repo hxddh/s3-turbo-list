@@ -6,7 +6,8 @@ use super::*;
 // commands that use it, so clap rejects a misplaced flag itself and each
 // command's --help lists only what it takes. Run options written before the
 // command name (`s3-turbo-list --output-dir out list …`, the pre-0.37
-// spelling) are moved behind it by `hoist_command_flags` before parsing.
+// spelling, deprecated in 0.38 and removed in 0.39) are moved behind it by
+// `hoist_command_flags` before parsing, with a deprecation warning.
 
 #[derive(Parser)]
 #[command(name = "s3-turbo-list")]
@@ -34,10 +35,10 @@ pub(crate) struct GlobalArgs {
     /// S3-compatible provider preset: aws, minio, bos, r2, b2 or oss (sets
     /// the endpoint and addressing style; credentials profiles go in
     /// AWS_PROFILE)
-    #[arg(long, global = true, alias = "profile", help_heading = "Endpoint")]
+    #[arg(long, global = true, help_heading = "Endpoint")]
     pub(crate) provider: Option<String>,
 
-    /// Custom S3 endpoint URL
+    /// Custom S3 endpoint URL (`--endpoint`: deprecated alias)
     #[arg(
         long = "endpoint-url",
         global = true,
@@ -66,16 +67,10 @@ pub(crate) struct SourceArgs {
 
     /// ListObjectsV2 delimiter: '/' lists one level (objects plus one row per
     /// folder); the default lists every key recursively
-    #[arg(
-        long,
-        default_value = "",
-        hide_default_value = true,
-        help_heading = "Source"
-    )]
-    pub(crate) delimiter: String,
+    #[arg(long, help_heading = "Source")]
+    pub(crate) delimiter: Option<String>,
 
-    /// Start listing after this key (lists one segment; not with
-    /// --hints-file or --resume)
+    /// Start listing after this key (lists one sequential chain)
     #[arg(long, help_heading = "Source")]
     pub(crate) start_after: Option<String>,
 
@@ -104,14 +99,6 @@ pub(crate) struct OutputArgs {
     /// Write the run log to a file (`<name>.log` beside the outputs)
     #[arg(short, long, help_heading = "Output")]
     pub(crate) log: bool,
-
-    /// KeySpace output path (deprecated: derived from --output-parquet-file)
-    #[arg(long, hide = true)]
-    pub(crate) output_ks_file: Option<String>,
-
-    /// Log file path (deprecated: --log names it after the outputs)
-    #[arg(long, hide = true)]
-    pub(crate) output_log_file: Option<String>,
 
     /// Parquet compression level (config: output.compression_level)
     #[arg(long, hide = true)]
@@ -157,14 +144,6 @@ pub(crate) struct AutomationArgs {
     /// Write S3 request trace events as JSONL to this file (`-`: stderr)
     #[arg(long, help_heading = "Automation")]
     pub(crate) trace_compat: Option<String>,
-
-    /// Write the dry-run plan to this path (deprecated: `--dry-run > file`)
-    #[arg(long, hide = true, requires = "dry_run")]
-    pub(crate) plan_json: Option<String>,
-
-    /// Trace S3 requests to stderr (deprecated: `--trace-compat -`)
-    #[arg(long, hide = true)]
-    pub(crate) debug_s3: bool,
 }
 
 #[derive(Subcommand)]
@@ -202,15 +181,6 @@ pub(crate) enum Commands {
         tuning: TuningArgs,
         #[command(flatten)]
         automation: AutomationArgs,
-
-        /// Resume from a continuation token (deprecated: use --resume or
-        /// --start-after)
-        #[arg(long, hide = true)]
-        continuation_token: Option<String>,
-
-        /// Count only (deprecated: --output-format summary)
-        #[arg(long, hide = true)]
-        summary_only: bool,
     },
 
     /// Diff two buckets into one Parquet file with a flag per key
@@ -267,16 +237,16 @@ pub(crate) enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Machine-readable output
+        /// Keep stderr quiet (no log, no default stderr trace; only the
+        /// final line on failure) and print a JSON result on stdout even
+        /// when the probe stops before running
         #[arg(long)]
         agent: bool,
 
-        /// Write S3 request trace events as JSONL to this file (`-`: stderr)
+        /// Write S3 request trace events as JSONL to this file (`-`: stderr;
+        /// the default without --agent)
         #[arg(long)]
         trace_compat: Option<String>,
-
-        #[arg(long, hide = true)]
-        debug_s3: bool,
     },
 
     /// Local preflight: config, provider, endpoint, proxy, outputs, hints file
@@ -305,10 +275,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         trace_compat: Option<String>,
 
-        #[arg(long, hide = true)]
-        output_ks_file: Option<String>,
-        #[arg(long, hide = true)]
-        output_log_file: Option<String>,
+        /// Deprecated: --json
         #[arg(long, hide = true)]
         agent: bool,
         /// Deprecated: the default output is the compact form
@@ -333,6 +300,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         check: bool,
 
+        /// Deprecated: --json
         #[arg(long, hide = true)]
         agent: bool,
     },
@@ -352,13 +320,6 @@ pub(crate) enum Commands {
 
     /// Generate a man page to stdout
     Man,
-
-    /// Removed in 0.37.0 (see docs/providers.md for a config example)
-    #[command(hide = true)]
-    InitConfig {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
-    },
 }
 
 /// The parsed command line with every command's options in one place, as
@@ -374,8 +335,6 @@ pub(crate) struct Cli {
     pub(crate) filter: Option<String>,
     pub(crate) log: bool,
     pub(crate) endpoint: Option<String>,
-    pub(crate) output_log_file: Option<String>,
-    pub(crate) output_ks_file: Option<String>,
     pub(crate) output_parquet_file: Option<String>,
     pub(crate) compression: Option<String>,
     pub(crate) compression_level: Option<u32>,
@@ -383,19 +342,19 @@ pub(crate) struct Cli {
     pub(crate) resume: bool,
     pub(crate) no_auto_hints: bool,
     pub(crate) delimiter: String,
+    /// `--delimiter` was given on the command line (even as '').
+    pub(crate) delimiter_explicit: bool,
     pub(crate) max_keys: Option<i32>,
     pub(crate) start_after: Option<String>,
-    pub(crate) continuation_token: Option<String>,
-    pub(crate) profile: Option<String>,
+    pub(crate) provider: Option<String>,
     pub(crate) addressing_style: Option<String>,
     pub(crate) trace_compat: Option<String>,
     pub(crate) agent: bool,
     pub(crate) dry_run: bool,
-    pub(crate) plan_json: Option<String>,
     pub(crate) run_manifest: Option<String>,
-    pub(crate) summary_only: bool,
-    /// Deprecated spellings used on this command line, for a warning.
-    pub(crate) deprecated: Vec<&'static str>,
+    /// Deprecated spellings used on this command line: each is printed as
+    /// `warning: deprecated …` and recorded in the plan/manifest warnings.
+    pub(crate) deprecated: Vec<String>,
 }
 
 impl Cli {
@@ -416,8 +375,6 @@ impl Cli {
             filter: None,
             log: false,
             endpoint,
-            output_log_file: None,
-            output_ks_file: None,
             output_parquet_file: None,
             compression: None,
             compression_level: None,
@@ -425,48 +382,30 @@ impl Cli {
             resume: false,
             no_auto_hints: false,
             delimiter: String::new(),
+            delimiter_explicit: false,
             max_keys: None,
             start_after: None,
-            continuation_token: None,
-            profile: provider,
+            provider,
             addressing_style,
             trace_compat: None,
             agent: false,
             dry_run: false,
-            plan_json: None,
             run_manifest: None,
-            summary_only: false,
             deprecated: Vec::new(),
         };
         let mut groups = None;
         match &mut cli.cmd {
             Commands::List {
-                output_format,
                 resume,
                 hints_file,
-                continuation_token,
-                summary_only,
                 source,
                 output,
                 tuning,
                 automation,
                 ..
             } => {
-                if *summary_only {
-                    cli.deprecated
-                        .push("--summary-only (use --output-format summary)");
-                    if *output_format == ListOutputFormat::Parquet {
-                        *output_format = ListOutputFormat::Summary;
-                    }
-                }
-                cli.summary_only = *summary_only || *output_format == ListOutputFormat::Summary;
                 cli.resume = *resume;
                 cli.hints_file = hints_file.clone();
-                if continuation_token.is_some() {
-                    cli.deprecated
-                        .push("--continuation-token (use --resume or --start-after)");
-                }
-                cli.continuation_token = continuation_token.clone();
                 groups = Some((
                     source.clone(),
                     output.clone(),
@@ -494,7 +433,6 @@ impl Cli {
                 dry_run,
                 agent,
                 trace_compat,
-                debug_s3,
                 ..
             } => {
                 cli.prefix = prefix.clone();
@@ -502,10 +440,6 @@ impl Cli {
                 cli.dry_run = *dry_run;
                 cli.agent = *agent;
                 cli.trace_compat = trace_compat.clone();
-                if *debug_s3 {
-                    cli.deprecated.push("--debug-s3 (use --trace-compat -)");
-                    cli.trace_compat.get_or_insert_with(|| "-".to_string());
-                }
             }
             Commands::Doctor {
                 json,
@@ -514,46 +448,51 @@ impl Cli {
                 output_dir,
                 output_parquet_file,
                 trace_compat,
-                output_ks_file,
-                output_log_file,
                 agent,
-                ..
+                simple,
+                fix_suggestions,
             } => {
+                if *agent {
+                    cli.deprecated
+                        .push("doctor --agent (use doctor --json)".to_string());
+                }
+                if *simple {
+                    cli.deprecated.push(
+                        "doctor --simple (a no-op: the output is always compact)".to_string(),
+                    );
+                }
+                if *fix_suggestions {
+                    cli.deprecated.push(
+                        "doctor --fix-suggestions (a no-op: suggestions are always printed)"
+                            .to_string(),
+                    );
+                }
                 *json |= *agent;
-                cli.agent = *agent;
                 cli.hints_file = hints_file.clone();
                 cli.filter = filter.clone();
                 cli.output_dir = output_dir.clone();
                 cli.output_parquet_file = output_parquet_file.clone();
-                cli.output_ks_file = output_ks_file.clone();
-                cli.output_log_file = output_log_file.clone();
                 cli.trace_compat = trace_compat.clone();
             }
             Commands::ManifestSummary { json, agent, .. } => {
+                if *agent {
+                    cli.deprecated
+                        .push("manifest-summary --agent (use --json)".to_string());
+                }
                 *json |= *agent;
-                cli.agent = *agent;
             }
             _ => {}
         }
         if let Some((source, output, tuning, automation)) = groups {
             cli.prefix = source.prefix;
-            cli.delimiter = source.delimiter;
+            cli.delimiter_explicit = source.delimiter.is_some();
+            cli.delimiter = source.delimiter.unwrap_or_default();
             cli.start_after = source.start_after;
             cli.filter = source.filter;
             cli.output_dir = output.output_dir;
             cli.output_parquet_file = output.output_parquet_file;
             cli.compression = output.compression;
             cli.log = output.log;
-            if output.output_ks_file.is_some() {
-                cli.deprecated
-                    .push("--output-ks-file (the KeySpace file follows --output-parquet-file)");
-            }
-            cli.output_ks_file = output.output_ks_file;
-            if output.output_log_file.is_some() {
-                cli.deprecated
-                    .push("--output-log-file (--log names the file after the outputs)");
-            }
-            cli.output_log_file = output.output_log_file;
             cli.compression_level = output.compression_level;
             cli.concurrency = tuning.concurrency;
             cli.threads = tuning.threads;
@@ -563,100 +502,124 @@ impl Cli {
             cli.agent = automation.agent;
             cli.run_manifest = automation.run_manifest;
             cli.trace_compat = automation.trace_compat;
-            if automation.plan_json.is_some() {
-                cli.deprecated.push("--plan-json (use --dry-run > file)");
-            }
-            cli.plan_json = automation.plan_json;
-            if automation.debug_s3 {
-                cli.deprecated.push("--debug-s3 (use --trace-compat -)");
-                cli.trace_compat.get_or_insert_with(|| "-".to_string());
-            }
         }
         cli
     }
+
+    /// The deprecation warnings for the plan / manifest `warnings`, in the
+    /// wording printed on stderr (without its `warning: ` prefix).
+    pub(crate) fn deprecation_warnings(&self) -> Vec<String> {
+        self.deprecated
+            .iter()
+            .map(|spelling| format!("deprecated {}; it will be removed in 0.39", spelling))
+            .collect()
+    }
+}
+
+/// How an option token resolves against a set of arguments: whether every
+/// option in it is known, and whether it consumes the next token as its value.
+/// A cluster of short options (`-lc 5`) is walked flag by flag; the last one
+/// takes the next token when it takes a value and nothing follows it in the
+/// token.
+fn classify_option(args: &[&clap::Arg], token: &str) -> Option<bool> {
+    let takes_value = |arg: &clap::Arg| arg.get_action().takes_values();
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, inline) = match long.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (long, false),
+        };
+        return args
+            .iter()
+            .find(|arg| {
+                arg.get_long() == Some(name)
+                    || arg.get_all_aliases().is_some_and(|a| a.contains(&name))
+            })
+            .map(|arg| takes_value(arg) && !inline);
+    }
+    let cluster = token.strip_prefix('-')?;
+    if cluster.is_empty() {
+        return None;
+    }
+    for (at, short) in cluster.char_indices() {
+        let arg = args.iter().find(|arg| arg.get_short() == Some(short))?;
+        if takes_value(arg) {
+            // The rest of the token is the value (`-c5`, `-lc5`, `-c=5`).
+            return Some(at + short.len_utf8() == cluster.len());
+        }
+    }
+    Some(false)
+}
+
+/// Where the command name is in `args` (index 0 is the program), skipping
+/// option values, and which command it is. `list --bucket doctor` is a list
+/// command: the scan stops at the first command name that is not a value.
+pub(crate) fn find_command(args: &[String]) -> Option<(usize, clap::Command)> {
+    let command = CliArgs::command();
+    let all: Vec<&clap::Arg> = command
+        .get_arguments()
+        .chain(
+            command
+                .get_subcommands()
+                .flat_map(|sub| sub.get_arguments()),
+        )
+        .collect();
+    let mut index = 1;
+    while index < args.len() {
+        let token = args[index].as_str();
+        if token == "--" {
+            return None;
+        }
+        if let Some(sub) = command.find_subcommand(token) {
+            return Some((index, sub.clone()));
+        }
+        if token.starts_with('-') && classify_option(&all, token) == Some(true) {
+            index += 1;
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Move command options written before the command name behind it:
 /// `s3-turbo-list --output-dir out list --bucket b` was the documented
 /// spelling while every option was global, and scripts use it. Global
 /// (endpoint) options stay where they are; an option the command does not
-/// take is left in place for clap to reject.
-pub(crate) fn hoist_command_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+/// take is left in place for clap to reject. Returns the rewritten argv and
+/// the options that were moved (deprecated: removed in 0.39).
+pub(crate) fn hoist_command_flags(
+    args: Vec<std::ffi::OsString>,
+) -> (Vec<std::ffi::OsString>, Vec<String>) {
     let command = CliArgs::command();
     let top_level: Vec<&clap::Arg> = command.get_arguments().collect();
-    let takes_value = |arg: &clap::Arg| arg.get_action().takes_values();
-    let find = |args: &[&clap::Arg], token: &str| -> Option<(bool, bool)> {
-        // (known, takes a separate value)
-        if let Some(long) = token.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((name, _)) => (name, true),
-                None => (long, false),
-            };
-            return args
-                .iter()
-                .find(|arg| {
-                    arg.get_long() == Some(name)
-                        || arg.get_all_aliases().is_some_and(|a| a.contains(&name))
-                })
-                .map(|arg| (true, takes_value(arg) && !inline));
-        }
-        let mut chars = token.strip_prefix('-')?.chars();
-        let short = chars.next()?;
-        args.iter()
-            .find(|arg| arg.get_short() == Some(short))
-            .map(|arg| (true, takes_value(arg) && chars.as_str().is_empty()))
-    };
     let strs: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-
-    // Find the command name, skipping option values.
-    let mut index = 1;
-    let mut command_at = None;
-    while index < strs.len() {
-        let token = strs[index].as_str();
-        if token == "--" {
-            break;
-        }
-        if let Some(sub) = command.find_subcommand(token) {
-            command_at = Some((index, sub));
-            break;
-        }
-        if token.starts_with('-') {
-            let all: Vec<&clap::Arg> = top_level
-                .iter()
-                .copied()
-                .chain(
-                    command
-                        .get_subcommands()
-                        .flat_map(|sub| sub.get_arguments()),
-                )
-                .collect();
-            if let Some((_, true)) = find(&all, token) {
-                index += 1;
-            }
-        }
-        index += 1;
-    }
-    let Some((at, sub)) = command_at else {
-        return args;
+    let Some((at, sub)) = find_command(&strs) else {
+        return (args, Vec::new());
     };
     let sub_args: Vec<&clap::Arg> = sub.get_arguments().collect();
     let mut kept = vec![args[0].clone()];
     let mut moved = Vec::new();
+    let mut moved_names = Vec::new();
     let mut index = 1;
     while index < at {
         let token = strs[index].as_str();
-        let global = find(&top_level, token);
-        let local = if global.is_none() {
-            find(&sub_args, token)
+        let global = if token.starts_with('-') {
+            classify_option(&top_level, token)
         } else {
             None
         };
+        let local = match global {
+            None if token.starts_with('-') => classify_option(&sub_args, token),
+            _ => None,
+        };
         let (target, value) = match (global, local) {
-            (Some((_, value)), _) => (&mut kept, value),
-            (None, Some((_, value))) => (&mut moved, value),
+            (Some(value), _) => (&mut kept, value),
+            (None, Some(value)) => {
+                moved_names.push(token.split_once('=').map_or(token, |(n, _)| n).to_string());
+                (&mut moved, value)
+            }
             (None, None) => (&mut kept, false),
         };
         target.push(args[index].clone());
@@ -669,7 +632,7 @@ pub(crate) fn hoist_command_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi
     kept.push(args[at].clone());
     kept.extend(moved);
     kept.extend(args[at + 1..].iter().cloned());
-    kept
+    (kept, moved_names)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -720,49 +683,78 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
 // ── Main ───────────────────────────────────────────────────
 
 /// Parse the command line. A usage error under `--agent` also prints the
-/// failed-run JSON, like every other failure before a run starts.
+/// failed-run JSON, like every other failure before a run starts, and one
+/// under `doctor --json` prints doctor's JSON.
 pub(crate) fn parse_cli() -> Cli {
-    let argv = hoist_command_flags(std::env::args_os().collect());
+    let (argv, moved) = hoist_command_flags(std::env::args_os().collect());
+    let strs: Vec<String> = argv
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let command = find_command(&strs).map(|(at, sub)| (at, sub.get_name().to_string()));
     match CliArgs::try_parse_from(&argv) {
         Ok(args) => {
             let mut cli = Cli::from_args(args);
+            if !moved.is_empty() {
+                let name = command.as_ref().map_or("the command", |(_, name)| name);
+                cli.deprecated.insert(
+                    0,
+                    format!(
+                        "spelling with options before the command name ({}): write them after `{}`",
+                        moved.join(", "),
+                        name
+                    ),
+                );
+            }
             // clap does not say which spelling matched the hidden alias.
-            if argv.iter().any(|arg| {
-                arg.to_str()
-                    .is_some_and(|a| a == "--profile" || a.starts_with("--profile="))
-            }) {
-                cli.deprecated.push("--profile (use --provider)");
+            let uses_endpoint_alias = strs
+                .iter()
+                .skip(1)
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| arg == "--endpoint" || arg.starts_with("--endpoint="));
+            if uses_endpoint_alias {
+                cli.deprecated
+                    .push("option --endpoint (use --endpoint-url)".to_string());
             }
             cli
         }
         Err(e) => {
             use clap::error::ErrorKind;
-            let has = |flag: &str| argv.iter().any(|arg| arg == flag);
             let usage_error = !matches!(
                 e.kind(),
                 ErrorKind::DisplayHelp
                     | ErrorKind::DisplayVersion
                     | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             );
-            // `doctor --json` promises JSON on stdout for every config error.
-            if usage_error && has("doctor") && has("--json") {
-                let _ = DOCTOR_JSON.set(true);
+            // Route on the command the same scan as hoisting finds, and on
+            // flags written after it — never on raw strings anywhere in argv
+            // (`list --bucket doctor --json` is a list usage error).
+            if let (true, Some((at, name))) = (usage_error, command.as_ref()) {
+                let has = |flag: &str| {
+                    strs[at + 1..]
+                        .iter()
+                        .take_while(|arg| arg.as_str() != "--")
+                        .any(|arg| arg == flag)
+                };
                 let rendered = e.to_string();
                 let first = rendered.lines().next().unwrap_or_default();
-                exit_doctor_check_error("cli", first.trim_start_matches("error: "));
-            }
-            let agent = has("--agent");
-            if agent && usage_error {
-                let _ = e.print();
-                let _ = RUN_COMMAND.set(true);
-                let _ = AGENT_RUN.set(true);
-                let rendered = e.to_string();
-                let first = rendered.lines().next().unwrap_or_default();
-                run_failure_epilogue(
-                    agent::ExitCode::CliConfig,
-                    first.trim_start_matches("error: "),
-                );
-                std::process::exit(agent::ExitCode::CliConfig.code());
+                let reason = first.trim_start_matches("error: ");
+                match name.as_str() {
+                    // `doctor --json` promises JSON on stdout for every
+                    // config error.
+                    "doctor" if has("--json") || has("--agent") => {
+                        let _ = DOCTOR_JSON.set(true);
+                        exit_doctor_check_error("cli", reason);
+                    }
+                    "list" | "diff" | "compat-probe" if has("--agent") => {
+                        let _ = e.print();
+                        let _ = RUN_COMMAND.set(true);
+                        let _ = AGENT_RUN.set(true);
+                        run_failure_epilogue(agent::ExitCode::CliConfig, reason);
+                        std::process::exit(agent::ExitCode::CliConfig.code());
+                    }
+                    _ => {}
+                }
             }
             e.exit()
         }
@@ -791,12 +783,6 @@ pub(crate) fn validate_output_format_command(cli: &Cli) {
     let Some(format) = list_output_format(cli) else {
         return;
     };
-    if cli.summary_only && format.writes_stdout_rows() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--summary-only cannot be combined with --output-format tsv or ndjson".to_string(),
-        );
-    }
     if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
         exit_before_run(
             agent::ExitCode::CliConfig,
@@ -894,40 +880,6 @@ pub(crate) fn listing_prefix(cli: &Cli) -> String {
     }
 }
 
-pub(crate) fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
-    let Some(token) = cli.continuation_token.as_deref() else {
-        return;
-    };
-    if token.trim().is_empty() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--continuation-token cannot be empty".to_string(),
-        );
-    }
-    if !matches!(cli.cmd, Commands::List { .. }) {
-        return;
-    }
-    if cli.resume {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--continuation-token cannot be combined with --resume; use checkpoint resume or a continuation token, not both".to_string(),
-        );
-    }
-    if cfg.s3.start_after.is_some() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--continuation-token cannot be combined with --start-after".to_string(),
-        );
-    }
-    if cli.hints_file.is_some() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--continuation-token is single-chain only and cannot be combined with --hints-file"
-                .to_string(),
-        );
-    }
-}
-
 /// `--start-after` is a single-chain mode: with multiple hint segments, every
 /// segment would override its start with the CLI key and list overlapping
 /// ranges, duplicating output rows. Reject explicit multi-segment inputs.
@@ -984,9 +936,7 @@ pub(crate) fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
 /// format, and diff. (compat-probe writes only its report and log.)
 pub(crate) fn list_writes_artifacts(cli: &Cli) -> bool {
     match &cli.cmd {
-        Commands::List { output_format, .. } => {
-            !cli.summary_only && output_format.writes_artifacts()
-        }
+        Commands::List { output_format, .. } => output_format.writes_artifacts(),
         Commands::Diff { .. } => true,
         _ => false,
     }
@@ -1006,7 +956,7 @@ pub(crate) fn cli_config_overrides(cli: &Cli) -> Vec<String> {
     if cli.addressing_style.is_some() {
         overrides.push("addressing_style".to_string());
     }
-    if cli.profile.is_some() {
+    if cli.provider.is_some() {
         overrides.push("provider".to_string());
     }
     if cli.trace_compat.is_some() {
@@ -1014,12 +964,6 @@ pub(crate) fn cli_config_overrides(cli: &Cli) -> Vec<String> {
     }
     if cli.start_after.is_some() {
         overrides.push("start_after".to_string());
-    }
-    if cli.output_log_file.is_some() {
-        overrides.push("output_log_file".to_string());
-    }
-    if cli.output_ks_file.is_some() {
-        overrides.push("output_ks_file".to_string());
     }
     if cli.output_parquet_file.is_some() {
         overrides.push("output_parquet_file".to_string());
