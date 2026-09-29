@@ -628,6 +628,14 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
             .iter()
             .any(|event| event["common_prefixes_count"] == 1)
     );
+    // Each page's event records the continuation token that request sent.
+    let page_tokens: Vec<&Value> = trace_events
+        .iter()
+        .filter(|event| event["operation"] == "ListObjectsV2" && event["http_status"] == 200)
+        .filter(|event| event["contents_count"] != 0)
+        .map(|event| &event["continuation_token"])
+        .collect();
+    assert_eq!(page_tokens, [&Value::Null, &Value::from("token-1")]);
     assert!(trace_events.iter().any(|event| {
         event["operation"] == "ListObjectsV2SegmentSummary"
             && event["segment_index"] == 0

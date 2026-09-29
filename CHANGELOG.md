@@ -142,6 +142,9 @@ stderr (not under `--agent`) and is listed in the plan / manifest
   debugging knobs).
 - `diff --help` said `--start-after` cannot be combined with `--hints-file`
   or `--resume`, which diff does not take.
+- Listing trace events record the continuation token each request sent
+  (`continuation_token`); they carried only the removed CLI seed token, so
+  the field was always absent.
 
 ### Build
 - Dependencies: `aws-smithy-async`, `aws-smithy-runtime`, `dashmap`,

@@ -321,7 +321,7 @@ absent.  `profile` is deprecated (0.38; removed in 0.39): read `provider`.
 | `delimiter` | string? | Delimiter sent with the request.  The listing default is `""` (recursive), which is omitted from requests and from the event; hierarchical runs and structural probes send `"/"`. |
 | `start_after` | string? | `start-after` parameter, if sent. |
 | `max_keys` | int? | `max-keys` parameter, if sent. |
-| `continuation_token` | string? | Continuation token sent (compat-probe's pagination check; listing page events omit it). |
+| `continuation_token` | string? | Continuation token the request sent (absent on a chain's first page). |
 | `http_status` | uint16 | HTTP response status. |
 | `s3_error_code` | string? | S3 error code (e.g. `"NoSuchBucket"`). |
 | `s3_error_message` | string? | Error message body. |
