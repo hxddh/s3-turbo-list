@@ -175,7 +175,16 @@ glob such as `duckdb.sql("SELECT * FROM 'out/name*.parquet'")` /
 output directory: it also holds the `.ks` CSV (not Parquet) and the files of
 any other run written there.  A run removes stale `.partN` files that an
 earlier, wider run of the same output path left behind.  The companion `.ks`
-counts and all run metrics are merged across the parts into one set.
+counts are kept once by the coordinator for the whole run, and all run metrics
+are merged across the parts into one set.
+
+Response parsing is the other per-object CPU cost, and part of it is outside
+this project: before deserializing each ListObjectsV2 page, the AWS SDK checks
+whether the 200 response is really an `<Error>` document, and that check
+UTF-8-validates and tokenizes the whole page a second time.  It is well under a
+page's network round-trip, so it only shows on an unthrottled local store, and
+avoiding it would mean replacing the SDK's response parser, which this project
+does not do.
 Streaming TSV/NDJSON to stdout and `diff` output stay single-writer by nature
 (one pipe / one file).  TSV/NDJSON rows arrive in segment-completion order, not
 key order; sort downstream if order matters.  Diff Parquet output is in key

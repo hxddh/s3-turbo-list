@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A missing `--config` file is an error** (exit 2). An explicitly named
+  config that did not exist was silently ignored, so the run fell back to
+  plain AWS defaults. `doctor --json` now prints a JSON report for every config
+  error, and `init-config --json` / `manifest-summary --json` print JSON
+  errors.
+- **Unknown `--profile` names are rejected** (exit 2), in listing runs and in
+  `init-config`. The bos/b2/oss templates comment out the region-derived
+  endpoint, and `init-config` refuses `--dry-run`.
+- **`--delimiter` list runs emit CommonPrefixes as rows** (Key = the prefix,
+  Size and LastModified 0, empty ETag), in key order with the objects, for
+  Parquet, TSV and NDJSON. They used to be dropped, so a bucket whose top level
+  held only folders listed as empty with exit 0. Folder rows count in
+  `streamed_rows` but not in KS counts or `bytes_total`.
+- **The KS `prefix` column is the key's directory including its trailing
+  `/`** (`logs/` for `logs/a.gz`), and `""` for root-level keys. The old form
+  dropped the slash, which conflated root keys with keys under `//`.
+- **Checkpoints are written only when a run ends.** Mid-run saves recorded a
+  segment as complete before its rows were durable, so a crash could leave a
+  checkpoint that made `--resume` skip rows that were never written. A failed
+  run keeps the previous checkpoint. Saves are atomic (temp file + rename), a
+  prefixed run gets its own checkpoint file, and the identity includes the
+  endpoint URL.
+- **Outputs cannot overwrite each other.** Two outputs resolving to the same
+  file (Parquet and its `.partN` names, KS, log, trace, run manifest, plan
+  JSON) exit 2. Stale `.partN` files an earlier, wider run left at the output
+  path are removed, and the plan and manifest say so. Missing parent
+  directories of explicit output paths are created.
+- **`--dry-run` exits like the run would.** With no resolvable region and
+  IMDS disabled (`AWS_EC2_METADATA_DISABLED=true`) the plan is `blocked` and
+  exits 3; otherwise it warns. An unloadable `--hints-file` exits 2. The
+  `diff` hints plan names its one-segment modes.
+- **`compat-probe`** exits 3 without an endpoint, honours `--prefix`, rejects
+  listing and output flags it would ignore (exit 2), and writes its "report
+  written" note to stderr.
+- **Run manifest** records `cwd`. `manifest-summary --check` resolves relative
+  artifact paths against it, fails a Parquet artifact recorded without
+  metadata, and checks the artifacts' row total against
+  `metrics.parquet_rows`. The first output error is recorded in the manifest
+  warnings and the stderr failure reason. `outputs.hints_file` reports a hints
+  cache this run wrote.
+
+### Fixed
+- **`diff` could succeed with a partial result** when a side's last segment
+  failed as its stream ended; the merge now re-checks the abort flag after
+  both streams finish. Diff KS counts and `bytes_total` count written rows
+  only, like `list`.
+- A broken TOML hints file is an error instead of being read as plain
+  boundaries.
+- `doctor` compiles `--filter`, and its `config_file` check reflects the config
+  that was actually loaded.
+- The KS `line_count` counts CSV records; `benchmark-local` output sizes
+  include part files; trace retryable/fatal flags match the retry
+  classification.
+
+### Performance
+- Runs exit as soon as their tasks finish instead of on the monitor's next
+  poll tick (about 100ms saved on small runs).
+- TSV/NDJSON rows are rendered without `fmt` or per-row struct serialization
+  (the bytes are unchanged). Parquet list runs keep one KS prefix map in the
+  coordinator instead of one per writer, and prefix maps use a faster hasher.
+  On the local 2M-object / 200k-prefix benchmark: Parquet +46% objects/s and
+  −27% peak RSS, NDJSON +18%.
+
 ## [0.33.0] - 2026-09-27
 
 ### Changed
