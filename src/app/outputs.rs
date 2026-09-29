@@ -296,12 +296,17 @@ pub(crate) fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
     ) {
         return;
     }
+    let report_file = match &cli.cmd {
+        Commands::CompatProbe { output, .. } => output.as_deref(),
+        _ => None,
+    };
     let paths = [
         cfg.output.parquet_file.as_deref(),
         cfg.output.ks_file.as_deref(),
         cfg.output.log_file.as_deref(),
         cfg.s3.trace_compat.as_deref(),
         cli.run_manifest.as_deref(),
+        report_file,
     ];
     for path in paths.into_iter().flatten() {
         let Some(parent) = std::path::Path::new(path)

@@ -1352,6 +1352,48 @@ fn test_cli_manifest_summary_ndjson_row_check_is_not_applicable() {
 }
 
 #[test]
+fn test_cli_dry_run_reports_finished_checkpoint_as_not_resumable() {
+    // A checkpoint with no ranges left is discarded by the run, which lists
+    // everything again; the plan must not predict a zero-range resume.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("us-east-1_test-bucket_checkpoint.toml"),
+        r#"bucket = "test-bucket"
+prefix = ""
+last_updated = "2026-05-17T00:00:00Z"
+remaining = []
+
+[identity]
+bucket = "test-bucket"
+region = "us-east-1"
+prefix = ""
+delimiter = ""
+addressing_style = "auto"
+mode = "list"
+"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "list",
+            "--agent",
+            "--dry-run",
+            "--resume",
+            "--bucket",
+            "test-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["checkpoint"]["exists"], true);
+    assert_eq!(json["checkpoint"]["valid"], false, "{}", json["checkpoint"]);
+    assert_eq!(json["checkpoint"]["remaining_ranges"], 0);
+}
+
+#[test]
 fn test_cli_dry_run_reports_hints_and_checkpoint_summary() {
     let dir = tempfile::tempdir().unwrap();
     let hints_path = dir.path().join("hints.toml");

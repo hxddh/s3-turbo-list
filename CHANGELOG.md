@@ -149,6 +149,16 @@ stderr (not under `--agent`) and is listed in the plan / manifest
   debugging knobs).
 - `diff --help` said `--start-after` cannot be combined with `--hints-file`
   or `--resume`, which diff does not take.
+- A dry-run plan reported a checkpoint with no ranges left as `valid` (a
+  zero-range resume) while the run discards it and lists everything;
+  `checkpoint.valid` is false for any checkpoint the run would discard.
+- `compat-probe -o dir/that/does/not/exist/report.json` contacted the
+  endpoint and failed only at the final write: the report's missing parent
+  directories are created like every other output's. The output check also
+  runs before any directory is created, so a blocked path is reported as
+  "cannot be created" for every output.
+- `compat-probe --agent` with a deprecated spelling (`--endpoint`) dropped
+  the warning entirely; the report carries it in `warnings`.
 - Listing trace events record the continuation token each request sent
   (`continuation_token`); they carried only the removed CLI seed token, so
   the field was always absent.

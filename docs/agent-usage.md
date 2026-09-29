@@ -147,7 +147,7 @@ never splits at runtime), and carry the single-chain warning.
 | `enabled` | The run saves a checkpoint at `path` if it is interrupted — `true` for every `list` run except `--start-after`; `false` for `diff`. |
 | `resume` | The run reads the checkpoint at `path` (`--resume`). |
 | `path` | `<region>_<bucket>[_<prefix-hash>]_checkpoint.toml`, in `--output-dir` when given, else the working directory. |
-| `exists`, `valid`, `identity_matches`, `identity_mismatches` | State of the file at `path` and whether its identity matches this run. |
+| `exists`, `valid`, `identity_matches`, `identity_mismatches` | State of the file at `path` and whether its identity matches this run. `valid` is false for a checkpoint the run would discard: unreadable, or with no key ranges left to resume. |
 | `remaining_ranges` | Key ranges a resume would list. |
 | `identity_fields` | The fields that make up the checkpoint identity (`provider` was `profile` up to 0.37; checkpoints written by 0.37 still load, and the preset name compares case-insensitively). |
 | `resumed_segments_skipped` | See [Resumed runs](#resumed-runs). |

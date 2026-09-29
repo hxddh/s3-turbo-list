@@ -188,6 +188,7 @@ pub(crate) fn run_compat_probe(
     output: Option<&str>,
     cfg: &S3TurboConfig,
     quiet: bool,
+    warnings: Vec<String>,
 ) {
     let rt = build_runtime_or_exit(2);
 
@@ -201,6 +202,7 @@ pub(crate) fn run_compat_probe(
             output,
             cfg,
             quiet,
+            warnings,
         )
         .await
         {

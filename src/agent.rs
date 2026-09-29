@@ -604,7 +604,9 @@ pub fn checkpoint_plan(
 
     match CheckpointJournal::load(&path) {
         Some(journal) => {
-            plan.valid = Some(true);
+            // The run discards a checkpoint with no ranges left (or none
+            // recorded, pre-0.36) and lists everything again; say so here.
+            plan.valid = Some(journal.remaining.as_ref().is_some_and(|r| !r.is_empty()));
             plan.remaining_ranges = journal.remaining.as_ref().map(Vec::len);
             if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
                 let mismatches = stored.diff(current);

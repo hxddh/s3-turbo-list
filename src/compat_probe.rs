@@ -13,6 +13,10 @@ pub struct CompatProbeReport {
     pub addressing_style: String,
     pub tests: Vec<ProbeTestResult>,
     pub overall_status: String,
+    /// Deprecated spellings this invocation used (under `--agent` they are
+    /// reported only here).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl CompatProbeReport {
@@ -92,6 +96,7 @@ pub async fn run_compat_probe(
     output: Option<&str>,
     cfg: &S3TurboConfig,
     quiet: bool,
+    warnings: Vec<String>,
 ) -> Result<CompatProbeReport, String> {
     // --trace-compat as for a listing run; without it, the probe keeps its
     // historical default of tracing to stderr — except under `--agent`
@@ -249,6 +254,7 @@ pub async fn run_compat_probe(
         addressing_style: addressing_style.to_string(),
         tests: results,
         overall_status: overall.to_string(),
+        warnings,
     };
 
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;

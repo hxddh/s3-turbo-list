@@ -1453,7 +1453,8 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    let report = dir.path().join("compat.json");
+    // A missing parent directory is created, as for any other output.
+    let report = dir.path().join("reports/probe/compat.json");
     write_fast_config(&config);
 
     let args = vec![
@@ -5599,4 +5600,41 @@ fn local_mock_delimiter_retry_after_common_prefix_emits_each_folder_once() {
         .map(|l| l.split('\t').next().unwrap())
         .collect();
     assert_eq!(rows, ["a/", "b/", "c/", "d.txt", "e.txt"], "{}", stdout);
+}
+
+#[test]
+fn local_mock_compat_probe_agent_reports_deprecations_in_its_json() {
+    // Under --agent stderr stays quiet, so a deprecated spelling must reach
+    // the probe's own report: it has no plan or manifest to carry it.
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::error(501, "NotImplemented", "not supported")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "compat-probe".into(),
+        "--endpoint".into(),
+        server.endpoint(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--agent".into(),
+    ];
+    let (_code, stdout, stderr) = run_cli(&args, dir.path());
+    assert!(!stderr.contains("warning: deprecated"), "{}", stderr);
+    let report: Value = serde_json::from_str(&stdout).expect("report JSON on stdout");
+    let warnings = report["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("--endpoint")),
+        "{}",
+        report
+    );
 }

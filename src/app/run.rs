@@ -256,10 +256,10 @@ pub(crate) fn run() {
     }
 
     validate_provider_setup_or_exit(&cli, &cfg);
-    create_output_parents(&cli, &cfg);
     // The dry run's output check, before any request: an output the run
     // cannot create (a directory, an unwritable path) used to surface only
-    // after the whole listing had been paid for.
+    // after the whole listing had been paid for. It runs before the missing
+    // parents are created, so it names the ancestor that blocks them.
     let planned = runtime_output_summary(
         &cli,
         &cfg,
@@ -275,6 +275,7 @@ pub(crate) fn run() {
             ),
         );
     }
+    create_output_parents(&cli, &cfg);
 
     let mut run_warnings = config_source_warnings;
     run_warnings.extend(cli.deprecation_warnings());
@@ -378,6 +379,7 @@ pub(crate) fn run() {
                 output.as_deref(),
                 &cfg,
                 cli.agent,
+                cli.deprecation_warnings(),
             );
             return;
         }
