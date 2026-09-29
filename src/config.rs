@@ -273,7 +273,7 @@ impl S3TurboConfig {
             vec![
                 (PathBuf::from("./s3-turbo-list.toml"), "workspace"),
                 (
-                    dirs_next::home_dir()
+                    std::env::home_dir()
                         .unwrap_or_default()
                         .join(".s3-turbo-list.toml"),
                     "home",

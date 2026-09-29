@@ -17,16 +17,13 @@ clap_mangen = "0.3"
 tokio = { version = "1", features = ["full"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
-aws-smithy-runtime = { version = "1", features = ["client"] }
 aws-smithy-runtime-api = "1"
-aws-smithy-async = "1"
 # ListObjectsV2 fast path (src/list_page.rs): wraps the response body
 # (`SdkBody::from_body_1_x`) and scans it with memchr.
 aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 http-body = "1"
 bytes = "1"
 memchr = "2"
-arrow = "60"
 arrow-array = "60"
 arrow-schema = "60"
 parquet = { version = "60", features = ["async"] }
@@ -44,8 +41,6 @@ foldhash = "0.2"
 hyper-util = { version = "0.1", features = ["client-proxy"] }
 http = "1"
 toml = "1"
-dashmap = "6"
-dirs-next = "2"
 
 # `access(2)` for the dry run's output-writability check: mode bits say
 # read-only to a root user who can write anyway (containers, CI).
@@ -53,7 +48,8 @@ dirs-next = "2"
 libc = "0.2"
 
 [dev-dependencies]
-tokio-test = "0.4"
+# Integration tests read Parquet outputs back through `arrow::array`.
+arrow = "60"
 tempfile = "3"
 
 # The output-pipeline benchmark (the former hidden `benchmark-local`

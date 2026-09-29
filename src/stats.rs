@@ -1,36 +1,31 @@
-use dashmap::DashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
+/// Response counts per HTTP status code. Updated once per request, so an
+/// uncontended mutex costs nothing measurable, and the map keeps the codes
+/// sorted for the snapshot.
 pub struct HttpStatusCodeTracker {
-    map: DashMap<u16, Arc<AtomicUsize>>,
+    map: Mutex<BTreeMap<u16, usize>>,
 }
 
 impl HttpStatusCodeTracker {
     pub fn new() -> Self {
         Self {
-            map: DashMap::new(),
+            map: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Increment the counter for a status code — safe because the DashMap
-    /// entry API is lock-free, so two callers racing on a first-seen code
-    /// cannot lose an update.
     pub fn inc_sync(&self, code: u16) {
-        self.map
-            .entry(code)
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
+        *self.map.lock().unwrap().entry(code).or_insert(0) += 1;
     }
 
     pub fn snapshot(&self) -> Vec<(u16, usize)> {
-        let mut v: Vec<_> = self
-            .map
+        self.map
+            .lock()
+            .unwrap()
             .iter()
-            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
-            .collect();
-        v.sort_by_key(|(code, _)| *code);
-        v
+            .map(|(code, count)| (*code, *count))
+            .collect()
     }
 }
 
@@ -48,7 +43,7 @@ impl std::fmt::Display for HttpStatusCodeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier};
 
     #[tokio::test]
     async fn test_single_code_inc_and_snapshot() {
