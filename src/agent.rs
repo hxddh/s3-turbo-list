@@ -705,6 +705,15 @@ pub fn output_path_problem(path: &str) -> Option<String> {
     if target.is_dir() {
         return Some(format!("'{}' is a directory", path));
     }
+    // An existing target is opened in place, so its own permissions decide,
+    // not its directory's: `/dev/null` is writable although macOS's `/dev`
+    // is mode 555.
+    if let Ok(meta) = std::fs::metadata(target) {
+        return meta
+            .permissions()
+            .readonly()
+            .then(|| format!("'{}' is read-only", path));
+    }
     let mut ancestor = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1415,5 +1424,25 @@ mod tests {
         let args = redact_command_args(["s3-turbo-list", "list", "--continuation-token"]);
 
         assert_eq!(args, vec!["s3-turbo-list", "list", "--continuation-token"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_path_problem_judges_an_existing_target_by_its_own_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let existing = ro.join("out.ks");
+        std::fs::write(&existing, b"").unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Opened in place: the read-only directory does not matter (macOS /dev).
+        assert_eq!(super::output_path_problem(existing.to_str().unwrap()), None);
+        // A new file still needs a writable directory.
+        let fresh = ro.join("new.ks");
+        assert!(super::output_path_problem(fresh.to_str().unwrap()).is_some());
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(super::output_path_problem(existing.to_str().unwrap()).is_some());
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
