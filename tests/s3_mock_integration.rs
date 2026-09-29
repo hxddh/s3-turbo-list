@@ -5608,3 +5608,124 @@ fn local_mock_doctor_skips_the_proxy_check_when_the_host_depends_on_the_bucket()
         assert_eq!(check["status"], "skipped", "{}", check);
     }
 }
+
+// ── Truncated pages without a followable token ─────────────
+//
+// A page that says IsTruncated=true but gives no usable NextContinuationToken,
+// or hands back the token it was just sent, is not the end of the listing.
+// The SDK paginator used to end the stream there, and the run exited 0 with
+// the rest of the range silently missing. Such a page now fails the attempt
+// at the last key seen, so the retry loop resumes with start-after.
+
+const GUARD_KEYS: [&str; 6] = ["k1", "k2", "k3", "k4", "k5", "k6"];
+
+/// Keys after `start_after`, at most two per page, and whether more remain.
+fn guard_page(start_after: Option<&str>) -> (Vec<&'static str>, bool) {
+    let rest: Vec<&str> = GUARD_KEYS
+        .iter()
+        .copied()
+        .filter(|key| start_after.is_none_or(|after| *key > after))
+        .collect();
+    let page: Vec<&str> = rest.iter().copied().take(2).collect();
+    (page, rest.len() > 2)
+}
+
+fn guard_list_args(server: &MockS3Server, dir: &std::path::Path) -> Vec<String> {
+    let config = dir.join("config.toml");
+    write_fast_config(&config);
+    vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "--no-auto-hints".into(),
+        "--output-parquet-file".into(),
+        dir.join("out.parquet").display().to_string(),
+        "--output-ks-file".into(),
+        dir.join("out.ks").display().to_string(),
+        "list".into(),
+        "--bucket".into(),
+        "mock-bucket".into(),
+        "--region".into(),
+        "us-east-1".into(),
+    ]
+}
+
+#[test]
+fn local_mock_truncated_page_without_token_resumes_with_start_after() {
+    let server = MockS3Server::start(|request, _sequence| {
+        assert!(!request.query.contains_key("continuation-token"));
+        let (page, more) = guard_page(request.query.get("start-after").map(String::as_str));
+        // IsTruncated=true while keys remain, but never a token.
+        MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(parquet_keys(&dir.path().join("out.parquet")), GUARD_KEYS);
+
+    let start_afters: Vec<Option<String>> = server
+        .requests()
+        .iter()
+        .map(|r| r.query.get("start-after").cloned())
+        .collect();
+    assert_eq!(
+        start_afters,
+        vec![None, Some("k2".to_string()), Some("k4".to_string())]
+    );
+}
+
+#[test]
+fn local_mock_repeated_continuation_token_resumes_with_start_after() {
+    let server = MockS3Server::start(|request, _sequence| {
+        match request.query.get("continuation-token").map(String::as_str) {
+            // The first page hands out a token; following it returns the
+            // next page but repeats the same token, still truncated.
+            Some("t1") => {
+                let (page, more) = guard_page(Some("k2"));
+                MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, Some("t1")))
+            }
+            Some(other) => MockResponse::error(400, "InvalidToken", other),
+            None => {
+                let start_after = request.query.get("start-after").map(String::as_str);
+                let (page, more) = guard_page(start_after);
+                let token = (start_after.is_none() && more).then_some("t1");
+                MockResponse::ok_xml(list_bucket_xml("", 2, &page, &[], more, token))
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // Previously 4 of 6: the paginator stopped at the repeated token.
+    assert_eq!(parquet_keys(&dir.path().join("out.parquet")), GUARD_KEYS);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.query.get("start-after").map(String::as_str) == Some("k4")),
+        "the retry must resume after the last key listed: {:#?}",
+        server.requests()
+    );
+}
+
+#[test]
+fn local_mock_truncated_page_that_never_advances_fails_the_run() {
+    let requests_served = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&requests_served);
+    let server = MockS3Server::start(move |_request, _sequence| {
+        served.fetch_add(1, Ordering::SeqCst);
+        // Ignores start-after: always the first page, truncated, no token.
+        MockResponse::ok_xml(list_bucket_xml("", 2, &["k1", "k2"], &[], true, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let args = guard_list_args(&server, dir.path());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    // One advancing attempt, then max_attempts (3) that make no progress.
+    assert_eq!(requests_served.load(Ordering::SeqCst), 4);
+}
