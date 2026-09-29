@@ -120,6 +120,15 @@ pinning exact boundaries on repeated inventories.
 For high-latency or cross-region endpoints, consider raising
 `s3.operation_timeout_secs` to `30` or `60` to reduce retry churn.
 
+A page that reports `IsTruncated=true` without a usable
+`NextContinuationToken`, or hands back the continuation token it was just
+sent, is a truncated page the listing cannot follow — not the end of the
+listing.  It counts as a retryable failure of the segment: the retry resumes
+after the last key received, with `start-after`, and refunds the budget while
+it advances.  An endpoint that keeps doing this without progress exhausts
+`s3.max_attempts` and fails the run, rather than the run exiting 0 with short
+output.
+
 ## The single-bucket request-rate ceiling
 
 List throughput is ultimately bounded by how many `ListObjectsV2` requests
@@ -178,17 +187,31 @@ earlier, wider run of the same output path left behind.  The companion `.ks`
 counts are kept once by the coordinator for the whole run, and all run metrics
 are merged across the parts into one set.
 
-Response parsing is the other per-object CPU cost, and part of it is outside
-this project: before deserializing each ListObjectsV2 page, the AWS SDK checks
-whether the 200 response is really an `<Error>` document, and that check
-UTF-8-validates and tokenizes the whole page a second time.  It is well under a
-page's network round-trip, so it only shows on an unthrottled local store, and
-avoiding it would mean replacing the SDK's response parser, which this project
-does not do.  The SDK is moving services to a new schema-based deserializer that
-does not make this pass; as of `aws-sdk-s3` 1.150 S3 is not yet on it (its
-generated `ListObjectsV2ResponseDeserializer` still calls
-`rest_xml_unwrapped_errors::body_is_error`).  Check that call when upgrading the
-SDK: once it is gone, the extra pass is gone with no change here.
+Response parsing is the other per-object CPU cost.  Deserializing a
+ListObjectsV2 page through the AWS SDK tokenizes every `<Contents>` element,
+copies each field into owned strings (and, before that, checks whether the 200
+response is really an `<Error>` document, which UTF-8-validates and tokenizes
+the page again); on an unthrottled local store that was ~80% of the listing's
+CPU.  The list and diff engines therefore parse `<Contents>` themselves: each
+ListObjectsV2 request carries its own interceptor that, for an HTTP 200
+`ListBucketResult` body, builds the engine's rows directly from the response
+bytes in one forward pass, and gives the SDK the same document with the
+`<Contents>` elements removed.  The SDK still parses everything else —
+`IsTruncated`, `NextContinuationToken`, `KeyCount`, `CommonPrefixes`, and error
+responses — as before, over a few hundred bytes instead of the whole page.  The
+rows are identical to the SDK path's (same key unescaping, ETag, size, and
+`LastModified` rules), so output does not change; locally this cut listing CPU
+about 3x (see `docs/validation-results/listobjectsv2-fast-contents-parser-20260929.md`).
+
+The fast parser only accepts a strict subset of XML, and falls back per page,
+automatically, to the unmodified SDK path when a page steps outside it: CDATA,
+comments, processing instructions other than the XML declaration, a DOCTYPE,
+namespace-prefixed element names, attributes on elements other than the root,
+non-UTF-8 input or characters XML forbids, an unknown entity or invalid
+character reference, nested markup inside a field, duplicate fields, a
+`<Contents>` without a `<Key>`, or a field value the SDK would reject.
+Discovery probes, split probes, and `compat-probe` stay on the plain SDK path.
+
 Streaming TSV/NDJSON to stdout and `diff` output stay single-writer by nature
 (one pipe / one file).  TSV/NDJSON rows arrive in segment-completion order, not
 key order; sort downstream if order matters.  Diff Parquet output is in key
