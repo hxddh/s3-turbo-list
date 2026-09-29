@@ -5094,6 +5094,14 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
     let keys: Vec<&str> = rows.iter().map(|r| r["k"].as_str().unwrap()).collect();
     assert_eq!(keys, vec!["dir0/", "dir1/", "dir2/"]);
     assert!(rows.iter().all(|r| r["s"] == 0 && r["m"] == 0));
+
+    // `--filter` selects objects, not folders: a size predicate must not
+    // drop the folder rows (Size 0) and bring the empty listing back.
+    let mut filtered = vec!["--filter".to_string(), "SOURCE.size > 0".to_string()];
+    filtered.extend(args.iter().cloned());
+    let (code, stdout, stderr) = run_cli(&filtered, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(stdout.lines().count(), 3, "stdout: {}", stdout);
 }
 
 #[test]

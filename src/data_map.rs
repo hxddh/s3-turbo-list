@@ -950,15 +950,6 @@ fn tsv_escape(value: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-fn record_prefix_stat(prefix_stats: &mut PrefixStats, prefix: &str, size: u64) {
-    let entry = match prefix_stats.get_mut(prefix) {
-        Some(entry) => entry,
-        None => prefix_stats.entry(prefix.to_string()).or_default(),
-    };
-    entry.objects += 1;
-    entry.bytes = entry.bytes.saturating_add(size);
-}
-
 /// Prefix accounting that coalesces runs of equal prefixes. Listing batches
 /// arrive in S3 key order, so consecutive objects overwhelmingly share a
 /// prefix; folding a whole run into one map update replaces the per-object
@@ -1297,6 +1288,9 @@ impl DiffSideStream {
 struct DiffRowSink {
     buf: Vec<(ObjectKey, ObjectProps, u8)>,
     prefix_stats: PrefixStats,
+    // Merged rows arrive in key order, so consecutive rows share a prefix:
+    // fold runs instead of a hash lookup per row, as the list paths do.
+    prefix_run: PrefixRunFolder,
     rows: usize,
     plus: usize,
     minus: usize,
@@ -1319,6 +1313,7 @@ impl DiffRowSink {
         Self {
             buf: Vec::new(),
             prefix_stats: PrefixStats::default(),
+            prefix_run: PrefixRunFolder::default(),
             rows: 0,
             plus: 0,
             minus: 0,
@@ -1344,7 +1339,8 @@ impl DiffRowSink {
         // Prefix stats (KS file, bytes_total, unique/top prefixes) describe
         // the rows written — as in list mode — not filter-ignored pairs, so
         // the manifest's metrics agree with the Parquet artifact.
-        record_prefix_stat(&mut self.prefix_stats, key.prefix(), props.size());
+        self.prefix_run
+            .add(&mut self.prefix_stats, key.prefix(), props.size());
         self.rows += 1;
         self.buf.push((key, props, flag));
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
@@ -1358,6 +1354,7 @@ impl DiffRowSink {
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     ) -> Result<(), String> {
+        self.prefix_run.flush(&mut self.prefix_stats);
         if !self.buf.is_empty() {
             let batch = std::mem::take(&mut self.buf);
             send_to_writer(writer_tx, batch).await?;
