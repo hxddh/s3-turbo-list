@@ -1198,6 +1198,14 @@ pub struct DiffStreamSides {
     pub right: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
 }
 
+/// Where the merge publishes the index of the segment it is reading on each
+/// side, so the listing can hold back segments too far ahead of it
+/// (`tasks_s3::diff_list_side_task`).
+pub struct DiffMergeHeads {
+    pub left: tokio::sync::watch::Sender<usize>,
+    pub right: tokio::sync::watch::Sender<usize>,
+}
+
 struct DiffSideStream {
     rx: Option<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
     pending: std::vec::IntoIter<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
@@ -1207,12 +1215,15 @@ struct DiffSideStream {
     name: &'static str,
     received_batches: usize,
     received_objects: usize,
+    segment: usize,
+    head: Option<tokio::sync::watch::Sender<usize>>,
 }
 
 impl DiffSideStream {
     fn new(
         receivers: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
         name: &'static str,
+        head: Option<tokio::sync::watch::Sender<usize>>,
     ) -> Self {
         let mut pending = receivers.into_iter();
         let rx = pending.next();
@@ -1225,6 +1236,8 @@ impl DiffSideStream {
             name,
             received_batches: 0,
             received_objects: 0,
+            segment: 0,
+            head,
         }
     }
 
@@ -1235,7 +1248,13 @@ impl DiffSideStream {
             let rx = self.rx.as_mut()?;
             match rx.recv().await {
                 Some(batch) => return Some(batch),
-                None => self.rx = self.pending.next(),
+                None => {
+                    self.rx = self.pending.next();
+                    self.segment += 1;
+                    if let Some(head) = &self.head {
+                        head.send_replace(self.segment);
+                    }
+                }
             }
         }
     }
@@ -1518,12 +1537,26 @@ pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
     aborted: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<DiffMergeOutcome, String> {
+    run_diff_merge_with_heads(sides, None, parquet, aborted).await
+}
+
+/// [`run_diff_merge`] that also publishes the merge's segment position.
+pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
+    sides: DiffStreamSides,
+    heads: Option<DiffMergeHeads>,
+    parquet: &mut crate::utils::AsyncParquetOutput<W>,
+    aborted: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<DiffMergeOutcome, String> {
+    let (left_head, right_head) = match heads {
+        Some(heads) => (Some(heads.left), Some(heads.right)),
+        None => (None, None),
+    };
     let (writer_tx, mut writer_rx) =
         tokio::sync::mpsc::channel::<DiffWriteBatch>(DIFF_WRITE_PIPELINE_CAP);
 
     let merge_task = tokio::spawn(async move {
-        let mut left = DiffSideStream::new(sides.left, "left");
-        let mut right = DiffSideStream::new(sides.right, "right");
+        let mut left = DiffSideStream::new(sides.left, "left", left_head);
+        let mut right = DiffSideStream::new(sides.right, "right", right_head);
         let mut sink = DiffRowSink::new();
 
         merge_diff_streams(&mut left, &mut right, &writer_tx, &mut sink, &aborted).await?;
@@ -1574,6 +1607,7 @@ pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
 pub async fn data_map_task_diff_streaming(
     g_state: core::GlobalState,
     sides: DiffStreamSides,
+    heads: Option<DiffMergeHeads>,
     filename_ks: &str,
     filename_output: &str,
     output_config: OutputConfig,
@@ -1608,24 +1642,27 @@ pub async fn data_map_task_diff_streaming(
     let started_at = Instant::now();
     let mut output_ok = true;
     let abort_state = g_state.clone();
-    let outcome = match run_diff_merge(sides, &mut parquet, move || abort_state.is_quit()).await {
-        Ok(outcome) => Some(outcome),
-        Err(e) => {
-            log::error!("Diff merge failed: {}", e);
-            // A merge stopped because the run is quitting — a side failed
-            // (AccessDenied, retries exhausted) or the run was interrupted —
-            // is explained by that fatal error or interrupt; counting it as an
-            // output failure made a side's AccessDenied exit 5 "output write
-            // failed" instead of 3 with the S3 reason. Anything else (an
-            // ordering violation, a write error) is an output failure with
-            // this message as its reason.
-            if !g_state.is_quit() {
-                g_state.note_output_error(format!("diff merge failed: {}", e));
-                output_ok = false;
+    let outcome =
+        match run_diff_merge_with_heads(sides, heads, &mut parquet, move || abort_state.is_quit())
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                log::error!("Diff merge failed: {}", e);
+                // A merge stopped because the run is quitting — a side failed
+                // (AccessDenied, retries exhausted) or the run was interrupted —
+                // is explained by that fatal error or interrupt; counting it as an
+                // output failure made a side's AccessDenied exit 5 "output write
+                // failed" instead of 3 with the S3 reason. Anything else (an
+                // ordering violation, a write error) is an output failure with
+                // this message as its reason.
+                if !g_state.is_quit() {
+                    g_state.note_output_error(format!("diff merge failed: {}", e));
+                    output_ok = false;
+                }
+                None
             }
-            None
-        }
-    };
+        };
 
     let parquet_rows = parquet.total_rows();
     let ks_entries = if let Some(ref outcome) = outcome {

@@ -1524,6 +1524,8 @@ fn main() {
                 left_checkpoint.clone(),
             );
 
+            let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
+            let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
             let prefix = opt_prefix.clone();
             set.spawn(async move {
                 tasks_s3::diff_list_side_task(
@@ -1532,6 +1534,7 @@ fn main() {
                     concurrency,
                     &left_bounds,
                     left_senders,
+                    Some(left_head_rx),
                 )
                 .await
             });
@@ -1543,6 +1546,7 @@ fn main() {
                     concurrency,
                     &right_bounds,
                     right_senders,
+                    Some(right_head_rx),
                 )
                 .await
             });
@@ -1550,6 +1554,10 @@ fn main() {
             let sides = data_map::DiffStreamSides {
                 left: left_receivers,
                 right: right_receivers,
+            };
+            let heads = data_map::DiffMergeHeads {
+                left: left_head_tx,
+                right: right_head_tx,
             };
             let diff_g_state = g_state.clone();
             let diff_ks = filename_ks_for_task.clone();
@@ -1559,6 +1567,7 @@ fn main() {
                 data_map::data_map_task_diff_streaming(
                     diff_g_state,
                     sides,
+                    Some(heads),
                     &diff_ks,
                     &diff_output,
                     diff_output_config,
@@ -1722,6 +1731,16 @@ fn main() {
                     .as_ref()
                     .and_then(|slot| slot.lock().unwrap().take());
                 match progress {
+                    // Interrupted after the last range was listed: nothing is
+                    // left to resume. A checkpoint with no ranges would make
+                    // the next --resume write an empty output and succeed.
+                    Some(progress) if progress.remaining.is_empty() => {
+                        let _ = std::fs::remove_file(cp_path);
+                        checkpoint_note = Some(
+                            "the listing had already finished; no checkpoint is needed"
+                                .to_string(),
+                        );
+                    }
                     Some(progress) => {
                         let completed = merged_completed_indices(
                             checkpoint_journal.as_ref(),

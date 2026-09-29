@@ -261,6 +261,12 @@ async fn probe_split_candidate(
             .prefix(&dir)
             .start_after(cursor)
             .delimiter("/")
+            // Only CommonPrefixes matter here, but at the leaf rung the page
+            // is up to 1000 `<Contents>`: let the fast parser strip them (the
+            // SDK's per-object deserializer made these probes ~15% of a
+            // listing's CPU). The parsed rows are simply dropped.
+            .customize()
+            .interceptor(FastContentsInterceptor::new(ParsedPageSlot::default()))
             .send();
         let response = match timeout_at(Instant::now() + timeout_dur, send).await {
             Ok(Ok(r)) => r,
@@ -520,6 +526,11 @@ async fn flat_reactor_task(
     let mut last_ts = epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
+    // In-flight split probes. Each holds a context clone — and with it a
+    // data-map sender — so a detached probe kept the output open, delaying
+    // the end of the run (and Ctrl-C) by up to its request timeouts. They
+    // are aborted when the reactor exits.
+    let mut probes = tokio::task::JoinSet::new();
     let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -563,7 +574,23 @@ async fn flat_reactor_task(
             });
         }
 
-        if set.is_empty() {
+        while probes.try_join_next().is_some() {}
+
+        // A segment that accepted a split sent its child range before it
+        // finished; when `join_next` won the race below, that child is still
+        // queued here. Leaving it there dropped its keys from the listing —
+        // and from the resume ranges — while the run reported success.
+        let mut drained = false;
+        while let Ok(range) = split_rx.try_recv() {
+            split_count += 1;
+            pending_children.push(range);
+            drained = true;
+        }
+        if drained && !ctx.is_quit() {
+            continue;
+        }
+
+        if set.is_empty() && pending_children.is_empty() {
             // Every segment task has joined, so every cloned sender is dropped
             // and every `send` has completed — the batches are in the channel.
             // Returning drops the last sender, and the data map receives all of
@@ -672,7 +699,7 @@ async fn flat_reactor_task(
                     && hints.is_empty()
                 {
                     let idle = cap - set.len();
-                    maybe_start_split_probes(ctx, start_prefix, &controls, idle);
+                    maybe_start_split_probes(ctx, start_prefix, &controls, idle, &mut probes);
                 }
             },
         }
@@ -692,11 +719,17 @@ async fn flat_reactor_task(
                     completed_pieces += 1;
                 }
             }
+            // Children split off before or during the abort are unlisted
+            // ranges: they belong in the resume ranges.
+            while let Ok(range) = split_rx.try_recv() {
+                pending_children.push(range);
+            }
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
         }
     }
 
+    probes.abort_all();
     controls.extend(unfinished);
     *ctx.resume_progress.lock().unwrap() = Some(resume_progress(
         &controls,
@@ -801,13 +834,14 @@ fn maybe_start_split_probes(
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
+    probes: &mut tokio::task::JoinSet<()>,
 ) {
     for index in select_split_targets(controls, idle_capacity) {
         let control = Arc::clone(&controls[&index]);
         control.splitting.store(true, Ordering::Relaxed);
         let probe_ctx = ctx.clone();
         let listing_prefix = start_prefix.to_string();
-        tokio::spawn(async move {
+        probes.spawn(async move {
             let (cursor, end) = control.snapshot();
             if cursor.is_empty() {
                 control.splitting.store(false, Ordering::Relaxed);
@@ -1255,7 +1289,7 @@ async fn flat_list(
                 // no keys remain in its range, so the child would be an
                 // empty segment (a wasted request) and `was_split` would
                 // withhold this fully-completed segment's checkpoint record.
-                if let (Some(tx), false) = (split_tx, is_ended) {
+                if let (Some(tx), false) = (split_tx, is_ended || ctx.is_quit()) {
                     if let Some(child) = control.try_accept_split() {
                         info!(
                             "Segment {} accepted runtime split at '{}'",
@@ -2002,10 +2036,20 @@ mod flat_cut_tests {
 // the prefetch window, bounding memory. Runtime splitting stays disabled
 // for diff: the segment set must remain static for ordered consumption.
 
-/// Per-segment channel capacity (batches) — the diff prefetch window.
-pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 4;
+/// Per-segment channel capacity (batches): how far one segment may list
+/// ahead of the merge.  At 4, a segment behind the merge head stalled after
+/// four pages, so a side with a few large segments listed nearly serially
+/// (one page per round trip).
+pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 32;
 /// Upper bound on concurrently listing segments per diff side.
 const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+/// Segments a side may start ahead of the one the merge is reading.  With
+/// the channel capacity this bounds a side's buffered batches to
+/// `DIFF_SIDE_LOOKAHEAD_SEGMENTS * DIFF_SEGMENT_CHANNEL_CAP` whatever the
+/// segment count: finished segments used to keep their batches queued, so a
+/// many-segment side could buffer most of the listing (RSS grew with bucket
+/// size).
+const DIFF_SIDE_LOOKAHEAD_SEGMENTS: usize = 16;
 
 /// List one diff side across its static segments, writing each segment's
 /// batches to the index-aligned sender. Any segment failure marks the run
@@ -2016,6 +2060,8 @@ pub async fn diff_list_side_task(
     concurrency: usize,
     boundaries: &[String],
     senders: Vec<tokio::sync::mpsc::Sender<Vec<(ObjectKey, ObjectProps)>>>,
+    // Index of the segment the merge is reading (see `DiffSideStream`).
+    mut merge_head: Option<tokio::sync::watch::Receiver<usize>>,
 ) {
     ctx.start();
     ctx.g_state.wait_to_start().await;
@@ -2036,9 +2082,17 @@ pub async fn diff_list_side_task(
     let mut senders = senders.into_iter();
     let mut set = tokio::task::JoinSet::new();
 
+    let mut next_pair = hints.next();
     loop {
         while set.len() < concurrency {
-            let Some(pair) = hints.next() else { break };
+            let Some(pair) = next_pair.take() else { break };
+            if let Some(head) = &merge_head {
+                if pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS {
+                    next_pair = Some(pair);
+                    break;
+                }
+            }
+            next_pair = hints.next();
             let sender = senders.next().expect("sender per segment");
             let mut task_ctx = ctx.clone();
             task_ctx.data_map_channel = sender;
@@ -2052,10 +2106,27 @@ pub async fn diff_list_side_task(
             });
         }
 
-        if set.is_empty() {
+        if set.is_empty() && next_pair.is_none() {
             break;
         }
-        match set.join_next().await {
+        // Wait for a segment to finish or, when the next segment is held
+        // back by the lookahead window, for the merge to move on.
+        let joined = tokio::select! {
+            joined = set.join_next(), if !set.is_empty() => joined,
+            changed = async {
+                match merge_head.as_mut() {
+                    Some(head) => head.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if next_pair.is_some() => {
+                if changed.is_err() {
+                    // The merge is gone; stop gating (the sends will fail).
+                    merge_head = None;
+                }
+                continue;
+            }
+        };
+        match joined {
             Some(Ok(_completed)) => {}
             Some(Err(e)) => {
                 // Losing a segment is worse here than in list mode: the merge

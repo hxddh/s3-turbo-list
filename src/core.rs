@@ -347,28 +347,71 @@ pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
 /// count used to fall back to the single-part reading of the same digest,
 /// with the same effect.
 pub(crate) fn parse_etag_bytes(etag: &str) -> ([u8; 16], u32) {
-    const UNAVAILABLE: ([u8; 16], u32) = ([0u8; 16], 0);
     let raw = etag.as_bytes();
+    if raw.len() < 2 {
+        return ([0u8; 16], 0);
+    }
+    // The rules only look at the bytes between the first and last one.
+    parse_etag_inner(&raw[1..raw.len() - 1])
+}
+
+/// [`parse_etag_bytes`] of an ETag whose first and last bytes (normally the
+/// quotes) are already stripped: `<32 hex>` or `<32 hex>-<parts>`.
+pub(crate) fn parse_etag_inner(inner: &[u8]) -> ([u8; 16], u32) {
+    const UNAVAILABLE: ([u8; 16], u32) = ([0u8; 16], 0);
     let mut md5 = [0u8; 16];
-    let Some(hex_span) = raw.get(1..33) else {
-        return UNAVAILABLE;
-    };
-    if raw.len() == 34 {
-        if hex::decode_to_slice(hex_span, &mut md5).is_ok() {
+    if inner.len() == 32 {
+        if decode_hex16(inner, &mut md5) {
             return (md5, 0);
         }
-    } else if raw.len() >= 36 && raw.get(33) == Some(&b'-') {
-        let parts = raw
-            .get(34..raw.len() - 1)
-            .and_then(|p| std::str::from_utf8(p).ok())
+    } else if inner.len() >= 34 && inner[32] == b'-' {
+        let parts = std::str::from_utf8(&inner[33..])
+            .ok()
             .and_then(|p| p.parse::<u32>().ok());
         if let Some(parts) = parts
-            && hex::decode_to_slice(hex_span, &mut md5).is_ok()
+            && decode_hex16(&inner[..32], &mut md5)
         {
             return (md5, parts);
         }
     }
     UNAVAILABLE
+}
+
+/// Hex digit value, or 0xFF for anything `hex::decode_to_slice` rejects
+/// (it accepts `0-9`, `a-f` and `A-F`).
+const HEX_VALUE: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        t[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// Decode 32 hex digits into `out`; `false` (with `out` unspecified) on any
+/// non-hex byte. Table-driven and branch-free per digit: the `hex` crate's
+/// per-character match was ~20% of the fast list parser's time on random
+/// (unpredictable digit/letter) MD5s.
+#[inline]
+fn decode_hex16(hex: &[u8], out: &mut [u8; 16]) -> bool {
+    let Ok(hex) = <&[u8; 32]>::try_from(hex) else {
+        return false;
+    };
+    let mut bad = 0u8;
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = HEX_VALUE[hex[2 * i] as usize];
+        let lo = HEX_VALUE[hex[2 * i + 1] as usize];
+        bad |= hi | lo;
+        *byte = (hi << 4) | (lo & 0x0F);
+    }
+    bad & 0xF0 == 0
 }
 
 impl From<&aws_sdk_s3::types::Object> for ObjectProps {
@@ -1163,6 +1206,26 @@ impl KeySpaceHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_hex16_matches_the_hex_crate_for_every_byte_at_every_position() {
+        let base = *b"0123456789abcdefABCDEF0123456789";
+        for pos in 0..32 {
+            for byte in 0..=255u8 {
+                let mut input = base;
+                input[pos] = byte;
+                let mut ours = [0u8; 16];
+                let mut theirs = [0u8; 16];
+                let ok = decode_hex16(&input, &mut ours);
+                let expected = hex::decode_to_slice(input, &mut theirs).is_ok();
+                assert_eq!(ok, expected, "pos {pos} byte {byte:#x}");
+                if ok {
+                    assert_eq!(ours, theirs, "pos {pos} byte {byte:#x}");
+                }
+            }
+        }
+        assert!(!decode_hex16(b"0123", &mut [0u8; 16]));
+    }
 
     #[test]
     fn test_object_key_top_level() {
