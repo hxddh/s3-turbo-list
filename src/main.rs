@@ -1204,6 +1204,14 @@ fn main() {
         if let Some(ep) = &cfg.s3.endpoint_url {
             info!("  endpoint: {}", ep);
         }
+        let proxy_probe = cfg
+            .s3
+            .endpoint_url
+            .as_deref()
+            .unwrap_or(agent::DEFAULT_AWS_ENDPOINT);
+        if let Some(proxy) = agent::env_proxy_for_endpoint(proxy_probe) {
+            info!("  proxy: {} (from the proxy environment variables)", proxy);
+        }
 
         // ── Spawn list / diff side tasks ─────────────────────
         let is_diff = mode == RunMode::BiDir;

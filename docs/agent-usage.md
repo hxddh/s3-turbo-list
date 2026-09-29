@@ -41,7 +41,10 @@ is never empty.
 
 `doctor --json` checks the binary version, current working
 directory, config parse status, local config file presence, `AWS_PROFILE`,
-endpoint compatibility profile status, local output parent directories, and
+endpoint compatibility profile status, the proxy that applies to the
+configured endpoint (`proxy`: decided from `HTTP(S)_PROXY` / `ALL_PROXY` /
+`NO_PROXY` exactly as the run's HTTP client decides it; credentials in the
+proxy URL are never printed), local output parent directories, and
 explicitly marks network probing as skipped.  An endpoint problem that stops
 every real run — a profile that requires an explicit endpoint URL, or an
 endpoint still containing template placeholders — is an `error` check, and

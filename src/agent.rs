@@ -786,7 +786,7 @@ fn sha256_file(path: &str) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Records in an RFC 4180 CSV file: newlines outside double quotes.
@@ -926,6 +926,7 @@ pub fn doctor_report(
         },
     });
     checks.push(endpoint_url_check(cfg));
+    checks.push(proxy_check(cfg));
     checks.push(DoctorCheck {
         name: "network".to_string(),
         status: "skipped".to_string(),
@@ -958,6 +959,72 @@ pub fn doctor_report(
         config_source,
         resolved_config: cfg.into(),
         hints,
+    }
+}
+
+/// The endpoint a run talks to when none is configured: the SDK then resolves
+/// an AWS S3 host, which `NO_PROXY` rules such as `.amazonaws.com` match.
+pub const DEFAULT_AWS_ENDPOINT: &str = "https://s3.amazonaws.com";
+
+/// The proxy the SDK's HTTP client will route `endpoint` through, if any.
+///
+/// The SDK (behavior version 2025-08-07 and later, which this binary uses)
+/// builds its connector's proxy rules from `HTTP_PROXY` / `HTTPS_PROXY` /
+/// `ALL_PROXY` / `NO_PROXY` with hyper-util's `Matcher::from_env`; asking the
+/// same matcher gives the same answer the run will get. Only the proxy's
+/// scheme, host and port are returned — never credentials in its URL.
+pub fn env_proxy_for_endpoint(endpoint: &str) -> Option<String> {
+    let uri: http::Uri = endpoint.parse().ok()?;
+    let intercept = hyper_util::client::proxy::matcher::Matcher::from_env().intercept(&uri)?;
+    let proxy = intercept.uri();
+    let host = proxy.host()?;
+    let scheme = proxy.scheme_str().unwrap_or("http");
+    Some(match proxy.port_u16() {
+        Some(port) => format!("{}://{}:{}", scheme, host, port),
+        None => format!("{}://{}", scheme, host),
+    })
+}
+
+fn proxy_check(cfg: &S3TurboConfig) -> DoctorCheck {
+    let endpoint = match cfg.s3.endpoint_url.as_deref() {
+        Some(e) if !profiles::endpoint_url_has_template_placeholder(e) => e,
+        Some(_) => {
+            return DoctorCheck {
+                name: "proxy".to_string(),
+                status: "skipped".to_string(),
+                message: "endpoint_url is still a template; proxy rules are checked once it \
+                          is a real URL"
+                    .to_string(),
+            }
+        }
+        // A non-AWS profile without an explicit endpoint derives it from the
+        // region, which doctor does not take; the default AWS host would
+        // report the wrong answer.
+        None if cfg.s3.profile.as_deref().is_some_and(|p| p != "aws") => {
+            return DoctorCheck {
+                name: "proxy".to_string(),
+                status: "skipped".to_string(),
+                message: "the endpoint is derived from --region at run time; the run log \
+                          names the proxy it uses, if any"
+                    .to_string(),
+            }
+        }
+        None => DEFAULT_AWS_ENDPOINT,
+    };
+    DoctorCheck {
+        name: "proxy".to_string(),
+        status: "ok".to_string(),
+        message: match env_proxy_for_endpoint(endpoint) {
+            Some(proxy) => format!(
+                "requests to {} go through proxy {} (from HTTP(S)_PROXY / ALL_PROXY; \
+                 add the host to NO_PROXY to connect directly)",
+                endpoint, proxy
+            ),
+            None => format!(
+                "requests to {} connect directly (no proxy applies)",
+                endpoint
+            ),
+        },
     }
 }
 

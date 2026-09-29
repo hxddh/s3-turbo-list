@@ -301,7 +301,7 @@ pub fn boundaries_digest(boundaries: &[String]) -> String {
         hasher.update(boundary.as_bytes());
         hasher.update([0u8]);
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Checkpoint path for a run over `prefix`.  A whole-bucket run keeps the

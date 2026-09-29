@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Dependencies upgraded.** The AWS SDK moves to `aws-sdk-s3` 1.150 /
+  `aws-config` 1.12 with the matching smithy runtime; its HTTP client now sets
+  `TCP_NODELAY` by default. Also `arrow` / `parquet` 54 → 60, `toml` 0.8 → 1,
+  `sha2` 0.10 → 0.11, `clap_mangen` 0.2 → 0.3, `tokio` 1.53, and the
+  semver-compatible updates of every other crate. Output files, checksums and
+  checkpoint names are unchanged, and the release binary is about 8% smaller.
+  On the local benchmark, Parquet throughput is unchanged to slightly higher.
+- **Minimum supported Rust is 1.94.1** (`rust-version`), which the new AWS SDK
+  crates require.
+
+### Added
+- **`doctor` reports the HTTP proxy that applies to the endpoint** (`proxy`
+  check), and a run logs it at startup. Runs have always honoured
+  `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` through the SDK's
+  HTTP client; the check uses the same matcher, so a local endpoint
+  unexpectedly routed through a proxy is visible before the run. Credentials in
+  the proxy URL are never printed. README documents the behaviour.
+
 ## [0.34.0] - 2026-09-29
 
 ### Changed
