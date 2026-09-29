@@ -501,7 +501,9 @@ async fn flat_reactor_task(
 
     loop {
         // Fill up to the concurrency limit: split children first, then hints.
-        while set.len() < flat_concurrency {
+        // Nothing new starts once the run is asked to stop — an interrupt
+        // during startup discovery used to be followed by a full first fill.
+        while set.len() < flat_concurrency && !ctx.is_quit() {
             let (index, start, end, checkpointable) = if let Some(child) = pending_children.pop() {
                 let index = next_child_index;
                 next_child_index += 1;

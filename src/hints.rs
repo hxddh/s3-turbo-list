@@ -74,12 +74,18 @@ pub fn parse_conventional_hints_file(path: &str, prefix: &str) -> Result<Vec<Str
         ));
     }
     warn_if_stale(path, &cache.generated_at);
+    // Segments are consecutive boundary pairs: an unsorted or duplicated
+    // (hand-edited) cache made ranges overlap and listed keys twice. The
+    // `--hints-file` TOML path already normalized; this one did not.
+    let mut boundaries = cache.boundaries;
+    boundaries.sort();
+    boundaries.dedup();
     info!(
         "Loaded {} key-space boundaries from TOML hints cache '{}'",
-        cache.boundaries.len(),
+        boundaries.len(),
         path
     );
-    Ok(cache.boundaries)
+    Ok(boundaries)
 }
 
 /// Age past which a cache is worth a word.  Boundaries are cut points in a
@@ -242,6 +248,12 @@ fn parse_toml_cache(path: &str, content: &str) -> Result<HintsCache, String> {
                 "Hints file '{}' boundary {} contains control characters",
                 path, i
             ));
+        }
+        // An empty boundary reads as "unbounded" when it ends a segment, so
+        // that segment would cover the whole key space and every key after
+        // it would be listed twice.
+        if b.is_empty() {
+            return Err(format!("Hints file '{}' boundary {} is empty", path, i));
         }
     }
 
@@ -473,6 +485,22 @@ generated_at = "2026-01-01T00:00:00Z"
         let (_dir, path) = write_tmp(content);
         let boundaries = parse_as_toml(&path, content).unwrap();
         assert_eq!(boundaries, vec!["c/".to_string(), "m/".to_string()]);
+    }
+
+    #[test]
+    fn test_conventional_toml_cache_sorts_dedups_and_rejects_empty() {
+        let content =
+            "bucket = \"b\"\ngenerated_at = \"x\"\nboundaries = [\"k003\", \"k001\", \"k003\"]\n";
+        let (_dir, path) = write_tmp(content);
+        assert_eq!(
+            parse_conventional_hints_file(&path, "").unwrap(),
+            vec!["k001".to_string(), "k003".to_string()]
+        );
+        // An empty boundary would end a segment "unbounded" and list keys twice.
+        let content = "bucket = \"b\"\ngenerated_at = \"x\"\nboundaries = [\"\", \"k003\"]\n";
+        let (_dir, path) = write_tmp(content);
+        assert!(parse_conventional_hints_file(&path, "").is_err());
+        assert!(parse_hints_file(&path).is_err());
     }
 
     #[test]

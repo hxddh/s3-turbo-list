@@ -2476,3 +2476,29 @@ fn test_cli_preflight_matches_run_for_probe_hints_and_local_tools() {
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("dry-run plan"));
 }
+
+#[test]
+fn test_cli_rejects_delimiter_with_hints_file() {
+    // CommonPrefixes are not bounded by a segment's range, so hint boundaries
+    // made delimiter runs drop or repeat folder rows.
+    let dir = tempfile::tempdir().unwrap();
+    let hints = dir.path().join("hints.txt");
+    std::fs::write(&hints, "b\n").unwrap();
+    let (code, _stdout, stderr) = run_cli_in_dir(
+        &[
+            "--dry-run",
+            "--delimiter",
+            "/",
+            "--hints-file",
+            hints.to_str().unwrap(),
+            "list",
+            "--bucket",
+            "b",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 2, "stderr: {}", stderr);
+    assert!(stderr.contains("--delimiter"), "stderr: {}", stderr);
+}

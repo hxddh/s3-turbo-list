@@ -551,6 +551,7 @@ fn main() {
     validate_output_format_command(&cli);
     validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
+    validate_delimiter_hints_command(&cli);
     validate_diff_hints_command(&cli);
     validate_diff_resume_command(&cli);
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
@@ -1142,48 +1143,60 @@ fn main() {
                 cfg.s3.force_path_style,
             );
             let target_boundaries = concurrency.saturating_mul(2).clamp(16, 512);
-            let discovery = auto_hints::discover_startup_boundaries(
-                &probe_client,
-                opt_bucket,
-                &opt_prefix,
-                target_boundaries,
-                cfg.s3.operation_timeout_secs,
-            )
-            .await;
-            // Flat namespace: no CommonPrefix structure, which previously
-            // meant starting as a single segment and relying on runtime
-            // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
-            // Bisect the key range with single-key probes instead — the same
-            // partitioner diff sides use — so the first run starts at full
-            // concurrency. The boundaries land in the same cache below.
-            let boundaries = if !discovery.boundaries.is_empty() {
-                discovery.boundaries
-            } else if discovery.is_single_page_listing(cli.max_keys) {
-                // The discovery probe's page was not truncated and held no
-                // CommonPrefixes, and this run's page size returns those keys
-                // in one request too: the whole listing is a single page.
-                // Bisecting it would cost several probes per cut to partition
-                // work the single segment finishes in one request, and would
-                // cache boundaries that pin that shape for later runs.
-                info!(
-                    "Startup discovery found a single-page listing — using single-segment listing"
-                );
-                Vec::new()
-            } else {
-                info!("Startup discovery found no prefix structure — bisecting flat key space");
-                // Runtime splitting still covers this run, so one boundary per
-                // worker is enough; spare boundaries would only cost probes.
-                let flat_target = concurrency.clamp(1, 64);
-                discover_flat_boundaries_via_client(
-                    &probe_client,
-                    opt_bucket,
-                    &opt_prefix,
-                    flat_target,
-                    cfg.s3.operation_timeout_secs,
-                )
-                .await
+            // Discovery can take many probe rounds on a slow endpoint; race it
+            // against Ctrl-C / SIGTERM so an interrupt stops it at once (the
+            // run then exits 7 without caching half-discovered boundaries).
+            let discovered = tokio::select! {
+                boundaries = async {
+                    let discovery = auto_hints::discover_startup_boundaries(
+                        &probe_client,
+                        opt_bucket,
+                        &opt_prefix,
+                        target_boundaries,
+                        cfg.s3.operation_timeout_secs,
+                    )
+                    .await;
+                    // Flat namespace: no CommonPrefix structure, which previously
+                    // meant starting as a single segment and relying on runtime
+                    // splitting to ramp up (SPLIT_MIN_PAGES pages per generation).
+                    // Bisect the key range with single-key probes instead — the same
+                    // partitioner diff sides use — so the first run starts at full
+                    // concurrency. The boundaries land in the same cache below.
+                    if !discovery.boundaries.is_empty() {
+                        discovery.boundaries
+                    } else if discovery.is_single_page_listing(cli.max_keys) {
+                        // The discovery probe's page was not truncated and held no
+                        // CommonPrefixes, and this run's page size returns those keys
+                        // in one request too: the whole listing is a single page.
+                        // Bisecting it would cost several probes per cut to partition
+                        // work the single segment finishes in one request, and would
+                        // cache boundaries that pin that shape for later runs.
+                        info!(
+                            "Startup discovery found a single-page listing — using single-segment listing"
+                        );
+                        Vec::new()
+                    } else {
+                        info!("Startup discovery found no prefix structure — bisecting flat key space");
+                        // Runtime splitting still covers this run, so one boundary per
+                        // worker is enough; spare boundaries would only cost probes.
+                        let flat_target = concurrency.clamp(1, 64);
+                        discover_flat_boundaries_via_client(
+                            &probe_client,
+                            opt_bucket,
+                            &opt_prefix,
+                            flat_target,
+                            cfg.s3.operation_timeout_secs,
+                        )
+                        .await
+                    }
+                } => Some(boundaries),
+                _ = quit_requested(&g_state) => None,
             };
-            if boundaries.is_empty() {
+            let interrupted_discovery = discovered.is_none();
+            let boundaries = discovered.unwrap_or_default();
+            if interrupted_discovery {
+                info!("Interrupted during startup discovery; no boundaries cached");
+            } else if boundaries.is_empty() {
                 info!(
                     "Startup discovery found no cuttable key space — using single-segment listing"
                 );
@@ -1280,6 +1293,7 @@ fn main() {
                         &cfg,
                         &cli,
                         &sdk_config,
+                        &g_state,
                     )
                     .await;
                     let right = diff_side_boundaries(
@@ -1290,6 +1304,7 @@ fn main() {
                         &cfg,
                         &cli,
                         &sdk_config,
+                        &g_state,
                     )
                     .await;
                     (left, right)
@@ -1303,6 +1318,7 @@ fn main() {
                             &cfg,
                             &cli,
                             &sdk_config,
+                            &g_state,
                         ),
                         diff_side_boundaries(
                             target_bucket,
@@ -1312,6 +1328,7 @@ fn main() {
                             &cfg,
                             &cli,
                             &sdk_config,
+                            &g_state,
                         ),
                     )
                 };
@@ -2072,6 +2089,23 @@ fn validate_continuation_token_command(cli: &Cli, cfg: &S3TurboConfig) {
 /// ranges, duplicating output rows. Reject explicit multi-segment inputs; the
 /// conventional hints cache is skipped at load time (with a log line) instead
 /// of erroring, because startup discovery writes it automatically on first run.
+/// A `--delimiter` listing is one hierarchical segment: CommonPrefixes are not
+/// bounded by a segment's key range, so boundaries from `--hints-file` made
+/// neighbouring segments drop or repeat folder rows. Runtime splitting and the
+/// hints cache were already off for delimiter runs; the explicit file was the
+/// remaining way in.
+fn validate_delimiter_hints_command(cli: &Cli) {
+    if matches!(cli.cmd, Commands::List { .. })
+        && !cli.delimiter.is_empty()
+        && cli.hints_file.is_some()
+    {
+        eprintln!(
+            "--delimiter lists one hierarchical segment and cannot be combined with --hints-file"
+        );
+        std::process::exit(agent::ExitCode::CliConfig.code());
+    }
+}
+
 fn validate_start_after_command(cli: &Cli, cfg: &S3TurboConfig) {
     if cfg.s3.start_after.is_none() {
         return;
@@ -3679,6 +3713,15 @@ fn diff_segment_channels(segments: usize) -> (Vec<SegmentBatchSender>, Vec<Segme
         .unzip()
 }
 
+/// Resolves once the run has been asked to stop (Ctrl-C / SIGTERM set the
+/// quit flag). Startup discovery races against it: its probe rounds run
+/// before any segment task exists, so nothing else would notice the signal.
+async fn quit_requested(g_state: &core::GlobalState) {
+    while !g_state.is_quit() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Key-space boundaries for one diff side: cached hints when present,
 /// otherwise startup structural discovery (cached for future runs). The
 /// same automatic sources as list mode; explicit --hints-file remains
@@ -3692,6 +3735,7 @@ async fn diff_side_boundaries(
     cfg: &S3TurboConfig,
     cli: &Cli,
     sdk_config: &aws_config::SdkConfig,
+    g_state: &core::GlobalState,
 ) -> Vec<String> {
     if cli.no_auto_hints || !cli.delimiter.is_empty() || cfg.s3.start_after.is_some() {
         return Vec::new();
@@ -3708,37 +3752,46 @@ async fn diff_side_boundaries(
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style);
     let target = cfg.runtime.max_concurrency.saturating_mul(2).clamp(16, 512);
-    let discovery = auto_hints::discover_startup_boundaries(
-        &client,
-        bucket,
-        prefix,
-        target,
-        cfg.s3.operation_timeout_secs,
-    )
-    .await;
-    let boundaries = if !discovery.boundaries.is_empty() {
-        discovery.boundaries
-    } else if discovery.is_single_page_listing(cli.max_keys) {
-        // Single-page side: nothing to partition, and the probes would cost
-        // more requests than the listing.
-        Vec::new()
-    } else {
-        // Flat namespace: structural discovery found no CommonPrefixes, so the
-        // side would otherwise list as one serial segment. Bisect the key range
-        // with single-key probes so it lists in parallel. The target is smaller
-        // than structural discovery's: each cut is a one-time up-front probe,
-        // and only `max_concurrency` segments run at once, so spare boundaries
-        // beyond that would just cost probes without adding parallelism. Diff
-        // has no runtime splitting to fall back on, so it keeps a floor.
-        let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
-        discover_flat_boundaries_via_client(
-            &client,
-            bucket,
-            prefix,
-            flat_target,
-            cfg.s3.operation_timeout_secs,
-        )
-        .await
+    // Race discovery against Ctrl-C / SIGTERM, as list mode does.
+    let discovered = tokio::select! {
+        boundaries = async {
+            let discovery = auto_hints::discover_startup_boundaries(
+                &client,
+                bucket,
+                prefix,
+                target,
+                cfg.s3.operation_timeout_secs,
+            )
+            .await;
+        if !discovery.boundaries.is_empty() {
+                discovery.boundaries
+            } else if discovery.is_single_page_listing(cli.max_keys) {
+                // Single-page side: nothing to partition, and the probes would cost
+                // more requests than the listing.
+                Vec::new()
+            } else {
+                // Flat namespace: structural discovery found no CommonPrefixes, so the
+                // side would otherwise list as one serial segment. Bisect the key range
+                // with single-key probes so it lists in parallel. The target is smaller
+                // than structural discovery's: each cut is a one-time up-front probe,
+                // and only `max_concurrency` segments run at once, so spare boundaries
+                // beyond that would just cost probes without adding parallelism. Diff
+                // has no runtime splitting to fall back on, so it keeps a floor.
+                let flat_target = cfg.runtime.max_concurrency.clamp(8, 64);
+                discover_flat_boundaries_via_client(
+                    &client,
+                    bucket,
+                    prefix,
+                    flat_target,
+                    cfg.s3.operation_timeout_secs,
+                )
+                .await
+            }
+        } => Some(boundaries),
+        _ = quit_requested(g_state) => None,
+    };
+    let Some(boundaries) = discovered else {
+        return Vec::new();
     };
     if !boundaries.is_empty()
         && let Err(e) = auto_hints::write_startup_hints_cache(bucket, region, prefix, &boundaries)

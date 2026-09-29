@@ -5104,6 +5104,78 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
     assert_eq!(stdout.lines().count(), 3, "stdout: {}", stdout);
 }
 
+#[cfg(unix)]
+#[test]
+fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
+    // Every probe is slow and the key space looks flat and endless, so
+    // startup discovery would run dozens of probe rounds. An interrupt used
+    // to be ignored until discovery finished (a minute here) and was then
+    // followed by a full first fill of segment tasks.
+    let server = MockS3Server::start(|_request, _sequence| {
+        thread::sleep(Duration::from_millis(1500));
+        MockResponse::ok_xml(list_bucket_xml("", 1, &["k0000"], &[], true, Some("t1")))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    let mut child = command
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--endpoint-url",
+            &server.endpoint(),
+            "--addressing-style",
+            "path",
+            "--summary-only",
+            "list",
+            "--bucket",
+            "mock-bucket",
+            "--region",
+            "us-east-1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("run did not stop within 20s of SIGINT");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, Some(7));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let cached: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_hints.toml"))
+        .collect();
+    assert!(
+        cached.is_empty(),
+        "interrupted discovery must not cache boundaries"
+    );
+}
+
 #[test]
 fn local_mock_list_routes_through_http_proxy_from_environment() {
     // The mock plays the forward proxy: the endpoint host does not resolve,
