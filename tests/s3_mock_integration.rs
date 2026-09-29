@@ -399,8 +399,35 @@ operation_timeout_secs = 2
     .unwrap();
 }
 
+const PROXY_ENV_VARS: &[&str] = &[
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
 fn run_cli(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    run_cli_with_env(args, cwd, &[])
+}
+
+/// Run the CLI with the caller's proxy environment cleared (the SDK honours
+/// HTTP(S)_PROXY / NO_PROXY, so an inherited proxy would reroute requests
+/// meant for the local mock) plus `extra_env`.
+fn run_cli_with_env(
+    args: &[String],
+    cwd: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    command.envs(extra_env.iter().copied());
+    let output = command
         .current_dir(cwd)
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -5035,4 +5062,181 @@ fn local_mock_delimiter_listing_of_only_folders_emits_them() {
     let keys: Vec<&str> = rows.iter().map(|r| r["k"].as_str().unwrap()).collect();
     assert_eq!(keys, vec!["dir0/", "dir1/", "dir2/"]);
     assert!(rows.iter().all(|r| r["s"] == 0 && r["m"] == 0));
+}
+
+#[test]
+fn local_mock_list_routes_through_http_proxy_from_environment() {
+    // The mock plays the forward proxy: the endpoint host does not resolve,
+    // so the listing can only succeed through HTTP_PROXY, and a proxied plain
+    // HTTP request names its target in absolute form.
+    let server = MockS3Server::start(|_request, _sequence| {
+        MockResponse::ok_xml(list_bucket_xml(
+            "",
+            1000,
+            &["a/1.txt", "b/2.txt"],
+            &[],
+            false,
+            None,
+        ))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let endpoint = "http://s3-proxy-only.invalid:9000";
+    let args: Vec<String> = [
+        "--config",
+        &config.display().to_string(),
+        "--endpoint-url",
+        endpoint,
+        "--addressing-style",
+        "path",
+        "--no-auto-hints",
+        "list",
+        "--bucket",
+        "mock-bucket",
+        "--region",
+        "us-east-1",
+        "--output-format",
+        "tsv",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let proxy = server.endpoint();
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("HTTP_PROXY", proxy.as_str())]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert_eq!(stdout.lines().count(), 2, "stdout: {}", stdout);
+    // The run names the proxy for the resolved request URL before any request.
+    assert!(
+        stderr.contains(&format!(
+            "source requests to http://s3-proxy-only.invalid:9000/mock-bucket go through proxy {}",
+            proxy
+        )),
+        "stderr: {}",
+        stderr
+    );
+    let requests = server.requests();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        assert!(
+            request
+                .path
+                .starts_with("http://s3-proxy-only.invalid:9000/mock-bucket"),
+            "request should reach the proxy in absolute form: {}",
+            request.path
+        );
+    }
+
+    // NO_PROXY exempts the host: the run connects directly, cannot resolve
+    // the endpoint, and the proxy sees nothing new.
+    let before = server.requests().len();
+    let (code, _stdout, stderr) = run_cli_with_env(
+        &args,
+        dir.path(),
+        &[("HTTP_PROXY", proxy.as_str()), ("NO_PROXY", ".invalid")],
+    );
+    assert_ne!(code, 0, "stderr: {}", stderr);
+    assert_eq!(server.requests().len(), before);
+}
+
+#[test]
+fn local_mock_doctor_reports_the_proxy_without_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<String> = [
+        "--endpoint-url",
+        "https://storage.example.test",
+        "--addressing-style",
+        "path",
+        "doctor",
+        "--json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let (code, stdout, stderr) = run_cli_with_env(
+        &args,
+        dir.path(),
+        &[("HTTPS_PROXY", "http://user:secret@proxy.example.test:3128")],
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "proxy")
+        .expect("proxy check");
+    let message = check["message"].as_str().unwrap();
+    assert!(
+        message.contains("http://proxy.example.test:3128"),
+        "{}",
+        message
+    );
+    assert!(!message.contains("secret"), "{}", message);
+    assert!(!stdout.contains("secret"), "{}", stdout);
+
+    let (_code, stdout, _stderr) = run_cli_with_env(
+        &args,
+        dir.path(),
+        &[
+            ("HTTPS_PROXY", "http://proxy.example.test:3128"),
+            ("NO_PROXY", "example.test"),
+        ],
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "proxy")
+        .expect("proxy check");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("connect directly"),
+        "{}",
+        check["message"]
+    );
+}
+
+#[test]
+fn local_mock_doctor_skips_the_proxy_check_when_the_host_depends_on_the_bucket() {
+    // Without an explicit path-style endpoint the request host is
+    // bucket-qualified and regional (e.g. <bucket>.s3.us-west-2.amazonaws.com);
+    // doctor has no bucket, so any stand-in host could disagree with a
+    // NO_PROXY rule. It reports the check as skipped instead of guessing.
+    let dir = tempfile::tempdir().unwrap();
+    for extra in [
+        vec![],
+        vec!["--endpoint-url", "https://storage.example.test"],
+    ] {
+        let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        args.extend(["doctor".to_string(), "--json".to_string()]);
+        let (code, stdout, stderr) = run_cli_with_env(
+            &args,
+            dir.path(),
+            &[
+                ("HTTPS_PROXY", "http://proxy.example.test:3128"),
+                ("NO_PROXY", ".s3.us-west-2.amazonaws.com"),
+            ],
+        );
+        assert!(
+            code == 0 || code == 2,
+            "stdout: {}\nstderr: {}",
+            stdout,
+            stderr
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "proxy")
+            .expect("proxy check");
+        assert_eq!(check["status"], "skipped", "{}", check);
+    }
 }

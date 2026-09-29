@@ -111,7 +111,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             .set_column_dictionary_enabled(ColumnPath::from("Key"), false)
             .set_column_dictionary_enabled(ColumnPath::from("ETag"), false)
             .set_compression(compression)
-            .set_max_row_group_size(row_group_size.max(1))
+            .set_max_row_group_row_count(Some(row_group_size.max(1)))
             .build();
 
         let writer =
