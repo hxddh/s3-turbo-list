@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-09-29
+
 ### Internal
 - The crate uses Rust edition 2024. `cargo fix --edition` needed no source
   changes; nested `if let` blocks became let-chains, and code is formatted with
