@@ -155,7 +155,9 @@ from, in precedence order:
    parallel with zero flags; nothing is cached in the working directory.
 3. **Startup bisection** (automatic) — a flat namespace with no
    `CommonPrefixes` is partitioned by single-key probes instead, so it also
-   starts parallel. Runtime splitting still covers mid-run skew.
+   starts parallel; so are large flat directories under too few prefixes
+   (`data/part-…` under a single `data/`). Runtime splitting still covers
+   mid-run skew.
 4. A single segment for listings that fit in one page (nothing to partition)
    and for `--start-after` and `--delimiter` runs.
 

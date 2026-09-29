@@ -119,6 +119,10 @@ fn infer_alphabet(lo_run: &str, hi_run: &str) -> Vec<u8> {
 /// strictly between them.  Adjacent leading characters (`9…`/`a…` in hex)
 /// simply take one more position: `9c…`/`a0…` gives `9e`.
 fn radix_midpoint(lo_tail: &str, hi_tail: &str) -> Option<String> {
+    radix_fraction(lo_tail, hi_tail, 1, 2)
+}
+
+fn radix_fraction(lo_tail: &str, hi_tail: &str, num: u64, den: u64) -> Option<String> {
     let (lo_run, hi_run) = (alnum_run(lo_tail), alnum_run(hi_tail));
     if hi_run.is_empty() {
         return None;
@@ -135,8 +139,11 @@ fn radix_midpoint(lo_tail: &str, hi_tail: &str) -> Option<String> {
         if b < a {
             return None;
         }
-        if b > a + 1 {
-            let mut mid = a + (b - a) / 2;
+        // A plain midpoint takes the fewest positions; a finer fraction
+        // resolves each step to ~1/16 so the cuts stay evenly spaced.
+        let span = if den == 2 { 2 } else { den * 16 };
+        if b >= a + span {
+            let mut mid = a + (b - a) / den * num + (b - a) % den * num / den;
             let mut encoded = vec![0u8; positions];
             for slot in encoded.iter_mut().rev() {
                 *slot = alphabet[(mid % radix) as usize];
@@ -178,6 +185,10 @@ fn digit_run(key: &str, start: usize) -> &str {
 /// right-padded with zeros, which preserves their lexicographic order).
 /// `None` when no number lies strictly between them.
 fn digit_midpoint(lo: &str, hi: &str) -> Option<String> {
+    digit_fraction(lo, hi, 1, 2)
+}
+
+fn digit_fraction(lo: &str, hi: &str, num: u128, den: u128) -> Option<String> {
     let width = lo.len().max(hi.len()).min(MAX_DIGITS);
     let value = |run: &str| -> u128 {
         run.bytes()
@@ -186,10 +197,14 @@ fn digit_midpoint(lo: &str, hi: &str) -> Option<String> {
             .fold(0u128, |acc, b| acc * 10 + u128::from(b - b'0'))
     };
     let (a, b) = (value(lo), value(hi));
-    if b <= a.saturating_add(1) {
+    if b < a.saturating_add(den) {
         return None;
     }
-    Some(format!("{:0width$}", a + (b - a) / 2, width = width))
+    Some(format!(
+        "{:0width$}",
+        a + (b - a) / den * num + (b - a) % den * num / den,
+        width = width
+    ))
 }
 
 /// A `start_after` candidate near the middle of `(lo, hi)`, strictly inside
@@ -198,6 +213,60 @@ fn digit_midpoint(lo: &str, hi: &str) -> Option<String> {
 /// (adjacent keys).
 pub(crate) fn flat_cut_candidate(lo: &str, listing_prefix: &str, hi: &str) -> Option<String> {
     midpoint(lo, hi).filter(|c| c.starts_with(listing_prefix))
+}
+
+/// A candidate at fraction `num/den` of `(lo, hi)`, from a digit run or an
+/// alphanumeric run at the first differing position (as `midpoint`), with
+/// enough positions to resolve `den` steps.  `None` outside those cases.
+fn fraction(lo: &str, hi: &str, num: u64, den: u64) -> Option<String> {
+    if hi <= lo {
+        return None;
+    }
+    let mut d = lo
+        .bytes()
+        .zip(hi.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !lo.is_char_boundary(d) {
+        d -= 1;
+    }
+    let lo_c = lo[d..].chars().next();
+    let hi_c = hi[d..].chars().next()?;
+    let inside = |c: &String| c.as_str() > lo && c.as_str() < hi;
+    // A digit run that continues into letters is part of a mixed (hex-like)
+    // token: read it over its alphabet instead.
+    let lettered = |t: &str| alnum_run(t).bytes().any(|b| b.is_ascii_alphabetic());
+    if lo_c.is_some_and(|c| c.is_ascii_digit())
+        && hi_c.is_ascii_digit()
+        && !lettered(&lo[d..])
+        && !lettered(&hi[d..])
+    {
+        let start = d - lo.as_bytes()[..d]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if let Some(m) = digit_fraction(
+            digit_run(lo, start),
+            digit_run(hi, start),
+            num.into(),
+            den.into(),
+        ) {
+            let c = format!("{}{}", &lo[..start], m);
+            if inside(&c) {
+                return Some(c);
+            }
+        }
+    }
+    if hi_c.is_ascii_alphanumeric() && lo_c.is_none_or(|c| c.is_ascii_alphanumeric()) {
+        if let Some(m) = radix_fraction(&lo[d..], &hi[d..], num, den) {
+            let c = format!("{}{}", &lo[..d], m);
+            if inside(&c) {
+                return Some(c);
+            }
+        }
+    }
+    None
 }
 
 fn midpoint(lo: &str, hi: &str) -> Option<String> {
@@ -538,6 +607,110 @@ where
         cut: Some(cut.unwrap_or_else(|| high.clone())),
         high: Some(high),
     })
+}
+
+/// Up to `k` ascending `start_after` candidates spread over `(lo, hi)`:
+/// midpoints of midpoints (an in-order walk of the midpoint tree, deep enough
+/// for `k`), then `k` of them picked evenly.  Pure; each is strictly inside
+/// `(lo, hi)` and under the listing prefix.
+pub(crate) fn quantile_candidates(
+    lo: &str,
+    listing_prefix: &str,
+    hi: &str,
+    k: usize,
+) -> Vec<String> {
+    fn walk(lo: &str, hi: &str, depth: u32, out: &mut Vec<String>) {
+        if depth == 0 {
+            return;
+        }
+        let Some(m) = midpoint(lo, hi) else { return };
+        walk(lo, &m, depth - 1, out);
+        out.push(m.clone());
+        walk(&m, hi, depth - 1, out);
+    }
+    if k == 0 {
+        return Vec::new();
+    }
+    let den = k as u64 + 1;
+    let mut direct: Vec<String> = (1..=k as u64)
+        .filter_map(|j| fraction(lo, hi, j, den))
+        .collect();
+    direct.retain(|c| c.starts_with(listing_prefix));
+    direct.dedup();
+    if direct.len() == k {
+        return direct;
+    }
+    let depth = usize::BITS - k.leading_zeros(); // 2^depth - 1 >= k
+    let mut all = Vec::new();
+    walk(lo, hi, depth, &mut all);
+    all.retain(|c| c.starts_with(listing_prefix) && c.as_str() > lo && c.as_str() < hi);
+    all.dedup();
+    if all.len() <= k {
+        return all;
+    }
+    let n = all.len();
+    (0..k)
+        .map(|j| all[(2 * j + 1) * n / (2 * k)].clone())
+        .collect()
+}
+
+/// Like [`find_flat_cut`], but up to `k` cuts spread over the range in one
+/// probe round (after the high-key estimate, when the range needs one).
+/// Returns the real in-range keys found, ascending and distinct, and the
+/// high-key estimate if one was made.  Falls back to `find_flat_cut` when the
+/// spread probes find nothing inside the range.
+pub(crate) async fn find_flat_cuts<F, Fut>(
+    listing_prefix: &str,
+    lo: &str,
+    end: Option<&str>,
+    known_high: Option<&str>,
+    k: usize,
+    probe: &F,
+) -> Result<(Vec<String>, Option<String>), String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>, String>>,
+{
+    if k <= 1 {
+        let one = find_flat_cut(listing_prefix, lo, end, known_high, probe).await?;
+        return Ok((one.cut.into_iter().collect(), one.high));
+    }
+    let in_range =
+        |key: &str| key > lo && key.starts_with(listing_prefix) && end.is_none_or(|e| key < e);
+    let mut estimated: Option<String> = None;
+    let upper: Option<String> = match end {
+        Some(e) if e.starts_with(listing_prefix) => Some(e.to_string()),
+        _ => match known_high.filter(|h| in_range(h)) {
+            Some(h) => Some(h.to_string()),
+            None => {
+                estimated = discover_high_key(listing_prefix, lo, end, probe).await?;
+                estimated.clone()
+            }
+        },
+    };
+    let Some(upper) = upper else {
+        return Ok((Vec::new(), None));
+    };
+    let candidates = quantile_candidates(lo, listing_prefix, &upper, k);
+    let found = futures::future::join_all(candidates.into_iter().map(probe)).await;
+    let mut cuts: Vec<String> = Vec::new();
+    for r in found {
+        if let Some(key) = r?.filter(|key| in_range(key)) {
+            cuts.push(key);
+        }
+    }
+    cuts.sort();
+    cuts.dedup();
+    if cuts.is_empty() {
+        // No spread candidate (adjacent keys): the estimate is itself a real
+        // in-range key.
+        if let Some(h) = estimated {
+            return Ok((vec![h.clone()], Some(h)));
+        }
+        let one = find_flat_cut(listing_prefix, lo, end, known_high, probe).await?;
+        return Ok((one.cut.into_iter().collect(), one.high.or(estimated)));
+    }
+    Ok((cuts, estimated))
 }
 
 #[cfg(test)]
