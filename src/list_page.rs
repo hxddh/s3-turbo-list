@@ -367,27 +367,25 @@ fn all_xml_space(b: &[u8]) -> bool {
     b.iter().all(|&c| is_xml_space(c))
 }
 
-/// Characters the XML tokenizer rejects anywhere in a document: C0 controls
-/// other than tab/LF/CR, and U+FFFE / U+FFFF.  (Character *references* to
-/// controls are fine and handled by `unescape_into`.)
-fn has_forbidden_chars(b: &[u8]) -> bool {
-    // One pass finds both the forbidden controls and whether the page has
-    // any non-ASCII byte at all; U+FFFE / U+FFFF (EF BF BE/BF) can only occur
-    // in a non-ASCII page, so an ASCII page skips that second scan.
-    let mut high = 0u8;
-    let controls = b.chunks(64).any(|chunk| {
-        let (found, hi) = chunk.iter().fold((false, 0u8), |(found, hi), &c| {
-            (
-                found | (c < 0x20 && c != b'\t' && c != b'\n' && c != b'\r'),
-                hi | c,
-            )
-        });
-        high |= hi;
-        found
-    });
-    controls
-        || (high >= 0x80
-            && memmem::find_iter(b, b"\xEF\xBF").any(|i| matches!(b.get(i + 2), Some(0xBE | 0xBF))))
+/// Characters the XML tokenizer rejects anywhere in a document are C0
+/// controls other than tab/LF/CR, and U+FFFE / U+FFFF.  Returns
+/// `(forbidden control present, any byte >= 0x80, any ']')`; branch-free per
+/// 64-byte chunk so it vectorizes.
+fn scan_page(b: &[u8]) -> (bool, bool, bool) {
+    let (mut ctl, mut hi, mut br) = (0u8, 0u8, 0u8);
+    for chunk in b.chunks(64) {
+        let (mut c1, mut h1, mut b1) = (0u8, 0u8, 0u8);
+        for &c in chunk {
+            let is_ws = (c == b'\t') | (c == b'\n') | (c == b'\r');
+            c1 |= ((c < 0x20) & !is_ws) as u8;
+            h1 |= c;
+            b1 |= (c == b']') as u8;
+        }
+        ctl |= c1;
+        hi |= h1;
+        br |= b1;
+    }
+    (ctl != 0, hi >= 0x80, br != 0)
 }
 
 // ── Tags ───────────────────────────────────────────────────
@@ -498,8 +496,26 @@ fn leaf_text<'a>(text: &'a str, start: usize, name: &[u8]) -> Option<(&'a str, u
 /// `None` when the page is outside the fast subset (the caller then passes
 /// the body to the SDK unchanged).
 pub(crate) fn parse_list_page(body: &[u8]) -> Option<(PageObjects, Vec<u8>)> {
-    let text = std::str::from_utf8(body).ok()?;
-    if has_forbidden_chars(body) || memmem::find(body, b"]]>").is_some() {
+    // One vectorized pass finds forbidden controls, whether any byte is
+    // non-ASCII and whether any `]` occurs; the UTF-8 check, the U+FFFE/FFFF
+    // scan and the `]]>` search then run only on pages that need them.
+    let (controls, high, bracket) = scan_page(body);
+    if controls {
+        return None;
+    }
+    let text = if high {
+        let text = std::str::from_utf8(body).ok()?;
+        if memmem::find_iter(body, b"\xEF\xBF")
+            .any(|i| matches!(body.get(i + 2), Some(0xBE | 0xBF)))
+        {
+            return None;
+        }
+        text
+    } else {
+        // SAFETY: every byte is < 0x80, so the page is ASCII and valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(body) }
+    };
+    if bracket && memmem::find(body, b"]]>").is_some() {
         return None;
     }
     let b = body;

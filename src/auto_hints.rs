@@ -46,6 +46,12 @@ pub struct StartupDiscovery {
     /// the same keys and is *not* single-page — the caller compares this
     /// against its configured page size before taking that shortcut.
     pub root_page_keys: usize,
+    /// Probed prefixes below the root whose page was truncated and held no
+    /// CommonPrefixes: flat directories with more than one page of keys.
+    /// Their boundaries alone cannot split them, so the caller bisects them
+    /// when discovery found fewer boundaries than it wants (`data/part-…`
+    /// under a single top-level `data/`).
+    pub flat_leaves: Vec<String>,
 }
 
 impl StartupDiscovery {
@@ -137,6 +143,7 @@ where
     // must not be read as "this bucket is tiny".
     let mut root_page_truncated = true;
     let mut root_page_keys = 0usize;
+    let mut flat_leaves: Vec<String> = Vec::new();
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -153,6 +160,8 @@ where
                     if depth == 0 {
                         root_page_truncated = page.truncated;
                         root_page_keys = page.keys;
+                    } else if page.truncated && page.prefixes.is_empty() {
+                        flat_leaves.push(parent.clone());
                     }
                     for child in &page.prefixes {
                         boundaries.insert(child.clone());
@@ -175,6 +184,7 @@ where
         boundaries: boundaries.into_iter().collect(),
         root_page_truncated,
         root_page_keys,
+        flat_leaves,
     }
 }
 
@@ -194,6 +204,8 @@ where
 /// usually a single probe, but an estimate of a range's high key fans out
 /// several per round.
 const FLAT_BISECT_MAX_IN_FLIGHT: usize = 64;
+/// Cuts one range takes per wave (one probe each, concurrently).
+const FLAT_CUTS_PER_RANGE: usize = 7;
 
 /// Discover key-space boundaries for a flat namespace by recursively
 /// bisecting the key range. `probe(start_after)` returns the first key
@@ -245,37 +257,59 @@ where
         // Each successful cut adds one boundary, so ranges beyond the
         // remaining budget are dropped — the same early-stop the serial
         // walk applied, decided before the wave instead of during it.
-        frontier.truncate(target_boundaries - boundaries.len());
-        let cuts = futures::future::join_all(frontier.iter().map(|(start, end)| {
-            crate::flat_cut::find_flat_cut(
-                prefix,
-                start,
-                end.as_deref(),
-                known_high.as_deref(),
-                &cut_probe,
-            )
-        }))
-        .await;
+        let remaining = target_boundaries - boundaries.len();
+        frontier.truncate(remaining);
+        let n = frontier.len();
+        // Spread the remaining budget over the ranges, up to
+        // FLAT_CUTS_PER_RANGE each (a range splits into up to eight near-equal
+        // parts per round-trip).  When the budget fits with at most one more
+        // cut for some ranges, hand it out exactly so this wave reaches the
+        // target; a range whose probes find fewer distinct keys than asked
+        // (adjacent keys) leaves the rest to the next wave.
+        let (even, extra) = (remaining / n, remaining % n);
+        let budget = |i: usize| {
+            if remaining <= n * (FLAT_CUTS_PER_RANGE + 1) {
+                even + usize::from(i < extra)
+            } else {
+                FLAT_CUTS_PER_RANGE
+            }
+        };
+        let cuts =
+            futures::future::join_all(frontier.iter().enumerate().map(|(i, (start, end))| {
+                crate::flat_cut::find_flat_cuts(
+                    prefix,
+                    start,
+                    end.as_deref(),
+                    known_high.as_deref(),
+                    budget(i),
+                    &cut_probe,
+                )
+            }))
+            .await;
         let mut next: Vec<(String, Option<String>)> = Vec::new();
         for ((start, end), found) in frontier.drain(..).zip(cuts) {
-            let found = match found {
+            let (found, high) = match found {
                 Ok(found) => found,
                 Err(e) => {
                     log::debug!("Flat bisection probe failed after '{}': {}", start, e);
                     continue;
                 }
             };
-            if let Some(high) = found.high {
+            if let Some(high) = high {
                 if known_high.as_ref().is_none_or(|k| high > *k) {
                     known_high = Some(high);
                 }
             }
-            if let Some(cut) = found.cut {
-                if cut > start && end.as_ref().is_none_or(|e| cut < *e) {
+            let mut lo = start.clone();
+            for cut in found {
+                if cut > lo && end.as_ref().is_none_or(|e| cut < *e) {
                     boundaries.insert(cut.clone());
-                    next.push((start, Some(cut.clone())));
-                    next.push((cut, end));
+                    next.push((lo, Some(cut.clone())));
+                    lo = cut;
                 }
+            }
+            if lo != start {
+                next.push((lo, end));
             }
         }
         frontier = next;
@@ -365,6 +399,57 @@ estimate_mode = "structural"
     async fn test_startup_discovery_flat_namespace_yields_no_boundaries() {
         let boundaries = run_discovery(fake_tree(&[]), "", 16).await;
         assert!(boundaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_startup_discovery_reports_flat_leaves() {
+        // `data/` holds only keys (no CommonPrefixes) and more than a page.
+        let tree = fake_tree(&[("", &["data/"])]);
+        let discovery = run_discovery_full(tree, "", 16, true).await;
+        assert_eq!(discovery.boundaries, vec!["data/"]);
+        assert_eq!(discovery.flat_leaves, vec!["data/"]);
+        // An untruncated leaf page is small: nothing to bisect.
+        let tree = fake_tree(&[("", &["data/"])]);
+        let discovery = run_discovery_full(tree, "", 16, false).await;
+        assert!(discovery.flat_leaves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_multiway_waves_stay_balanced() {
+        let keys: Vec<String> = (0..20_000)
+            .map(|i| format!("obj-{:09}.snappy.parquet", i))
+            .collect();
+        let boundaries = run_flat(keys.clone(), "", 64).await;
+        assert_eq!(boundaries.len(), 64);
+        let mut edges: Vec<usize> = vec![0];
+        edges.extend(boundaries.iter().map(|b| keys.partition_point(|k| k <= b)));
+        edges.push(keys.len());
+        let max = edges.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        let mean = keys.len() / (edges.len() - 1);
+        assert!(max <= mean * 2, "max segment {} vs mean {}", max, mean);
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_multiway_waves_reach_exact_target() {
+        // Multi-way waves must not stop short: every target a range can hold
+        // is reached exactly, with strictly ascending real keys.
+        let digits: Vec<String> = (0..20_000).map(|i| format!("k{:06}", i)).collect();
+        let hex: Vec<String> = {
+            let mut v: Vec<String> = (0..20_000u64)
+                .map(|i| format!("{:016x}.bin", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                .collect();
+            v.sort();
+            v
+        };
+        for keys in [&digits, &hex] {
+            for target in [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 57, 63, 64, 100] {
+                let boundaries = run_flat(keys.clone(), "", target).await;
+                assert_eq!(boundaries.len(), target, "target {target}: {boundaries:?}");
+                assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+                assert!(boundaries.iter().all(|b| keys.binary_search(b).is_ok()));
+                assert!(boundaries[0] > keys[0], "the first key cannot be a cut");
+            }
+        }
     }
 
     #[tokio::test]
@@ -558,6 +643,7 @@ estimate_mode = "structural"
             boundaries: Vec::new(),
             root_page_truncated: false,
             root_page_keys: 500,
+            flat_leaves: Vec::new(),
         };
         // The probe returned the whole listing in one page, and the run's page
         // size can too.
@@ -576,6 +662,7 @@ estimate_mode = "structural"
             boundaries: Vec::new(),
             root_page_truncated: true,
             root_page_keys: 1000,
+            flat_leaves: Vec::new(),
         };
         assert!(!truncated.is_single_page_listing(None));
         // Structure found: partitioned by boundaries, not by this shortcut.
@@ -583,6 +670,7 @@ estimate_mode = "structural"
             boundaries: vec!["a/".to_string()],
             root_page_truncated: false,
             root_page_keys: 3,
+            flat_leaves: Vec::new(),
         };
         assert!(!structured.is_single_page_listing(None));
     }

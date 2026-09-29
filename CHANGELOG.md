@@ -5,6 +5,36 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Performance
+- **Large flat directories under a single prefix are partitioned at
+  startup.** A bucket laid out as `data/part-…` listed without
+  `--prefix data/` had one discovered boundary (`data/`), so bisection never
+  ran: list waited for runtime splitting and each diff side listed as one
+  serial segment. When discovery finds fewer boundaries than one per worker,
+  probed prefixes whose page was truncated and held no `CommonPrefixes` are
+  now bisected concurrently and their boundaries (real keys) merged with the
+  structural ones. On a local 200k-key mock at 20 ms per request: diff
+  4.47 s → 0.74 s, list 1.36 s → 0.49 s — the same as with `--prefix data/`.
+- **Flat bisection cuts each range several ways per round-trip.** Each wave
+  probes up to seven evenly spaced candidates per range at once instead of
+  one midpoint, so 64 boundaries take two waves instead of seven levels; the
+  final wave hands out exactly the boundaries still missing, so the
+  boundary count and invariants (real keys, strictly increasing, inside
+  their range) are unchanged. Startup of a flat 200k-key listing at 20 ms per
+  request: ~340 ms → ~250 ms; list 0.55 s → 0.46 s, diff 0.82 s → 0.75 s
+  (hex keys: list 0.66 s → 0.55 s, diff 1.10 s → 0.80 s, segment max/mean
+  2.24 → 1.08).
+- **One pass over each page before parsing.** The fast Contents parser's
+  pre-check finds forbidden controls, non-ASCII bytes and `]` in one
+  vectorized pass; UTF-8 validation and the `]]>` search run only on pages
+  that need them (−25% on that step, ~1% of list CPU).
+
+Output is unchanged: Parquet rows and `.ks` files identical to v0.37.0 in
+every benchmark. See
+`docs/validation-results/startup-partitioning-and-page-scan-20260929.md`.
+
 ## [0.37.0] - 2026-09-29
 
 This release simplifies the command line: options belong to the commands

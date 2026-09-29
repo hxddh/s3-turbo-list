@@ -630,7 +630,14 @@ pub(crate) fn run() {
                     // partitioner diff sides use — so the first run starts at full
                     // concurrency. The boundaries land in the same cache below.
                     if !discovery.boundaries.is_empty() {
-                        discovery.boundaries
+                        refine_flat_leaves(
+                            &probe_client,
+                            opt_bucket,
+                            discovery,
+                            concurrency.clamp(1, 64),
+                            cfg.s3.operation_timeout_secs,
+                        )
+                        .await
                     } else if discovery.is_single_page_listing(cli.max_keys) {
                         // The discovery probe's page was not truncated and held no
                         // CommonPrefixes, and this run's page size returns those keys
@@ -1350,7 +1357,14 @@ pub(crate) async fn diff_side_boundaries(
             )
             .await;
         if !discovery.boundaries.is_empty() {
-                discovery.boundaries
+                refine_flat_leaves(
+                    &client,
+                    bucket,
+                    discovery,
+                    cfg.runtime.max_concurrency.clamp(8, 64),
+                    cfg.s3.operation_timeout_secs,
+                )
+                .await
             } else if discovery.is_single_page_listing(cli.max_keys) {
                 // Single-page side: nothing to partition, and the probes would cost
                 // more requests than the listing.
@@ -1377,6 +1391,44 @@ pub(crate) async fn diff_side_boundaries(
         _ = quit_requested(g_state) => None,
     };
     discovered.unwrap_or_default()
+}
+
+/// Structural discovery found CommonPrefixes, but fewer boundaries than one
+/// per worker, and some of the prefixes it probed are flat directories with
+/// more than one page of keys (`data/part-…` under a single `data/`): those
+/// segments would list serially (diff) or wait for runtime splitting (list).
+/// Bisect each such leaf with the flat partitioner, sharing the remaining
+/// budget, and merge its boundaries — all real keys inside the leaf — into
+/// the structural set.
+pub(crate) async fn refine_flat_leaves(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    discovery: auto_hints::StartupDiscovery,
+    flat_target: usize,
+    timeout_secs: u64,
+) -> Vec<String> {
+    let mut boundaries = discovery.boundaries;
+    let leaves = discovery.flat_leaves;
+    if leaves.is_empty() || boundaries.len() >= flat_target {
+        return boundaries;
+    }
+    let per_leaf = (flat_target - boundaries.len()) / leaves.len();
+    if per_leaf == 0 {
+        return boundaries;
+    }
+    info!(
+        "Startup discovery found {} boundaries and {} flat prefix(es) — bisecting them",
+        boundaries.len(),
+        leaves.len()
+    );
+    let found = futures::future::join_all(leaves.iter().map(|leaf| {
+        discover_flat_boundaries_via_client(client, bucket, leaf, per_leaf, timeout_secs)
+    }))
+    .await;
+    boundaries.extend(found.into_iter().flatten());
+    boundaries.sort();
+    boundaries.dedup();
+    boundaries
 }
 
 /// Bisect a flat key range into boundaries via single-key ListObjectsV2

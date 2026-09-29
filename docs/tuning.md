@@ -29,11 +29,24 @@ Where boundaries come from, in precedence order:
    a number, other characters over the alphabet the keys use), truncated
    right after it, so long constant suffixes such as
    `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
-   estimates the namespace's highest key with a few concurrent probe rounds;
-   after that each cut is usually one probe, and every bisection level probes
-   its ranges concurrently.  The boundaries are real observed keys.  List
-   mode targets one boundary per worker, since runtime splitting still
-   covers mid-run skew.
+   estimates the namespace's highest key with a few concurrent probe rounds.
+   Bisection then runs in waves: each wave cuts every open range at up to
+   seven evenly spaced candidates at once (one probe each, all ranges
+   concurrently), so a 64-boundary partition takes two waves instead of
+   seven levels; the last wave hands out exactly the boundaries still
+   missing, and a range whose probes find fewer keys than asked leaves the
+   rest to one more wave, so the target is always reached when the keys
+   allow it.  The boundaries are real observed keys.  List mode targets one
+   boundary per worker, since runtime splitting still covers mid-run skew.
+
+   The same bisection also runs *inside* prefixes when discovery finds
+   structure but too little of it: when discovery yields fewer boundaries
+   than one per worker and some probed prefix is a flat directory with more
+   than one page of keys (its page was truncated and held no
+   `CommonPrefixes` — `data/part-…` under a single top-level `data/`), those
+   flat prefixes are bisected concurrently, sharing the remaining budget,
+   and their boundaries are merged with the structural ones.  Listing such a
+   bucket with or without `--prefix data/` now partitions the same way.
 4. **Single segment** — listings that fit in one page (nothing to partition,
    and probing would cost more requests than the listing), and runs with
    `--start-after` (or the deprecated `--continuation-token`) or
@@ -46,9 +59,10 @@ The dry-run plan's `hints.source` names the choice: `explicit`,
 `delimiter_single_segment`, or `single_chain` (`--start-after`); `diff` plans
 report `diff_per_side_automatic`.
 
-`diff` partitions each side the same way (startup discovery, or bisection);
-because diff has no runtime splitting to fall back on, its bisection targets
-at least eight boundaries. Each side lists its segments concurrently; the
+`diff` partitions each side the same way (startup discovery, flat prefixes
+bisected when discovery found too few boundaries, or bisection); because diff
+has no runtime splitting to fall back on, its bisection targets at least eight
+boundaries. Each side lists its segments concurrently; the
 segment set stays static (no runtime splitting) so the merge can consume
 segments in key order.
 
