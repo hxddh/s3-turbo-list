@@ -4466,8 +4466,9 @@ operation_timeout_secs = 5
 }
 
 #[test]
-fn local_mock_throttling_is_reported_as_throttling() {
-    let (server, _gaps) = recovering_throttle_server(2);
+fn local_mock_throttling_backs_off_and_is_reported_as_throttling() {
+    // One run serves both checks (each costs the SDK's real backoff).
+    let (server, gaps) = recovering_throttle_server(2);
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let manifest = dir.path().join("run.json");
@@ -4481,10 +4482,10 @@ fn local_mock_throttling_is_reported_as_throttling() {
         stdout, stderr
     );
 
+    // Reported: the 503s are throttling, not timeouts.
     let manifest_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
     let metrics = &manifest_json["metrics"];
-
     assert!(
         metrics["throttled_responses"].as_u64().unwrap_or(0) >= 2,
         "the endpoint sent two 503 SlowDown responses; the run must report \
@@ -4500,21 +4501,9 @@ fn local_mock_throttling_is_reported_as_throttling() {
         "the 503s must reach the status histogram: {}",
         metrics
     );
-}
 
-#[test]
-fn local_mock_throttling_backs_off_instead_of_hammering() {
-    // Re-issuing immediately is the wrong answer to `SlowDown`: the endpoint
-    // has just asked for less load, and an undelayed retry answers with more.
-    let (server, gaps) = recovering_throttle_server(2);
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    write_default_config(&config);
-
-    let args = throttle_test_args(dir.path(), &config, server.endpoint(), None);
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-
+    // Backed off: re-issuing immediately is the wrong answer to `SlowDown`;
+    // the endpoint has just asked for less load.
     let observed = gaps.lock().unwrap().clone();
     assert!(
         !observed.is_empty(),
