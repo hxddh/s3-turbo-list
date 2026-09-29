@@ -1390,9 +1390,8 @@ estimated_objects = 20
         dir.path().join("us-east-1_test-bucket_checkpoint.toml"),
         r#"bucket = "test-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-17T00:00:00Z"
+remaining = [{ start_after = "m/" }]
 
 [identity]
 bucket = "test-bucket"
@@ -1430,11 +1429,40 @@ mode = "list"
     assert_eq!(json["hints"]["boundary_count"], 1);
 
     assert_eq!(json["checkpoint"]["enabled"], true);
+    assert_eq!(json["checkpoint"]["resume"], true);
     assert_eq!(json["checkpoint"]["exists"], true);
     assert_eq!(json["checkpoint"]["valid"], true);
     assert_eq!(json["checkpoint"]["identity_matches"], true);
-    assert_eq!(json["checkpoint"]["completed_segments"], 1);
-    assert_eq!(json["checkpoint"]["total_segments"], 2);
+    assert_eq!(json["checkpoint"]["remaining_ranges"], 1);
+    assert_eq!(
+        json["checkpoint"]["completed_segments"],
+        serde_json::Value::Null
+    );
+
+    // Without --resume the run still saves a checkpoint if interrupted
+    // (enabled), in --output-dir when one is given; it just does not read it.
+    let (code, stdout, stderr) = run_cli_in_dir(
+        &[
+            "--agent",
+            "--dry-run",
+            "--output-dir",
+            "out",
+            "list",
+            "--bucket",
+            "test-bucket",
+            "--region",
+            "us-east-1",
+        ],
+        dir.path(),
+    );
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["checkpoint"]["enabled"], true);
+    assert_eq!(json["checkpoint"]["resume"], false);
+    assert_eq!(
+        json["checkpoint"]["path"],
+        "out/us-east-1_test-bucket_checkpoint.toml"
+    );
 }
 
 #[test]

@@ -243,16 +243,20 @@ pub struct HintsPlan {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckpointPlan {
+    /// The run saves a checkpoint at `path` when it is interrupted.
     pub enabled: bool,
+    /// The run resumes from the checkpoint at `path` (`--resume`).
+    pub resume: bool,
     pub path: Option<String>,
     pub exists: bool,
     pub valid: Option<bool>,
     pub identity_matches: Option<bool>,
     pub identity_mismatches: Vec<String>,
+    /// Deprecated (0.37): always null; checkpoints record key ranges.
     pub completed_segments: Option<usize>,
+    /// Deprecated (0.37): always null.
     pub total_segments: Option<usize>,
-    /// Key ranges a resume would list (checkpoints written by 0.36+, which
-    /// record the unwritten key space instead of completed segment indices).
+    /// Key ranges a resume would list.
     pub remaining_ranges: Option<usize>,
     pub identity_fields: Vec<String>,
     /// Segments this run skipped because a checkpoint recorded them complete.
@@ -558,6 +562,7 @@ fn inspect_hints_for_plan(path: &str) -> Option<hints::HintsValidationReport> {
 pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> CheckpointPlan {
     CheckpointPlan {
         enabled,
+        resume: false,
         path,
         exists: false,
         valid: None,
@@ -584,13 +589,16 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
     }
 }
 
+/// `resume`: whether the run reads the checkpoint at `path`; `path`: where
+/// the run saves one on interrupt (`None` for runs that cannot resume).
 pub fn checkpoint_plan(
-    enabled: bool,
+    resume: bool,
     path: Option<String>,
     current_identity: Option<&CheckpointIdentity>,
     resumed_segments_skipped: Option<usize>,
 ) -> CheckpointPlan {
-    let mut plan = default_checkpoint_plan(enabled, path.clone());
+    let mut plan = default_checkpoint_plan(path.is_some(), path.clone());
+    plan.resume = resume;
     plan.resumed_segments_skipped = resumed_segments_skipped;
     let Some(path) = path else {
         return plan;
@@ -603,8 +611,6 @@ pub fn checkpoint_plan(
     match CheckpointJournal::load(&path) {
         Some(journal) => {
             plan.valid = Some(true);
-            plan.completed_segments = Some(journal.completed_indices.len());
-            plan.total_segments = Some(journal.total_segments);
             plan.remaining_ranges = journal.remaining.as_ref().map(Vec::len);
             if let (Some(stored), Some(current)) = (journal.identity.as_ref(), current_identity) {
                 let mismatches = stored.diff(current);

@@ -498,14 +498,14 @@ fn parquet_diff_flags(path: &std::path::Path) -> Vec<u8> {
     flags
 }
 
-fn checkpoint_completed_indices(path: &std::path::Path) -> Option<Vec<u64>> {
+/// The `start_after` of each range a checkpoint left to list.
+fn checkpoint_remaining_starts(path: &std::path::Path) -> Option<Vec<String>> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = toml::from_str(&content).ok()?;
-    value.get("completed_indices")?.as_array().map(|items| {
+    value.get("remaining")?.as_array().map(|items| {
         items
             .iter()
-            .filter_map(toml::Value::as_integer)
-            .map(|v| v as u64)
+            .filter_map(|item| item.get("start_after")?.as_str().map(str::to_string))
             .collect()
     })
 }
@@ -1883,9 +1883,8 @@ estimate_mode = "full"
         format!(
             r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-17T00:00:00Z"
+remaining = [{{ start_after = "m/" }}]
 
 [identity]
 bucket = "mock-bucket"
@@ -1894,10 +1893,8 @@ prefix = ""
 delimiter = ""
 addressing_style = "path"
 mode = "list"
-boundaries_digest = "{}"
 endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
             server.endpoint()
         ),
     )
@@ -1983,9 +1980,8 @@ estimate_mode = "full"
         &checkpoint,
         r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-24T00:00:00Z"
+remaining = [{ start_after = "m/" }]
 
 [identity]
 bucket = "mock-bucket"
@@ -2020,7 +2016,10 @@ mode = "list"
     ];
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     assert_ne!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(checkpoint_completed_indices(&checkpoint), Some(vec![0]));
+    assert_eq!(
+        checkpoint_remaining_starts(&checkpoint),
+        Some(vec!["m/".to_string()])
+    );
 
     let requests = server.requests();
     assert!(
@@ -3130,111 +3129,6 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     );
     // Nothing is cached in the working directory.
     assert!(!dir.path().join("us-east-1_mock-bucket_hints.toml").exists());
-}
-
-// ── Resume boundary verification ────────────────────────────
-//
-// Completed segment indices are positional. A checkpoint carried over to a
-// different boundary set with the same segment count (the normal outcome of
-// re-deriving flat-namespace boundaries against a bucket that took writes)
-// used to be accepted, marking ranges complete that were never listed — the
-// run then exited 0 with those keys silently missing from the output.
-#[test]
-fn local_mock_resume_rejects_same_count_different_boundaries() {
-    let keys = ["a-first.txt", "n-middle.txt", "z-last.txt"];
-    let server = MockS3Server::start(move |request, _sequence| {
-        let start_after = request
-            .query
-            .get("start-after")
-            .cloned()
-            .unwrap_or_default();
-        let page: Vec<&str> = keys
-            .iter()
-            .copied()
-            .filter(|k| *k > start_after.as_str())
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    let hints = dir.path().join("hints.toml");
-    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
-    let parquet = dir.path().join("resume.parquet");
-    let ks = dir.path().join("resume.ks");
-    write_fast_config(&config);
-    // This run partitions at "n/" ...
-    std::fs::write(
-        &hints,
-        r#"bucket = "mock-bucket"
-region = "us-east-1"
-boundaries = ["n/"]
-generated_at = "2026-05-17T00:00:00Z"
-"#,
-    )
-    .unwrap();
-    // ... but the checkpoint recorded segment 0 complete against "m/": same
-    // two segments, different ranges.
-    std::fs::write(
-        &checkpoint,
-        format!(
-            r#"bucket = "mock-bucket"
-prefix = ""
-total_segments = 2
-completed_indices = [0]
-last_updated = "2026-05-17T00:00:00Z"
-
-[identity]
-bucket = "mock-bucket"
-region = "us-east-1"
-prefix = ""
-delimiter = ""
-addressing_style = "path"
-mode = "list"
-boundaries_digest = "{}"
-endpoint_url = "{}"
-"#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
-            server.endpoint()
-        ),
-    )
-    .unwrap();
-
-    let args = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "--resume".into(),
-        "--hints-file".into(),
-        hints.display().to_string(),
-        "--output-parquet-file".into(),
-        parquet.display().to_string(),
-        "--output-ks-file".into(),
-        ks.display().to_string(),
-        "list".into(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ];
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(
-        stderr.contains("discarding checkpoint and starting fresh"),
-        "expected the mismatched checkpoint to be discarded: {}",
-        stderr
-    );
-
-    // Nothing was skipped: the whole key space is in the output.
-    let mut listed = parquet_keys(&parquet);
-    listed.sort();
-    assert_eq!(
-        listed,
-        keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()
-    );
 }
 
 // ── Conventional hints cache scoping ────────────────────────
@@ -4415,7 +4309,7 @@ fn local_mock_successful_run_leaves_no_checkpoint() {
         !checkpoint.exists(),
         "a run that listed the whole key space has nothing to resume, but it \
          left a checkpoint behind: {:?}",
-        checkpoint_completed_indices(&checkpoint)
+        checkpoint_remaining_starts(&checkpoint)
     );
 }
 
@@ -4504,9 +4398,9 @@ fn local_mock_resumed_run_declares_its_partial_coverage() {
         format!(
             r#"bucket = "mock-bucket"
 prefix = ""
-total_segments = 2
-completed_indices = [0]
 last_updated = "2026-05-17T00:00:00Z"
+remaining = [{{ start_after = "m/" }}]
+listed_ranges = 1
 
 [identity]
 bucket = "mock-bucket"
@@ -4515,10 +4409,8 @@ prefix = ""
 delimiter = ""
 addressing_style = "path"
 mode = "list"
-boundaries_digest = "{}"
 endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
             server.endpoint()
         ),
     )
@@ -4561,7 +4453,7 @@ endpoint_url = "{}"
         warnings
             .iter()
             .filter_map(Value::as_str)
-            .any(|w| w.contains("only the remaining key space")),
+            .any(|w| w.contains("only the rest of the key space")),
         "a resumed run must warn that its output is partial: {:?}",
         warnings
     );
@@ -5162,7 +5054,6 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
         &server.endpoint(),
         "--addressing-style",
         "path",
-        "--resume",
         "--max-keys",
         "50",
         "-c",
@@ -5220,6 +5111,10 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
         "the first run must be interrupted mid-listing"
     );
 
+    // The first run was not started with --resume: an interrupted run saves
+    // its checkpoint regardless, and the next run opts into reading it.
+    let mut args = args;
+    args.insert(6, "--resume".to_string());
     let (code, second_rows, stderr) = run_cli(&args, dir.path());
     assert_eq!(code, 0, "stderr: {}", stderr);
     // The partial-output warning reaches stderr, not only the manifest.

@@ -18,8 +18,8 @@ use config::S3TurboConfig;
 use core::RunMode;
 use log::{error, info, warn};
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ── CLI definition ─────────────────────────────────────────
@@ -1298,16 +1298,13 @@ fn main() {
     // checkpoint, so the file on disk can no longer answer this.
     let (resumed_segments_skipped, checkpoint_note): (Option<usize>, Option<String>) = rt
         .block_on(async {
-        // ── Checkpoint journal (resume mode) ──────────────────
-        let checkpoint_path_opt = if cli.resume {
-            Some(checkpoint::checkpoint_path_for_prefix(
-                opt_bucket,
-                opt_region,
-                &opt_prefix,
-            ))
-        } else {
-            None
-        };
+        // ── Checkpoint ───────────────────────────────────────
+        // Every list run that can resume saves a checkpoint when it is
+        // interrupted; --resume only decides whether one is read. (A run
+        // had to pass --resume from the start to get one, so the first
+        // Ctrl-C on a large bucket threw the progress away.)
+        let checkpoint_path_opt = run_checkpoint_path(&cli, opt_bucket, opt_region, &opt_prefix);
+        let resume_from = checkpoint_path_opt.as_deref().filter(|_| cli.resume);
 
         // Build the current run identity for checkpoint verification.
         let current_identity = checkpoint::CheckpointIdentity::new(
@@ -1327,13 +1324,11 @@ fn main() {
         )
         .with_endpoint(cfg.s3.endpoint_url.as_deref());
 
-        let checkpoint_journal = checkpoint_path_opt
-            .as_deref()
+        let checkpoint_journal = resume_from
             .and_then(|p| checkpoint::CheckpointJournal::load_and_verify(p, &current_identity));
 
-        // A checkpoint that recorded the unwritten key ranges (0.36+) is
-        // resumed by listing exactly those ranges; hints, startup discovery
-        // and segment indices play no part.
+        // A checkpoint is resumed by listing exactly its ranges; hints and
+        // startup discovery play no part.
         let resume_ranges: Option<Vec<checkpoint::ResumeRange>> = checkpoint_journal
             .as_ref()
             .and_then(|cj| cj.remaining.clone());
@@ -1525,66 +1520,27 @@ fn main() {
             }
         }
         let ks_list = ks_list;
-        let original_hints_count = core::KeySpaceHints::new_from(&ks_list).total_count();
-
-        // Discard a resume journal whose segment set does not match the
-        // current hints — completed indices are positional, so a mismatch
-        // would skip the wrong segments and silently drop keys.
-        let checkpoint_journal = checkpoint_journal.filter(|cj| {
-            cj.remaining.is_some() || cj.verify_segments(&ks_list, original_hints_count)
-        });
-        // The checkpoint records progress against *this* boundary set; the
-        // fingerprint is what a later --resume verifies it against.
-        let current_identity = current_identity.with_boundaries(&ks_list);
-
-        // Filter out completed segments when resuming.
-        // Segments this run will not list because the checkpoint records them
+        // Ranges this run will not list because the checkpoint records them
         // listed. Captured here rather than re-read at manifest time: a run
         // that finishes removes its checkpoint, so the file on disk at the end
-        // says nothing about whether this run resumed. Computed after the
-        // verification above — a discarded checkpoint skips nothing.
-        if let Some(ref cj) = checkpoint_journal {
-            let (skipped, warning) = match &cj.remaining {
-                Some(ranges) => {
-                    let listed = cj.listed_ranges.unwrap_or(0);
-                    info!(
-                        "Resuming checkpoint: {} key range(s) left to list",
-                        ranges.len()
-                    );
-                    (
-                        listed,
-                        format!(
-                            "Resuming from checkpoint: the key space earlier runs already wrote \
-                             ({} range(s), in whole or in part) will not be listed again; this run \
-                             lists the {} remaining range(s), so its output covers only the rest \
-                             of the key space. Combine it with the output of the interrupted \
-                             run(s); writing both to the same path leaves only this run's part.",
-                            listed,
-                            ranges.len()
-                        ),
-                    )
-                }
-                None => {
-                    let skipped = cj.completed_indices.len();
-                    info!(
-                        "Resuming checkpoint: {} of {} segments completed",
-                        skipped, cj.total_segments
-                    );
-                    (
-                        skipped,
-                        format!(
-                            "Resuming from checkpoint: {} of {} segments are already recorded \
-                             complete and will not be listed again, so this run's output covers \
-                             only the remaining key space. Combine it with the output of the \
-                             interrupted run; writing both to the same path leaves only this \
-                             run's half.",
-                            skipped, cj.total_segments
-                        ),
-                    )
-                }
-            };
-            resumed_segments_skipped = Some(skipped);
-            if skipped > 0 {
+        // says nothing about whether this run resumed.
+        if let (Some(cj), Some(ranges)) = (&checkpoint_journal, resume_ranges.as_deref()) {
+            let listed = cj.listed_ranges.unwrap_or(0);
+            info!(
+                "Resuming checkpoint: {} key range(s) left to list",
+                ranges.len()
+            );
+            resumed_segments_skipped = Some(listed);
+            if listed > 0 {
+                let warning = format!(
+                    "Resuming from checkpoint: the key space earlier runs already wrote \
+                     ({} range(s), in whole or in part) will not be listed again; this run \
+                     lists the {} remaining range(s), so its output covers only the rest \
+                     of the key space. Combine it with the output of the interrupted \
+                     run(s); writing both to the same path leaves only this run's part.",
+                    listed,
+                    ranges.len()
+                );
                 // The runtime warnings were printed before the checkpoint was
                 // read, so this one goes to stderr here or it never does.
                 if !cli.agent {
@@ -1594,19 +1550,9 @@ fn main() {
             }
         }
 
-        let hints = if let Some(ranges) = resume_ranges.as_deref() {
-            core::KeySpaceHints::from_ranges(ranges)
-        } else if let Some(ref cj) = checkpoint_journal {
-            let filtered =
-                core::KeySpaceHints::new_uncompleted_from(&ks_list, &cj.completed_indices);
-            info!(
-                "Resume: {} segments filtered, {} remaining",
-                original_hints_count.saturating_sub(filtered.total_count()),
-                filtered.total_count()
-            );
-            filtered
-        } else {
-            core::KeySpaceHints::new_from(&ks_list)
+        let hints = match resume_ranges.as_deref() {
+            Some(ranges) => core::KeySpaceHints::from_ranges(ranges),
+            None => core::KeySpaceHints::new_from(&ks_list),
         };
         let hints_count = hints.total_count();
 
@@ -1626,7 +1572,6 @@ fn main() {
         let is_diff = mode == RunMode::BiDir;
         let left_checkpoint: Arc<std::sync::Mutex<Vec<usize>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let right_checkpoint: Option<Arc<std::sync::Mutex<Vec<usize>>>> = None;
         // The list reactor's report of the key ranges it left unwritten.
         let mut resume_slot: Option<Arc<std::sync::Mutex<Option<checkpoint::ResumeProgress>>>> =
             None;
@@ -1900,12 +1845,10 @@ fn main() {
         }
 
         // ── Final checkpoint save / removal ────────────────
-        // What the exit line should say about resuming; `None` when this run
-        // did not use --resume.
+        // What the exit line should say about resuming; `None` for runs
+        // that cannot resume (diff, --start-after, --continuation-token).
         let mut checkpoint_note: Option<String> = None;
-        if cli.resume
-            && let Some(ref cp_path) = checkpoint_path_opt
-        {
+        if let Some(ref cp_path) = checkpoint_path_opt {
             let final_metrics = g_state.metrics_snapshot();
             let run_was_interrupted = interrupted.load(Ordering::SeqCst);
             // Another job's checkpoint that shares this file name (same
@@ -1967,20 +1910,14 @@ fn main() {
                         );
                     }
                     Some(progress) => {
-                        let completed = merged_completed_indices(
-                            checkpoint_journal.as_ref(),
-                            &left_checkpoint,
-                            right_checkpoint.as_ref(),
-                        );
-                        let listed_before = checkpoint_journal.as_ref().map_or(0, |cj| {
-                            cj.listed_ranges.unwrap_or(cj.completed_indices.len())
-                        });
+                        let listed_before = checkpoint_journal
+                            .as_ref()
+                            .and_then(|cj| cj.listed_ranges)
+                            .unwrap_or(0);
                         let remaining_count = progress.remaining.len();
                         let journal = checkpoint::CheckpointJournal {
                             bucket: opt_bucket.to_string(),
                             prefix: opt_prefix.clone(),
-                            total_segments: original_hints_count,
-                            completed_indices: completed,
                             last_updated: chrono::Local::now().to_rfc3339(),
                             identity: Some(current_identity.clone()),
                             remaining: Some(progress.remaining),
@@ -2114,10 +2051,8 @@ fn main() {
         metrics: metrics.into(),
         checkpoint: agent::checkpoint_plan(
             cli.resume,
-            cli.resume.then(|| {
-                checkpoint::checkpoint_path_for_prefix(opt_bucket, opt_region, &opt_prefix)
-            }),
-            Some(
+            run_checkpoint_path(&cli, opt_bucket, opt_region, &opt_prefix),
+            cli.resume.then_some(
                 &checkpoint::CheckpointIdentity::new(
                     opt_bucket,
                     opt_region,
@@ -2218,6 +2153,28 @@ fn build_runtime_or_exit(worker_threads: usize) -> tokio::runtime::Runtime {
                 format!("Runtime initialization error: {}", e),
             );
         })
+}
+
+/// Where this run keeps its checkpoint: `None` for runs that cannot resume
+/// (diff, --start-after, --continuation-token). In --output-dir when one is
+/// given — with the outputs it describes — else the working directory.
+fn run_checkpoint_path(
+    cli: &Cli,
+    bucket: &str,
+    region: Option<&str>,
+    prefix: &str,
+) -> Option<String> {
+    if !matches!(cli.cmd, Commands::List { .. })
+        || cli.start_after.is_some()
+        || cli.continuation_token.is_some()
+    {
+        return None;
+    }
+    let name = checkpoint::checkpoint_path_for_prefix(bucket, region, prefix);
+    Some(match cli.output_dir.as_deref() {
+        Some(dir) => std::path::Path::new(dir).join(name).display().to_string(),
+        None => name,
+    })
 }
 
 /// Set the command's region (both sides of a diff) where none was given.
@@ -2638,23 +2595,6 @@ fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<Stri
     warnings
 }
 
-fn merged_completed_indices(
-    checkpoint_journal: Option<&checkpoint::CheckpointJournal>,
-    left_checkpoint: &Arc<Mutex<Vec<usize>>>,
-    right_checkpoint: Option<&Arc<Mutex<Vec<usize>>>>,
-) -> Vec<usize> {
-    let mut completed = checkpoint_journal
-        .map(|journal| journal.completed_indices.clone())
-        .unwrap_or_default();
-    completed.extend(left_checkpoint.lock().unwrap().iter().copied());
-    if let Some(right_checkpoint) = right_checkpoint {
-        completed.extend(right_checkpoint.lock().unwrap().iter().copied());
-    }
-    completed.sort_unstable();
-    completed.dedup();
-    completed
-}
-
 fn list_output_format(cli: &Cli) -> Option<ListOutputFormat> {
     match &cli.cmd {
         Commands::List { output_format, .. } => Some(*output_format),
@@ -3011,13 +2951,9 @@ fn build_plan_report(
     let outputs =
         runtime_output_summary(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref());
     let inputs = command_input_summary(cli, cfg);
-    let checkpoint_path = inputs
-        .bucket
-        .as_deref()
-        .filter(|_| cli.resume)
-        .map(|bucket| {
-            checkpoint::checkpoint_path_for_prefix(bucket, inputs.region.as_deref(), &inputs.prefix)
-        });
+    let checkpoint_path = inputs.bucket.as_deref().and_then(|bucket| {
+        run_checkpoint_path(cli, bucket, inputs.region.as_deref(), &inputs.prefix)
+    });
     let current_identity = inputs.bucket.as_deref().map(|bucket| {
         checkpoint::CheckpointIdentity::new(
             bucket,
@@ -3184,7 +3120,7 @@ fn build_plan_report(
         checkpoint: agent::checkpoint_plan(
             cli.resume,
             checkpoint_path,
-            current_identity.as_ref(),
+            current_identity.as_ref().filter(|_| cli.resume),
             None,
         ),
         file_conflicts,
