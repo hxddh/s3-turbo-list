@@ -1828,8 +1828,10 @@ delimiter = ""
 addressing_style = "path"
 mode = "list"
 boundaries_digest = "{}"
+endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
+            server.endpoint()
         ),
     )
     .unwrap();
@@ -3125,8 +3127,10 @@ delimiter = ""
 addressing_style = "path"
 mode = "list"
 boundaries_digest = "{}"
+endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
+            server.endpoint()
         ),
     )
     .unwrap();
@@ -4551,8 +4555,10 @@ delimiter = ""
 addressing_style = "path"
 mode = "list"
 boundaries_digest = "{}"
+endpoint_url = "{}"
 "#,
-            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()])
+            s3_turbo_list::checkpoint::boundaries_digest(&["m/".to_string()]),
+            server.endpoint()
         ),
     )
     .unwrap();

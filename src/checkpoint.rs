@@ -40,6 +40,14 @@ pub struct CheckpointIdentity {
     /// verification existed.
     #[serde(default)]
     pub boundaries_digest: Option<String>,
+    /// The endpoint the listing ran against (`None`: the SDK's default AWS
+    /// endpoint).  A bucket name is only unique per endpoint: resuming a
+    /// checkpoint against another endpoint's same-named bucket would skip
+    /// segments that were listed somewhere else.  Checkpoints written before
+    /// this field existed read as `None` and are discarded once when resumed
+    /// against a custom endpoint — a relist, never a silent skip.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
 }
 
 impl CheckpointIdentity {
@@ -66,7 +74,14 @@ impl CheckpointIdentity {
             mode: mode.map(|m| m.to_string()),
             filter: filter.map(|f| f.to_string()),
             boundaries_digest: None,
+            endpoint_url: None,
         }
+    }
+
+    /// Attach the endpoint this run lists against (see `endpoint_url`).
+    pub fn with_endpoint(mut self, endpoint_url: Option<&str>) -> Self {
+        self.endpoint_url = endpoint_url.map(str::to_string);
+        self
     }
 
     /// Attach the fingerprint of the boundary set this run is partitioned by.
@@ -109,6 +124,9 @@ impl CheckpointIdentity {
         if self.filter != current.filter {
             mismatches.push("filter".into());
         }
+        if self.endpoint_url != current.endpoint_url {
+            mismatches.push("endpoint_url".into());
+        }
 
         mismatches
     }
@@ -148,7 +166,18 @@ impl CheckpointJournal {
     /// Load a checkpoint file if it exists (raw load — no identity check).
     pub fn load(path: &str) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
-        toml::from_str(&content).ok()
+        match toml::from_str(&content) {
+            Ok(journal) => Some(journal),
+            Err(e) => {
+                // Saves are atomic, so this is not a torn write of ours; say
+                // so rather than silently relisting everything.
+                warn!(
+                    "Checkpoint {} could not be parsed ({}) — ignoring it and starting fresh",
+                    path, e
+                );
+                None
+            }
+        }
     }
 
     /// Load a checkpoint file AND verify that the run identity matches.
@@ -249,9 +278,15 @@ impl CheckpointJournal {
     }
 
     /// Write the current checkpoint state.
+    /// Written to a sibling temp file and renamed into place, so a crash or
+    /// a full disk mid-write leaves the previous checkpoint intact instead of
+    /// a truncated one.
     pub fn save(&self, path: &str) {
         let toml_str = toml::to_string_pretty(self).expect("Failed to serialize checkpoint");
-        if let Err(e) = std::fs::write(path, &toml_str) {
+        let tmp = format!("{}.tmp", path);
+        let result = std::fs::write(&tmp, &toml_str).and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
             log::warn!("Failed to write checkpoint {}: {}", path, e);
         }
     }
@@ -267,6 +302,23 @@ pub fn boundaries_digest(boundaries: &[String]) -> String {
         hasher.update([0u8]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Checkpoint path for a run over `prefix`.  A whole-bucket run keeps the
+/// historical `checkpoint_path` name; a prefixed run gets its own file (keyed
+/// like the hints cache), so two `--resume` jobs on different prefixes of one
+/// bucket no longer overwrite — and on completion delete — each other's.
+pub fn checkpoint_path_for_prefix(bucket: &str, region: Option<&str>, prefix: &str) -> String {
+    let base = checkpoint_path(bucket, region);
+    if prefix.is_empty() {
+        return base;
+    }
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+    format!(
+        "{}_{}_checkpoint.toml",
+        base.trim_end_matches("_checkpoint.toml"),
+        &digest[..8]
+    )
 }
 
 /// Generate the checkpoint file path for a given bucket.

@@ -1276,12 +1276,6 @@ impl DiffRowSink {
         }
     }
 
-    /// Record a merged key in the KS prefix counts (every merged key counts
-    /// once, including filter-ignored pairs, matching legacy KS output).
-    fn record_key(&mut self, key: &ObjectKey, size: u64) {
-        record_prefix_stat(&mut self.prefix_stats, key.prefix(), size);
-    }
-
     async fn push(
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
@@ -1295,6 +1289,10 @@ impl DiffRowSink {
             OUTPUT_FLAG_ASTRISK => self.astrisk += 1,
             _ => self.equal += 1,
         }
+        // Prefix stats (KS file, bytes_total, unique/top prefixes) describe
+        // the rows written — as in list mode — not filter-ignored pairs, so
+        // the manifest's metrics agree with the Parquet artifact.
+        record_prefix_stat(&mut self.prefix_stats, key.prefix(), props.size());
         self.rows += 1;
         self.buf.push((key, props, flag));
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
@@ -1378,7 +1376,6 @@ async fn merge_diff_streams(
         match order {
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
-                sink.record_key(&key, props.size());
                 if core::ObjectProps::include_one_sided(&props) {
                     sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
                 } else {
@@ -1387,7 +1384,6 @@ async fn merge_diff_streams(
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
-                sink.record_key(&key, props.size());
                 if core::ObjectProps::include_one_sided(&props) {
                     sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
                 } else {
@@ -1397,7 +1393,6 @@ async fn merge_diff_streams(
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
                 let (_rkey, right_props) = right.buf.pop_front().expect("filled");
-                sink.record_key(&key, left_props.size());
                 match core::ObjectProps::classify_pair(&left_props, &right_props) {
                     Some(MatchResult::Astrisk) => {
                         sink.push(writer_tx, OUTPUT_FLAG_ASTRISK, key, left_props)
@@ -1411,6 +1406,17 @@ async fn merge_diff_streams(
                 }
             }
         }
+    }
+    // Both streams ended — but a side whose *last* segment failed also ends
+    // its stream (the failing task drops its sender after setting quit), so
+    // exhaustion is not proof of completion. Check once more, or the merge
+    // reports success over a side it never finished reading.
+    if aborted() {
+        return Err(
+            "run aborted while the last segment of a side was listing; a partial diff \
+             would classify unread keys as one-sided"
+                .to_string(),
+        );
     }
     Ok(())
 }

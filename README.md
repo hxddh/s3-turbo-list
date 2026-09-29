@@ -166,14 +166,21 @@ diff. `--hints-file` and `--resume` are rejected for diff.
 ## Checkpoint / resume
 
 ```bash
-s3-turbo-list list --region us-east-2 --bucket my-bucket            # interrupted…
+s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # interrupted (Ctrl-C / SIGTERM)…
 s3-turbo-list list --region us-east-2 --bucket my-bucket --resume   # picks up
 ```
 
-Progress is saved every 30 seconds and on graceful shutdown. The checkpoint
-identity covers bucket, region, prefix, delimiter, max-keys, addressing style,
-profile, mode, filter, and the key-space boundary set itself (count and
-fingerprint) — completed segments are recorded by index, so a checkpoint is
+Checkpoints are only kept by `--resume` runs, so pass it on the first run too.
+Progress is saved when the run is interrupted gracefully (Ctrl-C or SIGTERM),
+after the outputs are finalized. There are no mid-run saves: until an output
+file is closed its rows are not durable, so a crash (or a failed write) leaves
+the previous checkpoint unchanged and the next `--resume` lists those segments
+again rather than skipping rows that were never written. Checkpoint files are
+named per bucket, region and prefix, so `--resume` jobs over different
+prefixes do not interfere. The checkpoint
+identity covers bucket, region, endpoint, prefix, delimiter, max-keys,
+addressing style, profile, mode, filter, and the key-space boundary set itself
+(count and fingerprint) — completed segments are recorded by index, so a checkpoint is
 discarded with a warning unless the boundaries it was written against are the
 ones this run resolved.
 

@@ -620,6 +620,7 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
             // Added to the identity in 0.30.0; this list is what the manifest
             // reports as the verified set, and it was left behind.
             "filter".to_string(),
+            "endpoint_url".to_string(),
         ],
         resumed_segments_skipped: None,
     }

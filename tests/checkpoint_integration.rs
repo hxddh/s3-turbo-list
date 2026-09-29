@@ -263,3 +263,54 @@ fn test_boundaries_digest_is_order_and_separator_sensitive() {
         checkpoint::boundaries_digest(&boundaries(&["a", "b"]))
     );
 }
+
+#[test]
+fn test_prefixed_runs_get_their_own_checkpoint_path() {
+    let whole = checkpoint::checkpoint_path_for_prefix("b", Some("r"), "");
+    assert_eq!(whole, checkpoint::checkpoint_path("b", Some("r")));
+    let logs = checkpoint::checkpoint_path_for_prefix("b", Some("r"), "logs/");
+    let img = checkpoint::checkpoint_path_for_prefix("b", Some("r"), "img/");
+    assert_ne!(logs, whole);
+    assert_ne!(logs, img);
+    assert!(
+        logs.starts_with("r_b_") && logs.ends_with("_checkpoint.toml"),
+        "{}",
+        logs
+    );
+}
+
+#[test]
+fn test_checkpoint_identity_includes_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cp.toml");
+    let path_str = path.to_str().unwrap();
+    let id = |endpoint: Option<&str>| {
+        CheckpointIdentity::new(
+            "b",
+            Some("r"),
+            "",
+            Some(""),
+            None,
+            None,
+            Some("auto"),
+            Some("list"),
+            None,
+        )
+        .with_endpoint(endpoint)
+    };
+    let journal = CheckpointJournal {
+        bucket: "b".into(),
+        prefix: String::new(),
+        total_segments: 2,
+        completed_indices: vec![0],
+        last_updated: "now".into(),
+        identity: Some(id(Some("http://x:9000"))),
+    };
+    journal.save(path_str);
+    // Saved atomically: no temp file left behind.
+    assert!(!dir.path().join("cp.toml.tmp").exists());
+    assert!(CheckpointJournal::load_and_verify(path_str, &id(Some("http://x:9000"))).is_some());
+    // Same bucket name on another endpoint is another bucket.
+    assert!(CheckpointJournal::load_and_verify(path_str, &id(Some("http://y:9000"))).is_none());
+    assert!(CheckpointJournal::load_and_verify(path_str, &id(None)).is_none());
+}

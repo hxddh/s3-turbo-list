@@ -532,3 +532,43 @@ async fn test_dropping_the_sender_delivers_buffered_batches_first() {
     assert_eq!(received.last().unwrap(), "key-031");
     assert!(rx.recv().await.is_none(), "close is reported once drained");
 }
+
+#[tokio::test]
+async fn test_merge_fails_when_run_aborts_as_the_last_segment_ends() {
+    // A side whose last segment fails sets quit and drops its sender, so the
+    // stream simply ends. Exhausting both streams must not read as success
+    // while the run is aborting.
+    let (ltx, lrx) = tokio::sync::mpsc::channel(8);
+    let (rtx, rrx) = tokio::sync::mpsc::channel::<Batch>(8);
+    ltx.send(vec![left_obj("k1", 1, [1; 16])]).await.unwrap();
+    drop(ltx);
+    drop(rtx);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = tokio::fs::File::create(dir.path().join("d.parquet"))
+        .await
+        .unwrap();
+    let mut parquet = AsyncParquetOutput::new(tokio::io::BufWriter::new(file), "unused.ks");
+    let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = aborted.clone();
+    // The abort lands after the loop's last top-of-iteration check (calls 0
+    // and 1), exactly when the failing segment is the last one on its side.
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let err = run_diff_merge(
+        DiffStreamSides {
+            left: vec![lrx],
+            right: vec![rrx],
+        },
+        &mut parquet,
+        move || {
+            let calls = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if calls >= 2 {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            aborted.load(std::sync::atomic::Ordering::SeqCst)
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("aborted"), "{}", err);
+}

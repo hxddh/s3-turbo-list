@@ -23,9 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Cadence of periodic checkpoint-journal saves during a `--resume` run.
-const CHECKPOINT_SAVE_INTERVAL_SECS: u64 = 30;
-
 // ── CLI definition ─────────────────────────────────────────
 
 #[derive(Parser)]
@@ -826,7 +823,11 @@ fn main() {
     let resumed_segments_skipped: Option<usize> = rt.block_on(async {
         // ── Checkpoint journal (resume mode) ──────────────────
         let checkpoint_path_opt = if cli.resume {
-            Some(checkpoint::checkpoint_path(opt_bucket, opt_region))
+            Some(checkpoint::checkpoint_path_for_prefix(
+                opt_bucket,
+                opt_region,
+                &opt_prefix,
+            ))
         } else {
             None
         };
@@ -846,7 +847,8 @@ fn main() {
                 "list"
             }),
             cli.filter.as_deref(),
-        );
+        )
+        .with_endpoint(cfg.s3.endpoint_url.as_deref());
 
         let checkpoint_journal = checkpoint_path_opt
             .as_deref()
@@ -1301,69 +1303,36 @@ fn main() {
         // The channel senders are moved into the list-task contexts, so each
         // channel closes when its side's task finishes.
 
-        // Wait for all tasks. Periodic checkpoint saves are driven by a
-        // ticker: `join_next` only returns when one of the few long-lived
-        // tasks (list/data_map/mon) finishes, so a save evaluated only on
-        // task completion would never run during a healthy listing run and
-        // a crash would lose all resume progress.
-        let mut checkpoint_tick = tokio::time::interval_at(
-            tokio::time::Instant::now()
-                + std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
-            std::time::Duration::from_secs(CHECKPOINT_SAVE_INTERVAL_SECS),
-        );
-        checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                joined = set.join_next() => {
-                    let Some(result) = joined else { break };
-                    if let Err(e) = result {
-                        if e.is_cancelled() {
-                            // Cancellation is expected during shutdown (Ctrl-C aborts
-                            // in-flight tasks); it is not a fatal error, so do not count
-                            // it — counting it inflates the run manifest's fatal_errors
-                            // on a clean interrupt and trips `manifest-summary --check`.
-                            info!("Task was cancelled (abort or shutdown)");
-                        } else {
-                            error!("Task panicked: {}", e);
-                            if let Ok(panic_msg) = e.try_into_panic() {
-                                let msg: String = panic_msg
-                                    .downcast_ref::<&str>()
-                                    .map(|s: &&str| s.to_string())
-                                    .or_else(|| panic_msg.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "<unknown panic>".to_string());
-                                error!("Task panic message: {}", msg);
-                            }
-                            // A genuine panic is a fatal failure — record it.
-                            g_state.inc_fatal_error();
-                        }
-                        g_state.quit();
+        // Wait for all tasks.  There are deliberately no periodic checkpoint
+        // saves: a segment counts as complete once its last batch is queued,
+        // while its rows may still sit in the channel, a row-group buffer or
+        // a BufWriter — and a Parquet file has no readable footer until it is
+        // closed.  A mid-run save therefore recorded segments whose rows a
+        // crash or a later write error would lose, and the next `--resume`
+        // skipped them for good.  The checkpoint is written only on the
+        // graceful-interrupt path below, after the outputs are finalized.
+        while let Some(result) = set.join_next().await {
+            if let Err(e) = result {
+                if e.is_cancelled() {
+                    // Cancellation is expected during shutdown (Ctrl-C aborts
+                    // in-flight tasks); it is not a fatal error, so do not count
+                    // it — counting it inflates the run manifest's fatal_errors
+                    // on a clean interrupt and trips `manifest-summary --check`.
+                    info!("Task was cancelled (abort or shutdown)");
+                } else {
+                    error!("Task panicked: {}", e);
+                    if let Ok(panic_msg) = e.try_into_panic() {
+                        let msg: String = panic_msg
+                            .downcast_ref::<&str>()
+                            .map(|s: &&str| s.to_string())
+                            .or_else(|| panic_msg.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<unknown panic>".to_string());
+                        error!("Task panic message: {}", msg);
                     }
+                    // A genuine panic is a fatal failure — record it.
+                    g_state.inc_fatal_error();
                 }
-                _ = checkpoint_tick.tick() => {
-                    let progress_metrics = g_state.metrics_snapshot();
-                    if cli.resume
-                        && g_state.all_list_tasks_is_running()
-                        && progress_metrics.fatal_errors == 0
-                        && progress_metrics.output_errors == 0
-                    {
-                        if let Some(ref cp_path) = checkpoint_path_opt {
-                            let completed = merged_completed_indices(
-                                checkpoint_journal.as_ref(),
-                                &left_checkpoint,
-                                right_checkpoint.as_ref(),
-                            );
-                            let journal = checkpoint::CheckpointJournal {
-                                bucket: opt_bucket.to_string(),
-                                prefix: opt_prefix.clone(),
-                                total_segments: original_hints_count,
-                                completed_indices: completed,
-                                last_updated: chrono::Local::now().to_rfc3339(),
-                                identity: Some(current_identity.clone()),
-                            };
-                            journal.save(cp_path);
-                        }
-                    }
-                }
+                g_state.quit();
             }
         }
 
@@ -1499,23 +1468,27 @@ fn main() {
         metrics: metrics.into(),
         checkpoint: agent::checkpoint_plan(
             cli.resume,
-            cli.resume
-                .then(|| checkpoint::checkpoint_path(opt_bucket, opt_region)),
-            Some(&checkpoint::CheckpointIdentity::new(
-                opt_bucket,
-                opt_region,
-                &opt_prefix,
-                Some(&cli.delimiter),
-                cli.max_keys,
-                cfg.s3.profile.as_deref(),
-                Some(&cfg.s3.addressing_style.to_string()),
-                Some(if mode == RunMode::BiDir {
-                    "bidir"
-                } else {
-                    "list"
-                }),
-                cli.filter.as_deref(),
-            )),
+            cli.resume.then(|| {
+                checkpoint::checkpoint_path_for_prefix(opt_bucket, opt_region, &opt_prefix)
+            }),
+            Some(
+                &checkpoint::CheckpointIdentity::new(
+                    opt_bucket,
+                    opt_region,
+                    &opt_prefix,
+                    Some(&cli.delimiter),
+                    cli.max_keys,
+                    cfg.s3.profile.as_deref(),
+                    Some(&cfg.s3.addressing_style.to_string()),
+                    Some(if mode == RunMode::BiDir {
+                        "bidir"
+                    } else {
+                        "list"
+                    }),
+                    cli.filter.as_deref(),
+                )
+                .with_endpoint(cfg.s3.endpoint_url.as_deref()),
+            ),
             resumed_segments_skipped,
         ),
         warnings: run_warnings.clone(),
@@ -2763,7 +2736,9 @@ fn build_plan_report(
         .bucket
         .as_deref()
         .filter(|_| cli.resume)
-        .map(|bucket| checkpoint::checkpoint_path(bucket, inputs.region.as_deref()));
+        .map(|bucket| {
+            checkpoint::checkpoint_path_for_prefix(bucket, inputs.region.as_deref(), &inputs.prefix)
+        });
     let current_identity = inputs.bucket.as_deref().map(|bucket| {
         checkpoint::CheckpointIdentity::new(
             bucket,
@@ -2780,6 +2755,7 @@ fn build_plan_report(
             }),
             inputs.filter.as_deref(),
         )
+        .with_endpoint(cfg.s3.endpoint_url.as_deref())
     });
     let hints = if inputs.mode == "diff" {
         agent::diff_per_side_hints_plan(

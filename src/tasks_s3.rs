@@ -1406,7 +1406,7 @@ fn handle_sdk_error(
                 None,
                 None,
                 retryable,
-                false,
+                !retryable,
                 None,
             );
 
@@ -1439,8 +1439,10 @@ fn handle_sdk_error(
                 None,
                 None,
                 None,
-                false,
-                false,
+                // Classified as ERROR_S3_CLIENT_GENERIC below, which the
+                // segment loop retries; the trace must say the same.
+                is_retryable(ERROR_S3_CLIENT_GENERIC),
+                !is_retryable(ERROR_S3_CLIENT_GENERIC),
                 None,
             );
 
