@@ -73,11 +73,7 @@ pub(crate) fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) 
         }
         Commands::CompatProbe { .. } => {
             if cfg.s3.endpoint_url.is_none() {
-                warnings.push(
-                    "compat-probe needs an endpoint: pass --endpoint-url or --provider, or set \
-                     s3.endpoint_url in the config"
-                        .to_string(),
-                );
+                warnings.push(compat_probe_endpoint_problem(cli, cfg));
             }
             if let Some(endpoint) = cfg.s3.endpoint_url.as_deref()
                 && profiles::endpoint_url_has_template_placeholder(endpoint)
@@ -91,6 +87,31 @@ pub(crate) fn provider_setup_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) 
         _ => {}
     }
     warnings
+}
+
+/// Why compat-probe has no endpoint URL, naming what to pass: the probe
+/// always sends to an explicit endpoint, which a region-templated preset
+/// derives from `--region` and the aws preset (or no preset) does not have.
+pub(crate) fn compat_probe_endpoint_problem(cli: &Cli, cfg: &S3TurboConfig) -> String {
+    let region = command_region(&cli.cmd).unwrap_or("<region>");
+    match cfg.s3.provider.as_deref().and_then(profiles::get_profile) {
+        Some(preset) if preset.endpoint_template.is_some() => format!(
+            "compat-probe needs an endpoint URL: provider '{}' derives it from the region; \
+             pass --region (or --endpoint-url)",
+            preset.name
+        ),
+        Some(preset) if preset.requires_explicit_endpoint => format!(
+            "compat-probe needs an endpoint URL: provider '{}' has no fixed endpoint; pass \
+             --endpoint-url",
+            preset.name
+        ),
+        _ => format!(
+            "compat-probe needs an endpoint URL: for AWS S3 pass the regional endpoint, \
+             --endpoint-url https://s3.{}.amazonaws.com (or --provider for another service, \
+             or set s3.endpoint_url in the config)",
+            region
+        ),
+    }
 }
 
 pub(crate) fn build_plan_report(
@@ -113,7 +134,7 @@ pub(crate) fn build_plan_report(
             &inputs.prefix,
             Some(&inputs.delimiter),
             inputs.max_keys,
-            inputs.profile.as_deref(),
+            inputs.provider.as_deref(),
             Some(&inputs.addressing_style),
             Some(if inputs.mode == "diff" {
                 "bidir"
@@ -153,16 +174,18 @@ pub(crate) fn build_plan_report(
             None => agent::diff_per_side_hints_plan(),
         }
     } else {
+        // compat-probe sends a fixed handful of requests: no partitioning.
         agent::detect_hints_plan(agent::HintsPlanInputs {
             explicit_hints_file: cli.hints_file.as_deref(),
-            listing: inputs.bucket.is_some(),
+            listing: matches!(cli.cmd, Commands::List { .. }),
             no_auto_hints: cli.no_auto_hints,
-            single_chain: cfg.s3.start_after.is_some() || cli.continuation_token.is_some(),
+            single_chain: cfg.s3.start_after.is_some(),
             delimited: !cli.delimiter.is_empty(),
         })
     };
     let file_conflicts = agent::output_conflicts(&outputs);
     let mut warnings = config_source.warnings.clone();
+    warnings.extend(cli.deprecation_warnings());
     let missing_region = sides_without_region(cli);
     if !missing_region.is_empty() && !imds_disabled() && !offline_region_resolves() {
         warnings.push(format!(
@@ -184,17 +207,11 @@ pub(crate) fn build_plan_report(
         }
     }
     warnings.extend(runtime_guardrail_warnings(cli, cfg));
-    if matches!(cli.cmd, Commands::CompatProbe { .. }) {
-        warnings.push(
-            "compat-probe will contact the configured endpoint when not run with --dry-run"
-                .to_string(),
-        );
-    }
     if let Some(target_endpoint) =
         diff_target_endpoint.filter(|target| Some(*target) != cfg.s3.endpoint_url.as_deref())
     {
         warnings.push(format!(
-            "diff target side lists against {} (the profile's endpoint for --target-region); \
+            "diff target side lists against {} (the provider's endpoint for --target-region); \
              the source side uses resolved_config.s3.endpoint_url",
             target_endpoint
         ));
@@ -213,21 +230,13 @@ pub(crate) fn build_plan_report(
                 .to_string(),
         );
     }
-    if cli.delimiter.is_empty() && matches!(cli.cmd, Commands::List { .. }) {
+    if cli.delimiter_explicit
+        && cli.delimiter.is_empty()
+        && matches!(cli.cmd, Commands::List { .. } | Commands::Diff { .. })
+    {
         warnings.push(
-            "--delimiter '' means recursive listing and is omitted from ListObjectsV2 requests for S3-compatible provider compatibility"
-                .to_string(),
-        );
-    }
-    if cli.summary_only {
-        warnings.push(
-            "summary-only will scan S3 ListObjectsV2 pages when not run with --dry-run, but it will not write Parquet or KeySpace outputs"
-                .to_string(),
-        );
-    }
-    if cli.continuation_token.is_some() {
-        warnings.push(
-            "continuation-token resumes one sequential ListObjectsV2 chain; hints and checkpoint resume are intentionally not combined with it"
+            "--delimiter '' is the default (a recursive listing) and is omitted from \
+             ListObjectsV2 requests"
                 .to_string(),
         );
     }
@@ -238,6 +247,7 @@ pub(crate) fn build_plan_report(
         outputs.ks_file.as_deref(),
         outputs.log_file.as_deref(),
         outputs.trace_compat.as_deref(),
+        outputs.report_file.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -248,14 +258,21 @@ pub(crate) fn build_plan_report(
     }
     let output_blocked = !output_problems.is_empty();
     warnings.extend(output_problems);
+    // The run exits 2 on an explicit hints file it cannot load; the plan
+    // says so (the reason is in `hints.warnings`).
+    let hints_blocked = hints.source == "explicit" && hints.valid == Some(false);
 
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION"),
-        // `blocked`: a problem that stops the real run — a provider setup
-        // problem (exit 3) or an output it cannot create (exit 5); the reason
-        // is in `warnings` and the dry run exits with the same code.
-        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty() && !output_blocked {
+        // `blocked`: a problem that stops the real run — an explicit hints
+        // file it cannot load (exit 2), a provider setup problem (exit 3) or
+        // an output it cannot create (exit 5); the reason is in `warnings`
+        // (or `hints.warnings`) and the dry run exits with the same code.
+        status: if provider_setup_guardrail_warnings(cli, cfg).is_empty()
+            && !output_blocked
+            && !hints_blocked
+        {
             "ok"
         } else {
             "blocked"
@@ -310,38 +327,14 @@ pub(crate) fn runtime_guardrail_warnings(cli: &Cli, cfg: &S3TurboConfig) -> Vec<
                 ));
         }
     }
-    if cli.summary_only
-        && (cli.output_dir.is_some()
-            || cli.output_parquet_file.is_some()
-            || cli.output_ks_file.is_some())
+    if let Some(format) = list_output_format(cli).filter(|format| !format.writes_artifacts())
+        && (cli.output_dir.is_some() || cli.output_parquet_file.is_some())
     {
-        warnings.push(
-            "--summary-only does not write Parquet or KeySpace outputs; output path flags are ignored"
-                .to_string(),
-        );
-    }
-    if list_output_format(cli)
-        .map(ListOutputFormat::writes_stdout_rows)
-        .unwrap_or(false)
-    {
-        warnings.push(
-            "--output-format tsv/ndjson streams list rows to stdout and does not write Parquet or KeySpace outputs"
-                .to_string(),
-        );
-        if cli.output_dir.is_some()
-            || cli.output_parquet_file.is_some()
-            || cli.output_ks_file.is_some()
-        {
-            warnings.push(
-                "output path flags are ignored when --output-format is tsv or ndjson".to_string(),
-            );
-        }
-    }
-    if matches!(cli.cmd, Commands::Diff { .. }) {
-        warnings.push(
-            "diff partitions each side automatically; explicit --hints-file and --resume are intentionally unsupported for diff"
-                .to_string(),
-        );
+        warnings.push(format!(
+            "--output-format {} writes no Parquet or KeySpace files; --output-dir and \
+             --output-parquet-file are ignored",
+            format
+        ));
     }
     warnings
 }
@@ -397,7 +390,6 @@ pub(crate) fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::Co
         Commands::ManifestSummary { .. } => {
             ("manifest-summary".to_string(), None, None, None, None, None)
         }
-        Commands::InitConfig { .. } => ("init-config".to_string(), None, None, None, None, None),
         Commands::Guide { .. } => ("guide".to_string(), None, None, None, None, None),
         Commands::Doctor { .. } => ("doctor".to_string(), None, None, None, None, None),
         Commands::Completions { .. } => ("completions".to_string(), None, None, None, None, None),
@@ -415,12 +407,9 @@ pub(crate) fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::Co
         delimiter: cli.delimiter.clone(),
         max_keys: cli.max_keys,
         start_after: cfg.s3.start_after.clone(),
-        // Redacted like the command line it came from.
-        continuation_token: cli
-            .continuation_token
-            .as_ref()
-            .map(|_| "<redacted>".to_string()),
-        profile: cfg.s3.profile.clone(),
+        continuation_token: None,
+        provider: cfg.s3.provider.clone(),
+        profile: cfg.s3.provider.clone(),
         addressing_style: cfg.s3.addressing_style.to_string(),
         filter: cli.filter.clone(),
     }
@@ -429,7 +418,7 @@ pub(crate) fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::Co
 // The region supplied by the active subcommand, used for profile endpoint
 // templating before the full command dispatch.
 /// The endpoint the diff target side lists against. A region-templated
-/// profile's preset was applied from the source region; when the endpoint
+/// provider preset was applied from the source region; when the endpoint
 /// came from that template (not from the user) and the target has its own
 /// region, the target gets its own region's host instead of the source's.
 pub(crate) fn diff_target_endpoint(
@@ -444,9 +433,9 @@ pub(crate) fn diff_target_endpoint(
         && !endpoint_was_explicit
         && let Some(endpoint) = cfg
             .s3
-            .profile
+            .provider
             .as_deref()
-            .and_then(|profile| profiles::region_endpoint(profile, target_region))
+            .and_then(|provider| profiles::region_endpoint(provider, target_region))
     {
         return Some(endpoint);
     }

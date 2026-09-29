@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 pub const AGENT_SCHEMA_VERSION: &str = "s3-turbo-list.agent.v1";
 const REDACTED_ARG_VALUE: &str = "<redacted>";
+// `--continuation-token` was removed in 0.38; a command line that still
+// passes it fails to parse, but its value is never echoed.
 const SENSITIVE_VALUE_FLAGS: &[&str] = &["--continuation-token", "--endpoint-url", "--endpoint"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,16 +118,16 @@ pub struct S3Summary {
     pub connect_timeout_secs: u64,
     pub operation_timeout_secs: u64,
     pub endpoint_url: Option<String>,
-    /// Deprecated (0.37): `addressing_style == "path"`.
-    pub force_path_style: bool,
     pub addressing_style: String,
     pub provider: Option<String>,
-    /// Deprecated (0.37): the same value as `provider`.
-    pub profile: Option<String>,
+    /// `provider` names a known preset.
+    pub provider_known: bool,
+    /// The preset's known limitations.
+    pub provider_warnings: Vec<String>,
+    /// Deprecated (0.38; removed in 0.39): `provider_known`.
     pub profile_known: bool,
+    /// Deprecated (0.38; removed in 0.39): `provider_warnings`.
     pub profile_warnings: Vec<String>,
-    /// Deprecated (0.37): `trace_compat == "-"`.
-    pub debug_s3: bool,
     pub trace_compat: Option<String>,
     pub start_after: Option<String>,
 }
@@ -147,41 +149,33 @@ pub struct ChannelSummary {
 
 impl From<&S3TurboConfig> for ResolvedConfigSummary {
     fn from(cfg: &S3TurboConfig) -> Self {
+        let preset = cfg.s3.provider.as_deref().and_then(profiles::get_profile);
+        let provider_warnings: Vec<String> = preset
+            .map(|profile| {
+                profile
+                    .limitations
+                    .iter()
+                    .map(|item| (*item).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             runtime: RuntimeSummary {
                 worker_threads: cfg.runtime.worker_threads,
                 max_concurrency: cfg.runtime.max_concurrency,
             },
             s3: S3Summary {
-                profile_known: cfg
-                    .s3
-                    .profile
-                    .as_deref()
-                    .and_then(profiles::get_profile)
-                    .is_some(),
-                profile_warnings: cfg
-                    .s3
-                    .profile
-                    .as_deref()
-                    .and_then(profiles::get_profile)
-                    .map(|profile| {
-                        profile
-                            .limitations
-                            .iter()
-                            .map(|item| (*item).to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                provider_known: preset.is_some(),
+                profile_known: preset.is_some(),
+                profile_warnings: provider_warnings.clone(),
+                provider_warnings,
                 max_attempts: cfg.s3.max_attempts,
                 initial_backoff_secs: cfg.s3.initial_backoff_secs,
                 connect_timeout_secs: cfg.s3.connect_timeout_secs,
                 operation_timeout_secs: cfg.s3.operation_timeout_secs,
                 endpoint_url: cfg.s3.endpoint_url.as_deref().map(redact_url_userinfo),
-                force_path_style: cfg.s3.force_path_style(),
                 addressing_style: cfg.s3.addressing_style.to_string(),
-                provider: cfg.s3.profile.clone(),
-                profile: cfg.s3.profile.clone(),
-                debug_s3: cfg.s3.trace_compat.as_deref() == Some("-"),
+                provider: cfg.s3.provider.clone(),
                 trace_compat: cfg.s3.trace_compat.clone(),
                 start_after: cfg.s3.start_after.clone(),
             },
@@ -212,7 +206,12 @@ pub struct CommandInputSummary {
     pub delimiter: String,
     pub max_keys: Option<i32>,
     pub start_after: Option<String>,
+    /// Deprecated (0.38; removed in 0.39): always null (`--continuation-token`
+    /// was removed).
     pub continuation_token: Option<String>,
+    /// The provider preset, canonical lowercase name.
+    pub provider: Option<String>,
+    /// Deprecated (0.38; removed in 0.39): the same value as `provider`.
     pub profile: Option<String>,
     pub addressing_style: String,
     /// The `--filter` expression this run applied, or `None` for no filter.
@@ -228,6 +227,8 @@ pub struct OutputPathSummary {
     pub hints_file: Option<String>,
     pub trace_compat: Option<String>,
     pub log_file: Option<String>,
+    /// compat-probe's `-o` report file.
+    pub report_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,10 +253,6 @@ pub struct CheckpointPlan {
     pub valid: Option<bool>,
     pub identity_matches: Option<bool>,
     pub identity_mismatches: Vec<String>,
-    /// Deprecated (0.37): always null; checkpoints record key ranges.
-    pub completed_segments: Option<usize>,
-    /// Deprecated (0.37): always null.
-    pub total_segments: Option<usize>,
     /// Key ranges a resume would list.
     pub remaining_ranges: Option<usize>,
     pub identity_fields: Vec<String>,
@@ -455,7 +452,7 @@ pub struct HintsPlanInputs<'a> {
     /// A run command with a bucket (not a local tool).
     pub listing: bool,
     pub no_auto_hints: bool,
-    /// `--start-after` or `--continuation-token`: one sequential chain.
+    /// `--start-after`: one sequential chain.
     pub single_chain: bool,
     /// A non-empty `--delimiter`: hierarchical, not partitioned.
     pub delimited: bool,
@@ -481,17 +478,20 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
     if single_chain {
         return plan_without_hints(
             "single_chain",
-            "--start-after / --continuation-token list one sequential ListObjectsV2 chain; \
-             hints, startup discovery and runtime splitting are skipped",
+            "--start-after lists one sequential ListObjectsV2 chain; hints, startup \
+             discovery and runtime splitting are skipped",
         );
     }
     if let Some(path) = explicit_hints_file {
         let report = inspect_hints_for_plan(path);
+        // The run loads the file with `parse_hints_file`: the plan's verdict
+        // must be the one the run reaches (it exits 2 on a file it cannot load).
+        let loads = hints::parse_hints_file(path).is_ok();
         return HintsPlan {
             source: "explicit".to_string(),
             path: Some(path.to_string()),
             exists: Path::new(path).exists(),
-            valid: report.as_ref().map(|r| r.valid),
+            valid: Some(loads && report.as_ref().is_none_or(|r| r.valid)),
             format: report
                 .as_ref()
                 .map(|r| format!("{:?}", r.format).to_lowercase()),
@@ -547,11 +547,7 @@ pub fn diff_per_side_hints_plan() -> HintsPlan {
         valid: None,
         format: None,
         boundary_count: None,
-        warnings: vec![
-            "diff partitions each side with startup discovery; --hints-file and --resume \
-             are list-only"
-                .to_string(),
-        ],
+        warnings: Vec::new(),
     }
 }
 
@@ -568,8 +564,6 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
         valid: None,
         identity_matches: None,
         identity_mismatches: Vec::new(),
-        completed_segments: None,
-        total_segments: None,
         remaining_ranges: None,
         identity_fields: vec![
             "bucket".to_string(),
@@ -577,7 +571,7 @@ pub fn default_checkpoint_plan(enabled: bool, path: Option<String>) -> Checkpoin
             "prefix".to_string(),
             "delimiter".to_string(),
             "max_keys".to_string(),
-            "profile".to_string(),
+            "provider".to_string(),
             "addressing_style".to_string(),
             "mode".to_string(),
             // Added to the identity in 0.30.0; this list is what the manifest
@@ -638,6 +632,7 @@ pub fn output_conflicts(outputs: &OutputPathSummary) -> Vec<FileConflict> {
         outputs.hints_file.as_ref(),
         outputs.trace_compat.as_ref(),
         outputs.log_file.as_ref(),
+        outputs.report_file.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -906,7 +901,7 @@ pub fn doctor_report(
     checks.push(DoctorCheck {
         name: "provider".to_string(),
         status: "ok".to_string(),
-        message: match cfg.s3.profile.as_deref().and_then(profiles::get_profile) {
+        message: match cfg.s3.provider.as_deref().and_then(profiles::get_profile) {
             Some(profile) => format!("provider preset '{}' ({})", profile.name, profile.provider),
             None => "no provider preset; plain S3 settings apply".to_string(),
         },
@@ -1061,37 +1056,53 @@ fn endpoint_url_check(cfg: &S3TurboConfig) -> DoctorCheck {
         };
     }
 
-    if let Some(profile_name) = cfg.s3.profile.as_deref() {
-        if let Some(profile) = profiles::get_profile(profile_name) {
-            if profile.requires_explicit_endpoint {
-                return DoctorCheck {
-                    name: "endpoint_url".to_string(),
-                    status: "error".to_string(),
-                    message: format!(
-                        "profile '{}' requires --endpoint-url or s3.endpoint_url in config",
-                        profile.name
-                    ),
-                };
-            }
-            // doctor takes no --region, so a region-derived endpoint cannot
-            // be resolved here; the run supplies it.
-            if profile.endpoint_template.is_some() && profile.default_region.is_none() {
-                return DoctorCheck {
-                    name: "endpoint_url".to_string(),
-                    status: "warn".to_string(),
-                    message: format!(
-                        "profile '{}' derives its endpoint from the region; the run needs --region or --endpoint-url",
-                        profile.name
-                    ),
-                };
-            }
-        }
+    let Some(profile) = cfg.s3.provider.as_deref().and_then(profiles::get_profile) else {
+        return DoctorCheck {
+            name: "endpoint_url".to_string(),
+            status: "ok".to_string(),
+            message: "no endpoint URL: requests go to AWS S3 (pass --endpoint-url or \
+                      --provider for another service)"
+                .to_string(),
+        };
+    };
+    if profile.requires_explicit_endpoint {
+        return DoctorCheck {
+            name: "endpoint_url".to_string(),
+            status: "error".to_string(),
+            message: format!(
+                "provider '{}' requires --endpoint-url or s3.endpoint_url in config",
+                profile.name
+            ),
+        };
     }
-
+    // doctor takes no --region, so a region-derived endpoint cannot be
+    // resolved here; the run supplies it.
+    if profile.endpoint_template.is_some() {
+        return DoctorCheck {
+            name: "endpoint_url".to_string(),
+            status: if profile.default_region.is_some() {
+                "ok"
+            } else {
+                "warn"
+            }
+            .to_string(),
+            message: match profile.default_region {
+                Some(region) => format!(
+                    "provider '{}' derives its endpoint from --region (default {})",
+                    profile.name, region
+                ),
+                None => format!(
+                    "provider '{}' derives its endpoint from the region; the run needs \
+                     --region or --endpoint-url",
+                    profile.name
+                ),
+            },
+        };
+    }
     DoctorCheck {
         name: "endpoint_url".to_string(),
         status: "ok".to_string(),
-        message: "no explicit endpoint URL required by the provider preset".to_string(),
+        message: format!("provider '{}' needs no explicit endpoint URL", profile.name),
     }
 }
 
@@ -1166,6 +1177,7 @@ mod tests {
             hints_file: None,
             trace_compat: None,
             log_file: None,
+            report_file: None,
         }
     }
 
@@ -1276,7 +1288,7 @@ mod tests {
         let args = redact_command_args([
             "s3-turbo-list",
             "--endpoint=https://account.example.com",
-            "--profile",
+            "--provider",
             "r2",
             "list",
             "--bucket",
@@ -1290,7 +1302,7 @@ mod tests {
             vec![
                 "s3-turbo-list",
                 "--endpoint=<redacted>",
-                "--profile",
+                "--provider",
                 "r2",
                 "list",
                 "--bucket",

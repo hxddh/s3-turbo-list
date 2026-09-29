@@ -26,6 +26,29 @@ pub(crate) static RESERVED_OUTPUT: std::sync::OnceLock<String> = std::sync::Once
 /// stops before listing.
 pub(crate) static AGENT_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// Set once a dry run printed its plan: the plan is its JSON result, so a
+/// later exit (a blocked plan) prints the run line but no second document.
+pub(crate) static PLAN_PRINTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// What `doctor --json` knows so far (`config_source`, `resolved_config`),
+/// for the report an early exit prints.
+static DOCTOR_CONTEXT: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+/// Record the configuration doctor has resolved so far; an early
+/// `doctor --json` exit includes it.
+pub(crate) fn set_doctor_context(config_source: &agent::ConfigSourceSummary, cfg: &S3TurboConfig) {
+    if !DOCTOR_JSON.get().copied().unwrap_or(false) {
+        return;
+    }
+    let resolved: agent::ResolvedConfigSummary = cfg.into();
+    if let Ok(mut slot) = DOCTOR_CONTEXT.lock() {
+        *slot = Some(serde_json::json!({
+            "config_source": config_source,
+            "resolved_config": resolved,
+        }));
+    }
+}
+
 /// Stop before (or instead of) listing with `code`. Every command prints the
 /// reason on stderr as before; a run command also prints the documented
 /// `s3-turbo-list: run failed (exit N): <reason>` line and, under `--agent`,
@@ -38,7 +61,11 @@ pub(crate) fn exit_before_run(code: agent::ExitCode, message: String) -> ! {
     if code == agent::ExitCode::CliConfig && DOCTOR_JSON.get().copied().unwrap_or(false) {
         exit_doctor_check_error("config_parse", &message);
     }
-    eprintln!("{}", message);
+    // A run command's run line carries the reason; the message is printed
+    // on its own only when it has more to say than that one line.
+    if !RUN_COMMAND.get().copied().unwrap_or(false) || message.trim_end().lines().count() > 1 {
+        eprintln!("{}", message);
+    }
     run_failure_epilogue(code, &message);
     std::process::exit(code.code())
 }
@@ -53,12 +80,14 @@ pub(crate) fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
         .next()
         .unwrap_or(message)
         .trim_end_matches('.');
+    let plan_printed = PLAN_PRINTED.get().copied().unwrap_or(false);
     eprintln!(
-        "s3-turbo-list: run failed (exit {}): {}. Nothing was listed.",
+        "s3-turbo-list: run {} (exit {}): {}. Nothing was listed.",
+        if plan_printed { "blocked" } else { "failed" },
         code.code(),
         reason
     );
-    if AGENT_RUN.get().copied().unwrap_or(false) {
+    if AGENT_RUN.get().copied().unwrap_or(false) && !plan_printed {
         println!(
             "{}",
             agent::to_pretty_json(&serde_json::json!({
@@ -73,23 +102,33 @@ pub(crate) fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
 }
 
 /// Exit 2 on a local input error; `doctor --json` still prints its JSON
-/// report (one `error` check named `check`), so its stdout is never empty.
+/// report, so its stdout is never empty: `status`, `cwd`, one `error` check
+/// named `check`, and `config_source` / `resolved_config` once the config
+/// has loaded (a config or usage error comes before that).
 pub(crate) fn exit_doctor_check_error(check: &str, message: &str) -> ! {
     eprintln!("{}", message);
     if DOCTOR_JSON.get().copied().unwrap_or(false) {
-        println!(
-            "{}",
-            agent::to_pretty_json(&serde_json::json!({
-                "schema_version": agent::AGENT_SCHEMA_VERSION,
-                "tool_version": env!("CARGO_PKG_VERSION"),
+        let mut report = serde_json::json!({
+            "schema_version": agent::AGENT_SCHEMA_VERSION,
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "status": "error",
+            "cwd": std::env::current_dir()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+            "checks": [{
+                "name": check,
                 "status": "error",
-                "checks": [{
-                    "name": check,
-                    "status": "error",
-                    "message": message,
-                }],
-            }))
-        );
+                "message": message,
+            }],
+        });
+        if let (Some(fields), Some(object)) = (
+            DOCTOR_CONTEXT.lock().ok().and_then(|slot| slot.clone()),
+            report.as_object_mut(),
+        ) && let Some(fields) = fields.as_object()
+        {
+            object.extend(fields.clone());
+        }
+        println!("{}", agent::to_pretty_json(&report));
     }
     run_failure_epilogue(agent::ExitCode::CliConfig, message);
     std::process::exit(agent::ExitCode::CliConfig.code());

@@ -4,16 +4,12 @@ use super::*;
 
 pub(crate) fn run() {
     let mut cli = parse_cli();
-    if let Commands::InitConfig { .. } = cli.cmd {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "init-config was removed in 0.37.0: a config file is only needed for settings \
-             the flags do not cover; see the example in docs/providers.md"
-                .to_string(),
-        );
-    }
-    for spelling in &cli.deprecated {
-        eprintln!("warning: deprecated option {}", spelling);
+    // Deprecations go to stderr and into the plan / manifest / doctor
+    // report; `--agent` keeps stderr quiet, so there they are JSON only.
+    if !cli.agent {
+        for warning in cli.deprecation_warnings() {
+            eprintln!("warning: {}", warning);
+        }
     }
     // A diff without --target-region lists the target in --region. It used to
     // fall through to the SDK's ambient region (AWS_REGION / profile), so the
@@ -28,17 +24,15 @@ pub(crate) fn run() {
     {
         *target_region = region.clone();
     }
-    let run_command = !cli.dry_run
-        && matches!(
-            cli.cmd,
-            Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
-        );
+    // Dry runs included: every non-zero list/diff/compat-probe exit prints
+    // the `s3-turbo-list: run <status> (exit N): <reason>` line.
+    let run_command = matches!(
+        cli.cmd,
+        Commands::List { .. } | Commands::Diff { .. } | Commands::CompatProbe { .. }
+    );
     let _ = RUN_COMMAND.set(run_command);
     let _ = AGENT_RUN.set(run_command && cli.agent);
-    let _ = DOCTOR_JSON.set(
-        matches!(cli.cmd, Commands::Doctor { json: true, .. })
-            || (cli.agent && matches!(cli.cmd, Commands::Doctor { .. })),
-    );
+    let _ = DOCTOR_JSON.set(matches!(cli.cmd, Commands::Doctor { json: true, .. }));
 
     match &cli.cmd {
         Commands::Completions { shell } => {
@@ -68,33 +62,46 @@ pub(crate) fn run() {
     // Load config.
     let (mut cfg, config_load) = S3TurboConfig::load_with_summary(cli.config.as_deref())
         .unwrap_or_else(|e| exit_config_error(&format!("Config error: {}", e)));
+    if !cli.agent {
+        for warning in config_load
+            .warnings
+            .iter()
+            .filter(|warning| warning.starts_with("deprecated"))
+        {
+            eprintln!("warning: {}", warning);
+        }
+    }
 
+    let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
+    set_doctor_context(&config_source, &cfg);
     validate_addressing_style_command(&cli);
     cfg.apply_cli_overrides(config::CliOverrides {
         threads: cli.threads,
         concurrency: cli.concurrency,
         endpoint: cli.endpoint.as_deref(),
         addressing_style: cli.addressing_style.as_deref(),
-        provider: cli.profile.as_deref(),
+        provider: cli.provider.as_deref(),
         trace_compat: cli.trace_compat.as_deref(),
         start_after: cli.start_after.as_deref(),
-        log_file: cli.output_log_file.as_deref(),
-        ks_file: cli.output_ks_file.as_deref(),
         parquet_file: cli.output_parquet_file.as_deref(),
         compression: cli.compression.as_deref(),
         compression_level: cli.compression_level,
     });
-    // Recorded before the preset fills it in: a diff derives the target
-    // side's endpoint from its own region only when the user gave none.
-    // A misspelled profile (`mino`) applied no preset at all — no endpoint,
+    set_doctor_context(&config_source, &cfg);
+    // A misspelled provider (`mino`) applied no preset at all — no endpoint,
     // no addressing style — and the run went to AWS. Like an unknown config
     // key, it is a configuration error.
-    if let Some(name) = cfg.s3.profile.as_deref()
+    if let Some(name) = cfg.s3.provider.as_deref()
         && profiles::get_profile(name).is_none()
     {
+        let source = match (&cli.provider, config_load.loaded_config.as_deref()) {
+            (None, Some(path)) => format!("s3.provider in {}", path),
+            _ => "--provider".to_string(),
+        };
         exit_config_error(&format!(
-            "--provider '{}' is not a provider preset; use one of: {} \
+            "{} '{}' is not a provider preset; use one of: {} \
                  (credentials profiles go in AWS_PROFILE)",
+            source,
             name,
             profiles::all_profiles()
                 .iter()
@@ -103,6 +110,12 @@ pub(crate) fn run() {
                 .join(", ")
         ));
     }
+    // `BOS` and `bos` are one preset: the canonical name goes into the plan,
+    // the manifest and the checkpoint identity (a resume under the other
+    // spelling was an identity mismatch).
+    cfg.normalize_provider();
+    // Recorded before the preset fills it in: a diff derives the target
+    // side's endpoint from its own region only when the user gave none.
     let endpoint_was_explicit = cfg.s3.endpoint_url.is_some();
     // A provider whose endpoint is built from the region (bos, oss, b2)
     // fills in its default region when none is given — and the request must
@@ -110,7 +123,7 @@ pub(crate) fn run() {
     // `--provider bos` alone signed for us-east-1 against the bj host).
     // A provider whose region is not tied to the endpoint (r2: "auto") gets
     // its default whenever --region is omitted.
-    if let Some(profile) = cfg.s3.profile.as_deref().and_then(profiles::get_profile)
+    if let Some(profile) = cfg.s3.provider.as_deref().and_then(profiles::get_profile)
         && (profile.endpoint_template.is_none() || !endpoint_was_explicit)
         && let Some(default_region) = profile.default_region
     {
@@ -120,12 +133,11 @@ pub(crate) fn run() {
     cfg.apply_profile_preset(command_region(&cli.cmd));
     let diff_target_endpoint = diff_target_endpoint(&cli, &cfg, endpoint_was_explicit);
     resolve_output_paths(&cli, &mut cfg);
+    set_doctor_context(&config_source, &cfg);
     validate_runtime_values(&cfg);
     validate_output_format_command(&cli);
-    validate_continuation_token_command(&cli, &cfg);
     validate_start_after_command(&cli, &cfg);
     validate_delimiter_hints_command(&cli);
-    let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
     let config_source_warnings = config_source.warnings.clone();
 
     if let Commands::Doctor { json, .. } = &cli.cmd {
@@ -137,6 +149,13 @@ pub(crate) fn run() {
             })
         });
         let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
+        for warning in cli.deprecation_warnings() {
+            report.checks.push(agent::DoctorCheck {
+                name: "deprecated".to_string(),
+                status: "warn".to_string(),
+                message: warning,
+            });
+        }
         // A filter that would fail the real run (exit 2) fails doctor too.
         if let Some(filter_expr) = cli.filter.as_deref() {
             let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
@@ -164,7 +183,7 @@ pub(crate) fn run() {
             print_doctor_report(&report);
         }
         if report.status == "error" {
-            // An endpoint/profile error is the same setup failure a real
+            // An endpoint/provider error is the same setup failure a real
             // run exits 3 on; any other error is a local config problem.
             let setup_error = report
                 .checks
@@ -205,19 +224,12 @@ pub(crate) fn run() {
             config_source.clone(),
             diff_target_endpoint.as_deref(),
         );
-        if let Some(path) = cli.plan_json.as_deref()
-            && let Err(e) = agent::write_json_file(path, &report)
-        {
-            exit_before_run(
-                agent::ExitCode::OutputWrite,
-                format!("Plan write error: {}", e),
-            );
-        }
-        if cli.agent || cli.plan_json.is_none() {
-            println!("{}", agent::to_pretty_json(&report));
-        }
+        println!("{}", agent::to_pretty_json(&report));
+        // The plan is the JSON result: a blocked dry run exits with the
+        // run's code and its run line, but prints no second JSON document.
+        let _ = PLAN_PRINTED.set(true);
         // An explicit hints file the run cannot load stops it with exit 2;
-        // so does the plan (still written above).
+        // so does the plan (status `blocked`, `hints.valid: false`).
         if let Some(path) = cli.hints_file.as_deref()
             && let Err(e) = hints::parse_hints_file(path)
         {
@@ -265,14 +277,28 @@ pub(crate) fn run() {
     }
 
     let mut run_warnings = config_source_warnings;
+    run_warnings.extend(cli.deprecation_warnings());
     run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
     if !cli.agent {
-        print_runtime_warnings(&run_warnings);
+        // Deprecations were printed as `warning: deprecated …` already.
+        let fresh: Vec<String> = run_warnings
+            .iter()
+            .filter(|warning| !warning.starts_with("deprecated"))
+            .cloned()
+            .collect();
+        print_runtime_warnings(&fresh);
     }
 
-    // Setup logging.
+    // Setup logging. `--agent` keeps stderr quiet: its default stderr filter
+    // is off (RUST_LOG still wins); a `--log` file keeps the normal level.
     let opt_log = cli.log || cfg.output.log_file.is_some();
-    let loglevel = std::env::var("RUST_LOG").unwrap_or_else(|_| "s3_turbo_list=info".to_string());
+    let loglevel = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        if cli.agent && !opt_log {
+            "off".to_string()
+        } else {
+            "s3_turbo_list=info".to_string()
+        }
+    });
 
     if opt_log {
         let logfile_s =
@@ -336,10 +362,11 @@ pub(crate) fn run() {
             // values that come from the config file or the provider.
             let endpoint_url = cfg.s3.endpoint_url.clone().unwrap_or_else(|| {
                 exit_before_run(
-                    agent::ExitCode::CliConfig,
-                    "compat-probe requires an endpoint: pass --endpoint-url or --provider, \
-                     or set s3.endpoint_url in the config"
-                        .to_string(),
+                    agent::ExitCode::ProviderSetup,
+                    format!(
+                        "Provider setup error: {}",
+                        compat_probe_endpoint_problem(&cli, &cfg)
+                    ),
                 );
             });
             run_compat_probe(
@@ -350,6 +377,7 @@ pub(crate) fn run() {
                 &cfg.s3.addressing_style.to_string(),
                 output.as_deref(),
                 &cfg,
+                cli.agent,
             );
             return;
         }
@@ -359,7 +387,7 @@ pub(crate) fn run() {
         Commands::Completions { .. } | Commands::Man => {
             unreachable!("local-only commands are handled before config load")
         }
-        Commands::ManifestSummary { .. } | Commands::InitConfig { .. } | Commands::Guide { .. } => {
+        Commands::ManifestSummary { .. } | Commands::Guide { .. } => {
             unreachable!("local tooling commands are handled before config load")
         }
     };
@@ -469,7 +497,7 @@ pub(crate) fn run() {
             &opt_prefix,
             Some(&cli.delimiter),
             cli.max_keys,
-            cfg.s3.profile.as_deref(),
+            cfg.s3.provider.as_deref(),
             Some(&cfg.s3.addressing_style.to_string()),
             Some(if mode == RunMode::BiDir {
                 "bidir"
@@ -599,7 +627,6 @@ pub(crate) fn run() {
             && !cli.no_auto_hints
             && cli.hints_file.is_none()
             && cli.delimiter.is_empty()
-            && cli.continuation_token.is_none()
             && cfg.s3.start_after.is_none()
         {
             info!("Probing bucket structure for startup key-space boundaries");
@@ -822,11 +849,10 @@ pub(crate) fn run() {
                 g_state: g_state.clone(),
                 trace_writer: trace_writer.clone(),
                 addressing_style: &cfg.s3.addressing_style.to_string(),
-                profile: cfg.s3.profile.as_deref(),
+                provider: cfg.s3.provider.as_deref(),
                 delimiter: Some(&cli.delimiter),
                 max_keys: cli.max_keys,
                 start_after: cfg.s3.start_after.as_deref(),
-                continuation_token: cli.continuation_token.as_deref(),
             });
             let right_ctx = core::S3TaskContext::new(core::TaskContextParams {
                 bucket: target_bucket,
@@ -840,11 +866,10 @@ pub(crate) fn run() {
                 g_state: g_state.clone(),
                 trace_writer: trace_writer.clone(),
                 addressing_style: &cfg.s3.addressing_style.to_string(),
-                profile: cfg.s3.profile.as_deref(),
+                provider: cfg.s3.provider.as_deref(),
                 delimiter: Some(&cli.delimiter),
                 max_keys: cli.max_keys,
                 start_after: cfg.s3.start_after.as_deref(),
-                continuation_token: cli.continuation_token.as_deref(),
             });
 
             let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
@@ -911,11 +936,10 @@ pub(crate) fn run() {
                 g_state: g_state.clone(),
                 trace_writer: trace_writer.clone(),
                 addressing_style: &cfg.s3.addressing_style.to_string(),
-                profile: cfg.s3.profile.as_deref(),
+                provider: cfg.s3.provider.as_deref(),
                 delimiter: Some(&cli.delimiter),
                 max_keys: cli.max_keys,
                 start_after: cfg.s3.start_after.as_deref(),
-                continuation_token: cli.continuation_token.as_deref(),
             });
             resume_slot = Some(task_ctx.resume_progress.clone());
             set.spawn(async move {
@@ -926,7 +950,7 @@ pub(crate) fn run() {
         // ── Spawn data map task (list modes) ─────────────────
         if is_diff {
             // spawned above alongside the side tasks
-        } else if cli.summary_only {
+        } else if list_output_format == ListOutputFormat::Summary {
             let rx = rx.expect("list mode allocates the streaming channel");
             let data_map_ctx = core::DataMapContext::new(rx, g_state.clone());
             set.spawn(async move { data_map::data_map_task_list_summary_only(data_map_ctx).await });
@@ -998,7 +1022,7 @@ pub(crate) fn run() {
 
         // ── Final checkpoint save / removal ────────────────
         // What the exit line should say about resuming; `None` for runs
-        // that cannot resume (diff, --start-after, --continuation-token).
+        // that cannot resume (diff, --start-after).
         let mut checkpoint_note: Option<String> = None;
         if let Some(ref cp_path) = checkpoint_path_opt {
             let final_metrics = g_state.metrics_snapshot();
@@ -1211,7 +1235,7 @@ pub(crate) fn run() {
                     &opt_prefix,
                     Some(&cli.delimiter),
                     cli.max_keys,
-                    cfg.s3.profile.as_deref(),
+                    cfg.s3.provider.as_deref(),
                     Some(&cfg.s3.addressing_style.to_string()),
                     Some(if mode == RunMode::BiDir {
                         "bidir"
@@ -1255,7 +1279,9 @@ pub(crate) fn run() {
     }
     if cli.agent {
         println!("{}", agent::to_pretty_json(&manifest));
-    } else if exit_code == agent::ExitCode::Success && cli.summary_only {
+    } else if exit_code == agent::ExitCode::Success
+        && list_output_format == ListOutputFormat::Summary
+    {
         print_summary(&manifest.metrics, &cli.delimiter);
     } else if exit_code == agent::ExitCode::Success && list_output_format.writes_stdout_rows() {
         // stdout is reserved for TSV/NDJSON rows.

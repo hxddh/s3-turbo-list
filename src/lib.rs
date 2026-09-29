@@ -32,5 +32,5 @@ pub mod mon;
 pub mod profiles;
 pub mod stats;
 pub mod tasks_s3;
-pub mod trace; // S3CompatEvent, S3TraceWriter, JsonlTraceWriter, create_trace_writer
+pub mod trace; // S3CompatEvent, S3TraceWriter, JsonlTraceWriter, trace_writer_for_target
 pub mod utils; // AsyncParquetOutput

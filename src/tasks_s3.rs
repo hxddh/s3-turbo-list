@@ -472,13 +472,12 @@ async fn flat_reactor_task(
 
     // Adaptive splitting only applies to plain list runs: diff uses a fixed,
     // key-ordered segment set per side (the merge needs it static), and
-    // --start-after / --continuation-token are single-chain modes. A
+    // --start-after is a single-chain mode. A
     // --delimiter run is excluded for the reason hints are: a page's
     // CommonPrefixes are not range-bounded, so a split parent would keep
     // paging past its cut, re-listing the child's prefixes.
     let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && ctx.start_after.is_none()
-        && ctx.continuation_token.is_none()
         && ctx.delimiter.as_deref().unwrap_or("").is_empty();
 
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
@@ -861,15 +860,8 @@ async fn flat_list_run_to_complete(
     control: &SegmentControl,
     split_tx: Option<&SplitSender>,
 ) -> bool {
-    let mut continuation_token = ctx.continuation_token.clone();
     // If the CLI provided --start-after, it overrides the segment's start.
-    // Continuation-token resume is a single-chain mode; do not also send
-    // start_after on the initial token request.
-    let mut start_after = if continuation_token.is_some() {
-        String::new()
-    } else {
-        ctx.start_after.as_deref().unwrap_or(start).to_string()
-    };
+    let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(
@@ -879,7 +871,6 @@ async fn flat_list_run_to_complete(
             &start_after,
             control,
             split_tx,
-            continuation_token.as_deref(),
             retry_attempt,
         )
         .await
@@ -913,14 +904,7 @@ async fn flat_list_run_to_complete(
                     retry_attempt.saturating_add(1)
                 };
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
-                    // A token-mode attempt that failed before recording any
-                    // key has no key to resume after: dropping the token then
-                    // would restart the listing at the top of the prefix and
-                    // re-emit everything the token had already skipped.
-                    if continuation_token.is_none() || !err.next_start().is_empty() {
-                        start_after = err.next_start_owned();
-                        continuation_token = None;
-                    }
+                    start_after = err.next_start_owned();
                     retry_attempt = next_retry_attempt;
                     // Space consecutive failures. Re-issuing immediately is
                     // the wrong answer to `SlowDown` in particular: the
@@ -1004,7 +988,6 @@ async fn flat_list(
     start_after: &str,
     control: &SegmentControl,
     split_tx: Option<&SplitSender>,
-    continuation_token: Option<&str>,
     retry_attempt: u32,
 ) -> Result<(), FlatRuntimeError> {
     let mut request = ctx
@@ -1042,7 +1025,7 @@ async fn flat_list(
     // `FastContentsInterceptor`, which parses the page's `<Contents>` directly
     // (see `list_page`) instead of through the SDK's per-object deserializer.
     // Later pages keep `start_after` alongside the token, as the paginator did.
-    let mut page_token: Option<String> = continuation_token.map(str::to_string);
+    let mut page_token: Option<String> = None;
     let mut next_start = start_after.to_string();
     let emit_common_prefixes = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && !ctx.delimiter.as_deref().unwrap_or("").is_empty();
@@ -1078,7 +1061,7 @@ async fn flat_list(
                     "ListObjectsV2",
                     prefix,
                     start_after,
-                    continuation_token,
+                    None,
                     retry_attempt,
                     latency_ms,
                     0,
@@ -1111,7 +1094,7 @@ async fn flat_list(
                     ctx,
                     prefix,
                     start_after,
-                    continuation_token,
+                    None,
                     retry_attempt,
                     latency_ms,
                 );
@@ -1143,7 +1126,7 @@ async fn flat_list(
                         "ListObjectsV2",
                         prefix,
                         start_after,
-                        continuation_token,
+                        None,
                         retry_attempt,
                         latency_ms,
                         200,
@@ -1341,7 +1324,7 @@ async fn flat_list(
                     "ListObjectsV2",
                     prefix,
                     start_after,
-                    continuation_token,
+                    None,
                     retry_attempt,
                     0,
                     200,
@@ -1412,7 +1395,7 @@ fn emit_segment_summary(
         prefix,
     );
     event.region = ctx.region.clone();
-    event.profile = ctx.profile.clone();
+    event.set_provider(ctx.provider.as_deref());
     event.addressing_style = ctx.addressing_style.clone();
     event.start_after = if start_after.is_empty() {
         None
@@ -1466,7 +1449,7 @@ fn emit_trace_compat(
 
     let mut event = S3CompatEvent::new(operation, &ctx.endpoint_url, &ctx.s3_bucket_name, prefix);
     event.region = ctx.region.clone();
-    event.profile = ctx.profile.clone();
+    event.set_provider(ctx.provider.as_deref());
     event.addressing_style = ctx.addressing_style.clone();
     event.start_after = if start_after.is_empty() {
         None

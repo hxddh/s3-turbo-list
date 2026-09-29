@@ -1,10 +1,11 @@
 //! Structured S3-compatible observability trace module.
 //!
-//! Every S3 API call produces one [`S3CompatEvent`] written via a
-//! [`S3TraceWriter`] implementation.  Three writers are provided:
-//!   - [`JsonlTraceWriter`]  — JSONL file  (--trace-compat <file>)
-//!   - [`StderrTraceWriter`] — stderr      (--debug-s3)
-//!   - [`NoopTraceWriter`]   — silent       (default)
+//! Every listing page request (and each compat-probe request) produces one
+//! [`S3CompatEvent`] written via a [`S3TraceWriter`]; startup discovery,
+//! flat-namespace bisection and runtime split probes are not traced.  The
+//! trace target (`--trace-compat`) is one of:
+//!   - [`JsonlTraceWriter`]  — a JSONL file (`--trace-compat <file>`)
+//!   - [`StderrTraceWriter`] — stderr       (`--trace-compat -`)
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -21,8 +22,12 @@ pub struct S3CompatEvent {
     // ── request identity ──────────────────────────────────
     pub timestamp: String, // ISO 8601, wall-clock
     pub operation: String, // "ListObjectsV2", "HeadBucket"
+    /// The provider preset (e.g. "bos").
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>, // vendor/profile name (e.g. "bos")
+    pub provider: Option<String>,
+    /// Deprecated (0.38; removed in 0.39): the same value as `provider`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub endpoint_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -98,6 +103,7 @@ impl S3CompatEvent {
         Self {
             timestamp: chrono::Utc::now().to_rfc3339(),
             operation: operation.to_string(),
+            provider: None,
             profile: None,
             endpoint_url: endpoint_url.to_string(),
             region: None,
@@ -133,6 +139,12 @@ impl S3CompatEvent {
             ended_by: None,
             truncated_raw_body: None,
         }
+    }
+
+    /// Record the provider preset (also under its deprecated `profile` name).
+    pub fn set_provider(&mut self, provider: Option<&str>) {
+        self.provider = provider.map(str::to_string);
+        self.profile = self.provider.clone();
     }
 }
 
@@ -177,8 +189,7 @@ impl S3TraceWriter for JsonlTraceWriter {
 
 // ── StderrTraceWriter ──────────────────────────────────────
 
-/// Writes events to stderr (one JSON object per line).  Used for
-/// `--debug-s3`.
+/// Writes events to stderr (one JSON object per line): `--trace-compat -`.
 pub struct StderrTraceWriter;
 
 impl S3TraceWriter for StderrTraceWriter {
@@ -189,98 +200,23 @@ impl S3TraceWriter for StderrTraceWriter {
     }
 }
 
-// ── CompositeTraceWriter ───────────────────────────────────
+// ── Convenience constructor ────────────────────────────────
 
-/// Fans events out to multiple underlying writers.
-/// Used when both `--debug-s3` and `--trace-compat` are set.
-pub struct CompositeTraceWriter {
-    writers: Vec<Box<dyn S3TraceWriter>>,
-}
-
-impl CompositeTraceWriter {
-    pub fn new() -> Self {
-        Self {
-            writers: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, writer: Box<dyn S3TraceWriter>) {
-        self.writers.push(writer);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.writers.is_empty()
-    }
-}
-
-impl S3TraceWriter for CompositeTraceWriter {
-    fn write_event(&self, event: S3CompatEvent) {
-        if self.writers.len() == 1 {
-            self.writers[0].write_event(event);
-        } else {
-            for writer in &self.writers {
-                writer.write_event(event.clone());
-            }
-        }
-    }
-}
-
-// ── NoopTraceWriter ────────────────────────────────────────
-
-/// Silent writer — used when tracing is disabled.
-pub struct NoopTraceWriter;
-
-impl S3TraceWriter for NoopTraceWriter {
-    fn write_event(&self, _event: S3CompatEvent) {}
-}
-
-// ── Convenience constructors ───────────────────────────────
-
-/// Create a unified trace writer that combines file and/or stderr outputs.
-/// Returns a single [`Box<dyn S3TraceWriter>`] that fans events to all
-/// enabled outputs, or the error from creating the trace file.
-pub fn create_trace_writer(
-    trace_compat: Option<&str>,
-    debug_s3: bool,
-) -> Result<Box<dyn S3TraceWriter>, String> {
-    Ok(create_trace_writer_opt(trace_compat, debug_s3)?
-        .unwrap_or_else(|| Box::new(NoopTraceWriter)))
-}
-
-/// An unwritable `--trace-compat` path is an output failure the caller
-/// reports through the documented exit codes, not a panic.
-/// The trace writer for a `--trace-compat` target: a JSONL file, or `-`
-/// for stderr.
+/// The trace writer for a `--trace-compat` target: a JSONL file, `-` for
+/// stderr, or `None` for no tracing. An unwritable path is an output failure
+/// the caller reports through the documented exit codes, not a panic.
 pub fn trace_writer_for_target(
     target: Option<&str>,
 ) -> Result<Option<Box<dyn S3TraceWriter>>, String> {
     match target {
-        Some("-") => create_trace_writer_opt(None, true),
-        other => create_trace_writer_opt(other, false),
+        None => Ok(None),
+        Some("-") => Ok(Some(Box::new(StderrTraceWriter))),
+        Some(path) => {
+            let writer = JsonlTraceWriter::new(path)
+                .map_err(|e| format!("Failed to create trace-compat file '{}': {}", path, e))?;
+            Ok(Some(Box::new(writer)))
+        }
     }
-}
-
-pub fn create_trace_writer_opt(
-    trace_compat: Option<&str>,
-    debug_s3: bool,
-) -> Result<Option<Box<dyn S3TraceWriter>>, String> {
-    let mut composite = CompositeTraceWriter::new();
-
-    if let Some(path) = trace_compat {
-        let writer = JsonlTraceWriter::new(path)
-            .map_err(|e| format!("Failed to create trace-compat file '{}': {}", path, e))?;
-        composite.push(Box::new(writer));
-    }
-
-    if debug_s3 {
-        composite.push(Box::new(StderrTraceWriter));
-    }
-
-    Ok(if composite.is_empty() {
-        None
-    } else {
-        Some(Box::new(composite))
-    })
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -379,40 +315,23 @@ mod tests {
     }
 
     #[test]
-    fn test_noop_trace_writer_is_silent() {
-        let writer = NoopTraceWriter;
-        let event = S3CompatEvent::new("HeadBucket", "http://x", "b", "/");
-        writer.write_event(event); // should not panic
-    }
-
-    #[test]
-    fn test_create_trace_writer_combinations() {
-        // No tracing
-        let w = create_trace_writer(None, false).unwrap();
-        w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-        // just should not panic
-        assert!(create_trace_writer_opt(None, false).unwrap().is_none());
-
-        // File only
+    fn test_trace_writer_for_target() {
+        assert!(trace_writer_for_target(None).unwrap().is_none());
+        assert!(trace_writer_for_target(Some("-")).unwrap().is_some());
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.jsonl");
         let p_str = p.to_str().unwrap();
-        let w = create_trace_writer(Some(p_str), false).unwrap();
+        let w = trace_writer_for_target(Some(p_str)).unwrap().unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
         assert!(
             std::fs::read_to_string(p_str)
                 .unwrap()
                 .contains("\"operation\":\"X\"")
         );
-        assert!(
-            create_trace_writer_opt(Some(p_str), false)
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]
-    fn test_create_trace_writer_unwritable_path_is_an_error_not_a_panic() {
+    fn test_trace_writer_unwritable_path_is_an_error_not_a_panic() {
         // A path whose parent is a regular file can never be created, by any
         // user — unlike a merely absent directory, which some other test or
         // tool may have since created.
@@ -420,8 +339,7 @@ mod tests {
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
         let path = blocker.join("trace.jsonl");
-        let result = create_trace_writer_opt(Some(path.to_str().unwrap()), false);
-        let err = match result {
+        let err = match trace_writer_for_target(Some(path.to_str().unwrap())) {
             Ok(_) => panic!("an unwritable trace path must surface as an error"),
             Err(e) => e,
         };
@@ -429,43 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_trace_writer_fans_to_both() {
-        // Capture stderr by swapping it out.
-        // Simpler: test with two files.
-        let dir = tempfile::tempdir().unwrap();
-        let p1 = dir.path().join("a.jsonl");
-        let p2 = dir.path().join("b.jsonl");
-        let w = {
-            let mut c = CompositeTraceWriter::new();
-            c.push(Box::new(
-                JsonlTraceWriter::new(p1.to_str().unwrap()).unwrap(),
-            ));
-            c.push(Box::new(
-                JsonlTraceWriter::new(p2.to_str().unwrap()).unwrap(),
-            ));
-            Box::new(c) as Box<dyn S3TraceWriter>
-        };
-        w.write_event(S3CompatEvent::new("HeadBucket", "http://x", "b", "/"));
-        let a = std::fs::read_to_string(&p1).unwrap();
-        let b = std::fs::read_to_string(&p2).unwrap();
-        assert!(a.contains("\"operation\":\"HeadBucket\""));
-        assert_eq!(a, b, "Both files should receive identical events");
-    }
-
-    #[test]
-    fn test_create_trace_writer_both_outputs() {
-        // File + debug: both should receive events.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("t.jsonl");
-        let p_str = p.to_str().unwrap();
-        let w = create_trace_writer(Some(p_str), true).unwrap();
-        w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-        assert!(
-            std::fs::read_to_string(p_str)
-                .unwrap()
-                .contains("\"operation\":\"X\"")
-        );
-        // stderr was also written — we just verify the composite didn't panic.
+    fn test_set_provider_fills_the_deprecated_profile_field() {
+        let mut event = S3CompatEvent::new("ListObjectsV2", "http://x", "b", "/");
+        event.set_provider(Some("bos"));
+        let v: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["provider"], "bos");
+        assert_eq!(v["profile"], "bos");
     }
 
     #[test]
