@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This release simplifies the command line: options belong to the commands
+that take them, several flags and one subcommand are gone or hidden, and
+two sources of state in the working directory (the hints cache and
+resume-only checkpoints) are gone. Old spellings keep working for one
+release, with a deprecation warning, unless noted.
+
+### Performance
+- **List CPU −23% to −36%, wall −18% to −26%** on a local 1M-object
+  benchmark (Parquet, TSV, NDJSON), output identical: runtime split probes
+  parse their pages with the fast Contents parser (they were ~16% of list
+  CPU on the SDK's slow path), and the parser itself is 2.1x faster
+  (table-driven ETag hex, one `memchr2` per value, no copy when nothing
+  needs unescaping, ASCII fast paths).
+- **Diff lists ahead of the merge, within a bound.** A segment behind the
+  merge stalled after 4 batches, so a side with a few large segments listed
+  about one page per round trip; the per-segment window is now 32 batches,
+  and a side starts at most 16 segments ahead of the one being merged.
+  With 20 ms latency: 3.75 s → 0.67 s. Buffered memory no longer grows with
+  the segment count: a 3M-object diff peaks at 100 MB instead of 390 MB.
+
+### Changed
+- **Options belong to their commands.** Only `--config`, `--provider`,
+  `--endpoint-url` and `--addressing-style` are global. Each command's
+  `--help` lists only what it takes, in groups (Source, Output, Run,
+  Automation, Endpoint), and a misplaced option is a usage error (exit 2).
+  Options written before the command name — the old documented spelling,
+  `s3-turbo-list --output-dir out list …` — are still accepted.
+- **`--profile` is now `--provider`** (config key `provider`); the old
+  spelling is a hidden alias. Manifests report
+  `resolved_config.s3.provider`.
+- **Interrupted list runs always save a checkpoint**; `--resume` only
+  reads it. A run had to be started with `--resume` to be resumable. With
+  `--output-dir` the checkpoint is written there.
+- **No hints cache in the working directory.** Startup discovery runs on
+  every run instead of reading and writing
+  `<region>_<bucket>[_<hash>]_hints.toml`. `--hints-file` still pins
+  boundaries.
+- **Output names**: the KeySpace file follows the Parquet path
+  (`<name>.ks` beside `--output-parquet-file`); `--log` writes
+  `<name>.log` beside the outputs; auto-named outputs are reserved
+  atomically, so concurrent runs never share names.
+- `list --output-format summary` replaces `--summary-only`.
+- `--trace-compat -` traces to stderr, replacing `--debug-s3`.
+- `--prefix` defaults to the whole bucket (`""`); `/` still means the same.
+- `compat-probe` takes the global endpoint options (its own `--endpoint`
+  is a hidden alias), `--region` is optional, and it no longer sends a
+  duplicate request or the `encoding-type=url` probe the list engine never
+  uses.
+- `doctor` has one compact human format (`--simple` and
+  `--fix-suggestions` are hidden no-ops) and no longer warns about the
+  normal "no config file" and "AWS_PROFILE unset" states.
+- `guide` prints the overview and the six provider pages; the recipes are
+  gone.
+- A provider whose endpoint comes from the region (bos, oss, b2) signs for
+  its default region when `--region` is omitted, not the ambient
+  `AWS_REGION`.
+- An explicit `--addressing-style` (including `auto`) wins over the
+  provider preset.
+
+### Deprecated (hidden; removed in the next release)
+- `--profile` (use `--provider`), `--summary-only`
+  (`--output-format summary`), `--plan-json` (`--dry-run > file`),
+  `--debug-s3` (`--trace-compat -`), `--continuation-token` (`--resume` or
+  `--start-after`), `--output-ks-file` and `--output-log-file` (derived
+  from the outputs), the config key `force_path_style` (`addressing_style
+  = "path"`). `-T/--threads`, `--max-keys`, `--no-auto-hints` and
+  `--compression-level` are hidden from `--help` but stay supported.
+- Manifest fields `resolved_config.s3.{profile, force_path_style,
+  debug_s3}` and `checkpoint.{completed_segments, total_segments}`.
+
+### Removed
+- `init-config` (a stub names the replacement: the config example in
+  `docs/providers.md`).
+- The hidden `benchmark-local` command: it is
+  `cargo run --release --example bench_local` now.
+- Config keys that were per-run state: `s3.start_after` (it silently
+  truncated every run), `s3.debug_s3`, `s3.trace_compat`,
+  `output.parquet_file`, `output.ks_file`, `output.log_file`. They are
+  rejected as unknown keys (exit 2).
+- Checkpoints written before 0.36 (segment indices) are discarded with a
+  warning; the run starts over.
+
+### Fixed
+- **Keys could be lost around a runtime split.** A child range sent just
+  before its parent segment finished — or around Ctrl-C — was never picked
+  up: its keys were neither listed nor recorded in the checkpoint, and the
+  run (and a later `--resume`) reported success. 8 of 100 randomized
+  interrupted runs lost keys; 0 of 100 now.
+- Ctrl-C after the listing finished saved a checkpoint with nothing left,
+  and the next `--resume` wrote an empty output that reported success.
+- An in-flight split probe held the output open, delaying the end of the
+  run and Ctrl-C by up to its request timeouts.
+- An unreadable `--hints-file` or an unopenable `--trace-compat` file
+  exited with nothing on stderr and no `--agent` JSON.
+- An output the run cannot create is detected before any request (it
+  surfaced after the whole listing), and a manifest write failure after a
+  completed listing reports the outputs as complete and still prints the
+  manifest under `--agent`.
+- The dry run and `doctor` judge writability with `access(2)`: root (CI,
+  containers) writes read-only-mode files, and `doctor` no longer calls a
+  missing parent directory, which the run creates, an error — or an output
+  path that is a directory fine.
+- `doctor --json` prints JSON for usage and validation errors.
+- The endpoint URL's `user:password@` is redacted in `resolved_config`,
+  and a continuation token in `inputs`.
+- compat-probe plans no longer report its report file as a Parquet output.
+
 ## [0.36.0] - 2026-09-29
 
 ### Performance
