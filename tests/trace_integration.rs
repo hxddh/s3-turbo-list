@@ -1,6 +1,6 @@
 // Integration tests for S3CompatEvent JSONL roundtrip and truncated_raw_body fix.
 use s3_turbo_list::trace::{
-    create_trace_writer, JsonlTraceWriter, NoopTraceWriter, S3CompatEvent, S3TraceWriter,
+    JsonlTraceWriter, NoopTraceWriter, S3CompatEvent, S3TraceWriter, create_trace_writer,
 };
 
 // ── JSON roundtrip — all required fields present ──────────
@@ -93,8 +93,10 @@ fn test_trace_event_truncated_raw_body_present() {
     let json = serde_json::to_string(&event).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(parsed["truncated_raw_body"].as_str().unwrap(),
-        "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>");
+    assert_eq!(
+        parsed["truncated_raw_body"].as_str().unwrap(),
+        "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>"
+    );
 }
 
 // ── JSONL writer writes one line per event ────────────────

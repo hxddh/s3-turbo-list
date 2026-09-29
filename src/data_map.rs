@@ -1,8 +1,8 @@
 use log::info;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
@@ -569,11 +569,7 @@ async fn coordinator_finalize(
     );
     info!(
         "Data Map Task — list streaming output metrics: Parquet rows {} to '{}', KS write entries {} to '{}', write elapsed {:.3}s",
-        parquet_rows,
-        filename_output,
-        ks_entries,
-        filename_ks,
-        write_elapsed,
+        parquet_rows, filename_output, ks_entries, filename_ks, write_elapsed,
     );
 }
 
@@ -1693,8 +1689,8 @@ pub async fn data_map_task_diff_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        output_should_grow, part_path, render_text_row, ListTextOutputFormat,
-        OUTPUT_GROW_MIN_BATCHES,
+        ListTextOutputFormat, OUTPUT_GROW_MIN_BATCHES, output_should_grow, part_path,
+        render_text_row,
     };
 
     const AWKWARD_KEYS: &[&str] = &[

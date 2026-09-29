@@ -450,9 +450,10 @@ mode = "list"
 "#;
         let id: CheckpointIdentity = toml::from_str(toml_src).unwrap();
         assert_eq!(id.filter, None);
-        assert!(id
-            .diff(&make_identity_with_filter(Some("SOURCE.size > 1000")))
-            .contains(&"filter".to_string()));
+        assert!(
+            id.diff(&make_identity_with_filter(Some("SOURCE.size > 1000")))
+                .contains(&"filter".to_string())
+        );
     }
 
     #[test]

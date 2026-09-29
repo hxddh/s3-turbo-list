@@ -714,18 +714,26 @@ mod tests {
 
     #[test]
     fn test_rejects_unknown_identifiers() {
-        assert!(FilterExpr::compile("OTHER > 5", false)
-            .unwrap_err()
-            .contains("not allowed"));
-        assert!(FilterExpr::compile("SOURCE.etag == 1", false)
-            .unwrap_err()
-            .contains("not allowed"));
-        assert!(FilterExpr::compile("max(SOURCE.size, 1) > 0", false)
-            .unwrap_err()
-            .contains("not allowed"));
-        assert!(FilterExpr::compile("SOURCE.trim() == 1", true)
-            .unwrap_err()
-            .contains("not allowed"));
+        assert!(
+            FilterExpr::compile("OTHER > 5", false)
+                .unwrap_err()
+                .contains("not allowed")
+        );
+        assert!(
+            FilterExpr::compile("SOURCE.etag == 1", false)
+                .unwrap_err()
+                .contains("not allowed")
+        );
+        assert!(
+            FilterExpr::compile("max(SOURCE.size, 1) > 0", false)
+                .unwrap_err()
+                .contains("not allowed")
+        );
+        assert!(
+            FilterExpr::compile("SOURCE.trim() == 1", true)
+                .unwrap_err()
+                .contains("not allowed")
+        );
     }
 
     #[test]

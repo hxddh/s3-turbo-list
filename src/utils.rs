@@ -1,6 +1,6 @@
-use arrow_array::array::ArrayRef;
-use arrow_array::builder::{StringBuilder, UInt64Builder, UInt8Builder};
 use arrow_array::RecordBatch;
+use arrow_array::array::ArrayRef;
+use arrow_array::builder::{StringBuilder, UInt8Builder, UInt64Builder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;

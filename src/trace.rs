@@ -388,12 +388,16 @@ mod tests {
         let p_str = p.to_str().unwrap();
         let w = create_trace_writer(Some(p_str), false).unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-        assert!(std::fs::read_to_string(p_str)
-            .unwrap()
-            .contains("\"operation\":\"X\""));
-        assert!(create_trace_writer_opt(Some(p_str), false)
-            .unwrap()
-            .is_some());
+        assert!(
+            std::fs::read_to_string(p_str)
+                .unwrap()
+                .contains("\"operation\":\"X\"")
+        );
+        assert!(
+            create_trace_writer_opt(Some(p_str), false)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -445,9 +449,11 @@ mod tests {
         let p_str = p.to_str().unwrap();
         let w = create_trace_writer(Some(p_str), true).unwrap();
         w.write_event(S3CompatEvent::new("X", "e", "b", "/"));
-        assert!(std::fs::read_to_string(p_str)
-            .unwrap()
-            .contains("\"operation\":\"X\""));
+        assert!(
+            std::fs::read_to_string(p_str)
+                .unwrap()
+                .contains("\"operation\":\"X\"")
+        );
         // stderr was also written — we just verify the composite didn't panic.
     }
 

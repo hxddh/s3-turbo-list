@@ -205,10 +205,10 @@ impl Drop for MockS3Server {
         }
         // Re-raise a handler assertion on the test thread; on a connection
         // thread it would have reached the client as a reset socket.
-        if !thread::panicking() {
-            if let Some(message) = self.handler_panic.lock().unwrap().take() {
-                panic!("mock handler panicked: {}", message);
-            }
+        if !thread::panicking()
+            && let Some(message) = self.handler_panic.lock().unwrap().take()
+        {
+            panic!("mock handler panicked: {}", message);
         }
     }
 }
@@ -293,14 +293,14 @@ fn percent_decode(value: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded);
-                    i += 3;
-                    continue;
-                }
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(decoded) = u8::from_str_radix(hex, 16)
+        {
+            out.push(decoded);
+            i += 3;
+            continue;
         }
         out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
@@ -370,11 +370,11 @@ fn list_bucket_xml_without_key_count(
     next_token: Option<&str>,
 ) -> String {
     let mut xml = list_bucket_xml(prefix, max_keys, contents, &[], truncated, next_token);
-    if let Some(start) = xml.find("<KeyCount>") {
-        if let Some(end) = xml[start..].find("</KeyCount>") {
-            let end = start + end + "</KeyCount>".len();
-            xml.replace_range(start..end, "");
-        }
+    if let Some(start) = xml.find("<KeyCount>")
+        && let Some(end) = xml[start..].find("</KeyCount>")
+    {
+        let end = start + end + "</KeyCount>".len();
+        xml.replace_range(start..end, "");
     }
     xml
 }
@@ -609,12 +609,16 @@ fn local_mock_list_paginates_and_records_protocol_fields() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert!(trace_events
-        .iter()
-        .any(|event| event["next_continuation_token_present"] == true));
-    assert!(trace_events
-        .iter()
-        .any(|event| event["common_prefixes_count"] == 1));
+    assert!(
+        trace_events
+            .iter()
+            .any(|event| event["next_continuation_token_present"] == true)
+    );
+    assert!(
+        trace_events
+            .iter()
+            .any(|event| event["common_prefixes_count"] == 1)
+    );
     assert!(trace_events.iter().any(|event| {
         event["operation"] == "ListObjectsV2SegmentSummary"
             && event["segment_index"] == 0
@@ -1189,9 +1193,11 @@ fn local_mock_list_tsv_streams_rows_to_stdout_without_artifacts() {
     assert_eq!(first[0], "logs/a.txt");
     assert_eq!(first[1], "100");
     assert!(first[2].parse::<u64>().unwrap() > 0);
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("images/c.jpg\t100\t")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("images/c.jpg\t100\t"))
+    );
 
     let manifest_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
@@ -1253,18 +1259,26 @@ fn local_mock_list_tsv_escapes_control_chars_and_preserves_rows() {
 
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines.len(), 4);
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("plain.txt\t100\t")));
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("tab\\tkey.txt\t101\t")));
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("line\\nkey.txt\t102\t")));
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("slash\\\\key.txt\t103\t")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("plain.txt\t100\t"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("tab\\tkey.txt\t101\t"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("line\\nkey.txt\t102\t"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("slash\\\\key.txt\t103\t"))
+    );
 }
 
 #[test]
@@ -1526,26 +1540,34 @@ fn local_mock_list_uses_initial_continuation_token_for_single_chain() {
         manifest_json["config_source"]["loaded_config_kind"],
         "explicit"
     );
-    assert!(manifest_json["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "--endpoint-url"));
-    assert!(!manifest_json["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value.as_str() == Some(server.endpoint().as_str())));
-    assert!(!manifest_json["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value.as_str() == Some("seed-token")));
-    assert!(manifest_json["config_source"]["cli_overrides"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "endpoint_url"));
+    assert!(
+        manifest_json["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "--endpoint-url")
+    );
+    assert!(
+        !manifest_json["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(server.endpoint().as_str()))
+    );
+    assert!(
+        !manifest_json["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("seed-token"))
+    );
+    assert!(
+        manifest_json["config_source"]["cli_overrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "endpoint_url")
+    );
     assert_eq!(manifest_json["inputs"]["continuation_token"], "seed-token");
     assert_eq!(manifest_json["metrics"]["streamed_rows"], 1);
 }
@@ -1682,16 +1704,20 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     assert_eq!(service_error["s3_error_code"], "NotImplemented");
     assert_eq!(service_error["error_kind"], "service");
     assert_eq!(service_error["diagnostic_code"], "operation_not_supported");
-    assert!(service_error["recommendation"]
-        .as_str()
-        .unwrap()
-        .contains("does not implement"));
+    assert!(
+        service_error["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("does not implement")
+    );
     assert_eq!(service_error["request_id"], "mock-request");
     assert_eq!(service_error["request_id_2"], "mock-request-2");
-    assert!(service_error
-        .as_object()
-        .unwrap()
-        .contains_key("error_message"));
+    assert!(
+        service_error
+            .as_object()
+            .unwrap()
+            .contains_key("error_message")
+    );
 }
 
 #[test]
@@ -2463,17 +2489,23 @@ estimate_mode = "full"
         .filter(|r| r.path.contains("/left") && !r.query.contains_key("delimiter"))
         .collect();
     assert_eq!(left_lists.len(), 2, "{:#?}", left_lists);
-    assert!(left_lists
-        .iter()
-        .any(|r| !r.query.contains_key("start-after")));
-    assert!(left_lists
-        .iter()
-        .any(|r| r.query.get("start-after").map(String::as_str) == Some("m/")));
+    assert!(
+        left_lists
+            .iter()
+            .any(|r| !r.query.contains_key("start-after"))
+    );
+    assert!(
+        left_lists
+            .iter()
+            .any(|r| r.query.get("start-after").map(String::as_str) == Some("m/"))
+    );
     // Right side: structural discovery probe, then flat-cut bisection probes
     // (max-keys=1) that partition the flat namespace for parallel listing.
-    assert!(requests
-        .iter()
-        .any(|r| r.path.contains("/right") && r.query.contains_key("delimiter")));
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.path.contains("/right") && r.query.contains_key("delimiter"))
+    );
     assert!(
         requests.iter().any(|r| r.path.contains("/right")
             && r.query.get("max-keys").map(String::as_str) == Some("1")),
@@ -4189,7 +4221,7 @@ fn paged_mock_with_failing_pages(
             {
                 Some(i) => i + 1,
                 None => {
-                    return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None))
+                    return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &[], false, None));
                 }
             },
             (None, Some(after)) if !after.is_empty() => {
@@ -4206,7 +4238,7 @@ fn paged_mock_with_failing_pages(
                             &[],
                             false,
                             None,
-                        ))
+                        ));
                     }
                 }
             }
