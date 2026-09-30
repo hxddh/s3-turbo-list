@@ -207,7 +207,13 @@ pub(crate) fn run_compat_probe(
         .await
         {
             Ok(report) => report,
-            Err(e) => {
+            Err(compat_probe::ProbeFailure::Setup(e)) => {
+                exit_before_run(
+                    agent::ExitCode::ProviderSetup,
+                    format!("Provider setup error: {}", e),
+                );
+            }
+            Err(compat_probe::ProbeFailure::Output(e)) => {
                 exit_before_run(
                     agent::ExitCode::OutputWrite,
                     format!("Compat-probe output error: {}", e),

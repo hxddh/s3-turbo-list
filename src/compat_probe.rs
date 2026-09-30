@@ -27,6 +27,8 @@ impl CompatProbeReport {
         let mut errors = self.tests.iter().filter(|t| t.status == "error").peekable();
         errors.peek().is_some()
             && errors.all(|t| match (t.s3_error_code.as_deref(), t.http_status) {
+                // No credentials: the request never left the SDK.
+                _ if t.diagnostic_code.as_deref() == Some("credentials_missing") => true,
                 // HEAD responses carry no body, so HeadBucket's refusal has a
                 // status and no code: 401/403 is access, 404 is the bucket.
                 (None, Some(401 | 403 | 404)) => true,
@@ -87,6 +89,13 @@ impl S3TraceWriter for NoTrace {
     fn write_event(&self, _event: S3CompatEvent) {}
 }
 
+/// Why a probe produced no report: its setup (the region) or writing it.
+#[derive(Debug)]
+pub enum ProbeFailure {
+    Setup(String),
+    Output(String),
+}
+
 pub async fn run_compat_probe(
     endpoint_url: &str,
     region: Option<&str>,
@@ -97,12 +106,14 @@ pub async fn run_compat_probe(
     cfg: &S3TurboConfig,
     quiet: bool,
     warnings: Vec<String>,
-) -> Result<CompatProbeReport, String> {
+) -> Result<CompatProbeReport, ProbeFailure> {
     // --trace-compat as for a listing run; without it, the probe keeps its
     // historical default of tracing to stderr — except under `--agent`
     // (`quiet`), which keeps stderr quiet.
     let trace_writer: Box<dyn S3TraceWriter> =
-        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())? {
+        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())
+            .map_err(ProbeFailure::Output)?
+        {
             Some(writer) => writer,
             None if quiet => Box::new(NoTrace),
             None => Box::new(StderrTraceWriter),
@@ -135,9 +146,11 @@ pub async fn run_compat_probe(
     let region = match region {
         Some(region) => region.to_string(),
         None => config.region().map(|r| r.to_string()).ok_or_else(|| {
-            "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
+            ProbeFailure::Setup(
+                "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
                  for a region)"
-                .to_string()
+                    .to_string(),
+            )
         })?,
     };
     let region = region.as_str();
@@ -248,7 +261,7 @@ pub async fn run_compat_probe(
     let overall = CompatProbeReport::overall_status_for(&results);
 
     let report = CompatProbeReport {
-        endpoint_url: endpoint_url.to_string(),
+        endpoint_url: crate::agent::redact_url_userinfo(endpoint_url),
         region: region.to_string(),
         bucket: bucket.to_string(),
         addressing_style: addressing_style.to_string(),
@@ -257,9 +270,10 @@ pub async fn run_compat_probe(
         warnings,
     };
 
-    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| ProbeFailure::Output(e.to_string()))?;
     if let Some(out_path) = output {
-        std::fs::write(out_path, &json).map_err(|e| e.to_string())?;
+        std::fs::write(out_path, &json).map_err(|e| ProbeFailure::Output(e.to_string()))?;
         // stdout is for the report itself; this note is for humans.
         if !quiet {
             eprintln!("Compat-probe report written to {}", out_path);
@@ -633,6 +647,10 @@ fn diagnostic_for(
                 "timeout",
                 "Check endpoint reachability and consider increasing connect or operation timeout settings",
             ),
+            Some("credentials") => (
+                "credentials_missing",
+                "No AWS credentials were found: set AWS_PROFILE or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY",
+            ),
             Some("dispatch") => (
                 "transport_failure",
                 "Check DNS, TLS certificates, proxy/firewall rules, and endpoint reachability",
@@ -684,6 +702,12 @@ where
         Some(match self {
             SdkError::ConstructionFailure(_) => "construction",
             SdkError::TimeoutError(_) => "timeout",
+            SdkError::DispatchFailure(e)
+                if e.as_connector_error()
+                    .is_some_and(|c| crate::error::is_missing_credentials(c)) =>
+            {
+                "credentials"
+            }
             SdkError::DispatchFailure(_) => "dispatch",
             SdkError::ResponseError(_) => "response",
             SdkError::ServiceError(_) => "service",

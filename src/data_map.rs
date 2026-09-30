@@ -1684,6 +1684,8 @@ pub async fn data_map_task_diff_streaming(
     }
     if !output_ok {
         g_state.inc_output_error();
+    } else if outcome.is_some() {
+        g_state.set_diff_merge_complete();
     }
     if outcome.is_none() {
         // The merge did not run to completion, so whatever reached the file

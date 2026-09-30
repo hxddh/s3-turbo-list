@@ -502,6 +502,8 @@ pub struct GlobalState {
     pub data_bytes_total: Arc<AtomicU64>,
     pub data_top_prefixes: Arc<Mutex<Vec<PrefixMetric>>>,
     pub data_summary_only: Arc<AtomicBool>,
+    /// A diff merge consumed both sides to the end and wrote its outputs.
+    pub diff_merge_complete: Arc<AtomicBool>,
     pub data_output_files: Arc<AtomicUsize>,
     pub(crate) task_rendez: TaskRendezvous,
 }
@@ -574,6 +576,7 @@ impl GlobalState {
             data_bytes_total: Arc::new(AtomicU64::new(0)),
             data_top_prefixes: Arc::new(Mutex::new(Vec::new())),
             data_summary_only: Arc::new(AtomicBool::new(false)),
+            diff_merge_complete: Arc::new(AtomicBool::new(false)),
             data_output_files: Arc::new(AtomicUsize::new(0)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
@@ -723,6 +726,12 @@ impl GlobalState {
     }
     pub fn is_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
+    }
+    pub fn set_diff_merge_complete(&self) {
+        self.diff_merge_complete.store(true, Ordering::SeqCst);
+    }
+    pub fn diff_merge_complete(&self) -> bool {
+        self.diff_merge_complete.load(Ordering::SeqCst)
     }
 
     pub fn list_task_start(&self, dir: u8) {

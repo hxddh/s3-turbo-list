@@ -14,6 +14,7 @@ pub const ERROR_S3_NEXT_STREAM_TIMEOUT: u8 = 0x1;
 pub const ERROR_S3_CLIENT_GENERIC: u8 = 0x2;
 pub const ERROR_S3_CLIENT_CONNECTION_TIMEOUT: u8 = 0x3;
 pub const ERROR_S3_MISSING_REGION: u8 = 0x4;
+pub const ERROR_S3_MISSING_CREDENTIALS: u8 = 0x5;
 pub const ERROR_NO_BUCKET: u8 = 0x10;
 pub const ERROR_ACCESS_DENIED: u8 = 0x11;
 pub const ERROR_PERMANENT_REDIRECT: u8 = 0x12;
@@ -39,7 +40,9 @@ pub const ERROR_UNKNOWN: u8 = 0xff;
 /// signature, malformed auth header, unrecognised codes — is permanent for
 /// this run: retrying re-sends a request that cannot start succeeding.
 pub fn is_retryable(errno: u8) -> bool {
-    (errno < ERROR_NO_BUCKET && errno != ERROR_S3_MISSING_REGION)
+    (errno < ERROR_NO_BUCKET
+        && errno != ERROR_S3_MISSING_REGION
+        && errno != ERROR_S3_MISSING_CREDENTIALS)
         || matches!(
             errno,
             ERROR_SLOW_DOWN
@@ -56,6 +59,7 @@ pub fn is_setup_error(errno: u8) -> bool {
     matches!(
         errno,
         ERROR_S3_MISSING_REGION
+            | ERROR_S3_MISSING_CREDENTIALS
             | ERROR_NO_BUCKET
             | ERROR_ACCESS_DENIED
             | ERROR_PERMANENT_REDIRECT
@@ -236,6 +240,29 @@ impl std::error::Error for FlatRuntimeError {}
 
 // ── Error code → name mapping ─────────────────────────────
 
+/// What the run line says when no credential provider in the SDK's default
+/// chain produced credentials. The SDK's own error is a multi-line dump of
+/// every provider it tried.
+pub const MISSING_CREDENTIALS_MESSAGE: &str = "no AWS credentials found: the SDK tried the \
+     environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), AWS_PROFILE and the shared \
+     config files, web identity, and container / instance metadata";
+
+/// Whether a request failed before it was sent because the SDK's credential
+/// chain produced no credentials. The SDK reports that as a dispatch failure
+/// (a connector error), which reads like a network problem and was retried
+/// for minutes; it is a setup error. Matched by the error type's name
+/// anywhere in the source chain, as the region check matches its message.
+pub fn is_missing_credentials(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if format!("{:?}", e).starts_with("CredentialsNotLoaded") {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 /// Return a human-readable S3 error classification for logging/trace.
 pub fn errno_to_name(errno: u8) -> &'static str {
     match errno {
@@ -243,6 +270,7 @@ pub fn errno_to_name(errno: u8) -> &'static str {
         ERROR_S3_CLIENT_GENERIC => "ClientGeneric",
         ERROR_S3_CLIENT_CONNECTION_TIMEOUT => "ClientConnectionTimeout",
         ERROR_S3_MISSING_REGION => "MissingRegion",
+        ERROR_S3_MISSING_CREDENTIALS => "MissingCredentials",
         ERROR_NO_BUCKET => "NoSuchBucket",
         ERROR_ACCESS_DENIED => "AccessDenied",
         ERROR_PERMANENT_REDIRECT => "PermanentRedirect",

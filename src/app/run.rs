@@ -959,10 +959,31 @@ pub(crate) fn run() {
         // What the exit line should say about resuming; `None` for runs
         // that cannot resume (diff, --start-after).
         let mut checkpoint_note: Option<String> = None;
-        let mut listing_finished = false;
+        // Ctrl-C after everything was listed and written: a list reactor
+        // with no key range left, or a diff merge that ran to the end. The
+        // outputs are complete, so the run reports success — in every mode,
+        // with or without a checkpoint.
+        let listing_finished = interrupted.load(Ordering::SeqCst) && {
+            let metrics = g_state.metrics_snapshot();
+            metrics.fatal_errors == 0
+                && metrics.output_errors == 0
+                && if is_diff {
+                    g_state.diff_merge_complete()
+                } else {
+                    resume_slot.as_ref().is_some_and(|slot| {
+                        slot.lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|progress| progress.remaining.is_empty())
+                    })
+                }
+        };
+        if listing_finished {
+            info!("Interrupted after the listing had finished; outputs are complete");
+        }
         if let Some(ref cp_path) = checkpoint_path_opt {
             let final_metrics = g_state.metrics_snapshot();
-            let run_was_interrupted = interrupted.load(Ordering::SeqCst);
+            let run_was_interrupted = interrupted.load(Ordering::SeqCst) && !listing_finished;
             // Another job's checkpoint that shares this file name (same
             // bucket, region and prefix; another endpoint, filter or page
             // size) is neither removed nor overwritten.
@@ -1011,14 +1032,6 @@ pub(crate) fn run() {
                     .as_ref()
                     .and_then(|slot| slot.lock().unwrap().take());
                 match progress {
-                    // Interrupted after the last range was listed: nothing is
-                    // left to resume. A checkpoint with no ranges would make
-                    // the next --resume write an empty output and succeed.
-                    Some(progress) if progress.remaining.is_empty() => {
-                        let _ = std::fs::remove_file(cp_path);
-                        info!("Interrupted after the listing had finished; outputs are complete");
-                        listing_finished = true;
-                    }
                     Some(progress) => {
                         let listed_before = checkpoint_journal
                             .as_ref()

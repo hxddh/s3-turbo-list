@@ -931,7 +931,12 @@ async fn flat_list_run_to_complete(
                         err
                     );
                     if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+                        // Raced against Ctrl-C: the backoff reaches 30 s,
+                        // and nothing else wakes a segment sleeping in it.
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = quit_signalled(ctx) => {}
+                        }
                         if ctx.is_quit() {
                             return false;
                         }
@@ -971,6 +976,13 @@ async fn flat_list_run_to_complete(
 /// all — at which point waiting longer neither helps it nor hurts a run that
 /// is going to fail anyway, while unbounded growth would stall the reactor's
 /// view of a segment that is still nominally alive.
+/// Resolves once the run has been asked to stop (Ctrl-C / SIGTERM).
+async fn quit_signalled(ctx: &S3TaskContext) {
+    while !ctx.is_quit() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn retry_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
     if attempt == 0 || initial_backoff_secs == 0 {
         return Duration::ZERO;
@@ -1188,7 +1200,11 @@ async fn flat_list(
                         // sends start-after=<prefix>; the keys under it sort
                         // after it and roll up into the same prefix, so the
                         // server returns it again. It was emitted already.
-                        .filter(|cp| cp.as_str() > start_after)
+                        // Only that one prefix: a --start-after inside a
+                        // folder (a/b/c) sorts after the folder's prefix
+                        // (a/), which the server rightly returns and which
+                        // was never emitted.
+                        .filter(|cp| cp.as_str() != start_after)
                         .filter(|cp| {
                             !is_ended && until.as_deref().is_none_or(|end| cp.as_str() <= end)
                         })
@@ -1526,6 +1542,8 @@ fn handle_sdk_error(
                 let err_str = conn_err.to_string();
                 if err_str.contains("region must be set") {
                     ERROR_S3_MISSING_REGION
+                } else if crate::error::is_missing_credentials(conn_err) {
+                    ERROR_S3_MISSING_CREDENTIALS
                 } else {
                     ctx.g_state.inc_s3_client_generic_error();
                     ERROR_S3_CLIENT_GENERIC
@@ -1536,27 +1554,21 @@ fn handle_sdk_error(
             };
 
             let retryable = is_retryable(errno);
+            let (code, message) = match errno {
+                ERROR_S3_MISSING_CREDENTIALS => (
+                    "MissingCredentials",
+                    MISSING_CREDENTIALS_MESSAGE.to_string(),
+                ),
+                _ if is_timeout => ("ConnectionTimeout", format!("{:?}", dispatch_err)),
+                _ => ("DispatchFailure", format!("{:?}", dispatch_err)),
+            };
 
             write_trace(
                 ctx,
-                traced.failure(
-                    ctx,
-                    0,
-                    Some(if is_timeout {
-                        "ConnectionTimeout".into()
-                    } else {
-                        "DispatchFailure".into()
-                    }),
-                    Some(format!("{:?}", dispatch_err)),
-                    retryable,
-                ),
+                traced.failure(ctx, 0, Some(code.into()), Some(message.clone()), retryable),
             );
 
-            Err(FlatRuntimeError::new(
-                errno,
-                format!("{:?}", dispatch_err),
-                next_start.into(),
-            ))
+            Err(FlatRuntimeError::new(errno, message, next_start.into()))
         }
         other => {
             error!("Unhandled SDK error: {:?}", other);
@@ -1955,6 +1967,7 @@ pub async fn diff_list_side_task(
     let mut set = tokio::task::JoinSet::new();
 
     let mut next_pair = hints.next();
+    let mut aborted = false;
     loop {
         while set.len() < concurrency {
             // After Ctrl-C (possibly during startup discovery) start nothing
@@ -1992,6 +2005,14 @@ pub async fn diff_list_side_task(
         // back by the lookahead window, for the merge to move on.
         let joined = tokio::select! {
             joined = set.join_next(), if !set.is_empty() => joined,
+            // Ctrl-C: stop the in-flight segments now (list mode's reactor
+            // does the same); a request or a retry backoff would otherwise
+            // hold the exit for up to its timeout. The merge aborts.
+            _ = quit_signalled(ctx), if !set.is_empty() && !aborted => {
+                set.abort_all();
+                aborted = true;
+                continue;
+            }
             changed = async {
                 match merge_head.as_mut() {
                     Some(head) => head.changed().await,

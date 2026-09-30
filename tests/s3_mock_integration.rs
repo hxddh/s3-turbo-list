@@ -5638,3 +5638,385 @@ fn local_mock_compat_probe_agent_reports_deprecations_in_its_json() {
         report
     );
 }
+
+#[test]
+fn local_mock_delimiter_start_after_inside_a_folder_keeps_the_folder_row() {
+    // --start-after a/b/c: a/b/d and a/z sort after it and roll up into a/,
+    // which the endpoint returns and the run must emit (0.38 dropped every
+    // CommonPrefix sorting before the start key).
+    let cases: [(&[&str], &[&str], &[&str]); 2] = [
+        (
+            &["a/b/1", "a/b/c", "a/b/d", "a/z", "b.txt"],
+            &[],
+            &["a/", "b.txt"],
+        ),
+        (
+            &["a/b/1", "a/b/c", "a/b/d", "a/z"],
+            &["--prefix", "a/"],
+            &["a/b/", "a/z"],
+        ),
+    ];
+    for (keys, extra, expected) in cases {
+        let keys: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
+        let server = MockS3Server::start(move |request, _| {
+            MockResponse::ok_xml(emulated_list(&keys, &request.query))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        write_fast_config(&config);
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+            "--output-format".into(),
+            "tsv".into(),
+            "--delimiter".into(),
+            "/".into(),
+            "--start-after".into(),
+            "a/b/c".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let (code, stdout, stderr) = run_cli(&args, dir.path());
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        let rows: Vec<&str> = stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').next().unwrap())
+            .collect();
+        assert_eq!(rows, expected, "{}", stdout);
+    }
+}
+
+// ── Setup errors that are not the endpoint's ─────────────────
+
+/// Run with no credentials anywhere the SDK looks: no key variables, no
+/// profile, an empty HOME (no shared config files), no instance metadata.
+fn run_cli_without_credentials(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS.iter().chain(&[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ]) {
+        command.env_remove(var);
+    }
+    let output = command
+        .current_dir(cwd)
+        .env("HOME", cwd)
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(args)
+        .output()
+        .expect("run s3-turbo-list");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn local_mock_missing_credentials_is_a_setup_error_without_retries() {
+    // The SDK reports no credentials as a dispatch failure, which used to be
+    // retried as a network error for minutes and then exit 4.
+    let server = MockS3Server::start(|request, _| {
+        MockResponse::ok_xml(emulated_list(&["k".to_string()], &request.query))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[s3]\nmax_attempts = 3\ninitial_backoff_secs = 1\nconnect_timeout_secs = 2\noperation_timeout_secs = 2\n",
+    )
+    .unwrap();
+    let base = |cmd: &str| -> Vec<String> {
+        vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            cmd.into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+        ]
+    };
+    let started = std::time::Instant::now();
+    let mut list = base("list");
+    list.extend(["--output-format".into(), "summary".into()]);
+    let (code, stdout, stderr) = run_cli_without_credentials(&list, dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("no AWS credentials found"), "{}", stderr);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "retried for {:?}",
+        started.elapsed()
+    );
+
+    let (code, stdout, stderr) = run_cli_without_credentials(&base("compat-probe"), dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("credentials_missing"), "{}", stdout);
+    // Nothing left the process.
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+#[test]
+fn local_mock_compat_probe_without_a_region_is_a_setup_error() {
+    let server = MockS3Server::start(|_, _| MockResponse::error(500, "InternalError", "unused"));
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<String> = vec![
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "compat-probe".into(),
+        "--bucket".into(),
+        "b".into(),
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // It was exit 5, "output error".
+    assert_eq!(output.status.code(), Some(3), "{}", stderr);
+    assert!(stderr.contains("no region"), "{}", stderr);
+}
+
+#[test]
+fn local_mock_trace_and_probe_report_redact_endpoint_userinfo() {
+    let server = MockS3Server::start(|request, _| match request.method.as_str() {
+        "HEAD" => MockResponse::empty_ok(),
+        _ => MockResponse::ok_xml(emulated_list(&["k".to_string()], &request.query)),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let endpoint = server
+        .endpoint()
+        .replacen("http://", "http://user:secretpw@", 1);
+    let trace = dir.path().join("trace.jsonl");
+    let report = dir.path().join("report.json");
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        endpoint,
+        "--addressing-style".into(),
+        "path".into(),
+        "compat-probe".into(),
+        "--bucket".into(),
+        "b".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
+        "--output".into(),
+        report.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    for path in [&trace, &report] {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.is_empty());
+        assert!(!text.contains("secretpw"), "{}: {}", path.display(), text);
+    }
+}
+
+// ── Interrupts at the edges ──────────────────────────────────
+
+/// SIGTERM after the listing finished while stdout is still held: the rows
+/// are all written, so the run reports success in every mode (it exited 7
+/// "partial" with --start-after or another job's checkpoint in place).
+#[cfg(unix)]
+#[test]
+fn local_mock_interrupt_after_the_listing_finished_reports_success() {
+    let keys: Vec<String> = (0..5000)
+        .map(|i| format!("key-{:06}-padding-padding-padding", i))
+        .collect();
+    let foreign_checkpoint = r#"bucket = "b"
+prefix = ""
+last_updated = "x"
+listed_ranges = 1
+[identity]
+bucket = "b"
+region = "us-east-1"
+prefix = ""
+delimiter = ""
+max_keys = 5
+provider = "aws"
+addressing_style = "path"
+mode = "list"
+[[remaining]]
+start_after = "key-000100"
+"#;
+    for (label, extra, foreign) in [
+        ("plain", vec![], false),
+        ("start-after", vec!["--start-after", "k"], false),
+        ("another job's checkpoint", vec![], true),
+    ] {
+        let served = keys.clone();
+        let server = MockS3Server::start(move |request, _| {
+            MockResponse::ok_xml(emulated_list(&served, &request.query))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        write_fast_config(&config);
+        if foreign {
+            std::fs::write(
+                dir.path().join("us-east-1_b_checkpoint.toml"),
+                foreign_checkpoint,
+            )
+            .unwrap();
+        }
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+            "--output-format".into(),
+            "tsv".into(),
+            "--no-auto-hints".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+        for var in PROXY_ENV_VARS {
+            command.env_remove(var);
+        }
+        let child = command
+            .current_dir(dir.path())
+            .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+            .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Five 1000-key pages list everything; stdout is not read yet, so
+        // the writer is still busy when the signal arrives.
+        let waited = std::time::Instant::now();
+        while server.requests().len() < 5 && waited.elapsed() < Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(500));
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let rows = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(rows, keys.len(), "{}: {}", label, stderr);
+        assert_eq!(output.status.code(), Some(0), "{}: {}", label, stderr);
+    }
+}
+
+/// Ctrl-C while diff segments sit in a retry backoff: the exit waited out
+/// the backoff (up to 30 s); list mode already stopped at once.
+#[cfg(unix)]
+#[test]
+fn local_mock_diff_ctrl_c_during_retry_backoff_exits_promptly() {
+    let keys: Vec<String> = (0..50).map(|i| format!("k{:03}", i)).collect();
+    let server = MockS3Server::start(move |request, _| {
+        if request.query.contains_key("delimiter")
+            || request.query.get("max-keys").map(String::as_str) == Some("1")
+        {
+            return MockResponse::ok_xml(emulated_list(&keys, &request.query));
+        }
+        MockResponse::error(500, "InternalError", "flaky")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[s3]\nmax_attempts = 10\ninitial_backoff_secs = 1\noperation_timeout_secs = 2\nconnect_timeout_secs = 2\n",
+    )
+    .unwrap();
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--output-dir".into(),
+        "out".into(),
+    ];
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
+    let mut child = command
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // A few failed attempts in: the backoff has grown past several seconds.
+    thread::sleep(Duration::from_secs(8));
+    let signalled = std::time::Instant::now();
+    let _ = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if signalled.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(code, Some(7));
+    assert!(
+        signalled.elapsed() < Duration::from_secs(2),
+        "exit took {:?} after Ctrl-C",
+        signalled.elapsed()
+    );
+}

@@ -105,7 +105,8 @@ impl S3CompatEvent {
             operation: operation.to_string(),
             provider: None,
             profile: None,
-            endpoint_url: endpoint_url.to_string(),
+            // Trace files get shared for diagnosis: never carry credentials.
+            endpoint_url: crate::agent::redact_url_userinfo(endpoint_url),
             region: None,
             addressing_style: "auto".to_string(),
             bucket: bucket.to_string(),
