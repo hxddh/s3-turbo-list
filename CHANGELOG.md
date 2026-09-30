@@ -5,6 +5,38 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Performance
+- **Startup discovery keeps at most its boundary target.** A probed level
+  adds every CommonPrefix it finds, so a wide tree (20 prefixes of 1,000
+  subdirectories) produced 20,000 boundaries — 20,000 segments, each costing
+  at least one page request. The discovered set is now thinned to the target
+  (two per worker), evenly spaced; any subset of real boundaries is still a
+  valid partition. Local 200k-key mock at 20 ms per request: list
+  6.61 s → 0.33 s, diff 30.1 s → 0.72 s.
+- **Flat runs share the boundary budget by size.** When discovery finds too
+  few boundaries, the flat directories it probed were each given an equal
+  share of the remaining budget, so a directory holding 90% of the keys got
+  one twentieth of the cuts. Each run is now sized with one concurrent round
+  of seven `max-keys=1` probes extrapolated from the page discovery already
+  fetched, and the budget follows the sizes (never more cuts than a run has
+  pages; boundaries stay real keys, strictly increasing, inside their run).
+  Files listed next to subdirectories (`obj-…` beside `logs/`) are now
+  bisected the same way, under the text they share, instead of listing as
+  one serial segment. 90% of 200k keys in one of 20 directories: list
+  1.55 s → 0.58 s, diff 3.39 s → 0.87 s; 90% of the keys as root files
+  beside ten folders: list 2.02 s → 0.63 s, diff 4.63 s → 0.98 s.
+- **Startup probes parse pages with the fast Contents parser and reuse what
+  they fetched.** Discovery's delimiter pages go through the same parser as
+  listing pages (the SDK deserializer cost ~100 ms of CPU for a level of
+  twenty 1,000-key pages before the first object was listed); flat bisection
+  anchors on the first key of discovery's page instead of probing for it.
+- **Runtime split probes reuse their pages.** When no delimiter rung has a
+  CommonPrefix inside the segment's range but the rung pages together hold
+  every remaining key (the tail of a leaf directory), the split is the median
+  of those keys, with no further flat-cut probes.
+
 ## [0.38.0] - 2026-09-29
 
 This release removes the spellings 0.37 deprecated, puts a warning on the

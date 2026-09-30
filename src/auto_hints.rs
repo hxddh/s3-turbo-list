@@ -46,16 +46,32 @@ pub struct StartupDiscovery {
     /// the same keys and is *not* single-page — the caller compares this
     /// against its configured page size before taking that shortcut.
     pub root_page_keys: usize,
-    /// Probed prefixes below the root whose page was truncated and held no
-    /// CommonPrefixes: flat directories with more than one page of keys.
-    /// Their boundaries alone cannot split them, so the caller bisects them
-    /// when discovery found fewer boundaries than it wants (`data/part-…`
-    /// under a single top-level `data/`).
-    pub flat_leaves: Vec<String>,
-    /// First key of each probed prefix whose page held no CommonPrefixes
-    /// (the root of a flat namespace, and every flat leaf): flat bisection
-    /// anchors on it instead of spending a `max-keys=1` round-trip to find it.
-    pub first_keys: std::collections::HashMap<String, String>,
+    /// Flat runs of keys more than a page long that CommonPrefix boundaries
+    /// alone cannot split: flat directories below the root (`data/part-…`
+    /// under a single top-level `data/`), and files listed next to
+    /// subdirectories (`obj-…` beside `logs/`).  The caller bisects them
+    /// when discovery found fewer boundaries than it wants.
+    pub flat_runs: Vec<FlatRun>,
+    /// First key of the root page when it held no CommonPrefixes (a flat
+    /// namespace): flat bisection anchors on it instead of spending a
+    /// `max-keys=1` round-trip to find it.
+    pub root_first_key: Option<String>,
+}
+
+/// One page of a flat run of keys, as startup discovery saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatRun {
+    /// Prefix the run is bisected under: the flat directory itself, or, for
+    /// files listed next to CommonPrefixes, the text those files share
+    /// before their number (`obj-`), so bisection stays among the files
+    /// instead of cutting across the subdirectories as well.
+    pub prefix: String,
+    /// First `<Contents>` key of the page.
+    pub first_key: String,
+    /// Last `<Contents>` key of the page.
+    pub last_key: String,
+    /// `<Contents>` the page held.
+    pub keys: usize,
 }
 
 impl StartupDiscovery {
@@ -88,11 +104,19 @@ pub async fn discover_startup_boundaries(
         let client = client.clone();
         let bucket = bucket.to_string();
         async move {
+            // A flat directory's page is 1,000 `<Contents>`: the fast parser
+            // takes them, as it does for listing pages (through the SDK's
+            // deserializer, a level of such pages cost ~100 ms of CPU before
+            // the first object was listed).  Only the first and last key and
+            // the count are kept.
+            let slot = crate::list_page::ParsedPageSlot::default();
             let send = client
                 .list_objects_v2()
                 .bucket(&bucket)
                 .prefix(&p)
                 .delimiter("/")
+                .customize()
+                .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
                 .send();
             // Startup discovery runs before the first object is listed; a
             // stalled endpoint must not hang the run there. Same watchdog the
@@ -106,6 +130,21 @@ pub async fn discover_startup_boundaries(
                 Ok(result) => result.map_err(|e| crate::error::concise_sdk_error(&e))?,
                 Err(_) => return Err("probe timed out".to_string()),
             };
+            // The parser's rows, or the SDK's when it left the page to them.
+            let (keys, first_key, last_key) = match slot.take() {
+                Some(rows) => (
+                    rows.len(),
+                    rows.first().map(|(k, _)| k.as_str().to_string()),
+                    rows.last().map(|(k, _)| k.as_str().to_string()),
+                ),
+                None => {
+                    let key = |o: Option<&aws_sdk_s3::types::Object>| {
+                        o.and_then(|o| o.key()).map(str::to_string)
+                    };
+                    let contents = response.contents();
+                    (contents.len(), key(contents.first()), key(contents.last()))
+                }
+            };
             Ok(ProbePage {
                 prefixes: response
                     .common_prefixes()
@@ -114,12 +153,9 @@ pub async fn discover_startup_boundaries(
                     .map(str::to_string)
                     .collect(),
                 truncated: response.is_truncated().unwrap_or(false),
-                keys: response.contents().len(),
-                first_key: response
-                    .contents()
-                    .first()
-                    .and_then(|o| o.key())
-                    .map(str::to_string),
+                keys,
+                first_key,
+                last_key,
             })
         }
     })
@@ -134,6 +170,41 @@ pub struct ProbePage {
     pub keys: usize,
     /// First `<Contents>` key of the page, if any.
     pub first_key: Option<String>,
+    /// Last `<Contents>` key of the page, if any.
+    pub last_key: Option<String>,
+}
+
+/// The flat run a probed page shows, if it is worth bisecting: the page was
+/// truncated (more keys follow) and holds at least two keys to size the run
+/// by.  A page without CommonPrefixes below the root is a flat directory.  A
+/// page with them lists its own files among the subdirectories; those files
+/// form a run only when they share text past the parent prefix (`obj-` in
+/// `obj-000000123.snappy.parquet`), which is then what bisection stays under.
+/// The root page of a flat namespace is not a run here: the caller bisects
+/// the whole listing then.
+fn flat_run(parent: &str, depth: usize, page: &ProbePage) -> Option<FlatRun> {
+    if !page.truncated || page.keys < 2 {
+        return None;
+    }
+    let (first_key, last_key) = (page.first_key.clone()?, page.last_key.clone()?);
+    let prefix = if page.prefixes.is_empty() {
+        if depth == 0 {
+            return None;
+        }
+        parent.to_string()
+    } else {
+        let scope = crate::flat_cut::RunScale::new(&first_key, &last_key, parent)?.scope;
+        if scope.len() <= parent.len() {
+            return None;
+        }
+        scope
+    };
+    Some(FlatRun {
+        prefix,
+        first_key,
+        last_key,
+        keys: page.keys,
+    })
 }
 
 /// BFS over CommonPrefixes via an injected probe (one request per call).
@@ -154,8 +225,8 @@ where
     // must not be read as "this bucket is tiny".
     let mut root_page_truncated = true;
     let mut root_page_keys = 0usize;
-    let mut flat_leaves: Vec<String> = Vec::new();
-    let mut first_keys = std::collections::HashMap::new();
+    let mut flat_runs: Vec<FlatRun> = Vec::new();
+    let mut root_first_key: Option<String> = None;
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -172,16 +243,14 @@ where
                     if depth == 0 {
                         root_page_truncated = page.truncated;
                         root_page_keys = page.keys;
-                    } else if page.truncated && page.prefixes.is_empty() {
-                        flat_leaves.push(parent.clone());
-                    }
-                    // A page without CommonPrefixes starts with the prefix's
-                    // first key (a CommonPrefix could sort before it).
-                    if page.prefixes.is_empty() {
-                        if let Some(first) = page.first_key {
-                            first_keys.insert(parent.clone(), first);
+                        // Without CommonPrefixes, the page starts with the
+                        // listing's first key (a CommonPrefix could sort
+                        // before it).
+                        if page.prefixes.is_empty() {
+                            root_first_key = page.first_key.clone();
                         }
                     }
+                    flat_runs.extend(flat_run(parent, depth, &page));
                     for child in &page.prefixes {
                         boundaries.insert(child.clone());
                     }
@@ -203,8 +272,8 @@ where
         boundaries: cap_boundaries(boundaries.into_iter().collect(), target_boundaries),
         root_page_truncated,
         root_page_keys,
-        flat_leaves,
-        first_keys,
+        flat_runs,
+        root_first_key,
     }
 }
 
@@ -239,15 +308,23 @@ fn cap_boundaries(boundaries: Vec<String>, target: usize) -> Vec<String> {
 /// usually a single probe, but an estimate of a range's high key fans out
 /// several per round.
 const FLAT_BISECT_MAX_IN_FLIGHT: usize = 64;
+/// Probes in flight at once while sizing flat runs: the whole sizing is one
+/// round of seven probes per run, and the runs number fewer than the flat
+/// target (at most 64), so this lets twenty runs size in one round-trip
+/// while still bounding the burst.
+const FLAT_SIZING_MAX_IN_FLIGHT: usize = 256;
 /// Cuts one range takes per wave (one probe each, concurrently).
 const FLAT_CUTS_PER_RANGE: usize = 7;
 
 /// Discover key-space boundaries for a flat namespace by recursively
 /// bisecting the key range. `probe(start_after)` returns the first key
 /// strictly after `start_after` within the listing prefix (or the first key
-/// of all when `None`). `first_key`, when the caller already saw the range's first
-/// key (startup discovery's page of the same prefix), saves that probe. Returns up to `target_boundaries` sorted boundaries;
-/// empty means an empty range or no cuttable structure (single segment).
+/// of all when `None`).  `first_key`, when the caller already saw the
+/// range's first key (startup discovery's page of the same prefix), saves
+/// that probe; it only anchors the first range, so any boundary found is
+/// still a real key after it.  Returns up to `target_boundaries` sorted
+/// boundaries; empty means an empty range or no cuttable structure (single
+/// segment).
 ///
 /// Each cut lands near the middle of its range's keys (see `flat_cut`): the
 /// open-ended root range first estimates the namespace's high key, which
@@ -358,6 +435,149 @@ where
     boundaries.into_iter().take(target_boundaries).collect()
 }
 
+/// Bisect the flat runs startup discovery found, sharing `budget` boundaries
+/// between them by their estimated size: a run holding 90% of the keys gets
+/// about 90% of the boundaries, not `1/runs` of them.  `probe(prefix,
+/// start_after)` is `discover_flat_boundaries`' probe under `prefix`.
+/// Sizing costs one concurrent probe round (see
+/// `flat_cut::estimate_run_keys`), skipped for a single run.  Every boundary
+/// is a real key inside its run, so the result — sorted, distinct, at most
+/// `budget` long — merges with the structural boundaries as is.
+pub async fn partition_flat_runs<F, Fut>(runs: &[FlatRun], budget: usize, probe: F) -> Vec<String>
+where
+    F: Fn(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    if budget == 0 || runs.is_empty() {
+        return Vec::new();
+    }
+    let shares = if runs.len() == 1 {
+        vec![budget]
+    } else {
+        let permits = tokio::sync::Semaphore::new(FLAT_SIZING_MAX_IN_FLIGHT);
+        let sizes = futures::future::join_all(runs.iter().map(|run| {
+            let (probe, permits) = (&probe, &permits);
+            let scoped = move |start_after: String| {
+                let request = probe(run.prefix.clone(), Some(start_after));
+                async move {
+                    let _permit = permits.acquire().await.ok();
+                    request.await
+                }
+            };
+            async move {
+                crate::flat_cut::estimate_run_keys(
+                    &run.first_key,
+                    &run.last_key,
+                    run.keys,
+                    &run.prefix,
+                    &scoped,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    log::debug!("Sizing flat run '{}' failed: {}", run.prefix, e);
+                    None
+                })
+            }
+        }))
+        .await;
+        log::debug!(
+            "Flat run size estimates: {}",
+            runs.iter()
+                .zip(&sizes)
+                .map(|(run, size)| format!("{}={:?}", run.prefix, size))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let pages: Vec<usize> = runs.iter().map(|run| run.keys).collect();
+        share_budget(&sizes, &pages, budget)
+    };
+    let found =
+        futures::future::join_all(runs.iter().zip(shares).filter(|(_, share)| *share > 0).map(
+            |(run, share)| {
+                let probe = &probe;
+                discover_flat_boundaries(
+                    &run.prefix,
+                    share,
+                    Some(run.first_key.clone()),
+                    move |start_after| probe(run.prefix.clone(), start_after),
+                )
+            },
+        ))
+        .await;
+    let mut boundaries: Vec<String> = found.into_iter().flatten().collect();
+    boundaries.sort();
+    boundaries.dedup();
+    boundaries
+}
+
+/// Split `budget` cuts between runs in proportion to their estimated sizes
+/// (`None`: no estimate — the median of the others, or an even split when no
+/// run has one), by largest remainder.  A run is never given more cuts than
+/// it has pages (`page_keys` is the size of the page it was seen by): past
+/// that its segments would be single requests anyway, so those cuts go to the
+/// other runs, and when every run is capped the total stays below `budget`.
+fn share_budget(sizes: &[Option<u64>], page_keys: &[usize], budget: usize) -> Vec<usize> {
+    let n = sizes.len();
+    let mut known: Vec<u64> = sizes.iter().flatten().copied().collect();
+    known.sort_unstable();
+    let fallback = known.get(known.len() / 2).copied().unwrap_or(1);
+    let weight: Vec<u128> = sizes
+        .iter()
+        .map(|s| u128::from(s.unwrap_or(fallback).max(1)))
+        .collect();
+    let cap: Vec<usize> = sizes
+        .iter()
+        .zip(page_keys)
+        .map(|(size, &page)| match size {
+            Some(size) => usize::try_from(size.div_ceil(page.max(1) as u64))
+                .unwrap_or(usize::MAX)
+                .max(1),
+            None => budget,
+        })
+        .collect();
+    let mut share = vec![0usize; n];
+    let mut active: Vec<usize> = (0..n).collect();
+    let mut left = budget;
+    while !active.is_empty() && left > 0 {
+        let total: u128 = active.iter().map(|&i| weight[i]).sum();
+        let mut alloc: Vec<(usize, usize, u128)> = active
+            .iter()
+            .map(|&i| {
+                let scaled = left as u128 * weight[i];
+                (i, (scaled / total) as usize, scaled % total)
+            })
+            .collect();
+        let mut spare = left - alloc.iter().map(|a| a.1).sum::<usize>();
+        let mut by_remainder: Vec<usize> = (0..alloc.len()).collect();
+        by_remainder.sort_by(|&a, &b| alloc[b].2.cmp(&alloc[a].2));
+        for j in by_remainder {
+            if spare == 0 {
+                break;
+            }
+            alloc[j].1 += 1;
+            spare -= 1;
+        }
+        let over: Vec<usize> = alloc
+            .iter()
+            .filter(|(i, s, _)| *s > cap[*i])
+            .map(|a| a.0)
+            .collect();
+        if over.is_empty() {
+            for (i, s, _) in alloc {
+                share[i] = s;
+            }
+            break;
+        }
+        // Pin the runs past their cap and share what is left again.
+        for i in over {
+            share[i] = cap[i];
+            left -= cap[i];
+            active.retain(|&a| a != i);
+        }
+    }
+    share
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -425,12 +645,16 @@ estimate_mode = "structural"
     ) -> StartupDiscovery {
         discover_with_probe(prefix, target, |p| {
             let children = tree.get(&p).cloned().unwrap_or_default();
+            // A prefix without children is a directory of keys: a page of
+            // `part-00000` .. `part-00999`.
+            let leaf = children.is_empty();
             async move {
                 Ok(ProbePage {
                     prefixes: children,
                     truncated,
-                    keys: 0,
-                    first_key: None,
+                    keys: if leaf { 1000 } else { 0 },
+                    first_key: leaf.then(|| format!("{p}part-00000")),
+                    last_key: leaf.then(|| format!("{p}part-00999")),
                 })
             }
         })
@@ -449,11 +673,61 @@ estimate_mode = "structural"
         let tree = fake_tree(&[("", &["data/"])]);
         let discovery = run_discovery_full(tree, "", 16, true).await;
         assert_eq!(discovery.boundaries, vec!["data/"]);
-        assert_eq!(discovery.flat_leaves, vec!["data/"]);
+        assert_eq!(
+            discovery.flat_runs,
+            vec![FlatRun {
+                prefix: "data/".into(),
+                first_key: "data/part-00000".into(),
+                last_key: "data/part-00999".into(),
+                keys: 1000,
+            }]
+        );
         // An untruncated leaf page is small: nothing to bisect.
         let tree = fake_tree(&[("", &["data/"])]);
         let discovery = run_discovery_full(tree, "", 16, false).await;
-        assert!(discovery.flat_leaves.is_empty());
+        assert!(discovery.flat_runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_startup_discovery_reports_files_next_to_folders() {
+        // The root lists `a/`, `z/` and a page of `obj-…` files: those files
+        // are a run under `obj-`, not under the root (which would cut across
+        // the folders as well).
+        let page = |prefixes: Vec<String>, first: &str, last: &str| ProbePage {
+            prefixes,
+            truncated: true,
+            keys: 998,
+            first_key: Some(first.to_string()),
+            last_key: Some(last.to_string()),
+        };
+        let discovery = discover_with_probe("", 16, |p| {
+            let result = match p.as_str() {
+                "" => page(
+                    vec!["a/".into(), "z/".into()],
+                    "obj-000000000.snappy.parquet",
+                    "obj-000000997.snappy.parquet",
+                ),
+                // Folder pages mix files with no shared run text: `x.txt`
+                // and `y.txt` differ in their first character.
+                _ => page(
+                    vec![format!("{p}sub/")],
+                    &format!("{p}x.txt"),
+                    &format!("{p}y.txt"),
+                ),
+            };
+            async move { Ok(result) }
+        })
+        .await;
+        assert_eq!(
+            discovery.flat_runs,
+            vec![FlatRun {
+                prefix: "obj-".into(),
+                first_key: "obj-000000000.snappy.parquet".into(),
+                last_key: "obj-000000997.snappy.parquet".into(),
+                keys: 998,
+            }]
+        );
+        assert_eq!(discovery.root_first_key, None);
     }
 
     #[tokio::test]
@@ -682,24 +956,35 @@ estimate_mode = "structural"
 
     #[tokio::test]
     async fn test_startup_discovery_keeps_first_key_of_pages_without_prefixes() {
-        let discovery = discover_with_probe("", 16, |p| async move {
-            Ok(ProbePage {
-                prefixes: if p.is_empty() {
-                    vec!["data/".to_string()]
-                } else {
-                    Vec::new()
-                },
-                truncated: true,
-                keys: 1000,
-                first_key: Some(format!("{p}first")),
-            })
-        })
-        .await;
-        assert_eq!(discovery.flat_leaves, vec!["data/"]);
+        let probe = |root_prefixes: Vec<String>| {
+            move |p: String| {
+                let root_prefixes = root_prefixes.clone();
+                async move {
+                    Ok(ProbePage {
+                        prefixes: if p.is_empty() {
+                            root_prefixes
+                        } else {
+                            Vec::new()
+                        },
+                        truncated: true,
+                        keys: 1000,
+                        first_key: Some(format!("{p}first")),
+                        last_key: Some(format!("{p}last")),
+                    })
+                }
+            }
+        };
+        let discovery = discover_with_probe("", 16, probe(vec!["data/".to_string()])).await;
+        assert_eq!(discovery.flat_runs.len(), 1);
+        assert_eq!(discovery.flat_runs[0].prefix, "data/");
+        assert_eq!(discovery.flat_runs[0].first_key, "data/first");
         // The root page had a CommonPrefix, which could sort before its first
-        // key: only the flat leaf's first key is kept.
-        assert_eq!(discovery.first_keys.len(), 1);
-        assert_eq!(discovery.first_keys["data/"], "data/first");
+        // key: the root's first key is not kept.
+        assert_eq!(discovery.root_first_key, None);
+        // A flat namespace's root page starts with the listing's first key.
+        let discovery = discover_with_probe("", 16, probe(Vec::new())).await;
+        assert_eq!(discovery.root_first_key.as_deref(), Some("first"));
+        assert!(discovery.flat_runs.is_empty());
     }
 
     #[tokio::test]
@@ -736,6 +1021,125 @@ estimate_mode = "structural"
         assert_eq!(reused.len(), 16);
     }
 
+    #[test]
+    fn test_share_budget_follows_run_sizes() {
+        let pages = [1000usize; 4];
+        // One run holds almost everything: it takes almost every cut, and the
+        // two-page runs are capped at two cuts' worth of their pages.
+        let share = share_budget(
+            &[Some(2000), Some(256_000), Some(2000), Some(2000)],
+            &pages,
+            43,
+        );
+        assert_eq!(share.iter().sum::<usize>(), 43);
+        assert!(share[1] >= 37, "{share:?}");
+        assert!(share.iter().enumerate().all(|(i, &s)| i == 1 || s <= 2));
+        // No estimates: an even split, the first runs taking the remainder.
+        assert_eq!(share_budget(&[None; 4], &pages, 10), vec![3, 3, 2, 2]);
+        // A run without an estimate counts as the median of the others.
+        let share = share_budget(&[Some(64_000), None, Some(64_000), Some(8_000)], &pages, 20);
+        assert_eq!(share.iter().sum::<usize>(), 20);
+        assert!(share[1] >= 6 && share[3] <= 1, "{share:?}");
+        // Every run capped at its pages: the total stays below the budget.
+        assert_eq!(
+            share_budget(&[Some(2000), Some(3000)], &pages[..2], 64),
+            vec![2, 3]
+        );
+        assert_eq!(share_budget(&[Some(8000)], &pages[..1], 0), vec![0]);
+    }
+
+    /// `partition_flat_runs` over a sorted key set: `probe(prefix, sa)` is the
+    /// first key under `prefix` after `sa`, as S3 `max-keys=1` returns it.
+    async fn run_partition(keys: &[String], runs: &[FlatRun], budget: usize) -> Vec<String> {
+        partition_flat_runs(runs, budget, |prefix, start_after| {
+            let from = start_after.map_or(0, |sa| keys.partition_point(|k| *k <= sa));
+            let next = keys[from..]
+                .iter()
+                .take_while(|k| k.as_str() >= prefix.as_str())
+                .find(|k| k.starts_with(&prefix))
+                .cloned();
+            std::future::ready(Ok(next))
+        })
+        .await
+    }
+
+    fn page_of(keys: &[String], prefix: &str) -> FlatRun {
+        let from = keys.partition_point(|k| k.as_str() < prefix);
+        let page: Vec<&String> = keys[from..]
+            .iter()
+            .take_while(|k| k.starts_with(prefix))
+            .take(1000)
+            .collect();
+        FlatRun {
+            prefix: prefix.to_string(),
+            first_key: page[0].clone(),
+            last_key: page[page.len() - 1].clone(),
+            keys: page.len(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_flat_runs_puts_the_budget_where_the_keys_are() {
+        // Twenty flat leaves, 90% of the keys in leaf 07.
+        let mut keys: Vec<String> = (0..180_000)
+            .map(|i| format!("data/leaf=07/part-{i:09}-c000.snappy.parquet"))
+            .collect();
+        for leaf in (0..20).filter(|&l| l != 7) {
+            keys.extend(
+                (0..1_050).map(|i| format!("data/leaf={leaf:02}/part-{i:09}-c000.snappy.parquet")),
+            );
+        }
+        keys.sort();
+        let runs: Vec<FlatRun> = (0..20)
+            .map(|l| page_of(&keys, &format!("data/leaf={l:02}/")))
+            .collect();
+        let budget = 43;
+        let boundaries = run_partition(&keys, &runs, budget).await;
+        assert!(boundaries.len() <= budget);
+        assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+        assert!(boundaries.iter().all(|b| keys.binary_search(b).is_ok()));
+        let big: Vec<&String> = boundaries
+            .iter()
+            .filter(|b| b.starts_with("data/leaf=07/"))
+            .collect();
+        assert!(big.len() >= 35, "big leaf got {} of {budget}", big.len());
+        // Its segments stay near the ideal size (180k / (cuts + 1)).
+        let lo = keys.partition_point(|k| k.as_str() < "data/leaf=07/");
+        let mut edges = vec![lo];
+        edges.extend(big.iter().map(|b| keys.partition_point(|k| k <= *b)));
+        edges.push(lo + 180_000);
+        let widest = edges.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(
+            widest <= 2 * 180_000 / (big.len() + 1),
+            "widest segment {widest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_flat_runs_splits_files_next_to_folders() {
+        // 90% of the keys are files at the root, next to ten small folders:
+        // the run under `obj-` is cut inside the files only.
+        let mut keys: Vec<String> = (0..90_000)
+            .map(|i| format!("obj-{i:09}.snappy.parquet"))
+            .collect();
+        for d in ["a0", "a1", "a2", "z0", "z1"] {
+            keys.extend((0..2_000).map(|i| format!("{d}/part-{i:06}")));
+        }
+        keys.sort();
+        let run = FlatRun {
+            prefix: "obj-".into(),
+            ..page_of(&keys, "obj-")
+        };
+        let boundaries = run_partition(&keys, &[run], 16).await;
+        assert_eq!(boundaries.len(), 16);
+        assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            boundaries
+                .iter()
+                .all(|b| b.starts_with("obj-") && keys.binary_search(b).is_ok())
+        );
+    }
+
     #[tokio::test]
     async fn test_startup_discovery_respects_listing_prefix() {
         let tree = fake_tree(&[("logs/", &["logs/2025/", "logs/2026/"])]);
@@ -752,6 +1156,7 @@ estimate_mode = "structural"
                     truncated: true,
                     keys: 0,
                     first_key: None,
+                    last_key: None,
                 })
             } else {
                 Err("probe failed".to_string())
@@ -776,8 +1181,8 @@ estimate_mode = "structural"
             boundaries: Vec::new(),
             root_page_truncated: false,
             root_page_keys: 500,
-            flat_leaves: Vec::new(),
-            first_keys: Default::default(),
+            flat_runs: Vec::new(),
+            root_first_key: None,
         };
         // The probe returned the whole listing in one page, and the run's page
         // size can too.
@@ -796,8 +1201,8 @@ estimate_mode = "structural"
             boundaries: Vec::new(),
             root_page_truncated: true,
             root_page_keys: 1000,
-            flat_leaves: Vec::new(),
-            first_keys: Default::default(),
+            flat_runs: Vec::new(),
+            root_first_key: None,
         };
         assert!(!truncated.is_single_page_listing(None));
         // Structure found: partitioned by boundaries, not by this shortcut.
@@ -805,8 +1210,8 @@ estimate_mode = "structural"
             boundaries: vec!["a/".to_string()],
             root_page_truncated: false,
             root_page_keys: 3,
-            flat_leaves: Vec::new(),
-            first_keys: Default::default(),
+            flat_runs: Vec::new(),
+            root_first_key: None,
         };
         assert!(!structured.is_single_page_listing(None));
     }

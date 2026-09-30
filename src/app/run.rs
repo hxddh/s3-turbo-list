@@ -1346,7 +1346,7 @@ async fn startup_boundaries(
                 Vec::new()
             } else {
                 info!("Startup discovery found no prefix structure — bisecting flat key space");
-                let first = discovery.first_keys.get(prefix).cloned();
+                let first = discovery.root_first_key;
                 discover_flat_boundaries_via_client(client, bucket, prefix, flat_target, first, timeout_secs)
                     .await
             }
@@ -1356,12 +1356,13 @@ async fn startup_boundaries(
 }
 
 /// Structural discovery found CommonPrefixes, but fewer boundaries than one
-/// per worker, and some of the prefixes it probed are flat directories with
-/// more than one page of keys (`data/part-…` under a single `data/`): those
-/// segments would list serially (diff) or wait for runtime splitting (list).
-/// Bisect each such leaf with the flat partitioner, sharing the remaining
-/// budget, and merge its boundaries — all real keys inside the leaf — into
-/// the structural set.
+/// per worker, and some of what it probed is a flat run of keys more than a
+/// page long — a flat directory (`data/part-…` under a single `data/`), or
+/// files next to subdirectories (`obj-…` beside `logs/`): those segments
+/// would list serially (diff) or wait for runtime splitting (list).  Bisect
+/// the runs with the flat partitioner, sharing the remaining budget by their
+/// estimated sizes, and merge their boundaries — all real keys inside each
+/// run — into the structural set.
 pub(crate) async fn refine_flat_leaves(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1370,41 +1371,22 @@ pub(crate) async fn refine_flat_leaves(
     timeout_secs: u64,
 ) -> Vec<String> {
     let mut boundaries = discovery.boundaries;
-    let leaves = discovery.flat_leaves;
-    let first_keys = discovery.first_keys;
-    if leaves.is_empty() || boundaries.len() >= flat_target {
+    let runs = discovery.flat_runs;
+    if runs.is_empty() || boundaries.len() >= flat_target {
         return boundaries;
     }
-    // Spread the remaining budget over the leaves; the first `extra` leaves
-    // take one more cut each, so the total reaches the target (and with more
-    // leaves than budget, the first ones still get a cut).
-    let budget = flat_target - boundaries.len();
-    let (per_leaf, extra) = (budget / leaves.len(), budget % leaves.len());
     info!(
-        "Startup discovery found {} boundaries and {} flat prefix(es) — bisecting them",
+        "Startup discovery found {} boundaries and {} flat run(s) — bisecting them",
         boundaries.len(),
-        leaves.len()
+        runs.len()
     );
-    let found = futures::future::join_all(
-        leaves
-            .iter()
-            .enumerate()
-            .map(|(i, leaf)| (leaf, per_leaf + usize::from(i < extra)))
-            .filter(|(_, target)| *target > 0)
-            .map(|(leaf, target)| {
-                let first = first_keys.get(leaf.as_str()).cloned();
-                discover_flat_boundaries_via_client(
-                    client,
-                    bucket,
-                    leaf,
-                    target,
-                    first,
-                    timeout_secs,
-                )
-            }),
-    )
-    .await;
-    boundaries.extend(found.into_iter().flatten());
+    let budget = flat_target - boundaries.len();
+    boundaries.extend(
+        auto_hints::partition_flat_runs(&runs, budget, |prefix, start_after| {
+            single_key_probe(client, bucket, prefix, start_after, timeout_secs)
+        })
+        .await,
+    );
     boundaries.sort();
     boundaries.dedup();
     boundaries
@@ -1421,41 +1403,52 @@ pub(crate) async fn discover_flat_boundaries_via_client(
     first_key: Option<String>,
     timeout_secs: u64,
 ) -> Vec<String> {
-    let probe_bucket = bucket.to_string();
-    let probe_prefix = prefix.to_string();
     auto_hints::discover_flat_boundaries(prefix, target, first_key, |start_after| {
-        let client = client.clone();
-        let bucket = probe_bucket.clone();
-        let prefix = probe_prefix.clone();
-        async move {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(&bucket)
-                .prefix(&prefix)
-                .max_keys(1);
-            if let Some(sa) = start_after {
-                req = req.start_after(sa);
-            }
-            // Same watchdog the runtime split probes use: startup runs before
-            // a single object is listed, so a stalled endpoint must not hang
-            // the run there.
-            let resp = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                req.send(),
-            )
-            .await
+        single_key_probe(
+            client,
+            bucket,
+            prefix.to_string(),
+            start_after,
+            timeout_secs,
+        )
+    })
+    .await
+}
+
+/// The first key under `prefix` strictly after `start_after` (the first of
+/// all when `None`): one `max-keys=1` ListObjectsV2 request.
+fn single_key_probe(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: String,
+    start_after: Option<String>,
+    timeout_secs: u64,
+) -> impl std::future::Future<Output = Result<Option<String>, String>> + use<> {
+    let mut req = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1);
+    if let Some(sa) = start_after {
+        req = req.start_after(sa);
+    }
+    async move {
+        // Same watchdog the runtime split probes use: startup runs before a
+        // single object is listed, so a stalled endpoint must not hang the
+        // run there.
+        let resp =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), req.send())
+                .await
             {
                 Ok(result) => result.map_err(|e| s3_turbo_list::error::concise_sdk_error(&e))?,
                 Err(_) => return Err("probe timed out".to_string()),
             };
-            Ok(resp
-                .contents()
-                .first()
-                .and_then(|o| o.key())
-                .map(str::to_string))
-        }
-    })
-    .await
+        Ok(resp
+            .contents()
+            .first()
+            .and_then(|o| o.key())
+            .map(str::to_string))
+    }
 }
 
 /// Boundaries from an explicit --hints-file; empty otherwise (the run then

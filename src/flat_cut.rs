@@ -713,6 +713,187 @@ where
     Ok((cuts, estimated))
 }
 
+// ── Run sizing ─────────────────────────────────────────────
+//
+// Startup discovery sees one page of a flat run of keys — its first and last
+// key and how many keys lie between.  Read as a number (a digit run, or an
+// alphanumeric run over its alphabet, as the cut candidates are), that page
+// spans some distance from the first key; a run `m` times that long ends near
+// `first + m × span`.  One probe per point of `SIZE_POINTS` tells which of
+// them the run still reaches, which sizes it to within the step between two
+// points — enough to share a boundary budget between runs whose sizes differ
+// by orders of magnitude.
+
+/// Page spans past a run's first key probed when sizing it (one concurrent
+/// round): steps of 4 up to 4,096 pages, with 2 added so the common small run
+/// (a page or two) is told apart from one of several pages.
+const SIZE_POINTS: [u64; 7] = [2, 4, 16, 64, 256, 1024, 4096];
+/// Positions a radix run is read over, past the first differing one.
+const SIZE_EXTRA_POSITIONS: usize = 4;
+/// Most positions a radix value spans (62^20 fits in a u128).
+const SIZE_MAX_POSITIONS: usize = 20;
+
+/// A run of keys read as numbers from one character position on: everything
+/// before `start` is shared, and `first`/`last` (the ends of one page of the
+/// run) are `lo`/`hi` in the run's number system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunScale {
+    /// The keys' shared text before the number: `obj-` for
+    /// `obj-000000123.snappy.parquet`.  Every key of the run starts with it.
+    pub scope: String,
+    lo: u128,
+    hi: u128,
+    /// Number of characters the value spans.
+    width: usize,
+    /// Digit characters, ascending: `0-9` for a digit run, the inferred
+    /// alphabet for an alphanumeric one.
+    alphabet: Vec<u8>,
+}
+
+impl RunScale {
+    /// The number system `first..last` is written in, found where they first
+    /// differ (as the cut candidates do), never reaching back into `floor`
+    /// (the prefix they were listed under).  `None` when they do not differ
+    /// in a digit or alphanumeric position.
+    pub(crate) fn new(first: &str, last: &str, floor: &str) -> Option<RunScale> {
+        if last <= first || !first.starts_with(floor) || !last.starts_with(floor) {
+            return None;
+        }
+        let d = first
+            .bytes()
+            .zip(last.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let (lo_b, hi_b) = (*first.as_bytes().get(d)?, *last.as_bytes().get(d)?);
+        let lettered = |t: &str| alnum_run(t).bytes().any(|b| b.is_ascii_alphabetic());
+        // Characters before `d` in the same run, not reaching into `floor`.
+        let back = |pred: fn(&u8) -> bool| {
+            first.as_bytes()[floor.len()..d]
+                .iter()
+                .rev()
+                .take_while(|b| pred(b))
+                .count()
+        };
+        if lo_b.is_ascii_digit()
+            && hi_b.is_ascii_digit()
+            && !lettered(&first[d..])
+            && !lettered(&last[d..])
+        {
+            let start = d - back(u8::is_ascii_digit);
+            let (lo_run, hi_run) = (digit_run(first, start), digit_run(last, start));
+            let width = lo_run.len().max(hi_run.len()).min(MAX_DIGITS);
+            let alphabet: Vec<u8> = (b'0'..=b'9').collect();
+            return Self::with(first, start, lo_run, hi_run, width, alphabet);
+        }
+        if lo_b.is_ascii_alphanumeric() && hi_b.is_ascii_alphanumeric() {
+            // Reach back to the start of the alphanumeric run, so a run that
+            // outgrows the differing position carries into the ones before it.
+            let start = d - back(u8::is_ascii_alphanumeric).min(SIZE_MAX_POSITIONS / 2);
+            let (lo_run, hi_run) = (alnum_run(&first[start..]), alnum_run(&last[start..]));
+            let alphabet = infer_alphabet(lo_run, hi_run);
+            let width = (d - start + SIZE_EXTRA_POSITIONS)
+                .min(SIZE_MAX_POSITIONS)
+                .min(lo_run.len().max(hi_run.len()));
+            return Self::with(first, start, lo_run, hi_run, width, alphabet);
+        }
+        None
+    }
+
+    fn with(
+        first: &str,
+        start: usize,
+        lo_run: &str,
+        hi_run: &str,
+        width: usize,
+        alphabet: Vec<u8>,
+    ) -> Option<RunScale> {
+        let radix = alphabet.len() as u128;
+        let value = |run: &str| -> Option<u128> {
+            let mut digits = run
+                .bytes()
+                .map(|b| alphabet.binary_search(&b).map_or(0, |i| i as u128))
+                .chain(std::iter::repeat(0));
+            (0..width).try_fold(0u128, |acc, _| {
+                acc.checked_mul(radix)?.checked_add(digits.next()?)
+            })
+        };
+        let (lo, hi) = (value(lo_run)?, value(hi_run)?);
+        (hi > lo && radix > 1).then(|| RunScale {
+            scope: first[..start].to_string(),
+            lo,
+            hi,
+            width,
+            alphabet,
+        })
+    }
+
+    /// The key position `m` page spans past the first key, as a `start_after`
+    /// candidate; `None` when it lies past the run's number system.
+    pub(crate) fn at(&self, m: u64) -> Option<String> {
+        let radix = self.alphabet.len() as u128;
+        let mut v = (self.hi - self.lo)
+            .checked_mul(u128::from(m))?
+            .checked_add(self.lo)?;
+        let mut encoded = vec![0u8; self.width];
+        for slot in encoded.iter_mut().rev() {
+            *slot = self.alphabet[(v % radix) as usize];
+            v /= radix;
+        }
+        if v != 0 {
+            return None;
+        }
+        Some(format!(
+            "{}{}",
+            self.scope,
+            String::from_utf8(encoded).ok()?
+        ))
+    }
+}
+
+/// Estimate how many keys a flat run holds from one page of it: `first` and
+/// `last` are that page's first and last key and `page_keys` how many it
+/// holds.  One concurrent round of probes, one per point of `SIZE_POINTS`
+/// page spans past `first`; the run reaches the farthest point whose probe
+/// still finds a key under the run's scope, and ends before the next one.
+/// `None` when the keys have no numeric reading to extrapolate along.
+pub(crate) async fn estimate_run_keys<F, Fut>(
+    first: &str,
+    last: &str,
+    page_keys: usize,
+    floor: &str,
+    probe: &F,
+) -> Result<Option<u64>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>, String>>,
+{
+    let Some(scale) = RunScale::new(first, last, floor) else {
+        return Ok(None);
+    };
+    // Points past the run's number system (a key cannot be written there)
+    // are not probed: the run cannot reach them.
+    let points: Vec<(u64, String)> = SIZE_POINTS
+        .iter()
+        .map_while(|&m| scale.at(m).map(|c| (m, c)))
+        .collect();
+    let found = futures::future::join_all(points.iter().map(|(_, c)| probe(c.clone()))).await;
+    let mut reached = 1u64;
+    for ((m, _), key) in points.iter().zip(found) {
+        if key?.is_some_and(|k| k.starts_with(&scale.scope)) {
+            reached = reached.max(*m);
+        }
+    }
+    // The run ends between `reached` and the next point: take the middle,
+    // geometrically.
+    let next = SIZE_POINTS
+        .iter()
+        .copied()
+        .find(|&m| m > reached)
+        .unwrap_or(reached * 4);
+    let pages = ((reached * next) as f64).sqrt();
+    Ok(Some((page_keys.max(1) as f64 * pages) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1147,73 @@ mod tests {
     async fn test_probe_error_aborts_the_search() {
         let probe = |_sa: String| std::future::ready(Err::<Option<String>, _>("boom".to_string()));
         assert!(find_flat_cut("", "a", None, None, &probe).await.is_err());
+    }
+
+    #[test]
+    fn test_run_scale_extrapolates_along_the_number() {
+        let s = RunScale::new(
+            "data/part-000000000-c000.snappy.parquet",
+            "data/part-000000999-c000.snappy.parquet",
+            "data/",
+        )
+        .unwrap();
+        assert_eq!(s.scope, "data/part-");
+        assert_eq!(s.at(1).as_deref(), Some("data/part-000000999"));
+        assert_eq!(s.at(64).as_deref(), Some("data/part-000063936"));
+        // Past the digit run's width: no candidate.
+        assert_eq!(s.at(10_000_000), None);
+        // Hex keys read over their own alphabet, from the start of the run.
+        let s = RunScale::new("00a3f1b2c4d5e6f7.bin", "0148cd02e1f3a4b5.bin", "").unwrap();
+        assert_eq!(s.scope, "");
+        let c = s.at(2).unwrap();
+        assert!(
+            c.as_str() > "0148cd" && c.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{c}"
+        );
+        // The floor is never reached back into, and a run needs a number.
+        let s = RunScale::new("logs/2024-01", "logs/2024-09", "logs/2024-").unwrap();
+        assert_eq!(s.scope, "logs/2024-");
+        assert_eq!(RunScale::new("a/x.txt", "a/x.txt", "a/"), None);
+        assert_eq!(RunScale::new("a/x-!", "a/x-~", "a/"), None);
+    }
+
+    #[tokio::test]
+    async fn test_run_size_estimate_is_within_the_step() {
+        for n in [1_050usize, 20_000, 180_000] {
+            let keys: Vec<String> = (0..n)
+                .map(|i| format!("data/leaf=07/part-{:09}-c000.snappy.parquet", i * 3))
+                .chain(std::iter::once("data/leaf=08/part-0".to_string()))
+                .collect();
+            let keys = Arc::new(keys);
+            let count = Arc::new(AtomicUsize::new(0));
+            let probe = probe_over(Arc::clone(&keys), Arc::clone(&count));
+            let est = estimate_run_keys(&keys[0], &keys[999], 1000, "data/leaf=07/", &probe)
+                .await
+                .unwrap()
+                .unwrap() as usize;
+            assert!(est >= n / 4 && est <= n * 4, "{n} keys estimated at {est}");
+            assert!(count.load(Ordering::Relaxed) <= SIZE_POINTS.len());
+        }
+        let hex: Vec<String> = {
+            let mut v: Vec<String> = (0u64..100_000)
+                .map(|i| format!("{:016x}.bin", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                .collect();
+            v.sort();
+            v
+        };
+        let keys = Arc::new(hex);
+        let probe = probe_over(Arc::clone(&keys), Arc::new(AtomicUsize::new(0)));
+        let est = estimate_run_keys(&keys[0], &keys[999], 1000, "", &probe)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((25_000..=400_000).contains(&est), "hex estimated at {est}");
+        // No number to read: no estimate, and no probe spent.
+        let count = Arc::new(AtomicUsize::new(0));
+        let probe = probe_over(Arc::clone(&keys), Arc::clone(&count));
+        let est = estimate_run_keys("a/x-!", "a/x-~", 1000, "a/", &probe).await;
+        assert_eq!(est, Ok(None));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
