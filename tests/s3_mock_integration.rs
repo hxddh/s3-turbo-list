@@ -109,10 +109,9 @@ impl MockS3Server {
     fn start(
         handler: impl Fn(RecordedRequest, usize) -> MockResponse + Send + Sync + 'static,
     ) -> Self {
+        // A blocking accept: `Drop` sets `shutdown` and then connects once to
+        // wake it.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        listener
-            .set_nonblocking(true)
-            .expect("set mock server nonblocking");
         let addr = listener.local_addr().expect("mock server local addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -135,6 +134,8 @@ impl MockS3Server {
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
+                    // The wake-up connection from `Drop`.
+                    Ok(_) if thread_shutdown.load(Ordering::SeqCst) => break,
                     Ok((stream, _)) => {
                         sequence += 1;
                         let seq = sequence;
@@ -167,9 +168,7 @@ impl MockS3Server {
                         }));
                         workers.retain(|worker| !worker.is_finished());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
             }
@@ -4093,8 +4092,9 @@ fn local_mock_retry_budget_still_exhausts_without_progress() {
 // short on every run after it.
 
 /// Keys skewed so bisection produces both tiny segments (which complete
-/// without splitting) and a dominant tail (which splits and loses credit).
-fn skewed_keys() -> Vec<String> {
+/// without splitting) and a dominant tail of `tail` keys (which splits and
+/// loses credit).
+fn skewed_keys(tail: usize) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for i in 0..40 {
         keys.push(format!("a-{:04}", i));
@@ -4102,7 +4102,7 @@ fn skewed_keys() -> Vec<String> {
     for i in 0..40 {
         keys.push(format!("m-{:04}", i));
     }
-    for i in 0..1920 {
+    for i in 0..tail {
         keys.push(format!("z-{:06}", i));
     }
     keys.sort();
@@ -4110,8 +4110,10 @@ fn skewed_keys() -> Vec<String> {
 }
 
 /// A flat namespace whose root page is truncated, so the run does not take the
-/// single-page shortcut and instead bisects into several segments.
-fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
+/// single-page shortcut and instead bisects into several segments. Listing
+/// pages hold 4 keys and each takes `page_latency`, so a long segment pages
+/// long enough for runtime splitting to act on it.
+fn multi_segment_flat_server(keys: Vec<String>, page_latency: Duration) -> MockS3Server {
     MockS3Server::start(move |request, _sequence| {
         let start_after = request
             .query
@@ -4132,7 +4134,7 @@ fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
             return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
         }
 
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(page_latency);
         let start_idx = match request.query.get("continuation-token") {
             Some(token) => token
                 .strip_prefix("off-")
@@ -4159,54 +4161,17 @@ fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
 }
 
 #[test]
-fn local_mock_successful_run_leaves_no_checkpoint() {
-    let keys = skewed_keys();
-    let server = multi_segment_flat_server(keys.clone());
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    write_fast_config(&config);
-    let args: Vec<String> = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "list".into(),
-        "--concurrency".into(),
-        "8".into(),
-        "--resume".into(),
-        "--output-parquet-file".into(),
-        dir.path().join("out.parquet").display().to_string(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ];
-
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(
-        parquet_keys(&dir.path().join("out.parquet")).len(),
-        keys.len()
-    );
-
-    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
-    assert!(
-        !checkpoint.exists(),
-        "a run that listed the whole key space has nothing to resume, but it \
-         left a checkpoint behind: {:?}",
-        checkpoint_remaining_starts(&checkpoint)
-    );
-}
-
-#[test]
 fn local_mock_repeated_resume_runs_stay_complete() {
     // The end-to-end shape of the bug: an unattended job that always passes
-    // --resume must produce the same complete listing every time.
-    let keys = skewed_keys();
-    let server = multi_segment_flat_server(keys.clone());
+    // --resume must produce the same complete listing every time — and a run
+    // that listed the whole key space, runtime splits included, must leave no
+    // checkpoint behind for the next one to skip ranges by.
+    // A tail of 960 keys at 5 ms per 4-key page lists for over a second
+    // serially: several split-probe ticks (200 ms) in, with margin. At a
+    // quarter of that the run can finish before the first split lands, which
+    // the split assertion below reports.
+    let keys = skewed_keys(960);
+    let server = multi_segment_flat_server(keys.clone(), Duration::from_millis(5));
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
@@ -4229,13 +4194,25 @@ fn local_mock_repeated_resume_runs_stay_complete() {
         "--region".into(),
         "us-east-1".into(),
     ];
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
 
-    for run in 1..=3 {
-        let (code, stdout, stderr) = run_cli(&args, dir.path());
+    for run in 1..=2 {
+        // Info level names each accepted runtime split.
+        let (code, stdout, stderr) =
+            run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3_turbo_list=info")]);
         assert_eq!(
             code, 0,
             "run {} stdout: {}\nstderr: {}",
             run, stdout, stderr
+        );
+        // The bug needs runtime-split segments (they record no checkpoint
+        // progress); a run that never split would pass without testing it.
+        assert!(
+            stderr.contains("accepted runtime split"),
+            "run {} did not split at runtime, so it no longer exercises the \
+             split-then-complete path: {}",
+            run,
+            stderr
         );
         let listed = parquet_keys(&dir.path().join("out.parquet"));
         assert_eq!(
@@ -4245,6 +4222,13 @@ fn local_mock_repeated_resume_runs_stay_complete() {
             run,
             listed.len(),
             keys.len()
+        );
+        assert!(
+            !checkpoint.exists(),
+            "run {} listed the whole key space and has nothing to resume, but \
+             it left a checkpoint behind: {:?}",
+            run,
+            checkpoint_remaining_starts(&checkpoint)
         );
     }
 }
