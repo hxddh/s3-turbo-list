@@ -1238,3 +1238,41 @@ mod tests {
         assert!((200..=300).contains(&at), "cut at {at}");
     }
 }
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::flat_cut_candidate;
+
+    #[test]
+    fn test_flat_cut_candidates_numeric_tail() {
+        // Numeric tail: the cut lands at the numeric midpoint of the range,
+        // strictly above the cursor.
+        let candidate = flat_cut_candidate("obj-0014", "", "obj-0214").unwrap();
+        assert!(candidate.as_str() > "obj-0014", "{}", candidate);
+        assert_eq!(candidate, "obj-0114");
+    }
+
+    #[test]
+    fn test_flat_cut_candidates_respect_end_bound() {
+        let c = flat_cut_candidate("prefix-3/object-000123", "", "prefix-3/p").unwrap();
+        assert!(c.as_str() > "prefix-3/object-000123", "{}", c);
+        assert!(c.as_str() < "prefix-3/p", "{}", c);
+    }
+
+    #[test]
+    fn test_flat_cut_candidates_listing_prefix_scopes_tail() {
+        // The cut lies between two keys under the listing prefix, so the
+        // candidate stays under the listing prefix scope.
+        let c = flat_cut_candidate("logs/2026/abcdef", "logs/", "logs/2027/zz").unwrap();
+        assert!(c.starts_with("logs/"), "{}", c);
+    }
+
+    #[test]
+    fn test_flat_cut_candidates_empty_or_non_ascii_tail() {
+        assert!(flat_cut_candidate("", "", "").is_none());
+        // Multibyte keys yield valid UTF-8 candidates, never split characters.
+        let c = flat_cut_candidate("中文键", "", "中文键键").unwrap();
+        assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        assert!(c.as_str() > "中文键" && c.as_str() < "中文键键", "{}", c);
+    }
+}
