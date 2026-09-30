@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub const AGENT_SCHEMA_VERSION: &str = "s3-turbo-list.agent.v1";
 const REDACTED_ARG_VALUE: &str = "<redacted>";
-// `--continuation-token` was removed in 0.38; a command line that still
-// passes it fails to parse, but its value is never echoed.
+// `--continuation-token` (removed in 0.38) and `--endpoint` (removed in
+// 0.39): a command line that still passes one fails to parse, but its value
+// is never echoed.
 const SENSITIVE_VALUE_FLAGS: &[&str] = &["--continuation-token", "--endpoint-url", "--endpoint"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,10 +125,6 @@ pub struct S3Summary {
     pub provider_known: bool,
     /// The preset's known limitations.
     pub provider_warnings: Vec<String>,
-    /// Deprecated (0.38; removed in 0.39): `provider_known`.
-    pub profile_known: bool,
-    /// Deprecated (0.38; removed in 0.39): `provider_warnings`.
-    pub profile_warnings: Vec<String>,
     pub trace_compat: Option<String>,
     pub start_after: Option<String>,
 }
@@ -166,8 +163,6 @@ impl From<&S3TurboConfig> for ResolvedConfigSummary {
             },
             s3: S3Summary {
                 provider_known: preset.is_some(),
-                profile_known: preset.is_some(),
-                profile_warnings: provider_warnings.clone(),
                 provider_warnings,
                 max_attempts: cfg.s3.max_attempts,
                 initial_backoff_secs: cfg.s3.initial_backoff_secs,
@@ -206,13 +201,8 @@ pub struct CommandInputSummary {
     pub delimiter: String,
     pub max_keys: Option<i32>,
     pub start_after: Option<String>,
-    /// Deprecated (0.38; removed in 0.39): always null (`--continuation-token`
-    /// was removed).
-    pub continuation_token: Option<String>,
     /// The provider preset, canonical lowercase name.
     pub provider: Option<String>,
-    /// Deprecated (0.38; removed in 0.39): the same value as `provider`.
-    pub profile: Option<String>,
     pub addressing_style: String,
     /// The `--filter` expression this run applied, or `None` for no filter.
     /// Two runs over one bucket under different filters produce different
@@ -239,7 +229,10 @@ pub struct HintsPlan {
     pub valid: Option<bool>,
     pub format: Option<String>,
     pub boundary_count: Option<usize>,
+    /// Problems with an explicit hints file; empty otherwise.
     pub warnings: Vec<String>,
+    /// How this source partitions the run (informational, not a problem).
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +274,8 @@ pub struct PlanReport {
     pub tool_version: &'static str,
     pub status: String,
     pub command: Vec<String>,
+    /// Working directory the plan's relative paths resolve against.
+    pub cwd: String,
     pub network: String,
     pub inputs: CommandInputSummary,
     pub outputs: OutputPathSummary,
@@ -299,6 +294,8 @@ pub struct ConfigSourceSummary {
     pub loaded_config_kind: String,
     pub searched: Vec<String>,
     pub cli_overrides: Vec<String>,
+    /// Always empty since 0.39: it listed the deprecated config keys, which
+    /// are now errors. Kept so readers of the field do not break.
     pub warnings: Vec<String>,
 }
 
@@ -310,7 +307,7 @@ impl ConfigSourceSummary {
             loaded_config_kind: load.loaded_config_kind.clone(),
             searched: load.searched.clone(),
             cli_overrides,
-            warnings: load.warnings.clone(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -336,6 +333,7 @@ pub struct MetricsSummary {
     pub ks_entries: usize,
     pub bytes_total: u64,
     pub top_prefixes: Vec<crate::core::PrefixMetric>,
+    /// Deprecated (0.39; removed in 0.40): `inputs.output_format == "summary"`.
     pub summary_only: bool,
 }
 
@@ -466,14 +464,15 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
         single_chain,
         delimited,
     } = inputs;
-    let plan_without_hints = |source: &str, warning: &str| HintsPlan {
+    let plan_without_hints = |source: &str, note: &str| HintsPlan {
         source: source.to_string(),
         path: None,
         exists: false,
         valid: None,
         format: None,
         boundary_count: None,
-        warnings: vec![warning.to_string()],
+        warnings: Vec::new(),
+        note: Some(note.to_string()),
     };
     if single_chain {
         return plan_without_hints(
@@ -499,6 +498,7 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
             warnings: report
                 .map(|r| r.warnings)
                 .unwrap_or_else(|| vec!["hints file does not exist or could not be parsed".into()]),
+            note: None,
         };
     }
 
@@ -536,6 +536,7 @@ pub fn detect_hints_plan(inputs: HintsPlanInputs<'_>) -> HintsPlan {
         format: None,
         boundary_count: None,
         warnings: Vec::new(),
+        note: None,
     }
 }
 
@@ -548,6 +549,11 @@ pub fn diff_per_side_hints_plan() -> HintsPlan {
         format: None,
         boundary_count: None,
         warnings: Vec::new(),
+        note: Some(
+            "each side is partitioned from its own structure at startup and listed in \
+             parallel; the ordered segment streams are merged"
+                .to_string(),
+        ),
     }
 }
 

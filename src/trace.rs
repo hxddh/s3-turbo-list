@@ -25,9 +25,6 @@ pub struct S3CompatEvent {
     /// The provider preset (e.g. "bos").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// Deprecated (0.38; removed in 0.39): the same value as `provider`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
     pub endpoint_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -104,7 +101,6 @@ impl S3CompatEvent {
             timestamp: chrono::Utc::now().to_rfc3339(),
             operation: operation.to_string(),
             provider: None,
-            profile: None,
             endpoint_url: endpoint_url.to_string(),
             region: None,
             addressing_style: "auto".to_string(),
@@ -141,10 +137,9 @@ impl S3CompatEvent {
         }
     }
 
-    /// Record the provider preset (also under its deprecated `profile` name).
+    /// Record the provider preset.
     pub fn set_provider(&mut self, provider: Option<&str>) {
         self.provider = provider.map(str::to_string);
-        self.profile = self.provider.clone();
     }
 }
 
@@ -263,7 +258,7 @@ mod tests {
         );
         event.region = Some("bj".into());
         event.addressing_style = "path".into();
-        event.profile = Some("bos".into());
+        event.set_provider(Some("bos"));
         event.http_status = 404;
         event.s3_error_code = Some("NoSuchBucket".into());
         event.s3_error_message = Some("The specified bucket does not exist".into());
@@ -347,12 +342,13 @@ mod tests {
     }
 
     #[test]
-    fn test_set_provider_fills_the_deprecated_profile_field() {
+    fn test_set_provider_fills_only_the_provider_field() {
         let mut event = S3CompatEvent::new("ListObjectsV2", "http://x", "b", "/");
         event.set_provider(Some("bos"));
         let v: serde_json::Value = serde_json::to_value(&event).unwrap();
         assert_eq!(v["provider"], "bos");
-        assert_eq!(v["profile"], "bos");
+        // The deprecated `profile` copy was removed in 0.39.
+        assert!(v.get("profile").is_none());
     }
 
     #[test]

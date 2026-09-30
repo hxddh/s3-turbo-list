@@ -4,7 +4,7 @@
 use super::*;
 
 pub(crate) fn generate_completions(shell: Shell) {
-    let mut cmd = without_hidden(&CliArgs::command());
+    let mut cmd = without_hidden(&cli_command());
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
@@ -36,7 +36,7 @@ fn without_hidden(cmd: &clap::Command) -> clap::Command {
 }
 
 pub(crate) fn generate_man_page() {
-    let cmd = CliArgs::command();
+    let cmd = cli_command();
     let man = clap_mangen::Man::new(cmd);
     let mut buffer: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buffer) {
@@ -165,9 +165,6 @@ pub(crate) fn print_doctor_report(report: &agent::DoctorReport) {
         config.runtime.max_concurrency,
         config.runtime.worker_threads
     );
-    for warning in &report.config_source.warnings {
-        println!("WARN  config: {}", warning);
-    }
     if let Some(hints) = &report.hints {
         print_doctor_hints(hints);
     }
@@ -215,21 +212,16 @@ pub(crate) fn run_compat_probe(
             }
         }
     });
-    // `partial` keeps exit 0: the report says which operations failed, and an
-    // endpoint that only lacks e.g. encoding-type=url can still be listed.
-    // `incompatible` — every operation failed — must not read as success.
-    if report.overall_status == "incompatible" {
-        let exit_code = if report.failures_are_setup_errors() {
-            agent::ExitCode::ProviderSetup
-        } else {
-            agent::ExitCode::NetworkRetryExhausted
-        };
+    // `partial` keeps exit 0 (`CompatProbeReport::exit_code_class`); an
+    // `incompatible` endpoint exits with the report's `exit_code` and the
+    // documented run line.
+    if report.exit_code != 0 {
         eprintln!(
-            "s3-turbo-list: compat-probe found the endpoint incompatible (exit {}): every probe \
-             operation failed; see the report's tests[] for each error.",
-            exit_code.code()
+            "s3-turbo-list: run failed (exit {}): compat-probe found the endpoint incompatible: \
+             every probe operation failed; see the report's tests[] for each error",
+            report.exit_code
         );
-        std::process::exit(exit_code.code());
+        std::process::exit(report.exit_code);
     }
 }
 

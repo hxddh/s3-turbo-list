@@ -1477,6 +1477,12 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 
     let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
     assert_eq!(report["overall_status"], "compatible");
+    assert_eq!(report["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(report["tool_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(report["status"], "success");
+    assert_eq!(report["exit_code"], 0);
+    // Always present, empty in the normal case.
+    assert_eq!(report["warnings"], serde_json::json!([]));
     assert!(report["tests"].as_array().unwrap().iter().any(|test| {
         test["test"] == "ListObjectsV2 pagination check" && test["status"] == "ok"
     }));
@@ -1525,10 +1531,20 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     // Every operation failed, and not on a setup error: an incompatible
     // endpoint must not exit 0 (it used to).
     assert_eq!(code, 4, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("incompatible"), "stderr: {}", stderr);
+    // The documented run line (nothing about "listed": a probe lists nothing).
+    assert!(
+        stderr.contains(
+            "s3-turbo-list: run failed (exit 4): compat-probe found the endpoint incompatible"
+        ),
+        "stderr: {}",
+        stderr
+    );
+    assert!(!stderr.contains("Nothing was listed"), "stderr: {}", stderr);
 
     let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
     assert_eq!(report["overall_status"], "incompatible");
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["exit_code"], 4);
     let tests = report["tests"].as_array().unwrap();
     assert!(tests.iter().all(|test| test["status"] == "error"));
     let service_error = tests
@@ -5603,38 +5619,59 @@ fn local_mock_delimiter_retry_after_common_prefix_emits_each_folder_once() {
 }
 
 #[test]
-fn local_mock_compat_probe_agent_reports_deprecations_in_its_json() {
-    // Under --agent stderr stays quiet, so a deprecated spelling must reach
-    // the probe's own report: it has no plan or manifest to carry it.
+fn local_mock_compat_probe_agent_report_and_trace_carry_the_contract_fields() {
+    // Under --agent stderr stays quiet: the report on stdout is the result,
+    // with the fields every other JSON result has.
     let server = MockS3Server::start(|_request, _sequence| {
         MockResponse::error(501, "NotImplemented", "not supported")
     });
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
+    let trace = dir.path().join("trace.jsonl");
     write_fast_config(&config);
     let args: Vec<String> = vec![
         "--config".into(),
         config.display().to_string(),
+        "--provider".into(),
+        "minio".into(),
         "compat-probe".into(),
-        "--endpoint".into(),
+        "--endpoint-url".into(),
         server.endpoint(),
         "--region".into(),
         "us-east-1".into(),
         "--bucket".into(),
         "mock-bucket".into(),
-        "--addressing-style".into(),
-        "path".into(),
+        "--prefix".into(),
+        "probe/".into(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
         "--agent".into(),
     ];
-    let (_code, stdout, stderr) = run_cli(&args, dir.path());
-    assert!(!stderr.contains("warning: deprecated"), "{}", stderr);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 4, "stdout: {}\nstderr: {}", stdout, stderr);
     let report: Value = serde_json::from_str(&stdout).expect("report JSON on stdout");
-    let warnings = report["warnings"].as_array().expect("warnings array");
+    assert_eq!(report["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["exit_code"], 4);
+    assert_eq!(report["warnings"], serde_json::json!([]));
+    // Only the run line on stderr.
+    assert_eq!(stderr.lines().count(), 1, "{}", stderr);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("--endpoint")),
+        stderr.starts_with("s3-turbo-list: run failed (exit 4)"),
         "{}",
-        report
+        stderr
     );
+    // Probe trace events record the prefix and the provider, as listing
+    // events do.
+    let events: Vec<Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty());
+    for event in &events {
+        assert_eq!(event["prefix"], "probe/", "{}", event);
+        assert_eq!(event["provider"], "minio", "{}", event);
+        assert!(event.get("profile").is_none(), "{}", event);
+    }
 }

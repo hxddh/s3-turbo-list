@@ -165,11 +165,16 @@ pub(crate) fn build_plan_report(
                 valid: None,
                 format: None,
                 boundary_count: None,
-                warnings: vec![
-                    "diff lists each side as one serial segment with these options; diff \
-                     does not split segments at runtime"
-                        .to_string(),
-                ],
+                warnings: Vec::new(),
+                note: Some(format!(
+                    "{} lists each side of the diff as one serial segment (diff does not \
+                     split segments at runtime)",
+                    match source {
+                        "single_chain" => "--start-after",
+                        "delimiter_single_segment" => "--delimiter",
+                        _ => "--no-auto-hints",
+                    }
+                )),
             },
             None => agent::diff_per_side_hints_plan(),
         }
@@ -184,8 +189,7 @@ pub(crate) fn build_plan_report(
         })
     };
     let file_conflicts = agent::output_conflicts(&outputs);
-    let mut warnings = config_source.warnings.clone();
-    warnings.extend(cli.deprecation_warnings());
+    let mut warnings = Vec::new();
     let missing_region = sides_without_region(cli);
     if !missing_region.is_empty() && !imds_disabled() && !offline_region_resolves() {
         warnings.push(format!(
@@ -225,10 +229,15 @@ pub(crate) fn build_plan_report(
     ) || (inputs.mode == "diff"
         && hints.source == "disabled_single_segment_fallback");
     if never_fans_out {
-        warnings.push(
-            "list is planned as a single ListObjectsV2 chain; --concurrency does not add parallelism to it"
-                .to_string(),
-        );
+        warnings.push(if inputs.mode == "diff" {
+            "diff lists each side as a single ListObjectsV2 chain; --concurrency does not add \
+             parallelism to it"
+                .to_string()
+        } else {
+            "list is planned as a single ListObjectsV2 chain; --concurrency does not add \
+             parallelism to it"
+                .to_string()
+        });
     }
     if cli.delimiter_explicit
         && cli.delimiter.is_empty()
@@ -261,6 +270,10 @@ pub(crate) fn build_plan_report(
     // The run exits 2 on an explicit hints file it cannot load; the plan
     // says so (the reason is in `hints.warnings`).
     let hints_blocked = hints.source == "explicit" && hints.valid == Some(false);
+    // `--agent` with tsv/ndjson: the run exits 2 before listing.
+    let agent_conflict = agent_output_format_conflict(cli);
+    let agent_blocked = agent_conflict.is_some();
+    warnings.extend(agent_conflict);
 
     agent::PlanReport {
         schema_version: agent::AGENT_SCHEMA_VERSION,
@@ -272,6 +285,7 @@ pub(crate) fn build_plan_report(
         status: if provider_setup_guardrail_warnings(cli, cfg).is_empty()
             && !output_blocked
             && !hints_blocked
+            && !agent_blocked
         {
             "ok"
         } else {
@@ -279,6 +293,9 @@ pub(crate) fn build_plan_report(
         }
         .to_string(),
         command: agent::redacted_command_args(),
+        cwd: std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
         network: "none: dry-run only resolves local configuration and planned paths".to_string(),
         inputs,
         outputs,
@@ -407,9 +424,7 @@ pub(crate) fn command_input_summary(cli: &Cli, cfg: &S3TurboConfig) -> agent::Co
         delimiter: cli.delimiter.clone(),
         max_keys: cli.max_keys,
         start_after: cfg.s3.start_after.clone(),
-        continuation_token: None,
         provider: cfg.s3.provider.clone(),
-        profile: cfg.s3.provider.clone(),
         addressing_style: cfg.s3.addressing_style.to_string(),
         filter: cli.filter.clone(),
     }

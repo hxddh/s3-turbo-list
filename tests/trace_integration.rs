@@ -38,7 +38,7 @@ fn test_trace_event_jsonl_roundtrip() {
     assert_eq!(parsed["key_count"], 100);
     assert_eq!(parsed["region"], "us-east-1");
     assert_eq!(parsed["provider"], "aws");
-    assert_eq!(parsed["profile"], "aws");
+    assert!(parsed.get("profile").is_none());
     assert_eq!(parsed["is_truncated"], true);
     assert_eq!(parsed["next_continuation_token"], "token-xyz");
     assert_eq!(parsed["contents_count"], 100);

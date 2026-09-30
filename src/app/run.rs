@@ -4,13 +4,6 @@ use super::*;
 
 pub(crate) fn run() {
     let mut cli = parse_cli();
-    // Deprecations go to stderr and into the plan / manifest / doctor
-    // report; `--agent` keeps stderr quiet, so there they are JSON only.
-    if !cli.agent {
-        for warning in cli.deprecation_warnings() {
-            eprintln!("warning: {}", warning);
-        }
-    }
     // A diff without --target-region lists the target in --region. It used to
     // fall through to the SDK's ambient region (AWS_REGION / profile), so the
     // target was signed for another region than the plan showed (it showed
@@ -62,15 +55,6 @@ pub(crate) fn run() {
     // Load config.
     let (mut cfg, config_load) = S3TurboConfig::load_with_summary(cli.config.as_deref())
         .unwrap_or_else(|e| exit_config_error(&format!("Config error: {}", e)));
-    if !cli.agent {
-        for warning in config_load
-            .warnings
-            .iter()
-            .filter(|warning| warning.starts_with("deprecated"))
-        {
-            eprintln!("warning: {}", warning);
-        }
-    }
 
     let config_source = agent::ConfigSourceSummary::new(&config_load, cli_config_overrides(&cli));
     set_doctor_context(&config_source, &cfg);
@@ -138,7 +122,6 @@ pub(crate) fn run() {
     validate_output_format_command(&cli);
     validate_start_after_command(&cli, &cfg);
     validate_delimiter_hints_command(&cli);
-    let config_source_warnings = config_source.warnings.clone();
 
     if let Commands::Doctor { json, .. } = &cli.cmd {
         // doctor absorbed the former hints-validate command: when a hints
@@ -149,13 +132,6 @@ pub(crate) fn run() {
             })
         });
         let mut report = agent::doctor_report(&cfg, config_source.clone(), hints);
-        for warning in cli.deprecation_warnings() {
-            report.checks.push(agent::DoctorCheck {
-                name: "deprecated".to_string(),
-                status: "warn".to_string(),
-                message: warning,
-            });
-        }
         // A filter that would fail the real run (exit 2) fails doctor too.
         if let Some(filter_expr) = cli.filter.as_deref() {
             let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
@@ -228,6 +204,9 @@ pub(crate) fn run() {
         // The plan is the JSON result: a blocked dry run exits with the
         // run's code and its run line, but prints no second JSON document.
         let _ = PLAN_PRINTED.set(true);
+        if let Some(problem) = agent_output_format_conflict(&cli) {
+            exit_before_run(agent::ExitCode::CliConfig, problem);
+        }
         // An explicit hints file the run cannot load stops it with exit 2;
         // so does the plan (status `blocked`, `hints.valid: false`).
         if let Some(path) = cli.hints_file.as_deref()
@@ -277,17 +256,9 @@ pub(crate) fn run() {
     }
     create_output_parents(&cli, &cfg);
 
-    let mut run_warnings = config_source_warnings;
-    run_warnings.extend(cli.deprecation_warnings());
-    run_warnings.extend(runtime_guardrail_warnings(&cli, &cfg));
+    let mut run_warnings = runtime_guardrail_warnings(&cli, &cfg);
     if !cli.agent {
-        // Deprecations were printed as `warning: deprecated …` already.
-        let fresh: Vec<String> = run_warnings
-            .iter()
-            .filter(|warning| !warning.starts_with("deprecated"))
-            .cloned()
-            .collect();
-        print_runtime_warnings(&fresh);
+        print_runtime_warnings(&run_warnings);
     }
 
     // Setup logging. `--agent` keeps stderr quiet: its default stderr filter
@@ -379,7 +350,7 @@ pub(crate) fn run() {
                 output.as_deref(),
                 &cfg,
                 cli.agent,
-                cli.deprecation_warnings(),
+                run_warnings.clone(),
             );
             return;
         }
