@@ -4,7 +4,7 @@
 use super::*;
 
 /// Where this run keeps its checkpoint: `None` for runs that cannot resume
-/// (diff, --start-after, --continuation-token). In --output-dir when one is
+/// (diff, --start-after). In --output-dir when one is
 /// given — with the outputs it describes — else the working directory.
 pub(crate) fn run_checkpoint_path(
     cli: &Cli,
@@ -12,10 +12,7 @@ pub(crate) fn run_checkpoint_path(
     region: Option<&str>,
     prefix: &str,
 ) -> Option<String> {
-    if !matches!(cli.cmd, Commands::List { .. })
-        || cli.start_after.is_some()
-        || cli.continuation_token.is_some()
-    {
+    if !matches!(cli.cmd, Commands::List { .. }) || cli.start_after.is_some() {
         return None;
     }
     let name = checkpoint::checkpoint_path_for_prefix(bucket, region, prefix);
@@ -30,9 +27,9 @@ pub(crate) fn run_checkpoint_path(
 ///
 /// - Parquet: `--output-parquet-file`, else `<dir>/<stem>.parquet` with the
 ///   auto-named stem (`--output-dir`, else the working directory).
-/// - KeySpace: beside the Parquet file as `<name>.ks` (the deprecated
-///   `--output-ks-file` still wins). It used to land in the working
-///   directory under a timestamp whenever only the Parquet path was given.
+/// - KeySpace: beside the Parquet file as `<name>.ks`. It used to land in
+///   the working directory under a timestamp whenever only the Parquet path
+///   was given.
 /// - Log (`--log`): beside the outputs as `<name>.log`, uniquely named with
 ///   them (every run in one second used to share, and truncate, one
 ///   `turbo_list_<ts>.log`, so earlier manifests failed `--check`).
@@ -73,13 +70,11 @@ pub(crate) fn resolve_output_paths(cli: &Cli, cfg: &mut S3TurboConfig) {
         cfg.output.parquet_file = None;
         cfg.output.ks_file = None;
     }
-    let wants_log = cli.log && cfg.output.log_file.is_none();
+    let wants_log = cli.log;
     // Explicit Parquet path: KS and log follow its name, nothing is reserved.
     if let Some(parquet) = cfg.output.parquet_file.clone() {
         let base = parquet.strip_suffix(".parquet").unwrap_or(&parquet);
-        cfg.output
-            .ks_file
-            .get_or_insert_with(|| format!("{}.ks", base));
+        cfg.output.ks_file = Some(format!("{}.ks", base));
         if wants_log {
             cfg.output.log_file = Some(format!("{}.log", base));
         }
@@ -114,9 +109,7 @@ pub(crate) fn resolve_output_paths(cli: &Cli, cfg: &mut S3TurboConfig) {
     let stem = pick_output_stem(&base, &extensions, &path_of, !cli.dry_run);
     if artifacts {
         cfg.output.parquet_file = Some(path_of(format!("{}.parquet", stem)));
-        cfg.output
-            .ks_file
-            .get_or_insert_with(|| path_of(format!("{}.ks", stem)));
+        cfg.output.ks_file = Some(path_of(format!("{}.ks", stem)));
     }
     if wants_log {
         cfg.output.log_file = Some(path_of(format!("{}.log", stem)));
@@ -246,14 +239,10 @@ pub(crate) fn validate_distinct_output_paths(
         }
     }
     let named = [
-        ("--output-ks-file", ks),
-        ("--output-log-file", cfg.output.log_file.as_deref()),
+        ("the KeySpace file", ks),
+        ("the --log file", cfg.output.log_file.as_deref()),
         ("--trace-compat", cfg.s3.trace_compat.as_deref()),
         ("--run-manifest", cli.run_manifest.as_deref()),
-        (
-            "--plan-json",
-            cli.plan_json.as_deref().filter(|_| cli.dry_run),
-        ),
     ];
     for (label, path) in named {
         if let Some(path) = path {
@@ -307,12 +296,17 @@ pub(crate) fn create_output_parents(cli: &Cli, cfg: &S3TurboConfig) {
     ) {
         return;
     }
+    let report_file = match &cli.cmd {
+        Commands::CompatProbe { output, .. } => output.as_deref(),
+        _ => None,
+    };
     let paths = [
         cfg.output.parquet_file.as_deref(),
         cfg.output.ks_file.as_deref(),
         cfg.output.log_file.as_deref(),
         cfg.s3.trace_compat.as_deref(),
         cli.run_manifest.as_deref(),
+        report_file,
     ];
     for path in paths.into_iter().flatten() {
         let Some(parent) = std::path::Path::new(path)
@@ -359,6 +353,7 @@ pub(crate) fn planned_output_problems(
         outputs.ks_file.as_deref(),
         outputs.log_file.as_deref(),
         outputs.trace_compat.as_deref(),
+        outputs.report_file.as_deref(),
         cli.run_manifest.as_deref(),
     ]
     .into_iter()
@@ -380,6 +375,10 @@ pub(crate) fn runtime_output_summary(
     ks_file: Option<&str>,
     parquet_file: Option<&str>,
 ) -> agent::OutputPathSummary {
+    let report_file = match &cli.cmd {
+        Commands::CompatProbe { output, .. } => output.clone(),
+        _ => None,
+    };
     if !list_writes_artifacts(cli) {
         return agent::OutputPathSummary {
             parquet_file: None,
@@ -387,6 +386,7 @@ pub(crate) fn runtime_output_summary(
             hints_file: None,
             trace_compat: cfg.s3.trace_compat.clone(),
             log_file: cfg.output.log_file.clone(),
+            report_file,
         };
     }
 
@@ -396,6 +396,7 @@ pub(crate) fn runtime_output_summary(
         hints_file: None,
         trace_compat: cfg.s3.trace_compat.clone(),
         log_file: cfg.output.log_file.clone(),
+        report_file,
     }
 }
 

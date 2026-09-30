@@ -56,7 +56,9 @@ s3-turbo-list list --bucket my-bucket --region us-east-2 \
 
 Options follow the command name, and each command's `--help` lists only
 what it takes. `--config`, `--provider`, `--endpoint-url` and
-`--addressing-style` are global and may go on either side of it.
+`--addressing-style` are global and may go on either side of it. Other
+options written before the command name (the pre-0.37 spelling) still work
+but print a deprecation warning; that spelling is removed in 0.39.
 
 Listing is recursive by default; `--prefix logs/2026/` narrows it. Use
 `--delimiter '/'` for a hierarchical listing: the objects at that level plus
@@ -155,7 +157,9 @@ from, in precedence order:
    parallel with zero flags; nothing is cached in the working directory.
 3. **Startup bisection** (automatic) — a flat namespace with no
    `CommonPrefixes` is partitioned by single-key probes instead, so it also
-   starts parallel. Runtime splitting still covers mid-run skew.
+   starts parallel; so are large flat directories under too few prefixes
+   (`data/part-…` under a single `data/`). Runtime splitting still covers
+   mid-run skew.
 4. A single segment for listings that fit in one page (nothing to partition)
    and for `--start-after` and `--delimiter` runs.
 
@@ -270,7 +274,7 @@ For CI and agents, every surface has a machine-readable form:
 - `--run-manifest run.json` records artifacts with SHA256 and Parquet
   row/schema metadata, and `--agent` prints the manifest on stdout;
   `manifest-summary run.json --check` verifies a completed run locally.
-- `--trace-compat trace.jsonl` records every S3 API call as JSONL
+- `--trace-compat trace.jsonl` records every listing page request as JSONL
   (`--trace-compat -` for stderr; fields in
   [`docs/tuning.md`](docs/tuning.md#trace-event-fields)).
 

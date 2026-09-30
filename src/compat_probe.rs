@@ -13,6 +13,10 @@ pub struct CompatProbeReport {
     pub addressing_style: String,
     pub tests: Vec<ProbeTestResult>,
     pub overall_status: String,
+    /// Deprecated spellings this invocation used (under `--agent` they are
+    /// reported only here).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl CompatProbeReport {
@@ -76,6 +80,13 @@ pub struct ProbeTestResult {
     pub next_continuation_token_present: Option<bool>,
 }
 
+/// Discards events: `--agent` without `--trace-compat`.
+struct NoTrace;
+
+impl S3TraceWriter for NoTrace {
+    fn write_event(&self, _event: S3CompatEvent) {}
+}
+
 pub async fn run_compat_probe(
     endpoint_url: &str,
     region: Option<&str>,
@@ -84,12 +95,18 @@ pub async fn run_compat_probe(
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
+    quiet: bool,
+    warnings: Vec<String>,
 ) -> Result<CompatProbeReport, String> {
-    // --trace-compat / --debug-s3 as for a listing run; with neither, the
-    // probe keeps its historical default of tracing to stderr.
+    // --trace-compat as for a listing run; without it, the probe keeps its
+    // historical default of tracing to stderr — except under `--agent`
+    // (`quiet`), which keeps stderr quiet.
     let trace_writer: Box<dyn S3TraceWriter> =
-        crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())?
-            .unwrap_or_else(|| Box::new(StderrTraceWriter));
+        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())? {
+            Some(writer) => writer,
+            None if quiet => Box::new(NoTrace),
+            None => Box::new(StderrTraceWriter),
+        };
 
     let loader = aws_config::from_env()
         .retry_config(
@@ -237,13 +254,16 @@ pub async fn run_compat_probe(
         addressing_style: addressing_style.to_string(),
         tests: results,
         overall_status: overall.to_string(),
+        warnings,
     };
 
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     if let Some(out_path) = output {
         std::fs::write(out_path, &json).map_err(|e| e.to_string())?;
         // stdout is for the report itself; this note is for humans.
-        eprintln!("Compat-probe report written to {}", out_path);
+        if !quiet {
+            eprintln!("Compat-probe report written to {}", out_path);
+        }
     } else {
         println!("{}", json);
     }
@@ -594,7 +614,7 @@ fn diagnostic_for(
         ),
         Some(401) | Some(403) => (
             "access_denied",
-            "Check credentials, permissions, bucket policy, and provider profile selection",
+            "Check credentials (AWS_PROFILE / keys), permissions, bucket policy, and the --provider preset",
         ),
         Some(404) => (
             "not_found",

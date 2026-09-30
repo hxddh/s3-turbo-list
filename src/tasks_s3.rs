@@ -472,13 +472,12 @@ async fn flat_reactor_task(
 
     // Adaptive splitting only applies to plain list runs: diff uses a fixed,
     // key-ordered segment set per side (the merge needs it static), and
-    // --start-after / --continuation-token are single-chain modes. A
+    // --start-after is a single-chain mode. A
     // --delimiter run is excluded for the reason hints are: a page's
     // CommonPrefixes are not range-bounded, so a split parent would keep
     // paging past its cut, re-listing the child's prefixes.
     let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && ctx.start_after.is_none()
-        && ctx.continuation_token.is_none()
         && ctx.delimiter.as_deref().unwrap_or("").is_empty();
 
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
@@ -861,15 +860,8 @@ async fn flat_list_run_to_complete(
     control: &SegmentControl,
     split_tx: Option<&SplitSender>,
 ) -> bool {
-    let mut continuation_token = ctx.continuation_token.clone();
     // If the CLI provided --start-after, it overrides the segment's start.
-    // Continuation-token resume is a single-chain mode; do not also send
-    // start_after on the initial token request.
-    let mut start_after = if continuation_token.is_some() {
-        String::new()
-    } else {
-        ctx.start_after.as_deref().unwrap_or(start).to_string()
-    };
+    let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(
@@ -879,7 +871,6 @@ async fn flat_list_run_to_complete(
             &start_after,
             control,
             split_tx,
-            continuation_token.as_deref(),
             retry_attempt,
         )
         .await
@@ -913,14 +904,7 @@ async fn flat_list_run_to_complete(
                     retry_attempt.saturating_add(1)
                 };
                 if err.continue_on_error() && next_retry_attempt < ctx.max_attempts {
-                    // A token-mode attempt that failed before recording any
-                    // key has no key to resume after: dropping the token then
-                    // would restart the listing at the top of the prefix and
-                    // re-emit everything the token had already skipped.
-                    if continuation_token.is_none() || !err.next_start().is_empty() {
-                        start_after = err.next_start_owned();
-                        continuation_token = None;
-                    }
+                    start_after = err.next_start_owned();
                     retry_attempt = next_retry_attempt;
                     // Space consecutive failures. Re-issuing immediately is
                     // the wrong answer to `SlowDown` in particular: the
@@ -1004,7 +988,6 @@ async fn flat_list(
     start_after: &str,
     control: &SegmentControl,
     split_tx: Option<&SplitSender>,
-    continuation_token: Option<&str>,
     retry_attempt: u32,
 ) -> Result<(), FlatRuntimeError> {
     let mut request = ctx
@@ -1042,7 +1025,7 @@ async fn flat_list(
     // `FastContentsInterceptor`, which parses the page's `<Contents>` directly
     // (see `list_page`) instead of through the SDK's per-object deserializer.
     // Later pages keep `start_after` alongside the token, as the paginator did.
-    let mut page_token: Option<String> = continuation_token.map(str::to_string);
+    let mut page_token: Option<String> = None;
     let mut next_start = start_after.to_string();
     let emit_common_prefixes = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && !ctx.delimiter.as_deref().unwrap_or("").is_empty();
@@ -1066,6 +1049,13 @@ async fn flat_list(
             .send();
         let res = timeout_at(Instant::now() + timeout_dur, send).await;
         let latency_ms = page_start.elapsed().as_millis() as u64;
+        let traced = TracedRequest {
+            prefix,
+            start_after,
+            continuation_token: page_token.as_deref(),
+            retry_attempt,
+            latency_ms,
+        };
 
         match res {
             Err(_elapsed) => {
@@ -1073,28 +1063,15 @@ async fn flat_list(
                 ctx.g_state.inc_task_next_stream_timeout();
 
                 // Emit trace event for timeout.
-                emit_trace_compat(
+                write_trace(
                     ctx,
-                    "ListObjectsV2",
-                    prefix,
-                    start_after,
-                    continuation_token,
-                    retry_attempt,
-                    latency_ms,
-                    0,
-                    Some("StreamTimeout".into()),
-                    Some("ListObjectsV2 stream timeout".into()),
-                    None,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    true,
-                    false,
-                    None,
+                    traced.failure(
+                        ctx,
+                        0,
+                        Some("StreamTimeout".into()),
+                        Some("ListObjectsV2 stream timeout".into()),
+                        true,
+                    ),
                 );
 
                 return Err(FlatRuntimeError::new(
@@ -1105,16 +1082,7 @@ async fn flat_list(
             }
             Ok(Err(sdk_err)) => {
                 error!("S3 API error: {:?}", sdk_err);
-                return handle_sdk_error(
-                    sdk_err,
-                    &next_start,
-                    ctx,
-                    prefix,
-                    start_after,
-                    continuation_token,
-                    retry_attempt,
-                    latency_ms,
-                );
+                return handle_sdk_error(sdk_err, &next_start, ctx, traced);
             }
             Ok(Ok(response)) => {
                 let mut objects = response;
@@ -1138,28 +1106,19 @@ async fn flat_list(
 
                 // Emit trace event for this page.
                 let emit_page = |contents_count: usize, first: Option<&str>, last: Option<&str>| {
-                    emit_trace_compat(
+                    write_trace(
                         ctx,
-                        "ListObjectsV2",
-                        prefix,
-                        start_after,
-                        continuation_token,
-                        retry_attempt,
-                        latency_ms,
-                        200,
-                        None,
-                        None,
-                        None,
-                        is_truncated,
-                        next_token.as_deref(),
-                        key_count_opt,
-                        Some(contents_count as i32),
-                        Some(cp_count),
-                        first,
-                        last,
-                        false,
-                        false,
-                        None,
+                        traced.event(ctx, 200).map(|mut event| {
+                            event.is_truncated = is_truncated;
+                            event.next_continuation_token = next_token.clone();
+                            event.next_continuation_token_present = Some(next_token.is_some());
+                            event.key_count = key_count_opt;
+                            event.contents_count = Some(contents_count as i32);
+                            event.common_prefixes_count = Some(cp_count);
+                            event.first_key = first.map(str::to_string);
+                            event.last_key = last.map(str::to_string);
+                            event
+                        }),
                     )
                 };
                 match &parsed {
@@ -1225,6 +1184,11 @@ async fn flat_list(
                         .unwrap_or_default()
                         .into_iter()
                         .filter_map(|cp| cp.prefix)
+                        // A chain restarted at a CommonPrefix (retry, resume)
+                        // sends start-after=<prefix>; the keys under it sort
+                        // after it and roll up into the same prefix, so the
+                        // server returns it again. It was emitted already.
+                        .filter(|cp| cp.as_str() > start_after)
                         .filter(|cp| {
                             !is_ended && until.as_deref().is_none_or(|end| cp.as_str() <= end)
                         })
@@ -1336,28 +1300,19 @@ async fn flat_list(
 
                 // Pagination complete — emit final trace event (the record
                 // the paginator's end of stream used to produce).
-                emit_trace_compat(
+                write_trace(
                     ctx,
-                    "ListObjectsV2",
-                    prefix,
-                    start_after,
-                    continuation_token,
-                    retry_attempt,
-                    0,
-                    200,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    Some(0),
-                    Some(0),
-                    Some(0),
-                    None,
-                    None,
-                    false,
-                    false,
-                    None,
+                    TracedRequest {
+                        latency_ms: 0,
+                        ..traced
+                    }
+                    .event(ctx, 200)
+                    .map(|mut event| {
+                        event.key_count = Some(0);
+                        event.contents_count = Some(0);
+                        event.common_prefixes_count = Some(0);
+                        event
+                    }),
                 );
                 break;
             }
@@ -1412,7 +1367,7 @@ fn emit_segment_summary(
         prefix,
     );
     event.region = ctx.region.clone();
-    event.profile = ctx.profile.clone();
+    event.set_provider(ctx.provider.as_deref());
     event.addressing_style = ctx.addressing_style.clone();
     event.start_after = if start_after.is_empty() {
         None
@@ -1436,65 +1391,65 @@ fn emit_segment_summary(
 
 // ── Trace event emission ───────────────────────────────────
 
-fn emit_trace_compat(
-    ctx: &S3TaskContext,
-    operation: &str,
-    prefix: &str,
-    start_after: &str,
-    continuation_token: Option<&str>,
+/// One ListObjectsV2 request of a segment's chain, as the compat trace
+/// records it.
+#[derive(Clone, Copy)]
+struct TracedRequest<'a> {
+    prefix: &'a str,
+    start_after: &'a str,
+    /// The continuation token this request sent (none on a chain's first page).
+    continuation_token: Option<&'a str>,
     retry_attempt: u32,
     latency_ms: u64,
-    http_status: u16,
-    s3_error_code: Option<String>,
-    s3_error_message: Option<String>,
-    request_id: Option<String>,
-    is_truncated: bool,
-    next_token: Option<&str>,
-    key_count: Option<i32>,
-    contents_count: Option<i32>,
-    common_prefixes_count: Option<i32>,
-    first_key: Option<&str>,
-    last_key: Option<&str>,
-    retryable: bool,
-    fatal: bool,
-    truncated_raw_body: Option<String>,
-) {
-    let writer = match &ctx.trace_writer {
-        Some(w) => w,
-        None => return,
-    };
+}
 
-    let mut event = S3CompatEvent::new(operation, &ctx.endpoint_url, &ctx.s3_bucket_name, prefix);
-    event.region = ctx.region.clone();
-    event.profile = ctx.profile.clone();
-    event.addressing_style = ctx.addressing_style.clone();
-    event.start_after = if start_after.is_empty() {
-        None
-    } else {
-        Some(start_after.to_string())
-    };
-    event.continuation_token = continuation_token.map(str::to_string);
-    event.delimiter = ctx.delimiter.clone();
-    event.max_keys = ctx.max_keys;
-    event.retry_attempt = retry_attempt;
-    event.latency_ms = latency_ms;
-    event.http_status = http_status;
-    event.s3_error_code = s3_error_code;
-    event.s3_error_message = s3_error_message;
-    event.request_id = request_id;
-    event.retryable = retryable;
-    event.fatal = fatal;
-    event.is_truncated = is_truncated;
-    event.next_continuation_token = next_token.map(|t| t.to_string());
-    event.next_continuation_token_present = Some(next_token.is_some());
-    event.key_count = key_count;
-    event.contents_count = contents_count;
-    event.common_prefixes_count = common_prefixes_count;
-    event.first_key = first_key.map(str::to_string);
-    event.last_key = last_key.map(str::to_string);
-    event.truncated_raw_body = truncated_raw_body;
+impl TracedRequest<'_> {
+    /// This request's trace event with the run-level fields filled in, or
+    /// `None` when tracing is off, so nothing is built for nothing.
+    fn event(&self, ctx: &S3TaskContext, http_status: u16) -> Option<S3CompatEvent> {
+        ctx.trace_writer.as_ref()?;
+        let mut event = S3CompatEvent::new(
+            "ListObjectsV2",
+            &ctx.endpoint_url,
+            &ctx.s3_bucket_name,
+            self.prefix,
+        );
+        event.region = ctx.region.clone();
+        event.set_provider(ctx.provider.as_deref());
+        event.addressing_style = ctx.addressing_style.clone();
+        event.start_after = (!self.start_after.is_empty()).then(|| self.start_after.to_string());
+        event.continuation_token = self.continuation_token.map(str::to_string);
+        event.delimiter = ctx.delimiter.clone();
+        event.max_keys = ctx.max_keys;
+        event.retry_attempt = self.retry_attempt;
+        event.latency_ms = self.latency_ms;
+        event.http_status = http_status;
+        event.next_continuation_token_present = Some(false);
+        Some(event)
+    }
 
-    writer.write_event(event);
+    /// The trace event of a failed request.
+    fn failure(
+        &self,
+        ctx: &S3TaskContext,
+        http_status: u16,
+        code: Option<String>,
+        message: Option<String>,
+        retryable: bool,
+    ) -> Option<S3CompatEvent> {
+        let mut event = self.event(ctx, http_status)?;
+        event.s3_error_code = code;
+        event.s3_error_message = message;
+        event.retryable = retryable;
+        event.fatal = !retryable;
+        Some(event)
+    }
+}
+
+fn write_trace(ctx: &S3TaskContext, event: Option<S3CompatEvent>) {
+    if let (Some(writer), Some(event)) = (&ctx.trace_writer, event) {
+        writer.write_event(event);
+    }
 }
 
 // ── SDK error classification ───────────────────────────────
@@ -1503,11 +1458,7 @@ fn handle_sdk_error(
     err: aws_sdk_s3::error::SdkError<ListObjectsV2Error>,
     next_start: &str,
     ctx: &S3TaskContext,
-    prefix: &str,
-    start_after: &str,
-    continuation_token: Option<&str>,
-    retry_attempt: u32,
-    latency_ms: u64,
+    traced: TracedRequest<'_>,
 ) -> Result<(), FlatRuntimeError> {
     let tracker = ctx.get_tracker();
 
@@ -1530,35 +1481,20 @@ fn handle_sdk_error(
             });
 
             let retryable = is_retryable(errno);
-            let fatal = !retryable;
 
             if is_throttle(errno) {
                 ctx.g_state.inc_throttled();
             }
 
-            // Emit trace event.
-            emit_trace_compat(
+            write_trace(
                 ctx,
-                "ListObjectsV2",
-                prefix,
-                start_after,
-                continuation_token,
-                retry_attempt,
-                latency_ms,
-                http_code,
-                s3_code.clone(),
-                s3_msg.clone(),
-                request_id.clone(),
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                retryable,
-                fatal,
-                body_excerpt.clone(),
+                traced
+                    .failure(ctx, http_code, s3_code.clone(), s3_msg.clone(), retryable)
+                    .map(|mut event| {
+                        event.request_id = request_id.clone();
+                        event.truncated_raw_body = body_excerpt.clone();
+                        event
+                    }),
             );
 
             error!(
@@ -1601,32 +1537,19 @@ fn handle_sdk_error(
 
             let retryable = is_retryable(errno);
 
-            emit_trace_compat(
+            write_trace(
                 ctx,
-                "ListObjectsV2",
-                prefix,
-                start_after,
-                continuation_token,
-                retry_attempt,
-                latency_ms,
-                0,
-                Some(if is_timeout {
-                    "ConnectionTimeout".into()
-                } else {
-                    "DispatchFailure".into()
-                }),
-                Some(format!("{:?}", dispatch_err)),
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                retryable,
-                !retryable,
-                None,
+                traced.failure(
+                    ctx,
+                    0,
+                    Some(if is_timeout {
+                        "ConnectionTimeout".into()
+                    } else {
+                        "DispatchFailure".into()
+                    }),
+                    Some(format!("{:?}", dispatch_err)),
+                    retryable,
+                ),
             );
 
             Err(FlatRuntimeError::new(
@@ -1639,30 +1562,17 @@ fn handle_sdk_error(
             error!("Unhandled SDK error: {:?}", other);
             ctx.g_state.inc_s3_client_generic_error();
 
-            emit_trace_compat(
+            // Classified as ERROR_S3_CLIENT_GENERIC below, which the segment
+            // loop retries; the trace must say the same.
+            write_trace(
                 ctx,
-                "ListObjectsV2",
-                prefix,
-                start_after,
-                continuation_token,
-                retry_attempt,
-                latency_ms,
-                0,
-                Some("Unknown".into()),
-                Some(format!("{:?}", other)),
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                // Classified as ERROR_S3_CLIENT_GENERIC below, which the
-                // segment loop retries; the trace must say the same.
-                is_retryable(ERROR_S3_CLIENT_GENERIC),
-                !is_retryable(ERROR_S3_CLIENT_GENERIC),
-                None,
+                traced.failure(
+                    ctx,
+                    0,
+                    Some("Unknown".into()),
+                    Some(format!("{:?}", other)),
+                    is_retryable(ERROR_S3_CLIENT_GENERIC),
+                ),
             );
 
             Err(FlatRuntimeError::new(
@@ -2047,6 +1957,13 @@ pub async fn diff_list_side_task(
     let mut next_pair = hints.next();
     loop {
         while set.len() < concurrency {
+            // After Ctrl-C (possibly during startup discovery) start nothing
+            // new: the merge aborts, and a fresh request would only delay
+            // the exit by up to its timeout.
+            if ctx.is_quit() {
+                next_pair = None;
+                break;
+            }
             let Some(pair) = next_pair.take() else { break };
             if let Some(head) = &merge_head {
                 if pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS {

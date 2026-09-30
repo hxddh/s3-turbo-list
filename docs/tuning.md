@@ -29,15 +29,27 @@ Where boundaries come from, in precedence order:
    a number, other characters over the alphabet the keys use), truncated
    right after it, so long constant suffixes such as
    `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
-   estimates the namespace's highest key with a few concurrent probe rounds;
-   after that each cut is usually one probe, and every bisection level probes
-   its ranges concurrently.  The boundaries are real observed keys.  List
-   mode targets one boundary per worker, since runtime splitting still
-   covers mid-run skew.
+   estimates the namespace's highest key with a few concurrent probe rounds.
+   Bisection then runs in waves: each wave cuts every open range at up to
+   seven evenly spaced candidates at once (one probe each, all ranges
+   concurrently), so a 64-boundary partition takes two waves instead of
+   seven levels; the last wave hands out exactly the boundaries still
+   missing, and a range whose probes find fewer keys than asked leaves the
+   rest to one more wave, so the target is always reached when the keys
+   allow it.  The boundaries are real observed keys.  List mode targets one
+   boundary per worker, since runtime splitting still covers mid-run skew.
+
+   The same bisection also runs *inside* prefixes when discovery finds
+   structure but too little of it: when discovery yields fewer boundaries
+   than one per worker and some probed prefix is a flat directory with more
+   than one page of keys (its page was truncated and held no
+   `CommonPrefixes` — `data/part-…` under a single top-level `data/`), those
+   flat prefixes are bisected concurrently, sharing the remaining budget,
+   and their boundaries are merged with the structural ones.  Listing such a
+   bucket with or without `--prefix data/` now partitions the same way.
 4. **Single segment** — listings that fit in one page (nothing to partition,
    and probing would cost more requests than the listing), and runs with
-   `--start-after` (or the deprecated `--continuation-token`) or
-   `--delimiter`, which are never split.  `--no-auto-hints` (supported,
+   `--start-after` or `--delimiter`, which are never split.  `--no-auto-hints` (supported,
    hidden from `--help`) also starts from one segment, which runtime
    splitting still fans out.
 
@@ -46,9 +58,10 @@ The dry-run plan's `hints.source` names the choice: `explicit`,
 `delimiter_single_segment`, or `single_chain` (`--start-after`); `diff` plans
 report `diff_per_side_automatic`.
 
-`diff` partitions each side the same way (startup discovery, or bisection);
-because diff has no runtime splitting to fall back on, its bisection targets
-at least eight boundaries. Each side lists its segments concurrently; the
+`diff` partitions each side the same way (startup discovery, flat prefixes
+bisected when discovery found too few boundaries, or bisection); because diff
+has no runtime splitting to fall back on, its bisection targets at least eight
+boundaries. Each side lists its segments concurrently; the
 segment set stays static (no runtime splitting) so the merge can consume
 segments in key order.
 
@@ -270,9 +283,15 @@ list, the search path, and a custom-endpoint example are in
 Long-tail segments are split at runtime automatically, so no offline
 rebalancing workflow is needed.  For the raw per-page and per-segment events,
 pass `--trace-compat trace.jsonl` to a run (`--trace-compat -` writes to
-stderr; it replaces the deprecated `--debug-s3`).  `--trace-compat` combines
-with `--run-manifest`: use the manifest for final status and aggregate
-metrics, the trace for per-request endpoint behavior.
+stderr).  `--trace-compat` combines with `--run-manifest`: use the manifest
+for final status and aggregate metrics, the trace for per-request endpoint
+behavior.
+
+The trace records every listing page request (with its retries) and one
+summary event per completed segment, plus each `compat-probe` request.  The
+planning probes are not traced: startup structural discovery, flat-namespace
+bisection, and runtime split probes (a few `max-keys=1` or delimiter
+requests each).
 
 ```bash
 s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out \
@@ -286,13 +305,14 @@ python3 examples/inspect-trace.py trace.jsonl          # summary
 ### Trace event fields
 
 Each line is one `S3CompatEvent`.  Optional fields (`?`) are omitted when
-absent.
+absent.  `profile` is deprecated (0.38; removed in 0.39): read `provider`.
 
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | string | ISO 8601 wall-clock time of the call. |
 | `operation` | string | S3 operation (e.g. `"ListObjectsV2"`, `"HeadBucket"`), or `"ListObjectsV2SegmentSummary"` for a completed segment. |
-| `profile` | string? | Provider preset name (e.g. `"bos"`, `"minio"`); the field keeps its pre-0.37 name. |
+| `provider` | string? | Provider preset name (e.g. `"bos"`, `"minio"`). |
+| `profile` | string? | Deprecated: the same value as `provider`. |
 | `endpoint_url` | string | Endpoint URL used for the request. |
 | `region` | string? | Region the request was signed for. |
 | `addressing_style` | string | `"path"`, `"virtual"`, or `"auto"`. |
@@ -301,7 +321,7 @@ absent.
 | `delimiter` | string? | Delimiter sent with the request.  The listing default is `""` (recursive), which is omitted from requests and from the event; hierarchical runs and structural probes send `"/"`. |
 | `start_after` | string? | `start-after` parameter, if sent. |
 | `max_keys` | int? | `max-keys` parameter, if sent. |
-| `continuation_token` | string? | Continuation token sent. |
+| `continuation_token` | string? | Continuation token the request sent (absent on a chain's first page). |
 | `http_status` | uint16 | HTTP response status. |
 | `s3_error_code` | string? | S3 error code (e.g. `"NoSuchBucket"`). |
 | `s3_error_message` | string? | Error message body. |

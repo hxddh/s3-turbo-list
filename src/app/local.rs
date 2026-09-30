@@ -4,9 +4,35 @@
 use super::*;
 
 pub(crate) fn generate_completions(shell: Shell) {
-    let mut cmd = CliArgs::command();
+    let mut cmd = without_hidden(&CliArgs::command());
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+/// A copy of `cmd` without its hidden arguments and subcommands:
+/// completions must not advertise the deprecated spellings and debugging
+/// knobs that `--help` hides (clap_complete lists every argument).
+fn without_hidden(cmd: &clap::Command) -> clap::Command {
+    // Names are `'static` in clap without its `string` feature; this runs
+    // once per process, so leaking the few copies is harmless.
+    let leak = |text: &str| -> &'static str { Box::leak(text.to_string().into_boxed_str()) };
+    let mut copy = clap::Command::new(leak(cmd.get_name()));
+    if let Some(about) = cmd.get_about() {
+        copy = copy.about(about.clone());
+    }
+    if let Some(version) = cmd.get_version() {
+        copy = copy.version(leak(version));
+    }
+    copy.args(
+        cmd.get_arguments()
+            .filter(|arg| !arg.is_hide_set())
+            .cloned(),
+    )
+    .subcommands(
+        cmd.get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(without_hidden),
+    )
 }
 
 pub(crate) fn generate_man_page() {
@@ -161,6 +187,8 @@ pub(crate) fn run_compat_probe(
     addressing_style: &str,
     output: Option<&str>,
     cfg: &S3TurboConfig,
+    quiet: bool,
+    warnings: Vec<String>,
 ) {
     let rt = build_runtime_or_exit(2);
 
@@ -173,6 +201,8 @@ pub(crate) fn run_compat_probe(
             addressing_style,
             output,
             cfg,
+            quiet,
+            warnings,
         )
         .await
         {

@@ -65,7 +65,8 @@ pub struct S3Config {
     /// `addressing_style`.
     #[serde(default, rename = "addressing_style", skip_serializing)]
     pub addressing_style_setting: Option<AddressingStyle>,
-    /// Deprecated spelling of `addressing_style = "path"`.
+    /// Deprecated (0.37; removed in 0.39) spelling of
+    /// `addressing_style = "path"`.
     #[serde(default, skip_serializing)]
     pub force_path_style: Option<bool>,
     #[serde(skip)]
@@ -74,9 +75,10 @@ pub struct S3Config {
     /// provider preset only fills in a style nobody chose).
     #[serde(skip)]
     pub addressing_style_explicit: bool,
-    /// The provider preset (`provider`; `profile` is its pre-0.37 name).
-    #[serde(default, rename = "provider", alias = "profile")]
-    pub profile: Option<String>,
+    /// The provider preset (`provider`; `profile` is its pre-0.37 name,
+    /// deprecated and removed in 0.39).
+    #[serde(default, alias = "profile")]
+    pub provider: Option<String>,
     /// Per-run settings from the command line; not config-file keys (a
     /// `start_after` in a config file silently truncated every run).
     #[serde(skip)]
@@ -103,7 +105,7 @@ impl Default for S3Config {
             force_path_style: None,
             addressing_style: AddressingStyle::default(),
             addressing_style_explicit: false,
-            profile: None,
+            provider: None,
             trace_compat: None,
             start_after: None,
         }
@@ -273,7 +275,7 @@ impl S3TurboConfig {
             vec![
                 (PathBuf::from("./s3-turbo-list.toml"), "workspace"),
                 (
-                    dirs_next::home_dir()
+                    std::env::home_dir()
                         .unwrap_or_default()
                         .join(".s3-turbo-list.toml"),
                     "home",
@@ -282,14 +284,20 @@ impl S3TurboConfig {
         };
         let mut loaded_config = None;
         let mut loaded_config_kind = "none".to_string();
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
 
         for (path, kind) in &search_paths {
             if path.exists() {
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
-                config = Self::parse(&content)
+                let (parsed, parse_warnings) = Self::parse_with_warnings(&content)
                     .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
+                config = parsed;
+                warnings.extend(
+                    parse_warnings
+                        .into_iter()
+                        .map(|warning| format!("{} (in {})", warning, path.display())),
+                );
                 log::info!("Loaded config from {}", path.display());
                 loaded_config = Some(path.display().to_string());
                 loaded_config_kind = (*kind).to_string();
@@ -324,10 +332,55 @@ impl S3TurboConfig {
 
     /// A config file's content over the defaults.
     pub fn parse(content: &str) -> Result<Self, String> {
+        Self::parse_with_warnings(content).map(|(config, _warnings)| config)
+    }
+
+    /// A config file's content over the defaults, and a warning for each
+    /// deprecated key it uses (`s3.profile`, `s3.force_path_style`).
+    pub fn parse_with_warnings(content: &str) -> Result<(Self, Vec<String>), String> {
+        let mut warnings = Vec::new();
+        // serde reports both spellings of the provider as a "duplicate
+        // field"; say what to do instead.
+        if let Ok(table) = toml::from_str::<toml::Table>(content)
+            && let Some(s3) = table.get("s3").and_then(toml::Value::as_table)
+        {
+            if s3.contains_key("profile") {
+                if s3.contains_key("provider") {
+                    return Err("s3.provider and s3.profile are both set: profile is the \
+                                deprecated name of provider; remove s3.profile"
+                        .to_string());
+                }
+                warnings.push(
+                    "deprecated config key s3.profile (use s3.provider); it will be removed \
+                     in 0.39"
+                        .to_string(),
+                );
+            }
+            if s3.contains_key("force_path_style") {
+                warnings.push(
+                    "deprecated config key s3.force_path_style (use s3.addressing_style = \
+                     \"path\"); it will be removed in 0.39"
+                        .to_string(),
+                );
+            }
+        }
         let file_config: S3TurboConfig = toml::from_str(content).map_err(|e| e.to_string())?;
         let mut config = Self::default();
         config.merge(file_config);
-        Ok(config)
+        Ok((config, warnings))
+    }
+
+    /// Replace a provider preset's name with its canonical spelling
+    /// (`BOS` → `bos`); an unknown name is left as given.
+    pub fn normalize_provider(&mut self) {
+        if let Some(preset) = self
+            .s3
+            .provider
+            .as_deref()
+            .and_then(crate::profiles::get_profile)
+        {
+            self.s3.provider = Some(preset.name.to_string());
+        }
     }
 
     fn merge(&mut self, other: S3TurboConfig) {
@@ -350,8 +403,8 @@ impl S3TurboConfig {
             self.s3.addressing_style = style;
             self.s3.addressing_style_explicit = true;
         }
-        if other.s3.profile.is_some() {
-            self.s3.profile = other.s3.profile;
+        if other.s3.provider.is_some() {
+            self.s3.provider = other.s3.provider;
         }
         self.runtime.worker_threads = other.runtime.worker_threads;
         self.runtime.max_concurrency = other.runtime.max_concurrency;
@@ -381,12 +434,10 @@ impl S3TurboConfig {
             self.s3.addressing_style_explicit = true;
         }
         if let Some(p) = cli.provider {
-            self.s3.profile = Some(p.to_string());
+            self.s3.provider = Some(p.to_string());
         }
         self.s3.trace_compat = cli.trace_compat.map(str::to_string);
         self.s3.start_after = cli.start_after.map(str::to_string);
-        self.output.log_file = cli.log_file.map(str::to_string);
-        self.output.ks_file = cli.ks_file.map(str::to_string);
         self.output.parquet_file = cli.parquet_file.map(str::to_string);
         if let Some(codec) = cli.compression {
             self.output.compression = codec.to_string();
@@ -400,14 +451,14 @@ impl S3TurboConfig {
         if let Some(application) = crate::profiles::apply_profile_preset(self, region) {
             if application.known {
                 log::info!(
-                    "Applied endpoint profile '{}': endpoint applied {}, addressing applied {}",
+                    "Applied provider preset '{}': endpoint applied {}, addressing applied {}",
                     application.name,
                     application.endpoint_url_applied,
                     application.addressing_style_applied
                 );
             } else {
                 log::warn!(
-                    "Unknown vendor/profile '{}' — no preset applied",
+                    "Unknown provider '{}' — no preset applied",
                     application.name
                 );
             }
@@ -425,8 +476,6 @@ pub struct CliOverrides<'a> {
     pub provider: Option<&'a str>,
     pub trace_compat: Option<&'a str>,
     pub start_after: Option<&'a str>,
-    pub log_file: Option<&'a str>,
-    pub ks_file: Option<&'a str>,
     pub parquet_file: Option<&'a str>,
     pub compression: Option<&'a str>,
     pub compression_level: Option<u32>,
@@ -501,7 +550,7 @@ mod tests {
         assert_eq!(config.output.compression_level, 1);
         assert_eq!(config.channel.capacity, 64);
         assert_eq!(config.s3.addressing_style, AddressingStyle::Auto);
-        assert!(config.s3.profile.is_none());
+        assert!(config.s3.provider.is_none());
         assert!(config.s3.trace_compat.is_none());
     }
 
@@ -549,8 +598,38 @@ max_concurrency = 50
             );
             assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
             assert!(config.s3.addressing_style_explicit);
-            assert_eq!(config.s3.profile.as_deref(), Some("bos"));
+            assert_eq!(config.s3.provider.as_deref(), Some("bos"));
         }
+    }
+
+    #[test]
+    fn test_deprecated_config_keys_warn() {
+        let (_, warnings) =
+            S3TurboConfig::parse_with_warnings("[s3]\nprovider = \"bos\"\n").unwrap();
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        let (config, warnings) = S3TurboConfig::parse_with_warnings(
+            "[s3]\nprofile = \"bos\"\nforce_path_style = true\n",
+        )
+        .unwrap();
+        assert_eq!(config.s3.provider.as_deref(), Some("bos"));
+        assert_eq!(warnings.len(), 2, "{:?}", warnings);
+        assert!(warnings[0].contains("s3.profile (use s3.provider)"));
+        assert!(warnings[1].contains("s3.force_path_style"));
+        // Both spellings: a clear message, not serde's "duplicate field".
+        let err =
+            S3TurboConfig::parse("[s3]\nprovider = \"bos\"\nprofile = \"minio\"\n").unwrap_err();
+        assert!(err.contains("remove s3.profile"), "{}", err);
+    }
+
+    #[test]
+    fn test_normalize_provider_uses_the_canonical_name() {
+        let mut config = S3TurboConfig::default();
+        config.s3.provider = Some("BOS".to_string());
+        config.normalize_provider();
+        assert_eq!(config.s3.provider.as_deref(), Some("bos"));
+        config.s3.provider = Some("NoSuch".to_string());
+        config.normalize_provider();
+        assert_eq!(config.s3.provider.as_deref(), Some("NoSuch"));
     }
 
     #[test]
@@ -621,8 +700,6 @@ max_concurrency = 50
             provider: Some("test-profile"),
             trace_compat: Some("/tmp/trace.jsonl"),
             start_after: Some("after-key"),
-            log_file: Some("log.txt"),
-            ks_file: Some("ks.csv"),
             parquet_file: Some("out.parquet"),
             compression: Some("zstd"),
             compression_level: Some(3),
@@ -634,11 +711,9 @@ max_concurrency = 50
             Some("https://custom.example.com")
         );
         assert!(config.s3.force_path_style());
-        assert_eq!(config.s3.profile.as_deref(), Some("test-profile"));
+        assert_eq!(config.s3.provider.as_deref(), Some("test-profile"));
         assert_eq!(config.s3.trace_compat.as_deref(), Some("/tmp/trace.jsonl"));
         assert_eq!(config.s3.start_after.as_deref(), Some("after-key"));
-        assert_eq!(config.output.log_file.as_deref(), Some("log.txt"));
-        assert_eq!(config.output.ks_file.as_deref(), Some("ks.csv"));
         assert_eq!(config.output.parquet_file.as_deref(), Some("out.parquet"));
         assert_eq!(config.output.compression, "zstd");
         assert_eq!(config.output.compression_level, 3);
@@ -660,7 +735,7 @@ max_concurrency = 50
             ),
         ] {
             let mut config = S3TurboConfig::default();
-            config.s3.profile = Some(profile.to_string());
+            config.s3.provider = Some(profile.to_string());
             config.apply_profile_preset(Some(region));
             assert_eq!(
                 config.s3.endpoint_url.as_deref(),
@@ -674,7 +749,7 @@ max_concurrency = 50
     #[test]
     fn test_profile_template_never_overrides_explicit_endpoint() {
         let mut config = S3TurboConfig::default();
-        config.s3.profile = Some("oss".to_string());
+        config.s3.provider = Some("oss".to_string());
         config.s3.endpoint_url = Some("https://oss-cn-beijing-internal.aliyuncs.com".to_string());
         config.apply_profile_preset(Some("oss-cn-beijing"));
         assert_eq!(
@@ -686,7 +761,7 @@ max_concurrency = 50
     #[test]
     fn test_profile_template_without_region_leaves_endpoint_unset() {
         let mut config = S3TurboConfig::default();
-        config.s3.profile = Some("oss".to_string());
+        config.s3.provider = Some("oss".to_string());
         config.apply_profile_preset(None);
         assert_eq!(config.s3.endpoint_url, None);
     }
@@ -694,7 +769,7 @@ max_concurrency = 50
     #[test]
     fn test_apply_bos_profile_preset() {
         let mut config = S3TurboConfig::default();
-        config.s3.profile = Some("bos".to_string());
+        config.s3.provider = Some("bos".to_string());
         config.apply_profile_preset(None);
         assert_eq!(
             config.s3.endpoint_url.as_deref(),
@@ -719,7 +794,7 @@ max_concurrency = 50
             assert_eq!(config.s3.addressing_style.to_string(), style);
         }
         let mut config = S3TurboConfig::default();
-        config.s3.profile = Some("minio".to_string());
+        config.s3.provider = Some("minio".to_string());
         config.apply_profile_preset(None);
         assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
     }

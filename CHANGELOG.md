@@ -5,6 +5,169 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-09-29
+
+This release removes the spellings 0.37 deprecated, puts a warning on the
+remaining old ones (removed in 0.39), makes `--agent` output and the JSON
+contract consistent, and fixes three wrong-result edge cases (a finished
+checkpoint, repeated folder rows after a retry, and Ctrl-C after the
+listing finished). Buckets with one large flat directory under a single
+prefix now list and diff in parallel from the start.
+
+### Performance
+- **Large flat directories under a single prefix are partitioned at
+  startup.** A bucket laid out as `data/part-…` listed without
+  `--prefix data/` had one discovered boundary (`data/`), so bisection never
+  ran: list waited for runtime splitting and each diff side listed as one
+  serial segment. When discovery finds fewer boundaries than one per worker,
+  probed prefixes whose page was truncated and held no `CommonPrefixes` are
+  now bisected concurrently and their boundaries (real keys) merged with the
+  structural ones. On a local 200k-key mock at 20 ms per request: diff
+  4.47 s → 0.74 s, list 1.36 s → 0.49 s — the same as with `--prefix data/`.
+- **Flat bisection cuts each range several ways per round-trip.** Each wave
+  probes up to seven evenly spaced candidates per range at once instead of
+  one midpoint, so 64 boundaries take two waves instead of seven levels; the
+  final wave hands out exactly the boundaries still missing, so the
+  boundary count and invariants (real keys, strictly increasing, inside
+  their range) are unchanged. Startup of a flat 200k-key listing at 20 ms per
+  request: ~340 ms → ~250 ms; list 0.55 s → 0.46 s, diff 0.82 s → 0.75 s
+  (hex keys: list 0.66 s → 0.55 s, diff 1.10 s → 0.80 s, segment max/mean
+  2.24 → 1.08).
+- **One pass over each page before parsing.** The fast Contents parser's
+  pre-check finds forbidden controls, non-ASCII bytes and `]` in one
+  vectorized pass; UTF-8 validation and the `]]>` search run only on pages
+  that need them (−25% on that step, ~1% of list CPU).
+
+Output is unchanged: Parquet rows and `.ks` files identical to v0.37.0 in
+every benchmark. See
+`docs/validation-results/startup-partitioning-and-page-scan-20260929.md`.
+
+### Removed
+- The spellings deprecated in 0.37: `--profile` (use `--provider`),
+  `--summary-only` (`--output-format summary`), `--plan-json`
+  (`--dry-run > file`), `--debug-s3` (`--trace-compat -`),
+  `--continuation-token` (`--resume` or `--start-after`), and
+  `--output-ks-file` / `--output-log-file` (the KeySpace file is always
+  `<parquet stem>.ks`, the `--log` file `<name>.log`), including the hidden
+  `doctor` copies of the last two. Each is now a usage error (exit 2).
+- The `init-config` stub: it is an unknown subcommand (exit 2).
+- Plan and `doctor --json` fields `resolved_config.s3.{profile,
+  force_path_style, debug_s3}`, and plan/manifest fields
+  `checkpoint.{completed_segments, total_segments}`.
+- The trace writers' fan-out and no-op variants: the trace target is a
+  JSONL file or stderr (`trace_writer_for_target`).
+
+### Deprecated (removed in 0.39)
+These warned nowhere in 0.37. Each now prints `warning: deprecated …` on
+stderr (not under `--agent`) and is listed in the plan / manifest
+`warnings`, in `config_source.warnings` (config keys), or as a `deprecated`
+`doctor` check.
+- Options other than `--config`, `--provider`, `--endpoint-url` and
+  `--addressing-style` written before the command name
+  (`s3-turbo-list --output-dir out list …`): write them after it.
+- Config keys `s3.profile` (use `s3.provider`) and `s3.force_path_style`
+  (use `s3.addressing_style = "path"`).
+- `--endpoint` (use `--endpoint-url`), `doctor --agent` and
+  `manifest-summary --agent` (use `--json`), and the no-ops
+  `doctor --simple` and `doctor --fix-suggestions`.
+- JSON fields renamed to "provider": `inputs.profile` (use
+  `inputs.provider`), `resolved_config.s3.profile_known` /
+  `profile_warnings` (use `provider_known` / `provider_warnings`), the trace
+  field `profile` (use `provider`). `inputs.continuation_token` stays for
+  one release, always null.
+
+### Changed
+- **`--agent` keeps stderr quiet**, as documented: the stderr log is off
+  unless `RUST_LOG` is set (a `--log` file keeps its level), deprecation
+  warnings go to the JSON only, and a pre-run failure prints just the run
+  line. `compat-probe --agent` no longer traces to stderr by default.
+- **Plan `warnings` is empty in the normal case.** Dropped: the always-on
+  diff "--hints-file/--resume unsupported" note, the compat-probe "will
+  contact the endpoint" note, the tsv/ndjson and summary "writes no files"
+  notes (kept only when output path options are given and ignored), and the
+  `--delimiter ''` note unless the option was written out.
+- The provider is "provider" throughout: `inputs.provider`,
+  `resolved_config.s3.provider_known` / `provider_warnings`, the trace
+  field `provider`, and the checkpoint identity field `provider`
+  (checkpoints written by 0.37 with `profile` still load and resume). The
+  name is normalized to the preset's lowercase spelling, so `--provider BOS`
+  and a later `--provider bos --resume` are the same run. Messages that said
+  "profile" say "provider", and an unknown provider from the config file is
+  reported as `s3.provider in <file>`, not as `--provider`.
+- Every non-zero `list`/`diff`/`compat-probe` exit prints the run line, dry
+  runs included: `s3-turbo-list: run blocked (exit N): …` after a blocked
+  plan, `run failed` for a pre-plan error; the reason is no longer printed
+  twice. A blocked dry run under `--agent` prints only the plan.
+- `doctor --json` early exits (usage error, unreadable hints file, unknown
+  provider, config error) include `cwd`, and `config_source` /
+  `resolved_config` once the config is read.
+- compat-probe plans report `hints.source: not_applicable` and list the
+  `-o` report as `outputs.report_file`, which is checked (and flagged in
+  `file_conflicts`) like any other output before a request.
+- `guide <provider>` says `status: validated` or `status: documented
+  preset`, as the docs do.
+- `doctor` without a provider says requests go to AWS S3 instead of "no
+  explicit endpoint URL required by the provider preset".
+- The trace docs no longer claim every S3 call is traced: startup
+  discovery, bisection and split probes are not.
+
+### Fixed
+- **Resuming from a finished checkpoint wrote an empty output and reported
+  success.** 0.36 saved a checkpoint with no ranges left when Ctrl-C came
+  after the listing had finished; `--resume` from it listed nothing and
+  exited 0. Such a checkpoint is now discarded with a warning and the run
+  starts over.
+- **`--delimiter` runs repeated a folder row after a retry or a resume.** A
+  request chain restarted at a CommonPrefix sends `start-after=<prefix>`,
+  and the server returns that prefix again (the keys under it sort after
+  it); it was emitted twice. CommonPrefixes at or before the chain's start
+  are dropped.
+- Ctrl-C after the last range was listed exited 7 with "interrupted … Any
+  outputs written are partial" although the outputs were complete; it now
+  reports success.
+- Every Hive-style boundary (`dt=2026-01-01/`) logged a "looks like a TOML
+  assignment" warning on every run; the check is gone (hints files are
+  validated when loaded).
+- Ctrl-C during diff startup discovery still sent each side's first
+  listing request, delaying the exit by up to its timeout.
+- Clustered short options before the command name (`-lc 5 list …`) failed
+  with "unrecognized subcommand '5'".
+- Usage-error JSON was routed on raw argv strings: `list --bucket doctor
+  --json` printed doctor JSON, and `--agent` anywhere (even after
+  `manifest-summary`) printed the run-failure JSON. The command is found
+  the way option hoisting finds it; only `list`/`diff`/`compat-probe` print
+  the run-failure JSON and only `doctor` the doctor JSON.
+- A dry run with an unreadable or invalid `--hints-file` printed
+  `status: ok` and `hints.valid: null` while exiting 2; the plan is
+  `blocked` with `hints.valid: false`.
+- compat-probe without an endpoint now names what to pass: the regional
+  `--endpoint-url https://s3.<region>.amazonaws.com` for AWS (or no
+  preset), `--region` for a region-derived preset.
+- A config file with both `s3.provider` and `s3.profile` failed with
+  serde's "duplicate field"; it now says to remove `s3.profile`.
+- `completions` advertised hidden options (deprecated spellings and
+  debugging knobs).
+- `diff --help` said `--start-after` cannot be combined with `--hints-file`
+  or `--resume`, which diff does not take.
+- A dry-run plan reported a checkpoint with no ranges left as `valid` (a
+  zero-range resume) while the run discards it and lists everything;
+  `checkpoint.valid` is false for any checkpoint the run would discard.
+- `compat-probe -o dir/that/does/not/exist/report.json` contacted the
+  endpoint and failed only at the final write: the report's missing parent
+  directories are created like every other output's. The output check also
+  runs before any directory is created, so a blocked path is reported as
+  "cannot be created" for every output.
+- `compat-probe --agent` with a deprecated spelling (`--endpoint`) dropped
+  the warning entirely; the report carries it in `warnings`.
+- Listing trace events record the continuation token each request sent
+  (`continuation_token`); they carried only the removed CLI seed token, so
+  the field was always absent.
+
+### Build
+- Dependencies: `aws-smithy-async`, `aws-smithy-runtime`, `dashmap`,
+  `dirs-next` and `tokio-test` are gone and `arrow` is a dev-dependency
+  (292 → 270 crates in the release build).
+
 ## [0.37.0] - 2026-09-29
 
 This release simplifies the command line: options belong to the commands

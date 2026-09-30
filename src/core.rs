@@ -2,7 +2,7 @@ use crate::config::S3Config;
 use crate::stats::HttpStatusCodeTracker;
 use crate::trace::S3TraceWriter;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -81,6 +81,7 @@ impl ObjectKey {
 
     /// Consuming variant of [`decode`](Self::decode): reuses this key's
     /// allocation for the prefix, so only the name is newly allocated.
+    #[cfg(test)]
     pub fn into_decoded(self) -> (ObjectPrefix, ObjectName) {
         match self.0.rfind('/') {
             Some(pos) => {
@@ -185,12 +186,6 @@ impl ObjectProps {
     pub fn is_diff_mode(&self) -> bool {
         (self.flags & OBJECT_PROPS_FLAG_DIFF_MODE) == OBJECT_PROPS_FLAG_DIFF_MODE
     }
-    pub fn is_left(&self) -> bool {
-        (self.flags & OBJECT_PROPS_FLAG_DIR_LEFT) == OBJECT_PROPS_FLAG_DIR_LEFT
-    }
-    pub fn is_right(&self) -> bool {
-        (self.flags & OBJECT_PROPS_FLAG_DIR_RIGHT) == OBJECT_PROPS_FLAG_DIR_RIGHT
-    }
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -210,24 +205,12 @@ impl ObjectProps {
         (self.etag_md5, self.etag_parts)
     }
 
+    #[cfg(test)]
     pub fn etag_string(&self) -> String {
         if self.etag_parts == 0 {
             hex::encode(self.etag_md5)
         } else {
             format!("{}-{}", hex::encode(self.etag_md5), self.etag_parts)
-        }
-    }
-
-    pub fn append_etag_string(&self, out: &mut String) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        out.reserve(32 + usize::from(self.etag_parts != 0) * 11);
-        for byte in self.etag_md5 {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        if self.etag_parts != 0 {
-            let _ = std::fmt::Write::write_fmt(out, format_args!("-{}", self.etag_parts));
         }
     }
 
@@ -826,7 +809,8 @@ pub struct S3TaskContext {
     pub endpoint_url: String,
     pub region: Option<String>,
     pub addressing_style: String,
-    pub profile: Option<String>,
+    /// The provider preset, for trace events.
+    pub provider: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
     pub max_attempts: u32,
@@ -839,8 +823,6 @@ pub struct S3TaskContext {
     /// discovery are skipped when this is set, so exactly one segment exists
     /// and it starts after this key.
     pub start_after: Option<String>,
-    /// CLI `--continuation-token` override for a single ListObjectsV2 chain.
-    pub continuation_token: Option<String>,
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
@@ -859,11 +841,10 @@ pub struct TaskContextParams<'a> {
     pub g_state: GlobalState,
     pub trace_writer: Option<Arc<dyn S3TraceWriter>>,
     pub addressing_style: &'a str,
-    pub profile: Option<&'a str>,
+    pub provider: Option<&'a str>,
     pub delimiter: Option<&'a str>,
     pub max_keys: Option<i32>,
     pub start_after: Option<&'a str>,
-    pub continuation_token: Option<&'a str>,
 }
 
 impl S3TaskContext {
@@ -919,14 +900,13 @@ impl S3TaskContext {
             endpoint_url: p.endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
             region: p.region.map(str::to_string),
             addressing_style: p.addressing_style.to_string(),
-            profile: p.profile.map(str::to_string),
+            provider: p.provider.map(str::to_string),
             delimiter: p.delimiter.map(str::to_string),
             max_keys: p.max_keys,
             max_attempts: p.s3_config.max_attempts.max(1),
             initial_backoff_secs: p.s3_config.initial_backoff_secs,
             operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
             start_after: p.start_after.map(str::to_string),
-            continuation_token: p.continuation_token.map(str::to_string),
             resume_progress: Arc::new(Mutex::new(None)),
         }
     }
@@ -1024,10 +1004,6 @@ impl KeySpacePair {
             end: e,
         }
     }
-
-    pub fn to_task_input(&self) -> (&str, Option<&str>) {
-        (&self.start, self.end.as_deref())
-    }
 }
 
 pub struct KeySpaceHints {
@@ -1036,67 +1012,8 @@ pub struct KeySpaceHints {
     done: Vec<KeySpacePair>,
 }
 
-/// Defence-in-depth: log a warning for every boundary that looks like leaked
-/// TOML syntax.  The hints loader should already reject these, but this guard
-/// catches any path that reaches `new_from` with raw TOML still present.
-fn warn_on_suspicious_boundaries(hints: &[String]) {
-    for (i, b) in hints.iter().enumerate() {
-        // Leading whitespace that isn't a legitimate key character.
-        if b.starts_with(' ') || b.starts_with('\t') {
-            log::warn!(
-                "KeySpaceHints boundary {} has leading whitespace: '{}'. \
-                 This will be sent verbatim as an S3 start_after value and may \
-                 cause request failures.",
-                i,
-                b
-            );
-        }
-        // Trailing comma — classic TOML array entry leakage.
-        if b.ends_with(',') {
-            log::warn!(
-                "KeySpaceHints boundary {} ends with a comma: '{}'. \
-                 This looks like leaked TOML array syntax.",
-                i,
-                b
-            );
-        }
-        // Surrounded by quotes — another TOML leakage pattern.
-        if (b.starts_with('"') && b.ends_with('"')) || (b.starts_with('\'') && b.ends_with('\'')) {
-            log::warn!(
-                "KeySpaceHints boundary {} is quoted: '{}'. \
-                 This looks like leaked TOML string syntax.",
-                i,
-                b
-            );
-        }
-        // TOML array-open or array-close.
-        if b == "[" || b == "]" {
-            log::warn!(
-                "KeySpaceHints boundary {} is a TOML bracket: '{}'. \
-                 This will produce invalid S3 start_after values.",
-                i,
-                b
-            );
-        }
-        // TOML key = value assignment.
-        if b.contains('=') {
-            log::warn!(
-                "KeySpaceHints boundary {} contains '=': '{}'. \
-                 This looks like a TOML assignment line, not an object key.",
-                i,
-                b
-            );
-        }
-    }
-}
-
 impl KeySpaceHints {
     pub fn new_from(hints: &[String]) -> Self {
-        // Defensive validation: warn on any boundary that looks like leaked TOML
-        // syntax.  The hints loader should already have rejected these, but this
-        // guard catches any path that bypasses the loader.
-        warn_on_suspicious_boundaries(hints);
-
         let v = Self::pairs_from_boundaries(hints);
         Self {
             inner: v,
@@ -1119,21 +1036,6 @@ impl KeySpaceHints {
             .collect();
         Self {
             inner,
-            inflight: HashMap::new(),
-            done: Vec::new(),
-        }
-    }
-
-    pub fn new_uncompleted_from(hints: &[String], completed_indices: &[usize]) -> Self {
-        warn_on_suspicious_boundaries(hints);
-
-        let completed: HashSet<usize> = completed_indices.iter().copied().collect();
-        let v = Self::pairs_from_boundaries(hints)
-            .into_iter()
-            .filter(|pair| !completed.contains(&pair.index))
-            .collect();
-        Self {
-            inner: v,
             inflight: HashMap::new(),
             done: Vec::new(),
         }
@@ -1292,31 +1194,6 @@ mod tests {
         assert_eq!(p2.end, None);
 
         assert!(hints.next().is_none());
-    }
-
-    #[test]
-    fn test_key_space_hints_uncompleted_preserves_original_segment_starts() {
-        let boundaries = vec!["m/".to_string()];
-        let mut hints = KeySpaceHints::new_uncompleted_from(&boundaries, &[0]);
-        assert_eq!(hints.total_count(), 1);
-
-        let remaining = hints.next().unwrap();
-        assert_eq!(remaining.index, 1);
-        assert_eq!(remaining.start, "m/");
-        assert_eq!(remaining.end, None);
-        assert!(hints.next().is_none());
-    }
-
-    #[test]
-    fn test_key_space_hints_index_end_covers_sparse_resume_set() {
-        // Resume with segment 0 done: one segment left, but its index is 10.
-        // Fresh (split-child) indices must not collide with it.
-        let boundaries: Vec<String> = (0..10).map(|i| format!("k{i:02}/")).collect();
-        let completed: Vec<usize> = (0..10).collect();
-        let hints = KeySpaceHints::new_uncompleted_from(&boundaries, &completed);
-        assert_eq!(hints.total_count(), 1);
-        assert_eq!(hints.index_end(), 11);
-        assert_eq!(KeySpaceHints::new_from(&[]).index_end(), 1);
     }
 
     #[test]

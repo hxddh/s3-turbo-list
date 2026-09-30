@@ -12,8 +12,9 @@ defaults for the endpoint and addressing style: it never touches
 credentials, probes nothing, changes no output schema, and adds no
 provider-specific pagination behavior.  Credentials always come from the
 AWS SDK chain (`AWS_PROFILE`, environment variables, instance roles).
-`--provider` replaces the pre-0.37 `--profile`, which still works as a
-hidden alias.
+`--provider` replaced the pre-0.37 `--profile`, which was removed in 0.38.
+The name is case-insensitive and reported in its canonical lowercase form
+(`--provider BOS` is `bos` in plans, manifests and checkpoints).
 
 `s3-turbo-list guide <provider>` prints a quickstart and the preset's facts
 locally (no S3 access).
@@ -110,9 +111,12 @@ Keys are checked: an unknown section or key — a typo, or a pre-0.37 per-run
 key such as `s3.start_after`, `s3.debug_s3`, `s3.trace_compat`,
 `output.parquet_file`, `output.ks_file`, or `output.log_file` — fails with
 exit code `2` and names the expected keys.  The deprecated `s3.profile` and
-`s3.force_path_style` keys are still read for one release; use `provider`
-and `addressing_style = "path"`.  An explicit `--config` path that does not
-exist is also exit `2`.
+`s3.force_path_style` keys are still read until 0.39, each with a
+`warning: deprecated config key …` on stderr and in
+`config_source.warnings` (plans, manifests, `doctor`); use `provider` and
+`addressing_style = "path"`.  A file that sets both `provider` and
+`profile` is an error (exit `2`) that says to remove `profile`.  An
+explicit `--config` path that does not exist is also exit `2`.
 
 ## compat-probe
 
@@ -131,15 +135,24 @@ does — global `--endpoint-url` / `--addressing-style`, then the config file,
 then the `--provider` preset — so it exercises what the run would use.  It
 needs an endpoint from one of those (for AWS, pass the regional endpoint,
 e.g. `https://s3.us-east-1.amazonaws.com`); without one it exits `3` before
-any request.  `--region` is optional: it defaults to the preset's region,
-else the SDK's.  `-p/--prefix` probes under a prefix.  The pre-0.37
-subcommand-local `--endpoint` still works as a hidden alias.
+any request, and the error names what to pass: the regional
+`--endpoint-url` for AWS (or no preset), `--region` for a region-derived
+preset (`oss`, `b2`), `--endpoint-url` for `minio` and `r2`.  `--region` is
+optional: it defaults to the preset's region, else the SDK's.
+`-p/--prefix` probes under a prefix.  The pre-0.37 subcommand-local
+`--endpoint` still works as a hidden alias of `--endpoint-url`, with a
+deprecation warning, until 0.39.
 
 The probe sends `HeadBucket`, `ListObjectsV2 (max-keys=1)`,
 `ListObjectsV2 with delimiter`, and a `ListObjectsV2 pagination check`.
 `--trace-compat <file>` writes the requests' trace as JSONL (`-` for
-stderr); without it, the trace goes to stderr.  `--dry-run` prints the plan
-without contacting the endpoint.  Template placeholders such as
+stderr); without it, the trace goes to stderr, except under `--agent`,
+which keeps stderr quiet (no log, no trace; only the final line on
+failure).  `-o/--output` writes the report to a file instead of stdout; the
+path is checked with the run's other outputs before any request, and the
+dry-run plan lists it as `outputs.report_file`.  `--dry-run` prints the
+plan without contacting the endpoint (its `hints.source` is
+`not_applicable`: the probe sends a fixed set of requests).  Template placeholders such as
 `<account-id>` are rejected locally with exit `3`; a literal but unreachable
 endpoint is left to the probe, so transport failures are part of the report.
 
