@@ -72,7 +72,10 @@ s3-turbo-list completions fish > s3-turbo-list.fish
 s3-turbo-list man > s3-turbo-list.1
 ```
 
-These write to stdout only and do not contact S3.
+These write to stdout only and do not contact S3.  The man page covers the
+top-level command and lists the subcommands; each command's options are in
+`s3-turbo-list <command> --help` (clap_mangen writes per-command pages only
+to a directory, which `man` does not take).
 
 ## Credentials
 

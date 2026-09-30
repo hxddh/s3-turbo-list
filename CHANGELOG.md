@@ -5,6 +5,84 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- The spellings deprecated in 0.38. Each is now a usage error (exit 2) that
+  names the replacement:
+  - Options other than `--config`, `--provider`, `--endpoint-url` and
+    `--addressing-style` written before the command name are no longer
+    moved behind it: `s3-turbo-list --output-dir out list …` fails with
+    "option '--output-dir' must follow the command name `list`".
+    `s3-turbo-list --agent list …` still prints the run-failure JSON.
+  - `--endpoint` (use `--endpoint-url`), `doctor --agent` and
+    `manifest-summary --agent` (use `--json`), and the no-ops
+    `doctor --simple` and `doctor --fix-suggestions`.
+  - The config keys `s3.profile` and `s3.force_path_style` are unknown keys
+    (exit 2), with a message naming `s3.provider` /
+    `s3.addressing_style = "path"`; the list of valid keys no longer shows
+    them.
+- JSON fields: `inputs.profile` and `inputs.continuation_token` (plans and
+  manifests), `resolved_config.s3.profile_known` / `profile_warnings`, and
+  the trace field `profile`. Read `provider`, `provider_known` and
+  `provider_warnings`.
+- Deprecation warnings: with nothing left to deprecate, no `warning:
+  deprecated …` lines, no deprecations in plan / manifest / compat-probe
+  `warnings`, and no `deprecated` doctor check. `config_source.warnings`
+  stays, always empty. Checkpoints written by 0.37 (identity field
+  `profile`) still load and resume.
+- A usage error that names a spelling removed in 0.38 (`--summary-only`,
+  `--plan-json`, `init-config`, `--profile`, `--debug-s3`,
+  `--continuation-token`, `--output-ks-file`, `--output-log-file`) adds a
+  note with its replacement.
+
+### Deprecated (removed in 0.40)
+- `metrics.summary_only` in the run manifest, and `summary_only` (and the
+  `Summary only:` line) in `manifest-summary`: use
+  `inputs.output_format == "summary"`. `manifest-summary` now derives its
+  `summary_only` from the output format and falls back to
+  `metrics.summary_only` only for a manifest without one;
+  `examples/read_manifest.py` does the same.
+
+### Changed
+- JSON results are consistent (additive; nothing renamed): the compat-probe
+  report has `schema_version`, `tool_version`, `status` (`success` /
+  `failed`), `exit_code`, and an always-present `warnings` (the run's
+  warnings, which `--agent` keeps off stderr); `manifest-summary --json`
+  has `schema_version` and `outputs.report_file`; dry-run plans have `cwd`.
+- `hints.warnings` in plans is empty unless an explicit `--hints-file` has
+  problems. The description of how a source partitions the run
+  (`startup_discovery`, `single_chain`, …) moved to a new `hints.note`; for
+  a diff left as one segment per side it names the option that did it, and
+  the plan warning says "diff lists each side as a single ListObjectsV2
+  chain" instead of "list is planned as …".
+- compat-probe trace events record the probe's `prefix` (they had `""`)
+  and `provider`.
+- `--endpoint-url` help reads "S3-compatible endpoint URL (default: the
+  provider's, or AWS S3)", with value name `URL`.
+- `manifest-summary`, `guide`, `completions` and `man --help` no longer
+  list the Endpoint options (still accepted and ignored there).
+- INSTALL.md says the man page covers the top-level command only and
+  points to `<command> --help` for each command's options.
+
+### Fixed
+- `list --output-format ndjson|tsv --agent --dry-run` printed plan
+  `status: ok` and exited 0 while the real run exits 2; the plan is
+  `blocked` and the dry run exits 2 with the run line.
+- A config or validation error of a `list` / `diff` / `compat-probe` run
+  (unknown provider, bad config value, …) printed its reason twice (the
+  message, then the run line), under `--agent` too; it is printed once, in
+  the run line, unless it spans several lines.
+- compat-probe's exit on an `incompatible` endpoint used its own line;
+  it is the documented run line, `s3-turbo-list: run failed (exit N):
+  compat-probe found the endpoint incompatible: …`.
+- Docs: the trace field table says listing events always carry
+  `"delimiter"` (`""` for the recursive default) and that probes are not
+  traced; providers.md documents the compat-probe report's `warnings` and
+  new fields and `-o` with `--agent`; agent-usage.md documents the
+  `manifest-summary --json` output and the compat-probe report under
+  `--agent`.
+
 ## [0.38.0] - 2026-09-29
 
 This release removes the spellings 0.37 deprecated, puts a warning on the

@@ -56,9 +56,9 @@ s3-turbo-list list --bucket my-bucket --region us-east-2 \
 
 Options follow the command name, and each command's `--help` lists only
 what it takes. `--config`, `--provider`, `--endpoint-url` and
-`--addressing-style` are global and may go on either side of it. Other
-options written before the command name (the pre-0.37 spelling) still work
-but print a deprecation warning; that spelling is removed in 0.39.
+`--addressing-style` are global and may go on either side of it. Any other
+option written before the command name (the pre-0.37 spelling) is a usage
+error since 0.39 that names the command it must follow.
 
 Listing is recursive by default; `--prefix logs/2026/` narrows it. Use
 `--delimiter '/'` for a hierarchical listing: the objects at that level plus
