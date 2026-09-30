@@ -18,9 +18,14 @@ Where boundaries come from, in precedence order:
    probes (one ListObjectsV2 page each, at most 3 levels deep) finds real
    `CommonPrefixes` boundaries at run start.  It runs on every run and costs
    at most a second or two of startup, so first runs list in parallel with no
-   prior steps.  Nothing is cached: there is no hints file in the working
-   directory (0.37 removed the `<region>_<bucket>[_<hash>]_hints.toml`
-   cache).
+   prior steps.  A probed level adds every prefix it finds, so a wide tree
+   (20 prefixes of 1,000 subdirectories each) can find far more boundaries
+   than the target of two per worker; the set is then thinned to the target,
+   evenly spaced.  Every segment costs at least one page request, and its
+   last page is mostly keys past its end, so tens of thousands of tiny
+   segments would cost far more requests than the listing itself.  Nothing
+   is cached: there is no hints file in the working directory (0.37 removed
+   the `<region>_<bucket>[_<hash>]_hints.toml` cache).
 3. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
    namespace) and the listing spans more than one page, the key range is
    partitioned up front by single-key `max-keys=1` probes.  Each cut aims at
@@ -29,7 +34,9 @@ Where boundaries come from, in precedence order:
    a number, other characters over the alphabet the keys use), truncated
    right after it, so long constant suffixes such as
    `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
-   estimates the namespace's highest key with a few concurrent probe rounds.
+   estimates the namespace's highest key with a few concurrent probe rounds
+   (its low end is the first key of discovery's own page, so finding it
+   costs no probe).
    Bisection then runs in waves: each wave cuts every open range at up to
    seven evenly spaced candidates at once (one probe each, all ranges
    concurrently), so a 64-boundary partition takes two waves instead of
@@ -41,12 +48,22 @@ Where boundaries come from, in precedence order:
 
    The same bisection also runs *inside* prefixes when discovery finds
    structure but too little of it: when discovery yields fewer boundaries
-   than one per worker and some probed prefix is a flat directory with more
-   than one page of keys (its page was truncated and held no
-   `CommonPrefixes` — `data/part-…` under a single top-level `data/`), those
-   flat prefixes are bisected concurrently, sharing the remaining budget,
-   and their boundaries are merged with the structural ones.  Listing such a
-   bucket with or without `--prefix data/` now partitions the same way.
+   than one per worker and a probed page shows a flat run of keys longer
+   than a page, the runs are bisected concurrently and their boundaries
+   merged with the structural ones.  A run is either a flat directory (its
+   page was truncated and held no `CommonPrefixes` — `data/part-…` under a
+   single top-level `data/`) or files listed next to subdirectories
+   (`obj-000000123.snappy.parquet` beside `logs/`); the latter are bisected
+   under the text they share before their number (`obj-`), so the cuts stay
+   among the files.  The remaining budget is shared by each run's
+   **estimated size**, not evenly: the page discovery already fetched spans
+   some distance along the keys' number, and one concurrent round of seven
+   `max-keys=1` probes (at 2, 4, 16, … 4,096 times that span) tells how far
+   the run reaches — within a factor of two to four, which is enough when
+   one directory holds 90% of the keys.  A run never gets more cuts than it
+   has pages; runs whose keys have no number to read along count as the
+   median of the others.  Listing such a bucket with or without
+   `--prefix data/` partitions the same way.
 4. **Single segment** — listings that fit in one page (nothing to partition,
    and probing would cost more requests than the listing), and runs with
    `--start-after` or `--delimiter`, which are never split.  `--no-auto-hints` (supported,
@@ -69,7 +86,11 @@ Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits
 cooperatively — the right half becomes a new parallel child segment,
 recursively.  Split points come from a delimiter probe when the remaining
-range has `CommonPrefixes` structure; for flat ranges (no `/` structure), the
+range has `CommonPrefixes` structure.  When none of those probes finds a
+prefix inside the range but their pages, together, hold every key left in it
+(the ladder reached the listing prefix and no page was truncated — the tail of
+a leaf directory), the cut is the median of those keys, with no further
+probes.  Otherwise, for flat ranges (no `/` structure), the
 cut is placed near the middle of the range between the segment's cursor and
 its end (or the listing's estimated highest key, for the last segment) the
 same way startup bisection places it, and validated with single-key probes, so

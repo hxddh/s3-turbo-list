@@ -10,13 +10,13 @@ license = "Apache-2.0"
 
 [dependencies]
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "io-std"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
 aws-smithy-runtime-api = "1"
 # ListObjectsV2 fast path (src/list_page.rs): wraps the response body
 # (`SdkBody::from_body_1_x`) and scans it with memchr.
