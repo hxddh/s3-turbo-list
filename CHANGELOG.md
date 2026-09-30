@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every remaining key (the tail of a leaf directory), the split is the median
   of those keys, with no further flat-cut probes.
 
+### Build
+- **Leaner dependency features.** `aws-sdk-s3` no longer enables the legacy
+  `rustls` feature (a second hyper 0.14 / rustls 0.21 HTTP stack next to the
+  default one); the default HTTPS client, `rt-tokio`, `sigv4a` and `http-1x`
+  are kept. `tokio` enables only the features used (`rt-multi-thread`,
+  `macros`, `sync`, `time`, `fs`, `io-util`, `io-std`) instead of `full`,
+  and `env_logger` drops its `regex` filter feature (`RUST_LOG` directives
+  still work; a `/regex` message filter is matched as a plain substring).
+  Unique crates in the normal dependency tree: 359 → 329; release binary
+  (x86_64 Linux): 23.4 MB → 20.1 MB. Proxy (`HTTP(S)_PROXY` / `NO_PROXY`)
+  and TLS behave as before: they come from the default HTTPS client, which
+  is unchanged.
+
 ## [0.38.0] - 2026-09-29
 
 This release removes the spellings 0.37 deprecated, puts a warning on the
