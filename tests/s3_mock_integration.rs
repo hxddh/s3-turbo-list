@@ -1,3 +1,5 @@
+mod common;
+
 use arrow::array::{Array, StringArray, UInt8Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
@@ -410,33 +412,20 @@ operation_timeout_secs = 2
     .unwrap();
 }
 
-const PROXY_ENV_VARS: &[&str] = &[
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
-
 fn run_cli(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
     run_cli_with_env(args, cwd, &[])
 }
 
-/// Run the CLI with the caller's proxy environment cleared (the SDK honours
-/// HTTP(S)_PROXY / NO_PROXY, so an inherited proxy would reroute requests
-/// meant for the local mock) plus `extra_env`.
+/// Run the CLI in `cwd` (also its `HOME`), isolated from the developer's
+/// config, AWS profile and proxy (`common::hermetic_command`: an inherited
+/// proxy would reroute requests meant for the local mock), with mock
+/// credentials plus `extra_env`.
 fn run_cli_with_env(
     args: &[String],
     cwd: &std::path::Path,
     extra_env: &[(&str, &str)],
 ) -> (i32, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
+    let mut command = common::hermetic_command(cwd);
     command.envs(extra_env.iter().copied());
     let output = command
         .current_dir(cwd)
@@ -447,12 +436,7 @@ fn run_cli_with_env(
         .args(args)
         .output()
         .expect("run s3-turbo-list");
-
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    common::exit_and_output(output)
 }
 
 fn parquet_keys(path: &std::path::Path) -> Vec<String> {
@@ -4594,7 +4578,7 @@ fn local_mock_missing_region_fails_fast_without_requests() {
     write_fast_config(&config);
 
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let output = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -4963,11 +4947,7 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
     .map(|s| s.to_string())
     .collect();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
-    let child = command
+    let child = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -5041,11 +5021,7 @@ fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     write_fast_config(&config);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
-    let mut child = command
+    let mut child = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -5738,18 +5714,15 @@ fn local_mock_delimiter_start_after_inside_a_folder_keeps_the_folder_row() {
 /// Run with no credentials anywhere the SDK looks: no key variables, no
 /// profile, an empty HOME (no shared config files), no instance metadata.
 fn run_cli_without_credentials(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS.iter().chain(&[
+    let mut command = common::hermetic_command(cwd);
+    for var in [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
-        "AWS_PROFILE",
-        "AWS_CONFIG_FILE",
-        "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    ]) {
+    ] {
         command.env_remove(var);
     }
     let output = command
@@ -5825,7 +5798,7 @@ fn local_mock_compat_probe_without_a_region_is_a_setup_error() {
         "--bucket".into(),
         "b".into(),
     ];
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let output = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("HOME", dir.path())
         .env_remove("AWS_REGION")
@@ -5946,11 +5919,7 @@ start_after = "key-000100"
             "--no-auto-hints".into(),
         ];
         args.extend(extra.iter().map(|s| s.to_string()));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-        for var in PROXY_ENV_VARS {
-            command.env_remove(var);
-        }
-        let child = command
+        let child = common::hermetic_command(dir.path())
             .current_dir(dir.path())
             .env("AWS_ACCESS_KEY_ID", "mock-access-key")
             .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -6020,11 +5989,7 @@ fn local_mock_diff_ctrl_c_during_retry_backoff_exits_promptly() {
         "--output-dir".into(),
         "out".into(),
     ];
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
-    let mut child = command
+    let mut child = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")

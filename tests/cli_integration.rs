@@ -1,32 +1,30 @@
 // Integration tests for CLI help regression.
 // These shell out to Cargo's already-built binary to keep tests fast.
+mod common;
+
+use common::{exit_and_output, hermetic_command};
 use std::process::Command;
 
 /// Helper: run `s3-turbo-list <args>` and return (exit_code, stdout, stderr).
+/// `HOME` is an empty temporary directory (see `hermetic_command`).
 fn run_cli(args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let home = tempfile::tempdir().unwrap();
+    let output = hermetic_command(home.path())
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 fn run_cli_without_aws_env(args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = hermetic_command(home.path());
     clear_aws_env(&mut cmd);
     let output = cmd
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 fn clear_aws_env(cmd: &mut Command) {
@@ -46,17 +44,14 @@ fn clear_aws_env(cmd: &mut Command) {
     }
 }
 
+/// Run in `cwd`, which is also the run's `HOME`.
 fn run_cli_in_dir(args: &[&str], cwd: &std::path::Path) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let output = hermetic_command(cwd)
         .current_dir(cwd)
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 #[test]
@@ -2003,7 +1998,8 @@ fn test_cli_rejects_invalid_values_before_any_work() {
 fn test_cli_doctor_suggestions_respect_env_credentials() {
     // Static keys in the environment already give the SDK credentials;
     // suggesting `export AWS_PROFILE=default` would point it elsewhere.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = hermetic_command(home.path());
     clear_aws_env(&mut cmd);
     let output = cmd
         .env("AWS_ACCESS_KEY_ID", "test-access-key")
