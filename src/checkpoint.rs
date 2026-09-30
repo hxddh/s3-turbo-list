@@ -296,12 +296,18 @@ pub fn checkpoint_path_for_prefix(bucket: &str, region: Option<&str>, prefix: &s
     if prefix.is_empty() {
         return base;
     }
-    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
     format!(
         "{}_{}_checkpoint.toml",
         base.trim_end_matches("_checkpoint.toml"),
-        &digest[..8]
+        prefix_digest(prefix)
     )
+}
+
+/// The first 8 hex digits of the prefix's SHA-256: what tells apart the
+/// checkpoint and output names of runs over different prefixes of a bucket.
+pub fn prefix_digest(prefix: &str) -> String {
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
+    digest[..8].to_string()
 }
 
 /// Generate the checkpoint file path for a given bucket.

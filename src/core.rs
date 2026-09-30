@@ -321,6 +321,15 @@ pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
     secs.max(0) as u64
 }
 
+/// The current time in whole seconds since the epoch (0 if the clock is set
+/// before it); the task heartbeats' clock.
+pub(crate) fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Parse an S3 ETag (`"<32 hex>"` or `"<32 hex>-<parts>"`) into MD5 bytes and
 /// a part count. Anything else is "not available" (all zeros, 0 parts), which
 /// diff reports as a difference. Decoding goes through a scratch buffer:

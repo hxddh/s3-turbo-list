@@ -189,11 +189,10 @@ pub(crate) fn output_stem_with_timestamp(
         parts.push(sanitize_path_component(target_bucket));
     }
     // Runs over different prefixes of one bucket get different names (the
-    // hints cache and checkpoint are keyed the same way): parallel per-prefix
-    // runs started in the same second used to overwrite each other.
+    // checkpoint is keyed the same way): parallel per-prefix runs started in
+    // the same second used to overwrite each other.
     if !prefix.is_empty() {
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
-        parts.push(format!("p{}", &digest[..8]));
+        parts.push(format!("p{}", checkpoint::prefix_digest(prefix)));
     }
     parts.push(timestamp.to_string());
     parts.join("_")

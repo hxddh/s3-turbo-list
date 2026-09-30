@@ -13,7 +13,7 @@ use log::{error, info};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentOutcome {
@@ -76,7 +76,7 @@ async fn flat_reactor_task(
     let flat_high: FlatHigh = Arc::new(Mutex::new(None));
     let mut retired_pages = 0u64;
     let mut gov = FanOutGovernor::new(flat_concurrency);
-    let mut last_ts = epoch_secs();
+    let mut last_ts = core::epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
     // In-flight split probes. Each holds a context clone — and with it a
@@ -207,7 +207,7 @@ async fn flat_reactor_task(
                 }
             },
             _ = split_check.tick() => {
-                let now = epoch_secs();
+                let now = core::epoch_secs();
                 if now - last_ts >= core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
                     info!(
                         "Flat List S3 Task — {} — heartbeat, {} segments in-flight, {} done, {} remaining, {} runtime splits",
@@ -334,11 +334,4 @@ fn resume_progress(
         remaining,
         ranges_with_progress,
     }
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
