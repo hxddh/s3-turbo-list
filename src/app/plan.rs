@@ -456,3 +456,60 @@ pub(crate) fn diff_target_endpoint(
     }
     cfg.s3.endpoint_url.clone()
 }
+
+/// `--dry-run`: print the plan, then exit with the code the run would stop
+/// with before listing (2, 3 or 5), if any.
+pub(crate) fn run_dry_run(cli: &Cli, resolved: &Resolved) {
+    let cfg = &resolved.cfg;
+    // Validate --filter exactly as a real run would, so a bad expression
+    // fails with exit code 2 at plan time instead of at run time.
+    if let Some(ref filter_expr) = cli.filter {
+        let mode = if matches!(cli.cmd, Commands::Diff { .. }) {
+            RunMode::BiDir
+        } else {
+            RunMode::List
+        };
+        if let Err(e) = config::compile_filter_with_mode(filter_expr, &mode) {
+            exit_before_run(agent::ExitCode::CliConfig, format!("Filter error: {}", e));
+        }
+    }
+    let (planned_ks, planned_parquet, _) = planned_output_paths(cli, cfg);
+    validate_distinct_output_paths(cli, cfg, planned_ks.as_deref(), planned_parquet.as_deref());
+    let report = build_plan_report(
+        cli,
+        cfg,
+        resolved.config_source.clone(),
+        resolved.diff_target_endpoint.as_deref(),
+    );
+    println!("{}", agent::to_pretty_json(&report));
+    // The plan is the JSON result: a blocked dry run exits with the
+    // run's code and its run line, but prints no second JSON document.
+    let _ = PLAN_PRINTED.set(true);
+    if let Some(problem) = agent_output_format_conflict(cli) {
+        exit_before_run(agent::ExitCode::CliConfig, problem);
+    }
+    // An explicit hints file the run cannot load stops it with exit 2;
+    // so does the plan (status `blocked`, `hints.valid: false`).
+    if let Some(path) = cli.hints_file.as_deref()
+        && let Err(e) = hints::parse_hints_file(path)
+    {
+        exit_before_run(
+            agent::ExitCode::CliConfig,
+            format!("Hints file error: {}", e),
+        );
+    }
+    // The plan must predict the run: a setup problem the run would stop
+    // on with exit 3 fails the dry run the same way (plan still written).
+    if let Some(error) = provider_setup_guardrail_warnings(cli, cfg).first() {
+        exit_before_run(
+            agent::ExitCode::ProviderSetup,
+            format!("Provider setup error: {}", error),
+        );
+    }
+    if let Some(problem) = planned_output_problems(&report.outputs, cli).first() {
+        exit_before_run(
+            agent::ExitCode::OutputWrite,
+            format!("Output error: {}", problem),
+        );
+    }
+}

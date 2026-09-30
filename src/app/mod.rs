@@ -18,6 +18,8 @@ use std::time::Instant;
 
 mod cli;
 mod exit;
+mod finish;
+mod listing;
 mod local;
 mod outputs;
 mod plan;
@@ -25,6 +27,8 @@ mod run;
 
 pub(crate) use cli::*;
 pub(crate) use exit::*;
+pub(crate) use finish::*;
+pub(crate) use listing::*;
 pub(crate) use local::*;
 pub(crate) use outputs::*;
 pub(crate) use plan::*;

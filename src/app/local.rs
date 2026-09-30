@@ -265,3 +265,57 @@ pub(crate) fn print_doctor_hints(report: &hints::HintsValidationReport) {
         }
     }
 }
+
+/// `doctor`: the setup report, with the hints file (when given) linted and
+/// the filter (when given) compiled; exits 3 on an endpoint/provider error
+/// and 2 on any other error.
+pub(crate) fn run_doctor(cli: &Cli, resolved: &Resolved, json: bool) {
+    let cfg = &resolved.cfg;
+    // doctor absorbed the former hints-validate command: when a hints
+    // file is supplied it is linted and embedded in the report.
+    let hints = cli.hints_file.as_deref().map(|path| {
+        hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
+            exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
+        })
+    });
+    let mut report = agent::doctor_report(cfg, resolved.config_source.clone(), hints);
+    // A filter that would fail the real run (exit 2) fails doctor too.
+    if let Some(filter_expr) = cli.filter.as_deref() {
+        let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
+            .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
+        {
+            Ok(_) => agent::DoctorCheck {
+                name: "filter".to_string(),
+                status: "ok".to_string(),
+                message: format!("filter compiles: {}", filter_expr),
+            },
+            Err(e) => agent::DoctorCheck {
+                name: "filter".to_string(),
+                status: "error".to_string(),
+                message: format!("filter does not compile: {}", e),
+            },
+        };
+        if check.status == "error" {
+            report.status = "error".to_string();
+        }
+        report.checks.push(check);
+    }
+    if json {
+        println!("{}", agent::to_pretty_json(&report));
+    } else {
+        print_doctor_report(&report);
+    }
+    if report.status == "error" {
+        // An endpoint/provider error is the same setup failure a real
+        // run exits 3 on; any other error is a local config problem.
+        let setup_error = report
+            .checks
+            .iter()
+            .any(|check| check.name == "endpoint_url" && check.status == "error");
+        std::process::exit(if setup_error {
+            agent::ExitCode::ProviderSetup.code()
+        } else {
+            agent::ExitCode::CliConfig.code()
+        });
+    }
+}
