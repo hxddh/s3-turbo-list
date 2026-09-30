@@ -5,7 +5,14 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.39.0] - 2026-09-30
+
+This release removes what 0.38 deprecated, makes the `--agent` / JSON
+contract consistent across every output, turns three setup failures that
+read as network errors into immediate exit-3 setup errors, fixes a 0.38
+regression in `--delimiter` listings, and stops startup discovery from
+overshooting on wide trees (a 20×1000-folder bucket diffed in 30 s; now
+0.7 s). The release binary is 14% smaller.
 
 ### Performance
 - **Startup discovery keeps at most its boundary target.** A probed level
@@ -133,6 +140,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new fields and `-o` with `--agent`; agent-usage.md documents the
   `manifest-summary --json` output and the compat-probe report under
   `--agent`.
+
+### Internal
+- `run()` (1233 lines) is split into setup (`app/run.rs`), the listing
+  (`app/listing.rs`) and the exit (`app/finish.rs`); startup partitioning
+  moved into the library (`startup.rs`); `tasks_s3` and `agent` are split
+  into modules. Log lines of moved code name the new module paths
+  (`s3_turbo_list::startup`, `…::tasks_s3::chain`, …); a `RUST_LOG` filter
+  on the old module paths no longer matches them.
+- Tests run every spawned binary with an isolated `HOME` and without
+  inherited AWS profile, endpoint and proxy variables: a
+  `~/.s3-turbo-list.toml` on the developer's machine failed 8 tests.
 
 ### Build
 - **Leaner dependency features.** `aws-sdk-s3` no longer enables the legacy
