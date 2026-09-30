@@ -61,13 +61,18 @@ pub(crate) fn exit_before_run(code: agent::ExitCode, message: String) -> ! {
     if code == agent::ExitCode::CliConfig && DOCTOR_JSON.get().copied().unwrap_or(false) {
         exit_doctor_check_error("config_parse", &message);
     }
-    // A run command's run line carries the reason; the message is printed
-    // on its own only when it has more to say than that one line.
+    print_reason(&message);
+    run_failure_epilogue(code, &message);
+    std::process::exit(code.code())
+}
+
+/// Print why the command stops. A run command's run line carries the
+/// reason, so the message is printed on its own only when it has more to
+/// say than that one line (otherwise every config error was printed twice).
+fn print_reason(message: &str) {
     if !RUN_COMMAND.get().copied().unwrap_or(false) || message.trim_end().lines().count() > 1 {
         eprintln!("{}", message);
     }
-    run_failure_epilogue(code, &message);
-    std::process::exit(code.code())
 }
 
 pub(crate) fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
@@ -106,7 +111,7 @@ pub(crate) fn run_failure_epilogue(code: agent::ExitCode, message: &str) {
 /// named `check`, and `config_source` / `resolved_config` once the config
 /// has loaded (a config or usage error comes before that).
 pub(crate) fn exit_doctor_check_error(check: &str, message: &str) -> ! {
-    eprintln!("{}", message);
+    print_reason(message);
     if DOCTOR_JSON.get().copied().unwrap_or(false) {
         let mut report = serde_json::json!({
             "schema_version": agent::AGENT_SCHEMA_VERSION,

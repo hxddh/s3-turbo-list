@@ -4,7 +4,7 @@
 use super::*;
 
 pub(crate) fn generate_completions(shell: Shell) {
-    let mut cmd = without_hidden(&CliArgs::command());
+    let mut cmd = without_hidden(&cli_command());
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
@@ -36,7 +36,7 @@ fn without_hidden(cmd: &clap::Command) -> clap::Command {
 }
 
 pub(crate) fn generate_man_page() {
-    let cmd = CliArgs::command();
+    let cmd = cli_command();
     let man = clap_mangen::Man::new(cmd);
     let mut buffer: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buffer) {
@@ -165,9 +165,6 @@ pub(crate) fn print_doctor_report(report: &agent::DoctorReport) {
         config.runtime.max_concurrency,
         config.runtime.worker_threads
     );
-    for warning in &report.config_source.warnings {
-        println!("WARN  config: {}", warning);
-    }
     if let Some(hints) = &report.hints {
         print_doctor_hints(hints);
     }
@@ -207,7 +204,13 @@ pub(crate) fn run_compat_probe(
         .await
         {
             Ok(report) => report,
-            Err(e) => {
+            Err(compat_probe::ProbeFailure::Setup(e)) => {
+                exit_before_run(
+                    agent::ExitCode::ProviderSetup,
+                    format!("Provider setup error: {}", e),
+                );
+            }
+            Err(compat_probe::ProbeFailure::Output(e)) => {
                 exit_before_run(
                     agent::ExitCode::OutputWrite,
                     format!("Compat-probe output error: {}", e),
@@ -215,21 +218,16 @@ pub(crate) fn run_compat_probe(
             }
         }
     });
-    // `partial` keeps exit 0: the report says which operations failed, and an
-    // endpoint that only lacks e.g. encoding-type=url can still be listed.
-    // `incompatible` — every operation failed — must not read as success.
-    if report.overall_status == "incompatible" {
-        let exit_code = if report.failures_are_setup_errors() {
-            agent::ExitCode::ProviderSetup
-        } else {
-            agent::ExitCode::NetworkRetryExhausted
-        };
+    // `partial` keeps exit 0 (`CompatProbeReport::exit_code_class`); an
+    // `incompatible` endpoint exits with the report's `exit_code` and the
+    // documented run line.
+    if report.exit_code != 0 {
         eprintln!(
-            "s3-turbo-list: compat-probe found the endpoint incompatible (exit {}): every probe \
-             operation failed; see the report's tests[] for each error.",
-            exit_code.code()
+            "s3-turbo-list: run failed (exit {}): compat-probe found the endpoint incompatible: \
+             every probe operation failed; see the report's tests[] for each error",
+            report.exit_code
         );
-        std::process::exit(exit_code.code());
+        std::process::exit(report.exit_code);
     }
 }
 
@@ -265,5 +263,59 @@ pub(crate) fn print_doctor_hints(report: &hints::HintsValidationReport) {
         for warning in &report.warnings {
             println!("    - {}", warning);
         }
+    }
+}
+
+/// `doctor`: the setup report, with the hints file (when given) linted and
+/// the filter (when given) compiled; exits 3 on an endpoint/provider error
+/// and 2 on any other error.
+pub(crate) fn run_doctor(cli: &Cli, resolved: &Resolved, json: bool) {
+    let cfg = &resolved.cfg;
+    // doctor absorbed the former hints-validate command: when a hints
+    // file is supplied it is linted and embedded in the report.
+    let hints = cli.hints_file.as_deref().map(|path| {
+        hints::inspect_hints_file(path, 5).unwrap_or_else(|e| {
+            exit_doctor_check_error("hints", &format!("Hints validation failed: {}", e))
+        })
+    });
+    let mut report = agent::doctor_report(cfg, resolved.config_source.clone(), hints);
+    // A filter that would fail the real run (exit 2) fails doctor too.
+    if let Some(filter_expr) = cli.filter.as_deref() {
+        let check = match config::compile_filter_with_mode(filter_expr, &RunMode::List)
+            .or_else(|_| config::compile_filter_with_mode(filter_expr, &RunMode::BiDir))
+        {
+            Ok(_) => agent::DoctorCheck {
+                name: "filter".to_string(),
+                status: "ok".to_string(),
+                message: format!("filter compiles: {}", filter_expr),
+            },
+            Err(e) => agent::DoctorCheck {
+                name: "filter".to_string(),
+                status: "error".to_string(),
+                message: format!("filter does not compile: {}", e),
+            },
+        };
+        if check.status == "error" {
+            report.status = "error".to_string();
+        }
+        report.checks.push(check);
+    }
+    if json {
+        println!("{}", agent::to_pretty_json(&report));
+    } else {
+        print_doctor_report(&report);
+    }
+    if report.status == "error" {
+        // An endpoint/provider error is the same setup failure a real
+        // run exits 3 on; any other error is a local config problem.
+        let setup_error = report
+            .checks
+            .iter()
+            .any(|check| check.name == "endpoint_url" && check.status == "error");
+        std::process::exit(if setup_error {
+            agent::ExitCode::ProviderSetup.code()
+        } else {
+            agent::ExitCode::CliConfig.code()
+        });
     }
 }

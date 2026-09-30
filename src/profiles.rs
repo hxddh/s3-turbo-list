@@ -125,13 +125,6 @@ pub fn get_profile(name: &str) -> Option<&'static EndpointProfile> {
         .find(|profile| profile.name.eq_ignore_ascii_case(name))
 }
 
-pub fn is_endpoint_preset_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "bos" | "minio" | "r2" | "b2" | "oss"
-    )
-}
-
 pub fn endpoint_profile_guardrail_warnings(cfg: &S3TurboConfig) -> Vec<String> {
     let mut warnings = Vec::new();
 
@@ -236,19 +229,6 @@ pub fn apply_profile_preset(
         addressing_style_applied,
         warnings,
     })
-}
-
-/// A real region for the profile, for example commands: bos/b2/oss derive
-/// their endpoint from the region, so `us-east-1` there names a host that
-/// does not exist, and R2 uses `auto`.
-pub fn example_region(profile: &str) -> &'static str {
-    match profile {
-        "bos" => "bj",
-        "r2" => "auto",
-        "b2" => "us-west-004",
-        "oss" => "oss-cn-beijing",
-        _ => "us-east-1",
-    }
 }
 
 #[cfg(test)]

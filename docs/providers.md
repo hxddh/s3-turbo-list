@@ -110,13 +110,11 @@ Valid keys, by section (defaults in [`tuning.md`](tuning.md#core-defaults)):
 Keys are checked: an unknown section or key — a typo, or a pre-0.37 per-run
 key such as `s3.start_after`, `s3.debug_s3`, `s3.trace_compat`,
 `output.parquet_file`, `output.ks_file`, or `output.log_file` — fails with
-exit code `2` and names the expected keys.  The deprecated `s3.profile` and
-`s3.force_path_style` keys are still read until 0.39, each with a
-`warning: deprecated config key …` on stderr and in
-`config_source.warnings` (plans, manifests, `doctor`); use `provider` and
-`addressing_style = "path"`.  A file that sets both `provider` and
-`profile` is an error (exit `2`) that says to remove `profile`.  An
-explicit `--config` path that does not exist is also exit `2`.
+exit code `2` and names the expected keys.  `s3.profile` and
+`s3.force_path_style` were removed in 0.39: each is an unknown key whose
+message names the replacement (`s3.provider`, `s3.addressing_style =
+"path"`).  An explicit `--config` path that does not exist is also exit
+`2`.
 
 ## compat-probe
 
@@ -139,9 +137,8 @@ any request, and the error names what to pass: the regional
 `--endpoint-url` for AWS (or no preset), `--region` for a region-derived
 preset (`oss`, `b2`), `--endpoint-url` for `minio` and `r2`.  `--region` is
 optional: it defaults to the preset's region, else the SDK's.
-`-p/--prefix` probes under a prefix.  The pre-0.37 subcommand-local
-`--endpoint` still works as a hidden alias of `--endpoint-url`, with a
-deprecation warning, until 0.39.
+`-p/--prefix` probes under a prefix.  The `--endpoint` alias of
+`--endpoint-url` was removed in 0.39.
 
 The probe sends `HeadBucket`, `ListObjectsV2 (max-keys=1)`,
 `ListObjectsV2 with delimiter`, and a `ListObjectsV2 pagination check`.
@@ -156,16 +153,26 @@ plan without contacting the endpoint (its `hints.source` is
 `<account-id>` are rejected locally with exit `3`; a literal but unreachable
 endpoint is left to the probe, so transport failures are part of the report.
 
+With `--agent`, stdout carries the report (or, with `-o`, nothing: the
+report is in the file) and stderr only the run line on a non-zero exit; a
+failure before the probe runs prints the minimal JSON result described in
+[agent-usage.md](agent-usage.md#exit-codes) instead of a report.
+
 ### Report
 
 | Field | Type | Meaning |
 |---|---|---|
+| `schema_version` | string | `s3-turbo-list.agent.v1`, as in plans and manifests (since 0.39). |
+| `tool_version` | string | Version of the binary (since 0.39). |
+| `status` | string | `success` (exit `0`) or `failed` (`incompatible`) (since 0.39). |
+| `exit_code` | integer | The exit code (below) (since 0.39). |
 | `endpoint_url` | string | Endpoint probed. |
 | `region` | string | Region the probe signed for. |
 | `bucket` | string | Bucket probed. |
 | `addressing_style` | string | `path`, `virtual`, or `auto`. |
 | `tests` | array | Per-operation results. |
 | `overall_status` | string | `compatible`, `partial`, or `incompatible`. |
+| `warnings` | array of strings | The run's warnings (the `WARN` lines stderr shows without `--agent`, such as an endpoint URL without a scheme); always present, empty in the normal case. |
 
 | `overall_status` | Meaning | Exit code |
 |---|---|---|
@@ -173,7 +180,10 @@ endpoint is left to the probe, so transport failures are part of the report.
 | `partial` | Some tests reported `error`, at least one did not.  `tests[]` names the failing operations. | `0` |
 | `incompatible` | Every test reported `error`. | `3` when every failure is a setup error (`AccessDenied`, `NoSuchBucket`, bad signature, redirect, or a codeless 401/403/404 such as `HeadBucket`'s), otherwise `4` |
 
-The report is written (stdout or `--output`) before a non-zero exit.
+The report is written (stdout or `--output`) before a non-zero exit, which
+also prints `s3-turbo-list: run failed (exit N): compat-probe found the
+endpoint incompatible: …` on stderr.  Trace events of the probe's requests
+carry the probe's `prefix` and `provider`.
 
 Per-test fields:
 
@@ -199,6 +209,10 @@ Minimal report:
 
 ```json
 {
+  "schema_version": "s3-turbo-list.agent.v1",
+  "tool_version": "0.39.0",
+  "status": "success",
+  "exit_code": 0,
   "endpoint_url": "https://example.invalid",
   "region": "us-east-1",
   "bucket": "my-bucket",
@@ -226,7 +240,8 @@ Minimal report:
       "request_id_2": "EXTENDED456"
     }
   ],
-  "overall_status": "partial"
+  "overall_status": "partial",
+  "warnings": []
 }
 ```
 

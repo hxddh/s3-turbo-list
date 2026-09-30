@@ -321,6 +321,15 @@ pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
     secs.max(0) as u64
 }
 
+/// The current time in whole seconds since the epoch (0 if the clock is set
+/// before it); the task heartbeats' clock.
+pub(crate) fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Parse an S3 ETag (`"<32 hex>"` or `"<32 hex>-<parts>"`) into MD5 bytes and
 /// a part count. Anything else is "not available" (all zeros, 0 parts), which
 /// diff reports as a difference. Decoding goes through a scratch buffer:
@@ -502,6 +511,8 @@ pub struct GlobalState {
     pub data_bytes_total: Arc<AtomicU64>,
     pub data_top_prefixes: Arc<Mutex<Vec<PrefixMetric>>>,
     pub data_summary_only: Arc<AtomicBool>,
+    /// A diff merge consumed both sides to the end and wrote its outputs.
+    pub diff_merge_complete: Arc<AtomicBool>,
     pub data_output_files: Arc<AtomicUsize>,
     pub(crate) task_rendez: TaskRendezvous,
 }
@@ -574,6 +585,7 @@ impl GlobalState {
             data_bytes_total: Arc::new(AtomicU64::new(0)),
             data_top_prefixes: Arc::new(Mutex::new(Vec::new())),
             data_summary_only: Arc::new(AtomicBool::new(false)),
+            diff_merge_complete: Arc::new(AtomicBool::new(false)),
             data_output_files: Arc::new(AtomicUsize::new(0)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
@@ -723,6 +735,12 @@ impl GlobalState {
     }
     pub fn is_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
+    }
+    pub fn set_diff_merge_complete(&self) {
+        self.diff_merge_complete.store(true, Ordering::SeqCst);
+    }
+    pub fn diff_merge_complete(&self) -> bool {
+        self.diff_merge_complete.load(Ordering::SeqCst)
     }
 
     pub fn list_task_start(&self, dir: u8) {

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
@@ -313,7 +313,7 @@ pub async fn data_map_task_list_streaming(
 
     let started_at = Instant::now();
     let write_started_at = Instant::now();
-    let mut last_ts = epoch_secs();
+    let mut last_ts = core::epoch_secs();
     // Coordinator-side counters for heartbeat logging only; authoritative stats
     // come from the merged worker results at finalize time.
     let mut routed_batches: usize = 0;
@@ -470,7 +470,7 @@ pub async fn data_map_task_list_streaming(
             return;
         }
 
-        let now = epoch_secs();
+        let now = core::epoch_secs();
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
             let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
             info!(
@@ -581,7 +581,7 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
 
     let mut prefix_stats = PrefixStats::default();
     let started_at = Instant::now();
-    let mut last_ts = epoch_secs();
+    let mut last_ts = core::epoch_secs();
     let mut stats = ListStreamingStats {
         received_batches: 0,
         received_objects: 0,
@@ -627,7 +627,7 @@ pub async fn data_map_task_list_summary_only(mut ctx: DataMapContext) {
             return;
         }
 
-        let now = epoch_secs();
+        let now = core::epoch_secs();
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
             let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
             info!(
@@ -664,7 +664,7 @@ pub async fn data_map_task_list_text_writer<W>(
 
     let mut prefix_stats = PrefixStats::default();
     let started_at = Instant::now();
-    let mut last_ts = epoch_secs();
+    let mut last_ts = core::epoch_secs();
     let mut stats = ListStreamingStats {
         received_batches: 0,
         received_objects: 0,
@@ -778,7 +778,7 @@ pub async fn data_map_task_list_text_writer<W>(
             return;
         }
 
-        let now = epoch_secs();
+        let now = core::epoch_secs();
         if now - last_ts > core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
             let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
             info!(
@@ -1170,13 +1170,6 @@ fn top_prefixes(prefix_stats: &PrefixStats, limit: usize) -> Vec<core::PrefixMet
             bytes,
         })
         .collect()
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 // ── Streaming diff (merge-join) ────────────────────────────
@@ -1684,6 +1677,8 @@ pub async fn data_map_task_diff_streaming(
     }
     if !output_ok {
         g_state.inc_output_error();
+    } else if outcome.is_some() {
+        g_state.set_diff_merge_complete();
     }
     if outcome.is_none() {
         // The merge did not run to completion, so whatever reached the file

@@ -1,3 +1,5 @@
+mod common;
+
 use arrow::array::{Array, StringArray, UInt8Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
@@ -107,10 +109,9 @@ impl MockS3Server {
     fn start(
         handler: impl Fn(RecordedRequest, usize) -> MockResponse + Send + Sync + 'static,
     ) -> Self {
+        // A blocking accept: `Drop` sets `shutdown` and then connects once to
+        // wake it.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        listener
-            .set_nonblocking(true)
-            .expect("set mock server nonblocking");
         let addr = listener.local_addr().expect("mock server local addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -133,6 +134,8 @@ impl MockS3Server {
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
+                    // The wake-up connection from `Drop`.
+                    Ok(_) if thread_shutdown.load(Ordering::SeqCst) => break,
                     Ok((stream, _)) => {
                         sequence += 1;
                         let seq = sequence;
@@ -165,9 +168,7 @@ impl MockS3Server {
                         }));
                         workers.retain(|worker| !worker.is_finished());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
             }
@@ -410,33 +411,20 @@ operation_timeout_secs = 2
     .unwrap();
 }
 
-const PROXY_ENV_VARS: &[&str] = &[
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
-
 fn run_cli(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
     run_cli_with_env(args, cwd, &[])
 }
 
-/// Run the CLI with the caller's proxy environment cleared (the SDK honours
-/// HTTP(S)_PROXY / NO_PROXY, so an inherited proxy would reroute requests
-/// meant for the local mock) plus `extra_env`.
+/// Run the CLI in `cwd` (also its `HOME`), isolated from the developer's
+/// config, AWS profile and proxy (`common::hermetic_command`: an inherited
+/// proxy would reroute requests meant for the local mock), with mock
+/// credentials plus `extra_env`.
 fn run_cli_with_env(
     args: &[String],
     cwd: &std::path::Path,
     extra_env: &[(&str, &str)],
 ) -> (i32, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
+    let mut command = common::hermetic_command(cwd);
     command.envs(extra_env.iter().copied());
     let output = command
         .current_dir(cwd)
@@ -447,12 +435,7 @@ fn run_cli_with_env(
         .args(args)
         .output()
         .expect("run s3-turbo-list");
-
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    common::exit_and_output(output)
 }
 
 fn parquet_keys(path: &std::path::Path) -> Vec<String> {
@@ -1477,6 +1460,12 @@ fn local_mock_compat_probe_covers_head_list_and_pagination() {
 
     let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
     assert_eq!(report["overall_status"], "compatible");
+    assert_eq!(report["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(report["tool_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(report["status"], "success");
+    assert_eq!(report["exit_code"], 0);
+    // Always present, empty in the normal case.
+    assert_eq!(report["warnings"], serde_json::json!([]));
     assert!(report["tests"].as_array().unwrap().iter().any(|test| {
         test["test"] == "ListObjectsV2 pagination check" && test["status"] == "ok"
     }));
@@ -1525,10 +1514,20 @@ fn local_mock_compat_probe_reports_s3_error_metadata() {
     // Every operation failed, and not on a setup error: an incompatible
     // endpoint must not exit 0 (it used to).
     assert_eq!(code, 4, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(stderr.contains("incompatible"), "stderr: {}", stderr);
+    // The documented run line (nothing about "listed": a probe lists nothing).
+    assert!(
+        stderr.contains(
+            "s3-turbo-list: run failed (exit 4): compat-probe found the endpoint incompatible"
+        ),
+        "stderr: {}",
+        stderr
+    );
+    assert!(!stderr.contains("Nothing was listed"), "stderr: {}", stderr);
 
     let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
     assert_eq!(report["overall_status"], "incompatible");
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["exit_code"], 4);
     let tests = report["tests"].as_array().unwrap();
     assert!(tests.iter().all(|test| test["status"] == "error"));
     let service_error = tests
@@ -2151,7 +2150,7 @@ estimate_mode = "full"
 }
 
 #[test]
-fn local_mock_no_auto_hints_skips_conventional_cache() {
+fn local_mock_no_auto_hints_ignores_a_leftover_hints_cache() {
     let server = MockS3Server::start(|request, _sequence| {
         if request.query.contains_key("start-after") {
             return MockResponse::error(
@@ -2448,13 +2447,13 @@ fn local_mock_sdk_retries_transient_list_error() {
 
 // ── --start-after single-chain guarantees ──────────────────
 //
-// A cached conventional hints file must not fan a --start-after run out into
+// A leftover hints cache file must not fan a --start-after run out into
 // multiple segments: every segment would override its start with the CLI key
-// and list overlapping ranges, duplicating output rows. The cache is skipped
+// and list overlapping ranges, duplicating output rows. The file is ignored
 // (single chain); explicit --hints-file and --resume are rejected up front.
 
 #[test]
-fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
+fn local_mock_start_after_ignores_a_leftover_hints_cache_and_lists_single_chain() {
     // Real-S3 semantics: sorted keys, honor start-after, single page.
     let server = MockS3Server::start(move |request, _sequence| {
         let start_after = request
@@ -2474,8 +2473,8 @@ fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
     write_fast_config(&config);
-    // Conventional startup-discovery cache (cwd-relative), as written by a
-    // previous run of the same bucket: two segments split at "m/".
+    // A hints cache (cwd-relative) as older versions wrote for the same
+    // bucket: two segments split at "m/". Runs no longer read it.
     std::fs::write(
         dir.path().join("us-east-1_mock-bucket_hints.toml"),
         r#"bucket = "mock-bucket"
@@ -2826,7 +2825,7 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
 // the flat key range up front (the same partitioner diff sides use) instead
 // of starting single-segment and ramping via runtime splits. The first run
 // must list in parallel segments with every key emitted exactly once, and
-// the boundaries must land in the conventional hints cache.
+// nothing may be cached in the working directory.
 #[test]
 fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     let keys: Vec<String> = (0..200).map(|i| format!("obj-{:04}", i)).collect();
@@ -3049,14 +3048,15 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
     assert!(probes <= 120, "{} bisection probes", probes);
 }
 
-// ── Conventional hints cache scoping ────────────────────────
+// ── Leftover hints cache files ──────────────────────────────
 //
 // A hierarchical run rolls every key under a CommonPrefix and a page's
-// CommonPrefixes are not range-filtered, so cached segments would each
+// CommonPrefixes are not range-filtered, so segments from a leftover cache
+// file would each
 // re-list the same prefix set — N× the requests, N× the reported
 // CommonPrefix count, and no parallelism to show for it.
 #[test]
-fn local_mock_delimiter_run_ignores_conventional_hints_cache() {
+fn local_mock_delimiter_run_ignores_a_leftover_hints_cache() {
     let server = MockS3Server::start(move |request, _sequence| {
         let start_after = request
             .query
@@ -4092,8 +4092,9 @@ fn local_mock_retry_budget_still_exhausts_without_progress() {
 // short on every run after it.
 
 /// Keys skewed so bisection produces both tiny segments (which complete
-/// without splitting) and a dominant tail (which splits and loses credit).
-fn skewed_keys() -> Vec<String> {
+/// without splitting) and a dominant tail of `tail` keys (which splits and
+/// loses credit).
+fn skewed_keys(tail: usize) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for i in 0..40 {
         keys.push(format!("a-{:04}", i));
@@ -4101,7 +4102,7 @@ fn skewed_keys() -> Vec<String> {
     for i in 0..40 {
         keys.push(format!("m-{:04}", i));
     }
-    for i in 0..1920 {
+    for i in 0..tail {
         keys.push(format!("z-{:06}", i));
     }
     keys.sort();
@@ -4109,8 +4110,10 @@ fn skewed_keys() -> Vec<String> {
 }
 
 /// A flat namespace whose root page is truncated, so the run does not take the
-/// single-page shortcut and instead bisects into several segments.
-fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
+/// single-page shortcut and instead bisects into several segments. Listing
+/// pages hold 4 keys and each takes `page_latency`, so a long segment pages
+/// long enough for runtime splitting to act on it.
+fn multi_segment_flat_server(keys: Vec<String>, page_latency: Duration) -> MockS3Server {
     MockS3Server::start(move |request, _sequence| {
         let start_after = request
             .query
@@ -4131,7 +4134,7 @@ fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
             return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
         }
 
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(page_latency);
         let start_idx = match request.query.get("continuation-token") {
             Some(token) => token
                 .strip_prefix("off-")
@@ -4158,54 +4161,17 @@ fn multi_segment_flat_server(keys: Vec<String>) -> MockS3Server {
 }
 
 #[test]
-fn local_mock_successful_run_leaves_no_checkpoint() {
-    let keys = skewed_keys();
-    let server = multi_segment_flat_server(keys.clone());
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    write_fast_config(&config);
-    let args: Vec<String> = vec![
-        "--config".into(),
-        config.display().to_string(),
-        "--endpoint-url".into(),
-        server.endpoint(),
-        "--addressing-style".into(),
-        "path".into(),
-        "list".into(),
-        "--concurrency".into(),
-        "8".into(),
-        "--resume".into(),
-        "--output-parquet-file".into(),
-        dir.path().join("out.parquet").display().to_string(),
-        "--bucket".into(),
-        "mock-bucket".into(),
-        "--region".into(),
-        "us-east-1".into(),
-    ];
-
-    let (code, stdout, stderr) = run_cli(&args, dir.path());
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert_eq!(
-        parquet_keys(&dir.path().join("out.parquet")).len(),
-        keys.len()
-    );
-
-    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
-    assert!(
-        !checkpoint.exists(),
-        "a run that listed the whole key space has nothing to resume, but it \
-         left a checkpoint behind: {:?}",
-        checkpoint_remaining_starts(&checkpoint)
-    );
-}
-
-#[test]
 fn local_mock_repeated_resume_runs_stay_complete() {
     // The end-to-end shape of the bug: an unattended job that always passes
-    // --resume must produce the same complete listing every time.
-    let keys = skewed_keys();
-    let server = multi_segment_flat_server(keys.clone());
+    // --resume must produce the same complete listing every time — and a run
+    // that listed the whole key space, runtime splits included, must leave no
+    // checkpoint behind for the next one to skip ranges by.
+    // A tail of 960 keys at 5 ms per 4-key page lists for over a second
+    // serially: several split-probe ticks (200 ms) in, with margin. At a
+    // quarter of that the run can finish before the first split lands, which
+    // the split assertion below reports.
+    let keys = skewed_keys(960);
+    let server = multi_segment_flat_server(keys.clone(), Duration::from_millis(5));
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
@@ -4228,13 +4194,25 @@ fn local_mock_repeated_resume_runs_stay_complete() {
         "--region".into(),
         "us-east-1".into(),
     ];
+    let checkpoint = dir.path().join("us-east-1_mock-bucket_checkpoint.toml");
 
-    for run in 1..=3 {
-        let (code, stdout, stderr) = run_cli(&args, dir.path());
+    for run in 1..=2 {
+        // Info level names each accepted runtime split.
+        let (code, stdout, stderr) =
+            run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3_turbo_list=info")]);
         assert_eq!(
             code, 0,
             "run {} stdout: {}\nstderr: {}",
             run, stdout, stderr
+        );
+        // The bug needs runtime-split segments (they record no checkpoint
+        // progress); a run that never split would pass without testing it.
+        assert!(
+            stderr.contains("accepted runtime split"),
+            "run {} did not split at runtime, so it no longer exercises the \
+             split-then-complete path: {}",
+            run,
+            stderr
         );
         let listed = parquet_keys(&dir.path().join("out.parquet"));
         assert_eq!(
@@ -4244,6 +4222,13 @@ fn local_mock_repeated_resume_runs_stay_complete() {
             run,
             listed.len(),
             keys.len()
+        );
+        assert!(
+            !checkpoint.exists(),
+            "run {} listed the whole key space and has nothing to resume, but \
+             it left a checkpoint behind: {:?}",
+            run,
+            checkpoint_remaining_starts(&checkpoint)
         );
     }
 }
@@ -4577,7 +4562,7 @@ fn local_mock_missing_region_fails_fast_without_requests() {
     write_fast_config(&config);
 
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let output = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -4946,11 +4931,7 @@ fn local_mock_interrupted_then_resumed_run_lists_every_key_exactly_once() {
     .map(|s| s.to_string())
     .collect();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
-    let child = command
+    let child = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -5024,11 +5005,7 @@ fn local_mock_interrupt_during_startup_discovery_stops_promptly() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     write_fast_config(&config);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
-    for var in PROXY_ENV_VARS {
-        command.env_remove(var);
-    }
-    let mut child = command
+    let mut child = common::hermetic_command(dir.path())
         .current_dir(dir.path())
         .env("AWS_ACCESS_KEY_ID", "mock-access-key")
         .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
@@ -5603,38 +5580,430 @@ fn local_mock_delimiter_retry_after_common_prefix_emits_each_folder_once() {
 }
 
 #[test]
-fn local_mock_compat_probe_agent_reports_deprecations_in_its_json() {
-    // Under --agent stderr stays quiet, so a deprecated spelling must reach
-    // the probe's own report: it has no plan or manifest to carry it.
+fn local_mock_compat_probe_agent_report_and_trace_carry_the_contract_fields() {
+    // Under --agent stderr stays quiet: the report on stdout is the result,
+    // with the fields every other JSON result has.
     let server = MockS3Server::start(|_request, _sequence| {
         MockResponse::error(501, "NotImplemented", "not supported")
     });
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
+    let trace = dir.path().join("trace.jsonl");
     write_fast_config(&config);
     let args: Vec<String> = vec![
         "--config".into(),
         config.display().to_string(),
+        "--provider".into(),
+        "minio".into(),
         "compat-probe".into(),
-        "--endpoint".into(),
+        "--endpoint-url".into(),
         server.endpoint(),
         "--region".into(),
         "us-east-1".into(),
         "--bucket".into(),
         "mock-bucket".into(),
-        "--addressing-style".into(),
-        "path".into(),
+        "--prefix".into(),
+        "probe/".into(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
         "--agent".into(),
     ];
-    let (_code, stdout, stderr) = run_cli(&args, dir.path());
-    assert!(!stderr.contains("warning: deprecated"), "{}", stderr);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 4, "stdout: {}\nstderr: {}", stdout, stderr);
     let report: Value = serde_json::from_str(&stdout).expect("report JSON on stdout");
-    let warnings = report["warnings"].as_array().expect("warnings array");
+    assert_eq!(report["schema_version"], "s3-turbo-list.agent.v1");
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["exit_code"], 4);
+    assert_eq!(report["warnings"], serde_json::json!([]));
+    // Only the run line on stderr.
+    assert_eq!(stderr.lines().count(), 1, "{}", stderr);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("--endpoint")),
+        stderr.starts_with("s3-turbo-list: run failed (exit 4)"),
         "{}",
-        report
+        stderr
+    );
+    // Probe trace events record the prefix and the provider, as listing
+    // events do.
+    let events: Vec<Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty());
+    for event in &events {
+        assert_eq!(event["prefix"], "probe/", "{}", event);
+        assert_eq!(event["provider"], "minio", "{}", event);
+        assert!(event.get("profile").is_none(), "{}", event);
+    }
+}
+
+#[test]
+fn local_mock_delimiter_start_after_inside_a_folder_keeps_the_folder_row() {
+    // --start-after a/b/c: a/b/d and a/z sort after it and roll up into a/,
+    // which the endpoint returns and the run must emit (0.38 dropped every
+    // CommonPrefix sorting before the start key).
+    let cases: [(&[&str], &[&str], &[&str]); 2] = [
+        (
+            &["a/b/1", "a/b/c", "a/b/d", "a/z", "b.txt"],
+            &[],
+            &["a/", "b.txt"],
+        ),
+        (
+            &["a/b/1", "a/b/c", "a/b/d", "a/z"],
+            &["--prefix", "a/"],
+            &["a/b/", "a/z"],
+        ),
+    ];
+    for (keys, extra, expected) in cases {
+        let keys: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
+        let server = MockS3Server::start(move |request, _| {
+            MockResponse::ok_xml(emulated_list(&keys, &request.query))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        write_fast_config(&config);
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+            "--output-format".into(),
+            "tsv".into(),
+            "--delimiter".into(),
+            "/".into(),
+            "--start-after".into(),
+            "a/b/c".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let (code, stdout, stderr) = run_cli(&args, dir.path());
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        let rows: Vec<&str> = stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').next().unwrap())
+            .collect();
+        assert_eq!(rows, expected, "{}", stdout);
+    }
+}
+
+// ── Setup errors that are not the endpoint's ─────────────────
+
+/// Run with no credentials anywhere the SDK looks: no key variables, no
+/// profile, an empty HOME (no shared config files), no instance metadata.
+fn run_cli_without_credentials(args: &[String], cwd: &std::path::Path) -> (i32, String, String) {
+    let mut command = common::hermetic_command(cwd);
+    for var in [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ] {
+        command.env_remove(var);
+    }
+    let output = command
+        .current_dir(cwd)
+        .env("HOME", cwd)
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(args)
+        .output()
+        .expect("run s3-turbo-list");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn local_mock_missing_credentials_is_a_setup_error_without_retries() {
+    // The SDK reports no credentials as a dispatch failure, which used to be
+    // retried as a network error for minutes and then exit 4.
+    let server = MockS3Server::start(|request, _| {
+        MockResponse::ok_xml(emulated_list(&["k".to_string()], &request.query))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[s3]\nmax_attempts = 3\ninitial_backoff_secs = 1\nconnect_timeout_secs = 2\noperation_timeout_secs = 2\n",
+    )
+    .unwrap();
+    let base = |cmd: &str| -> Vec<String> {
+        vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            cmd.into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+        ]
+    };
+    let started = std::time::Instant::now();
+    let mut list = base("list");
+    list.extend(["--output-format".into(), "summary".into()]);
+    let (code, stdout, stderr) = run_cli_without_credentials(&list, dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stderr.contains("no AWS credentials found"), "{}", stderr);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "retried for {:?}",
+        started.elapsed()
+    );
+
+    let (code, stdout, stderr) = run_cli_without_credentials(&base("compat-probe"), dir.path());
+    assert_eq!(code, 3, "stdout: {}\nstderr: {}", stdout, stderr);
+    assert!(stdout.contains("credentials_missing"), "{}", stdout);
+    // Nothing left the process.
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+#[test]
+fn local_mock_compat_probe_without_a_region_is_a_setup_error() {
+    let server = MockS3Server::start(|_, _| MockResponse::error(500, "InternalError", "unused"));
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<String> = vec![
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "compat-probe".into(),
+        "--bucket".into(),
+        "b".into(),
+    ];
+    let output = common::hermetic_command(dir.path())
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // It was exit 5, "output error".
+    assert_eq!(output.status.code(), Some(3), "{}", stderr);
+    assert!(stderr.contains("no region"), "{}", stderr);
+}
+
+#[test]
+fn local_mock_trace_and_probe_report_redact_endpoint_userinfo() {
+    let server = MockS3Server::start(|request, _| match request.method.as_str() {
+        "HEAD" => MockResponse::empty_ok(),
+        _ => MockResponse::ok_xml(emulated_list(&["k".to_string()], &request.query)),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    write_fast_config(&config);
+    let endpoint = server
+        .endpoint()
+        .replacen("http://", "http://user:secretpw@", 1);
+    let trace = dir.path().join("trace.jsonl");
+    let report = dir.path().join("report.json");
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        endpoint,
+        "--addressing-style".into(),
+        "path".into(),
+        "compat-probe".into(),
+        "--bucket".into(),
+        "b".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--trace-compat".into(),
+        trace.display().to_string(),
+        "--output".into(),
+        report.display().to_string(),
+    ];
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    for path in [&trace, &report] {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.is_empty());
+        assert!(!text.contains("secretpw"), "{}: {}", path.display(), text);
+    }
+}
+
+// ── Interrupts at the edges ──────────────────────────────────
+
+/// SIGTERM after the listing finished while stdout is still held: the rows
+/// are all written, so the run reports success in every mode (it exited 7
+/// "partial" with --start-after or another job's checkpoint in place).
+#[cfg(unix)]
+#[test]
+fn local_mock_interrupt_after_the_listing_finished_reports_success() {
+    let keys: Vec<String> = (0..5000)
+        .map(|i| format!("key-{:06}-padding-padding-padding", i))
+        .collect();
+    let foreign_checkpoint = r#"bucket = "b"
+prefix = ""
+last_updated = "x"
+listed_ranges = 1
+[identity]
+bucket = "b"
+region = "us-east-1"
+prefix = ""
+delimiter = ""
+max_keys = 5
+provider = "aws"
+addressing_style = "path"
+mode = "list"
+[[remaining]]
+start_after = "key-000100"
+"#;
+    for (label, extra, foreign) in [
+        ("plain", vec![], false),
+        ("start-after", vec!["--start-after", "k"], false),
+        ("another job's checkpoint", vec![], true),
+    ] {
+        let served = keys.clone();
+        let server = MockS3Server::start(move |request, _| {
+            MockResponse::ok_xml(emulated_list(&served, &request.query))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        write_fast_config(&config);
+        if foreign {
+            std::fs::write(
+                dir.path().join("us-east-1_b_checkpoint.toml"),
+                foreign_checkpoint,
+            )
+            .unwrap();
+        }
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            config.display().to_string(),
+            "--endpoint-url".into(),
+            server.endpoint(),
+            "--addressing-style".into(),
+            "path".into(),
+            "list".into(),
+            "--bucket".into(),
+            "b".into(),
+            "--region".into(),
+            "us-east-1".into(),
+            "--output-format".into(),
+            "tsv".into(),
+            "--no-auto-hints".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let child = common::hermetic_command(dir.path())
+            .current_dir(dir.path())
+            .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+            .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Five 1000-key pages list everything; stdout is not read yet, so
+        // the writer is still busy when the signal arrives.
+        let waited = std::time::Instant::now();
+        while server.requests().len() < 5 && waited.elapsed() < Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(500));
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let rows = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(rows, keys.len(), "{}: {}", label, stderr);
+        assert_eq!(output.status.code(), Some(0), "{}: {}", label, stderr);
+    }
+}
+
+/// Ctrl-C while diff segments sit in a retry backoff: the exit waited out
+/// the backoff (up to 30 s); list mode already stopped at once.
+#[cfg(unix)]
+#[test]
+fn local_mock_diff_ctrl_c_during_retry_backoff_exits_promptly() {
+    let keys: Vec<String> = (0..50).map(|i| format!("k{:03}", i)).collect();
+    let server = MockS3Server::start(move |request, _| {
+        if request.query.contains_key("delimiter")
+            || request.query.get("max-keys").map(String::as_str) == Some("1")
+        {
+            return MockResponse::ok_xml(emulated_list(&keys, &request.query));
+        }
+        MockResponse::error(500, "InternalError", "flaky")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[s3]\nmax_attempts = 10\ninitial_backoff_secs = 1\noperation_timeout_secs = 2\nconnect_timeout_secs = 2\n",
+    )
+    .unwrap();
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config.display().to_string(),
+        "--endpoint-url".into(),
+        server.endpoint(),
+        "--addressing-style".into(),
+        "path".into(),
+        "diff".into(),
+        "--bucket".into(),
+        "left".into(),
+        "--region".into(),
+        "us-east-1".into(),
+        "--target-bucket".into(),
+        "right".into(),
+        "--output-dir".into(),
+        "out".into(),
+    ];
+    let mut child = common::hermetic_command(dir.path())
+        .current_dir(dir.path())
+        .env("AWS_ACCESS_KEY_ID", "mock-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "mock-secret-key")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // A few failed attempts in: the backoff has grown past several seconds.
+    thread::sleep(Duration::from_secs(8));
+    let signalled = std::time::Instant::now();
+    let _ = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if signalled.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(code, Some(7));
+    assert!(
+        signalled.elapsed() < Duration::from_secs(2),
+        "exit took {:?} after Ctrl-C",
+        signalled.elapsed()
     );
 }

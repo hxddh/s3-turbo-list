@@ -8,8 +8,8 @@ use config::S3TurboConfig;
 use core::RunMode;
 use log::{error, info, warn};
 use s3_turbo_list::{
-    agent, auto_hints, checkpoint, compat_probe, config, core, data_map, hints, local_tools, mon,
-    profiles, tasks_s3, trace,
+    agent, checkpoint, compat_probe, config, core, data_map, hints, local_tools, mon, profiles,
+    startup, tasks_s3, trace,
 };
 use std::io::Write;
 use std::sync::Arc;
@@ -18,6 +18,8 @@ use std::time::Instant;
 
 mod cli;
 mod exit;
+mod finish;
+mod listing;
 mod local;
 mod outputs;
 mod plan;
@@ -25,6 +27,8 @@ mod run;
 
 pub(crate) use cli::*;
 pub(crate) use exit::*;
+pub(crate) use finish::*;
+pub(crate) use listing::*;
 pub(crate) use local::*;
 pub(crate) use outputs::*;
 pub(crate) use plan::*;

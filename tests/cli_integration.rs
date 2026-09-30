@@ -1,32 +1,30 @@
 // Integration tests for CLI help regression.
 // These shell out to Cargo's already-built binary to keep tests fast.
+mod common;
+
+use common::{exit_and_output, hermetic_command};
 use std::process::Command;
 
 /// Helper: run `s3-turbo-list <args>` and return (exit_code, stdout, stderr).
+/// `HOME` is an empty temporary directory (see `hermetic_command`).
 fn run_cli(args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let home = tempfile::tempdir().unwrap();
+    let output = hermetic_command(home.path())
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 fn run_cli_without_aws_env(args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = hermetic_command(home.path());
     clear_aws_env(&mut cmd);
     let output = cmd
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 fn clear_aws_env(cmd: &mut Command) {
@@ -46,17 +44,14 @@ fn clear_aws_env(cmd: &mut Command) {
     }
 }
 
+/// Run in `cwd`, which is also the run's `HOME`.
 fn run_cli_in_dir(args: &[&str], cwd: &std::path::Path) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"))
+    let output = hermetic_command(cwd)
         .current_dir(cwd)
         .args(args)
         .output()
         .expect("failed to execute s3-turbo-list test binary");
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (exit_code, stdout, stderr)
+    exit_and_output(output)
 }
 
 #[test]
@@ -647,7 +642,7 @@ fn test_cli_compat_probe_dry_run_uses_command_endpoint_for_profile_guardrail() {
         "compat-probe",
         "--agent",
         "--dry-run",
-        "--endpoint",
+        "--endpoint-url",
         "https://account.example.com",
         "--region",
         "auto",
@@ -655,7 +650,6 @@ fn test_cli_compat_probe_dry_run_uses_command_endpoint_for_profile_guardrail() {
         "agent-test-bucket",
     ]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    // --agent keeps stderr quiet; the deprecation is in the plan instead.
     assert!(stderr.is_empty(), "{}", stderr);
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -666,36 +660,35 @@ fn test_cli_compat_probe_dry_run_uses_command_endpoint_for_profile_guardrail() {
             .unwrap()
             .contains("requires an explicit endpoint URL")
     }));
-    // `--endpoint` is the deprecated alias of --endpoint-url (removed in 0.39).
-    assert!(
-        warnings.iter().any(|warning| {
-            warning
-                .as_str()
-                .unwrap()
-                .contains("deprecated option --endpoint (use --endpoint-url)")
-        }),
-        "{:?}",
-        warnings
-    );
+    assert_eq!(json["warnings"], serde_json::json!([]), "{}", stdout);
     // compat-probe is not partitioned, and its plan says so.
     assert_eq!(json["hints"]["source"], "not_applicable");
 
-    // Without --agent the warning is on stderr.
-    let (code, _stdout, stderr) = run_cli_without_aws_env(&[
-        "compat-probe",
-        "--dry-run",
-        "--endpoint=https://account.example.com",
-        "--region",
-        "auto",
-        "--bucket",
-        "agent-test-bucket",
-    ]);
-    assert_eq!(code, 0, "{}", stderr);
-    assert!(
-        stderr.contains("warning: deprecated option --endpoint (use --endpoint-url)"),
-        "{}",
-        stderr
-    );
+    // `--endpoint`, the alias of --endpoint-url, was removed in 0.39: a usage
+    // error that names the replacement, with the value still redacted.
+    for endpoint in [
+        &["--endpoint", "https://user:secret@account.example.com"][..],
+        &["--endpoint=https://user:secret@account.example.com"][..],
+    ] {
+        let mut args = vec!["compat-probe", "--agent", "--dry-run"];
+        args.extend_from_slice(endpoint);
+        args.extend_from_slice(&["--region", "auto", "--bucket", "agent-test-bucket"]);
+        let (code, stdout, stderr) = run_cli_without_aws_env(&args);
+        assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+        assert!(stderr.contains("use --endpoint-url"), "{}", stderr);
+        assert!(!stderr.contains("secret"), "{}", stderr);
+        assert!(!stdout.contains("secret"), "{}", stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("removed in 0.39: use --endpoint-url"),
+            "{}",
+            stdout
+        );
+    }
 }
 
 #[test]
@@ -788,7 +781,7 @@ fn test_cli_dry_run_warns_for_profile_missing_or_placeholder_endpoint() {
     std::fs::write(
         &config,
         r#"[s3]
-profile = "r2"
+provider = "r2"
 endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
 "#,
     )
@@ -822,7 +815,7 @@ fn test_cli_doctor_warns_for_placeholder_endpoint() {
     std::fs::write(
         &config,
         r#"[s3]
-profile = "r2"
+provider = "r2"
 endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
 "#,
     )
@@ -934,7 +927,6 @@ fn test_cli_dry_run_output_format_ndjson_plans_no_output_artifacts() {
     let (code, stdout, stderr) = run_cli_without_aws_env(&[
         "list",
         "--dry-run",
-        "--agent",
         "--output-dir",
         "out",
         "--bucket",
@@ -962,6 +954,42 @@ fn test_cli_dry_run_output_format_ndjson_plans_no_output_artifacts() {
         "{:?}",
         warnings
     );
+}
+
+#[test]
+fn test_cli_dry_run_agent_with_row_output_is_blocked_like_the_run() {
+    // The real run exits 2 (stdout holds either rows or the manifest); the
+    // plan must predict that instead of reporting `ok`.
+    for format in ["ndjson", "tsv"] {
+        let (code, stdout, stderr) = run_cli_without_aws_env(&[
+            "list",
+            "--dry-run",
+            "--agent",
+            "--bucket",
+            "my-bucket",
+            "--region",
+            "us-east-1",
+            "--output-format",
+            format,
+        ]);
+        assert_eq!(code, 2, "stdout: {}\nstderr: {}", stdout, stderr);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["status"], "blocked");
+        assert!(
+            json["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("--agent writes the run manifest to stdout"),
+            "{}",
+            stdout
+        );
+        assert!(
+            stderr.starts_with("s3-turbo-list: run blocked (exit 2): --agent writes"),
+            "{}",
+            stderr
+        );
+        assert_eq!(stderr.lines().count(), 1, "{}", stderr);
+    }
 }
 
 #[test]
@@ -1970,7 +1998,8 @@ fn test_cli_rejects_invalid_values_before_any_work() {
 fn test_cli_doctor_suggestions_respect_env_credentials() {
     // Static keys in the environment already give the SDK credentials;
     // suggesting `export AWS_PROFILE=default` would point it elsewhere.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = hermetic_command(home.path());
     clear_aws_env(&mut cmd);
     let output = cmd
         .env("AWS_ACCESS_KEY_ID", "test-access-key")
@@ -2409,48 +2438,78 @@ fn test_doctor_json_reports_usage_errors_as_json() {
     assert_eq!(json["checks"][0]["name"], "cli");
 }
 
-// ── 0.38 contract: deprecations, usage-error routing, plan warnings ─────
+// ── 0.39 contract: removals, usage-error routing, plan warnings ─────
 
 #[test]
-fn test_options_before_the_command_are_hoisted_with_a_deprecation_warning() {
-    // The pre-0.37 spelling keeps working for one more release, and says so
-    // on stderr and in the plan's warnings.
-    let (code, stdout, stderr) = run_cli_without_aws_env(&[
-        "--output-dir",
-        "out",
-        "--no-auto-hints",
-        "list",
-        "--dry-run",
-        "--bucket",
-        "b",
-        "--region",
-        "us-east-1",
-    ]);
-    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
-    assert!(
-        stderr.contains(
-            "warning: deprecated spelling with options before the command name \
-             (--output-dir, --no-auto-hints): write them after `list`"
+fn test_options_before_the_command_are_a_usage_error_that_names_the_command() {
+    // The pre-0.37 spelling was hoisted with a warning in 0.38; since 0.39 it
+    // is a usage error that says where the option goes.
+    for (args, option) in [
+        (
+            &[
+                "--output-dir",
+                "out",
+                "--no-auto-hints",
+                "list",
+                "--dry-run",
+                "--bucket",
+                "b",
+                "--region",
+                "us-east-1",
+            ][..],
+            "--output-dir",
         ),
-        "{}",
-        stderr
-    );
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert!(
-        json["outputs"]["parquet_file"]
-            .as_str()
-            .unwrap()
-            .starts_with("out/")
-    );
-    assert_eq!(json["hints"]["source"], "disabled_single_segment_fallback");
-    let warnings = json["warnings"].as_array().unwrap();
-    assert_eq!(warnings.len(), 1, "{:?}", warnings);
-    assert!(
-        warnings[0]
-            .as_str()
-            .unwrap()
-            .contains("it will be removed in 0.39")
-    );
+        // A cluster of short options (`-lc 5`) is walked flag by flag.
+        (
+            &[
+                "-lc",
+                "5",
+                "list",
+                "--dry-run",
+                "--bucket",
+                "b",
+                "--region",
+                "r",
+            ][..],
+            "-lc",
+        ),
+        // Global options before the name are fine; the run option is not.
+        (
+            &[
+                "--provider",
+                "minio",
+                "--log",
+                "diff",
+                "--dry-run",
+                "--bucket",
+                "a",
+                "--target-bucket",
+                "b",
+            ][..],
+            "--log",
+        ),
+    ] {
+        let (code, stdout, stderr) = run_cli_without_aws_env(args);
+        assert_eq!(
+            code, 2,
+            "{:?}: stdout: {}\nstderr: {}",
+            args, stdout, stderr
+        );
+        assert!(stdout.is_empty(), "{}", stdout);
+        let command = args
+            .iter()
+            .find(|arg| ["list", "diff"].contains(arg))
+            .unwrap();
+        assert!(
+            stderr.contains(&format!(
+                "option '{}' must follow the command name `{}`",
+                option, command
+            )),
+            "{:?}: {}",
+            args,
+            stderr
+        );
+    }
 
     // The same options after the command name: no warning at all.
     let (code, stdout, stderr) = run_cli_without_aws_env(&[
@@ -2458,6 +2517,8 @@ fn test_options_before_the_command_are_hoisted_with_a_deprecation_warning() {
         "--output-dir",
         "out",
         "--no-auto-hints",
+        "-lc",
+        "5",
         "--dry-run",
         "--bucket",
         "b",
@@ -2468,43 +2529,75 @@ fn test_options_before_the_command_are_hoisted_with_a_deprecation_warning() {
     assert!(stderr.is_empty(), "{}", stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["warnings"], serde_json::json!([]));
+    assert_eq!(json["resolved_config"]["runtime"]["max_concurrency"], 5);
+    assert!(json["outputs"]["log_file"].is_string(), "{}", stdout);
+    assert!(
+        json["outputs"]["parquet_file"]
+            .as_str()
+            .unwrap()
+            .starts_with("out/")
+    );
 }
 
 #[test]
-fn test_hoisting_walks_clustered_short_options() {
-    // `-lc 5 list …` used to fail with "unrecognized subcommand '5'": the
-    // cluster's last flag takes the next token as its value.
-    for args in [
-        &[
-            "-lc",
-            "5",
-            "list",
-            "--dry-run",
-            "--bucket",
-            "b",
-            "--region",
-            "r",
-        ][..],
-        &[
-            "-lc5",
-            "list",
-            "--dry-run",
-            "--bucket",
-            "b",
-            "--region",
-            "r",
-        ][..],
+fn test_agent_before_a_run_command_still_prints_the_run_failure_json() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--agent",
+        "list",
+        "--bucket",
+        "b",
+        "--region",
+        "r",
+        "--endpoint-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_eq!(code, 2, "{}", stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "failed");
+    assert_eq!(json["exit_code"], 2);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("option '--agent' must follow the command name `list`"),
+        "{}",
+        stdout
+    );
+    assert!(
+        stderr.contains("s3-turbo-list: run failed (exit 2): option '--agent'"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn test_removed_spellings_name_their_replacement() {
+    for (args, hint) in [
+        (
+            &["list", "--summary-only", "--bucket", "b"][..],
+            "use --output-format summary",
+        ),
+        (
+            &[
+                "list",
+                "--dry-run",
+                "--plan-json",
+                "p.json",
+                "--bucket",
+                "b",
+            ][..],
+            "--dry-run > plan.json",
+        ),
+        (&["init-config"][..], "write the TOML config by hand"),
+        (&["doctor", "--simple"][..], "removed in 0.39"),
+        (&["doctor", "--fix-suggestions"][..], "removed in 0.39"),
+        (&["doctor", "--agent"][..], "use --json"),
+        (&["manifest-summary", "m.json", "--agent"][..], "use --json"),
     ] {
         let (code, stdout, stderr) = run_cli_without_aws_env(args);
-        assert_eq!(
-            code, 0,
-            "{:?}: stdout: {}\nstderr: {}",
-            args, stdout, stderr
-        );
-        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(json["resolved_config"]["runtime"]["max_concurrency"], 5);
-        assert!(json["outputs"]["log_file"].is_string(), "{}", stdout);
-        assert!(stderr.contains("(-lc"), "{}", stderr);
+        assert_eq!(code, 2, "{:?}: {}", args, stderr);
+        assert!(stdout.is_empty(), "{:?}: {}", args, stdout);
+        assert!(stderr.contains(hint), "{:?}: {}", args, stderr);
     }
 }
 
@@ -2557,89 +2650,89 @@ fn test_doctor_json_early_exit_includes_the_resolved_config() {
 }
 
 #[test]
-fn test_deprecated_config_keys_warn_in_plan_and_doctor() {
+fn test_removed_config_keys_are_errors_that_name_the_replacement() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("s3-turbo-list.toml");
-    std::fs::write(
-        &config,
-        "[s3]\nprofile = \"minio\"\nendpoint_url = \"http://127.0.0.1:9000\"\n\
-         force_path_style = true\n",
-    )
-    .unwrap();
-    let (code, stdout, stderr) = run_cli_in_dir(
-        &[
-            "list",
-            "--dry-run",
-            "--bucket",
-            "b",
-            "--region",
-            "us-east-1",
-        ],
-        dir.path(),
-    );
-    assert_eq!(code, 0, "{}", stderr);
-    assert!(
-        stderr.contains("warning: deprecated config key s3.profile (use s3.provider)"),
-        "{}",
-        stderr
-    );
-    assert!(
-        stderr.contains("warning: deprecated config key s3.force_path_style"),
-        "{}",
-        stderr
-    );
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["inputs"]["provider"], "minio");
-    assert_eq!(json["inputs"]["profile"], "minio");
-    assert_eq!(json["resolved_config"]["s3"]["provider_known"], true);
-    let source_warnings = json["config_source"]["warnings"].as_array().unwrap();
-    assert_eq!(source_warnings.len(), 2, "{:?}", source_warnings);
-    assert_eq!(json["warnings"].as_array().unwrap().len(), 2, "{}", stdout);
+    for (content, message) in [
+        (
+            "[s3]\nprofile = \"minio\"\nendpoint_url = \"http://127.0.0.1:9000\"\n",
+            "s3.profile was removed in 0.39; use s3.provider",
+        ),
+        (
+            "[s3]\nprovider = \"minio\"\nprofile = \"bos\"\n",
+            "s3.profile was removed in 0.39; use s3.provider",
+        ),
+        (
+            "[s3]\nforce_path_style = true\n",
+            "s3.force_path_style was removed in 0.39; use s3.addressing_style = \"path\"",
+        ),
+    ] {
+        std::fs::write(&config, content).unwrap();
+        let (code, stdout, stderr) = run_cli_in_dir(
+            &[
+                "list",
+                "--dry-run",
+                "--bucket",
+                "b",
+                "--region",
+                "us-east-1",
+            ],
+            dir.path(),
+        );
+        assert_eq!(code, 2, "{}", stderr);
+        assert!(stdout.is_empty(), "{}", stdout);
+        // One line: the run line carries the reason.
+        assert_eq!(stderr.matches(message).count(), 1, "{}", stderr);
+        assert!(stderr.contains("unknown field"), "{}", stderr);
 
-    let (code, stdout, _) = run_cli_in_dir(&["doctor", "--json"], dir.path());
-    assert_eq!(code, 0);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        json["config_source"]["warnings"].as_array().unwrap().len(),
-        2
-    );
-
-    // Both spellings at once: a clear message, not serde's "duplicate field".
-    std::fs::write(&config, "[s3]\nprovider = \"minio\"\nprofile = \"bos\"\n").unwrap();
+        let (code, stdout, _) = run_cli_in_dir(&["doctor", "--json"], dir.path());
+        assert_eq!(code, 2);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["checks"][0]["name"], "config_parse");
+        assert!(
+            json["checks"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains(message),
+            "{}",
+            stdout
+        );
+    }
+    // A typo lists the valid keys, which no longer include the removed ones.
+    std::fs::write(&config, "[s3]\nprofil = \"minio\"\n").unwrap();
     let (code, _, stderr) = run_cli_in_dir(&["doctor"], dir.path());
     assert_eq!(code, 2);
-    assert!(stderr.contains("remove s3.profile"), "{}", stderr);
-    assert!(!stderr.contains("duplicate"), "{}", stderr);
+    assert!(stderr.contains("expected one of"), "{}", stderr);
+    assert!(!stderr.contains("`profile`"), "{}", stderr);
+    assert!(!stderr.contains("force_path_style"), "{}", stderr);
 }
 
 #[test]
-fn test_hidden_no_op_flags_warn() {
-    let (code, stdout, stderr) = run_cli(&["doctor", "--simple", "--fix-suggestions"]);
-    assert_eq!(code, 0, "{}", stdout);
-    assert!(
-        stderr.contains("warning: deprecated doctor --simple"),
-        "{}",
-        stderr
-    );
-    assert!(
-        stderr.contains("warning: deprecated doctor --fix-suggestions"),
-        "{}",
-        stderr
-    );
-    let (code, stdout, stderr) = run_cli(&["doctor", "--agent"]);
+fn test_removed_json_fields_are_gone() {
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "--provider",
+        "minio",
+        "--endpoint-url",
+        "http://127.0.0.1:9",
+        "list",
+        "--dry-run",
+        "--bucket",
+        "b",
+        "--region",
+        "r",
+    ]);
     assert_eq!(code, 0, "{}", stderr);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert!(
-        json["checks"].as_array().unwrap().iter().any(|check| {
-            check["name"] == "deprecated"
-                && check["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("doctor --agent (use doctor --json)")
-        }),
-        "{}",
-        stdout
-    );
+    assert_eq!(json["inputs"]["provider"], "minio");
+    for (section, field) in [("inputs", "profile"), ("inputs", "continuation_token")] {
+        assert!(json[section].get(field).is_none(), "{}.{}", section, field);
+    }
+    let s3 = &json["resolved_config"]["s3"];
+    assert_eq!(s3["provider_known"], true);
+    assert!(s3.get("profile_known").is_none());
+    assert!(s3.get("profile_warnings").is_none());
+    // config_source.warnings stays, empty.
+    assert_eq!(json["config_source"]["warnings"], serde_json::json!([]));
 }
 
 #[test]
@@ -2831,4 +2924,116 @@ fn test_completions_do_not_advertise_hidden_options() {
     ] {
         assert!(!stdout.contains(hidden), "{} in completions", hidden);
     }
+}
+
+#[test]
+fn test_manifest_summary_derives_summary_only_from_the_output_format() {
+    // metrics.summary_only is deprecated (removed in 0.40): the output format
+    // decides; a manifest without one falls back to the flag.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("run.json");
+    for (inputs, metrics_flag, expected) in [
+        (r#""inputs": {"output_format": "summary"},"#, "", true),
+        (
+            r#""inputs": {"output_format": "parquet"},"#,
+            r#""summary_only": true,"#,
+            false,
+        ),
+        ("", r#""summary_only": true,"#, true),
+    ] {
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{
+  "status": "success",
+  "exit_code": 0,
+  "command": [],
+  {inputs}
+  "outputs": {{"parquet_file": null}},
+  "artifacts": [],
+  "metrics": {{ {metrics_flag} "streamed_rows": 0, "parquet_rows": 0 }},
+  "warnings": []
+}}"#
+            ),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_cli_in_dir(
+            &["manifest-summary", manifest.to_str().unwrap(), "--json"],
+            dir.path(),
+        );
+        assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["schema_version"], "s3-turbo-list.agent.v1");
+        assert_eq!(json["summary_only"], expected, "{}", stdout);
+        assert!(json["outputs"]["report_file"].is_null(), "{}", stdout);
+    }
+}
+
+#[test]
+fn test_local_tools_help_does_not_list_the_endpoint_options() {
+    for command in ["manifest-summary", "guide", "completions", "man"] {
+        let (code, stdout, _) = run_cli(&[command, "--help"]);
+        assert_eq!(code, 0, "{}", command);
+        assert!(!stdout.contains("Endpoint:"), "{}: {}", command, stdout);
+        assert!(
+            !stdout.contains("--endpoint-url"),
+            "{}: {}",
+            command,
+            stdout
+        );
+    }
+    // They still accept (and ignore) them, as before.
+    let (code, _, stderr) = run_cli(&["guide", "--config", "unused.toml", "bos"]);
+    assert_eq!(code, 0, "{}", stderr);
+    // The run commands keep them, under the URL value name.
+    let (_, stdout, _) = run_cli(&["list", "--help"]);
+    assert!(stdout.contains("--endpoint-url <URL>"), "{}", stdout);
+}
+
+#[test]
+fn test_plan_hints_describe_the_partitioning_in_a_note() {
+    // A normal plan carries no hints warnings; the partitioning is a note.
+    let (code, stdout, stderr) =
+        run_cli_without_aws_env(&["list", "--dry-run", "--bucket", "b", "--region", "r"]);
+    assert_eq!(code, 0, "{}", stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hints"]["source"], "startup_discovery");
+    assert_eq!(json["hints"]["warnings"], serde_json::json!([]));
+    assert!(json["hints"]["note"].is_string(), "{}", stdout);
+    assert!(json["cwd"].is_string(), "{}", stdout);
+    // A diff side left as one segment says which option did it, and the
+    // top-level warning names diff, not list.
+    let (code, stdout, stderr) = run_cli_without_aws_env(&[
+        "diff",
+        "--dry-run",
+        "--start-after",
+        "k",
+        "--bucket",
+        "a",
+        "--target-bucket",
+        "b",
+        "--region",
+        "r",
+    ]);
+    assert_eq!(code, 0, "{}", stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hints"]["source"], "single_chain");
+    assert_eq!(json["hints"]["warnings"], serde_json::json!([]));
+    assert!(
+        json["hints"]["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("--start-after lists each side of the diff"),
+        "{}",
+        stdout
+    );
+    assert!(
+        json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("diff lists each side")),
+        "{}",
+        stdout
+    );
 }

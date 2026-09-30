@@ -65,19 +65,14 @@ pub struct S3Config {
     /// `addressing_style`.
     #[serde(default, rename = "addressing_style", skip_serializing)]
     pub addressing_style_setting: Option<AddressingStyle>,
-    /// Deprecated (0.37; removed in 0.39) spelling of
-    /// `addressing_style = "path"`.
-    #[serde(default, skip_serializing)]
-    pub force_path_style: Option<bool>,
     #[serde(skip)]
     pub addressing_style: AddressingStyle,
     /// Whether `addressing_style` came from the CLI or the config file (a
     /// provider preset only fills in a style nobody chose).
     #[serde(skip)]
     pub addressing_style_explicit: bool,
-    /// The provider preset (`provider`; `profile` is its pre-0.37 name,
-    /// deprecated and removed in 0.39).
-    #[serde(default, alias = "profile")]
+    /// The provider preset.
+    #[serde(default)]
     pub provider: Option<String>,
     /// Per-run settings from the command line; not config-file keys (a
     /// `start_after` in a config file silently truncated every run).
@@ -102,7 +97,6 @@ impl Default for S3Config {
             operation_timeout_secs: default_operation_timeout_secs(),
             endpoint_url: None,
             addressing_style_setting: None,
-            force_path_style: None,
             addressing_style: AddressingStyle::default(),
             addressing_style_explicit: false,
             provider: None,
@@ -205,7 +199,6 @@ pub struct ConfigLoadSummary {
     pub loaded_config: Option<String>,
     pub loaded_config_kind: String,
     pub searched: Vec<String>,
-    pub warnings: Vec<String>,
 }
 
 impl Default for S3TurboConfig {
@@ -258,6 +251,12 @@ fn default_channel_capacity() -> usize {
 
 // ── Config loading ────────────────────────────────────────
 
+/// `[s3]` keys removed in 0.39, and what to write instead.
+const REMOVED_S3_KEYS: &[(&str, &str)] = &[
+    ("profile", "use s3.provider"),
+    ("force_path_style", "use s3.addressing_style = \"path\""),
+];
+
 impl S3TurboConfig {
     /// Load config from default locations, then merge CLI overrides.
     pub fn load(cli_config_path: Option<&str>) -> Result<Self, String> {
@@ -284,20 +283,13 @@ impl S3TurboConfig {
         };
         let mut loaded_config = None;
         let mut loaded_config_kind = "none".to_string();
-        let mut warnings = Vec::new();
 
         for (path, kind) in &search_paths {
             if path.exists() {
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
-                let (parsed, parse_warnings) = Self::parse_with_warnings(&content)
+                config = Self::parse(&content)
                     .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
-                config = parsed;
-                warnings.extend(
-                    parse_warnings
-                        .into_iter()
-                        .map(|warning| format!("{} (in {})", warning, path.display())),
-                );
                 log::info!("Loaded config from {}", path.display());
                 loaded_config = Some(path.display().to_string());
                 loaded_config_kind = (*kind).to_string();
@@ -324,7 +316,6 @@ impl S3TurboConfig {
                 .iter()
                 .map(|(path, _kind)| path.display().to_string())
                 .collect(),
-            warnings,
         };
 
         Ok((config, summary))
@@ -332,42 +323,24 @@ impl S3TurboConfig {
 
     /// A config file's content over the defaults.
     pub fn parse(content: &str) -> Result<Self, String> {
-        Self::parse_with_warnings(content).map(|(config, _warnings)| config)
-    }
-
-    /// A config file's content over the defaults, and a warning for each
-    /// deprecated key it uses (`s3.profile`, `s3.force_path_style`).
-    pub fn parse_with_warnings(content: &str) -> Result<(Self, Vec<String>), String> {
-        let mut warnings = Vec::new();
-        // serde reports both spellings of the provider as a "duplicate
-        // field"; say what to do instead.
+        // The keys removed in 0.39 would be serde's bare "unknown field";
+        // say what replaces them.
         if let Ok(table) = toml::from_str::<toml::Table>(content)
             && let Some(s3) = table.get("s3").and_then(toml::Value::as_table)
         {
-            if s3.contains_key("profile") {
-                if s3.contains_key("provider") {
-                    return Err("s3.provider and s3.profile are both set: profile is the \
-                                deprecated name of provider; remove s3.profile"
-                        .to_string());
+            for (key, replacement) in REMOVED_S3_KEYS {
+                if s3.contains_key(*key) {
+                    return Err(format!(
+                        "unknown field `{}` in [s3]: s3.{} was removed in 0.39; {}",
+                        key, key, replacement
+                    ));
                 }
-                warnings.push(
-                    "deprecated config key s3.profile (use s3.provider); it will be removed \
-                     in 0.39"
-                        .to_string(),
-                );
-            }
-            if s3.contains_key("force_path_style") {
-                warnings.push(
-                    "deprecated config key s3.force_path_style (use s3.addressing_style = \
-                     \"path\"); it will be removed in 0.39"
-                        .to_string(),
-                );
             }
         }
         let file_config: S3TurboConfig = toml::from_str(content).map_err(|e| e.to_string())?;
         let mut config = Self::default();
         config.merge(file_config);
-        Ok((config, warnings))
+        Ok(config)
     }
 
     /// Replace a provider preset's name with its canonical spelling
@@ -391,15 +364,7 @@ impl S3TurboConfig {
         if other.s3.endpoint_url.is_some() {
             self.s3.endpoint_url = other.s3.endpoint_url;
         }
-        // The deprecated `force_path_style = true` means path addressing
-        // unless the file also names a style.
-        let setting = other.s3.addressing_style_setting.or_else(|| {
-            other
-                .s3
-                .force_path_style
-                .and_then(|path| path.then_some(AddressingStyle::Path))
-        });
-        if let Some(style) = setting {
+        if let Some(style) = other.s3.addressing_style_setting {
             self.s3.addressing_style = style;
             self.s3.addressing_style_explicit = true;
         }
@@ -585,40 +550,43 @@ max_concurrency = 50
     }
 
     #[test]
-    fn test_parse_provider_toml_and_legacy_profile_key() {
-        for key in ["provider", "profile"] {
-            let config = S3TurboConfig::parse(&format!(
-                "[s3]\nendpoint_url = \"https://s3.bj.bcebos.com\"\naddressing_style = \"path\"\n{} = \"bos\"\n",
-                key
-            ))
-            .unwrap();
-            assert_eq!(
-                config.s3.endpoint_url.as_deref(),
-                Some("https://s3.bj.bcebos.com")
-            );
-            assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
-            assert!(config.s3.addressing_style_explicit);
-            assert_eq!(config.s3.provider.as_deref(), Some("bos"));
-        }
+    fn test_parse_provider_toml() {
+        let config = S3TurboConfig::parse(
+            "[s3]\nendpoint_url = \"https://s3.bj.bcebos.com\"\naddressing_style = \"path\"\nprovider = \"bos\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.s3.endpoint_url.as_deref(),
+            Some("https://s3.bj.bcebos.com")
+        );
+        assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
+        assert!(config.s3.addressing_style_explicit);
+        assert_eq!(config.s3.provider.as_deref(), Some("bos"));
     }
 
     #[test]
-    fn test_deprecated_config_keys_warn() {
-        let (_, warnings) =
-            S3TurboConfig::parse_with_warnings("[s3]\nprovider = \"bos\"\n").unwrap();
-        assert!(warnings.is_empty(), "{:?}", warnings);
-        let (config, warnings) = S3TurboConfig::parse_with_warnings(
-            "[s3]\nprofile = \"bos\"\nforce_path_style = true\n",
-        )
-        .unwrap();
-        assert_eq!(config.s3.provider.as_deref(), Some("bos"));
-        assert_eq!(warnings.len(), 2, "{:?}", warnings);
-        assert!(warnings[0].contains("s3.profile (use s3.provider)"));
-        assert!(warnings[1].contains("s3.force_path_style"));
-        // Both spellings: a clear message, not serde's "duplicate field".
-        let err =
-            S3TurboConfig::parse("[s3]\nprovider = \"bos\"\nprofile = \"minio\"\n").unwrap_err();
-        assert!(err.contains("remove s3.profile"), "{}", err);
+    fn test_removed_config_keys_are_unknown_keys_that_name_the_replacement() {
+        for (content, replacement) in [
+            ("[s3]\nprofile = \"bos\"\n", "use s3.provider"),
+            (
+                "[s3]\nprovider = \"bos\"\nprofile = \"minio\"\n",
+                "use s3.provider",
+            ),
+            (
+                "[s3]\nforce_path_style = true\n",
+                "use s3.addressing_style = \"path\"",
+            ),
+        ] {
+            let err = S3TurboConfig::parse(content).unwrap_err();
+            assert!(err.contains("unknown field"), "{content:?}: {err}");
+            assert!(err.contains("removed in 0.39"), "{content:?}: {err}");
+            assert!(err.contains(replacement), "{content:?}: {err}");
+        }
+        // Neither is offered among the expected keys any more.
+        let err = S3TurboConfig::parse("[s3]\nprofil = \"bos\"\n").unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(!err.contains("`profile`"), "{err}");
+        assert!(!err.contains("force_path_style"), "{err}");
     }
 
     #[test]
@@ -647,18 +615,6 @@ max_concurrency = 50
             let err = S3TurboConfig::parse(key).unwrap_err();
             assert!(err.contains("unknown field"), "{key:?}: {err}");
         }
-    }
-
-    #[test]
-    fn test_legacy_force_path_style_means_path() {
-        let config = S3TurboConfig::parse("[s3]\nforce_path_style = true\n").unwrap();
-        assert_eq!(config.s3.addressing_style, AddressingStyle::Path);
-        let config =
-            S3TurboConfig::parse("[s3]\nforce_path_style = true\naddressing_style = \"virtual\"\n")
-                .unwrap();
-        assert_eq!(config.s3.addressing_style, AddressingStyle::Virtual);
-        let config = S3TurboConfig::parse("[s3]\nforce_path_style = false\n").unwrap();
-        assert!(!config.s3.addressing_style_explicit);
     }
 
     #[test]

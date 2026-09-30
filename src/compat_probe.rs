@@ -7,19 +7,38 @@ use std::time::Instant;
 
 #[derive(Debug, Serialize)]
 pub struct CompatProbeReport {
+    pub schema_version: &'static str,
+    pub tool_version: &'static str,
+    /// `success` (exit 0: `compatible` or `partial`) or `failed`
+    /// (`incompatible`: exit 3 or 4, as `exit_code` says).
+    pub status: String,
+    pub exit_code: i32,
     pub endpoint_url: String,
     pub region: String,
     pub bucket: String,
     pub addressing_style: String,
     pub tests: Vec<ProbeTestResult>,
     pub overall_status: String,
-    /// Deprecated spellings this invocation used (under `--agent` they are
-    /// reported only here).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// The run's warnings (the ones printed as `WARN` on stderr without
+    /// `--agent`); always present, empty in the normal case.
     pub warnings: Vec<String>,
 }
 
 impl CompatProbeReport {
+    /// The exit class: `incompatible` (every operation failed) must not
+    /// read as success; `partial` keeps exit 0, since the report says which
+    /// operations failed and an endpoint that lacks one option can still be
+    /// listed.
+    pub fn exit_code_class(&self) -> crate::agent::ExitCode {
+        if self.overall_status != "incompatible" {
+            crate::agent::ExitCode::Success
+        } else if self.failures_are_setup_errors() {
+            crate::agent::ExitCode::ProviderSetup
+        } else {
+            crate::agent::ExitCode::NetworkRetryExhausted
+        }
+    }
+
     /// Whether every failed test failed on a setup problem — the bucket, the
     /// credentials, or the endpoint/region — rather than on transport or the
     /// endpoint's behaviour.  Drives the exit code of an incompatible probe.
@@ -27,6 +46,8 @@ impl CompatProbeReport {
         let mut errors = self.tests.iter().filter(|t| t.status == "error").peekable();
         errors.peek().is_some()
             && errors.all(|t| match (t.s3_error_code.as_deref(), t.http_status) {
+                // No credentials: the request never left the SDK.
+                _ if t.diagnostic_code.as_deref() == Some("credentials_missing") => true,
                 // HEAD responses carry no body, so HeadBucket's refusal has a
                 // status and no code: 401/403 is access, 404 is the bucket.
                 (None, Some(401 | 403 | 404)) => true,
@@ -80,11 +101,28 @@ pub struct ProbeTestResult {
     pub next_continuation_token_present: Option<bool>,
 }
 
+/// What every probe request is sent to, as recorded in its trace event.
+struct ProbeTarget<'a> {
+    endpoint_url: &'a str,
+    region: &'a str,
+    bucket: &'a str,
+    prefix: &'a str,
+    addressing_style: &'a str,
+    provider: Option<&'a str>,
+}
+
 /// Discards events: `--agent` without `--trace-compat`.
 struct NoTrace;
 
 impl S3TraceWriter for NoTrace {
     fn write_event(&self, _event: S3CompatEvent) {}
+}
+
+/// Why a probe produced no report: its setup (the region) or writing it.
+#[derive(Debug)]
+pub enum ProbeFailure {
+    Setup(String),
+    Output(String),
 }
 
 pub async fn run_compat_probe(
@@ -97,12 +135,14 @@ pub async fn run_compat_probe(
     cfg: &S3TurboConfig,
     quiet: bool,
     warnings: Vec<String>,
-) -> Result<CompatProbeReport, String> {
+) -> Result<CompatProbeReport, ProbeFailure> {
     // --trace-compat as for a listing run; without it, the probe keeps its
     // historical default of tracing to stderr — except under `--agent`
     // (`quiet`), which keeps stderr quiet.
     let trace_writer: Box<dyn S3TraceWriter> =
-        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())? {
+        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())
+            .map_err(ProbeFailure::Output)?
+        {
             Some(writer) => writer,
             None if quiet => Box::new(NoTrace),
             None => Box::new(StderrTraceWriter),
@@ -135,9 +175,11 @@ pub async fn run_compat_probe(
     let region = match region {
         Some(region) => region.to_string(),
         None => config.region().map(|r| r.to_string()).ok_or_else(|| {
-            "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
+            ProbeFailure::Setup(
+                "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
                  for a region)"
-                .to_string()
+                    .to_string(),
+            )
         })?,
     };
     let region = region.as_str();
@@ -148,14 +190,19 @@ pub async fn run_compat_probe(
     }
     let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
     let mut results: Vec<ProbeTestResult> = Vec::new();
+    let target = ProbeTarget {
+        endpoint_url,
+        region,
+        bucket,
+        prefix,
+        addressing_style,
+        provider: cfg.s3.provider.as_deref(),
+    };
 
     let (res, evt) = timed_s3_call(
         || async { client.head_bucket().bucket(bucket).send().await },
         "HeadBucket",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
+        &target,
         trace_writer.as_ref(),
         None,
     )
@@ -173,10 +220,7 @@ pub async fn run_compat_probe(
                 .await
         },
         "ListObjectsV2 (max-keys=1)",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
+        &target,
         trace_writer.as_ref(),
         None,
     )
@@ -195,10 +239,7 @@ pub async fn run_compat_probe(
                 .await
         },
         "ListObjectsV2 with delimiter",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
+        &target,
         trace_writer.as_ref(),
         None,
     )
@@ -222,33 +263,23 @@ pub async fn run_compat_probe(
             >(resp)
         },
         "ListObjectsV2 pagination check",
-        endpoint_url,
-        region,
-        bucket,
-        addressing_style,
+        &target,
         trace_writer.as_ref(),
         None,
     )
     .await;
     results.push(
-        pagination_probe_result(
-            &client,
-            endpoint_url,
-            region,
-            bucket,
-            prefix,
-            addressing_style,
-            trace_writer.as_ref(),
-            res,
-            &mut evt,
-        )
-        .await,
+        pagination_probe_result(&client, &target, trace_writer.as_ref(), res, &mut evt).await,
     );
 
     let overall = CompatProbeReport::overall_status_for(&results);
 
-    let report = CompatProbeReport {
-        endpoint_url: endpoint_url.to_string(),
+    let mut report = CompatProbeReport {
+        schema_version: crate::agent::AGENT_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: String::new(),
+        exit_code: 0,
+        endpoint_url: crate::agent::redact_url_userinfo(endpoint_url),
         region: region.to_string(),
         bucket: bucket.to_string(),
         addressing_style: addressing_style.to_string(),
@@ -256,10 +287,19 @@ pub async fn run_compat_probe(
         overall_status: overall.to_string(),
         warnings,
     };
+    let exit_code = report.exit_code_class();
+    report.exit_code = exit_code.code();
+    report.status = if exit_code == crate::agent::ExitCode::Success {
+        "success"
+    } else {
+        "failed"
+    }
+    .to_string();
 
-    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| ProbeFailure::Output(e.to_string()))?;
     if let Some(out_path) = output {
-        std::fs::write(out_path, &json).map_err(|e| e.to_string())?;
+        std::fs::write(out_path, &json).map_err(|e| ProbeFailure::Output(e.to_string()))?;
         // stdout is for the report itself; this note is for humans.
         if !quiet {
             eprintln!("Compat-probe report written to {}", out_path);
@@ -270,14 +310,9 @@ pub async fn run_compat_probe(
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn pagination_probe_result(
     client: &aws_sdk_s3::Client,
-    endpoint_url: &str,
-    region: &str,
-    bucket: &str,
-    prefix: &str,
-    addressing_style: &str,
+    target: &ProbeTarget<'_>,
     trace_writer: &dyn S3TraceWriter,
     res: Result<
         aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
@@ -320,11 +355,7 @@ async fn pagination_probe_result(
             } else if is_truncated {
                 pagination_second_page_result(
                     client,
-                    endpoint_url,
-                    region,
-                    bucket,
-                    prefix,
-                    addressing_style,
+                    target,
                     trace_writer,
                     evt,
                     key_count,
@@ -351,14 +382,9 @@ async fn pagination_probe_result(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn pagination_second_page_result(
     client: &aws_sdk_s3::Client,
-    endpoint_url: &str,
-    region: &str,
-    bucket: &str,
-    prefix: &str,
-    addressing_style: &str,
+    target: &ProbeTarget<'_>,
     trace_writer: &dyn S3TraceWriter,
     evt: &S3CompatEvent,
     key_count: i32,
@@ -374,8 +400,8 @@ async fn pagination_second_page_result(
                     async move {
                         client
                             .list_objects_v2()
-                            .bucket(bucket)
-                            .prefix(prefix)
+                            .bucket(target.bucket)
+                            .prefix(target.prefix)
                             .max_keys(3)
                             .continuation_token(token_for_request)
                             .send()
@@ -383,10 +409,7 @@ async fn pagination_second_page_result(
                     }
                 },
                 "ListObjectsV2 pagination check (page 2)",
-                endpoint_url,
-                region,
-                bucket,
-                addressing_style,
+                target,
                 trace_writer,
                 Some(&token),
             )
@@ -470,10 +493,7 @@ async fn pagination_second_page_result(
 async fn timed_s3_call<F, Fut, T, E>(
     f: F,
     test_name: &str,
-    endpoint_url: &str,
-    region: &str,
-    bucket: &str,
-    addressing_style: &str,
+    target: &ProbeTarget<'_>,
     trace_writer: &dyn S3TraceWriter,
     continuation_token: Option<&str>,
 ) -> (Result<T, E>, S3CompatEvent)
@@ -486,9 +506,11 @@ where
     let result = f().await;
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    let mut event = S3CompatEvent::new(test_name, endpoint_url, bucket, "");
-    event.region = Some(region.to_string());
-    event.addressing_style = addressing_style.to_string();
+    let mut event =
+        S3CompatEvent::new(test_name, target.endpoint_url, target.bucket, target.prefix);
+    event.set_provider(target.provider);
+    event.region = Some(target.region.to_string());
+    event.addressing_style = target.addressing_style.to_string();
     event.latency_ms = latency_ms;
     event.continuation_token = continuation_token.map(|token| token.to_string());
 
@@ -633,6 +655,10 @@ fn diagnostic_for(
                 "timeout",
                 "Check endpoint reachability and consider increasing connect or operation timeout settings",
             ),
+            Some("credentials") => (
+                "credentials_missing",
+                "No AWS credentials were found: set AWS_PROFILE or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY",
+            ),
             Some("dispatch") => (
                 "transport_failure",
                 "Check DNS, TLS certificates, proxy/firewall rules, and endpoint reachability",
@@ -684,6 +710,12 @@ where
         Some(match self {
             SdkError::ConstructionFailure(_) => "construction",
             SdkError::TimeoutError(_) => "timeout",
+            SdkError::DispatchFailure(e)
+                if e.as_connector_error()
+                    .is_some_and(|c| crate::error::is_missing_credentials(c)) =>
+            {
+                "credentials"
+            }
             SdkError::DispatchFailure(_) => "dispatch",
             SdkError::ResponseError(_) => "response",
             SdkError::ServiceError(_) => "service",

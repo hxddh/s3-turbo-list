@@ -5,6 +5,166 @@ All notable changes to s3-turbo-list will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-09-30
+
+This release removes what 0.38 deprecated, makes the `--agent` / JSON
+contract consistent across every output, turns three setup failures that
+read as network errors into immediate exit-3 setup errors, fixes a 0.38
+regression in `--delimiter` listings, and stops startup discovery from
+overshooting on wide trees (a 20×1000-folder bucket diffed in 30 s; now
+0.7 s). The release binary is 14% smaller.
+
+### Performance
+- **Startup discovery keeps at most its boundary target.** A probed level
+  adds every CommonPrefix it finds, so a wide tree (20 prefixes of 1,000
+  subdirectories) produced 20,000 boundaries — 20,000 segments, each costing
+  at least one page request. The discovered set is now thinned to the target
+  (two per worker), evenly spaced; any subset of real boundaries is still a
+  valid partition. Local 200k-key mock at 20 ms per request: list
+  6.61 s → 0.33 s, diff 30.1 s → 0.72 s.
+- **Flat runs share the boundary budget by size.** When discovery finds too
+  few boundaries, the flat directories it probed were each given an equal
+  share of the remaining budget, so a directory holding 90% of the keys got
+  one twentieth of the cuts. Each run is now sized with one concurrent round
+  of seven `max-keys=1` probes extrapolated from the page discovery already
+  fetched, and the budget follows the sizes (never more cuts than a run has
+  pages; boundaries stay real keys, strictly increasing, inside their run).
+  Files listed next to subdirectories (`obj-…` beside `logs/`) are now
+  bisected the same way, under the text they share, instead of listing as
+  one serial segment. 90% of 200k keys in one of 20 directories: list
+  1.55 s → 0.58 s, diff 3.39 s → 0.87 s; 90% of the keys as root files
+  beside ten folders: list 2.02 s → 0.63 s, diff 4.63 s → 0.98 s.
+- **Startup probes parse pages with the fast Contents parser and reuse what
+  they fetched.** Discovery's delimiter pages go through the same parser as
+  listing pages (the SDK deserializer cost ~100 ms of CPU for a level of
+  twenty 1,000-key pages before the first object was listed); flat bisection
+  anchors on the first key of discovery's page instead of probing for it.
+- **Runtime split probes reuse their pages.** When no delimiter rung has a
+  CommonPrefix inside the segment's range but the rung pages together hold
+  every remaining key (the tail of a leaf directory), the split is the median
+  of those keys, with no further flat-cut probes.
+
+### Removed
+- The spellings deprecated in 0.38. Each is now a usage error (exit 2) that
+  names the replacement:
+  - Options other than `--config`, `--provider`, `--endpoint-url` and
+    `--addressing-style` written before the command name are no longer
+    moved behind it: `s3-turbo-list --output-dir out list …` fails with
+    "option '--output-dir' must follow the command name `list`".
+    `s3-turbo-list --agent list …` still prints the run-failure JSON.
+  - `--endpoint` (use `--endpoint-url`), `doctor --agent` and
+    `manifest-summary --agent` (use `--json`), and the no-ops
+    `doctor --simple` and `doctor --fix-suggestions`.
+  - The config keys `s3.profile` and `s3.force_path_style` are unknown keys
+    (exit 2), with a message naming `s3.provider` /
+    `s3.addressing_style = "path"`; the list of valid keys no longer shows
+    them.
+- JSON fields: `inputs.profile` and `inputs.continuation_token` (plans and
+  manifests), `resolved_config.s3.profile_known` / `profile_warnings`, and
+  the trace field `profile`. Read `provider`, `provider_known` and
+  `provider_warnings`.
+- Deprecation warnings: with nothing left to deprecate, no `warning:
+  deprecated …` lines, no deprecations in plan / manifest / compat-probe
+  `warnings`, and no `deprecated` doctor check. `config_source.warnings`
+  stays, always empty. Checkpoints written by 0.37 (identity field
+  `profile`) still load and resume.
+- A usage error that names a spelling removed in 0.38 (`--summary-only`,
+  `--plan-json`, `init-config`, `--profile`, `--debug-s3`,
+  `--continuation-token`, `--output-ks-file`, `--output-log-file`) adds a
+  note with its replacement.
+
+### Deprecated (removed in 0.40)
+- `metrics.summary_only` in the run manifest, and `summary_only` (and the
+  `Summary only:` line) in `manifest-summary`: use
+  `inputs.output_format == "summary"`. `manifest-summary` now derives its
+  `summary_only` from the output format and falls back to
+  `metrics.summary_only` only for a manifest without one;
+  `examples/read_manifest.py` does the same.
+
+### Changed
+- JSON results are consistent (additive; nothing renamed): the compat-probe
+  report has `schema_version`, `tool_version`, `status` (`success` /
+  `failed`), `exit_code`, and an always-present `warnings` (the run's
+  warnings, which `--agent` keeps off stderr); `manifest-summary --json`
+  has `schema_version` and `outputs.report_file`; dry-run plans have `cwd`.
+- `hints.warnings` in plans is empty unless an explicit `--hints-file` has
+  problems. The description of how a source partitions the run
+  (`startup_discovery`, `single_chain`, …) moved to a new `hints.note`; for
+  a diff left as one segment per side it names the option that did it, and
+  the plan warning says "diff lists each side as a single ListObjectsV2
+  chain" instead of "list is planned as …".
+- compat-probe trace events record the probe's `prefix` (they had `""`)
+  and `provider`.
+- `--endpoint-url` help reads "S3-compatible endpoint URL (default: the
+  provider's, or AWS S3)", with value name `URL`.
+- `manifest-summary`, `guide`, `completions` and `man --help` no longer
+  list the Endpoint options (still accepted and ignored there).
+- INSTALL.md says the man page covers the top-level command only and
+  points to `<command> --help` for each command's options.
+
+### Fixed
+- **`--delimiter` with `--start-after` inside a folder dropped the folder's
+  row** (regression in 0.38). With `--start-after a/b/c`, the endpoint
+  returns `a/` (the keys after the start key roll up into it); the 0.38 fix
+  for repeated folder rows dropped every CommonPrefix sorting at or before
+  the start key. Only the prefix equal to a restart cursor comes back again,
+  so only that one is dropped.
+- **Missing credentials were retried as a network error for minutes and
+  exited 4.** The SDK reports an empty credential chain as a dispatch
+  failure; it is now a setup error (`MissingCredentials`, exit 3, no retry)
+  with a one-line message, and `compat-probe` reports it as
+  `credentials_missing` (exit 3).
+- `compat-probe` without a region exited 5 ("output error"); it exits 3.
+- The endpoint's `user:password@` appeared in trace events and the
+  `compat-probe` report; both redact it now, as plans and manifests did.
+- Ctrl-C after everything was listed and written reported "interrupted …
+  partial" (exit 7) with `--start-after`, with another job's checkpoint in
+  place, and in diff after the merge completed; it reports success in every
+  mode.
+- Ctrl-C during a diff waited out a segment's retry backoff (up to 30 s);
+  diff stops its in-flight segments at once, and every retry backoff races
+  the quit signal.
+- `list --output-format ndjson|tsv --agent --dry-run` printed plan
+  `status: ok` and exited 0 while the real run exits 2; the plan is
+  `blocked` and the dry run exits 2 with the run line.
+- A config or validation error of a `list` / `diff` / `compat-probe` run
+  (unknown provider, bad config value, …) printed its reason twice (the
+  message, then the run line), under `--agent` too; it is printed once, in
+  the run line, unless it spans several lines.
+- compat-probe's exit on an `incompatible` endpoint used its own line;
+  it is the documented run line, `s3-turbo-list: run failed (exit N):
+  compat-probe found the endpoint incompatible: …`.
+- Docs: the trace field table says listing events always carry
+  `"delimiter"` (`""` for the recursive default) and that probes are not
+  traced; providers.md documents the compat-probe report's `warnings` and
+  new fields and `-o` with `--agent`; agent-usage.md documents the
+  `manifest-summary --json` output and the compat-probe report under
+  `--agent`.
+
+### Internal
+- `run()` (1233 lines) is split into setup (`app/run.rs`), the listing
+  (`app/listing.rs`) and the exit (`app/finish.rs`); startup partitioning
+  moved into the library (`startup.rs`); `tasks_s3` and `agent` are split
+  into modules. Log lines of moved code name the new module paths
+  (`s3_turbo_list::startup`, `…::tasks_s3::chain`, …); a `RUST_LOG` filter
+  on the old module paths no longer matches them.
+- Tests run every spawned binary with an isolated `HOME` and without
+  inherited AWS profile, endpoint and proxy variables: a
+  `~/.s3-turbo-list.toml` on the developer's machine failed 8 tests.
+
+### Build
+- **Leaner dependency features.** `aws-sdk-s3` no longer enables the legacy
+  `rustls` feature (a second hyper 0.14 / rustls 0.21 HTTP stack next to the
+  default one); the default HTTPS client, `rt-tokio`, `sigv4a` and `http-1x`
+  are kept. `tokio` enables only the features used (`rt-multi-thread`,
+  `macros`, `sync`, `time`, `fs`, `io-util`, `io-std`) instead of `full`,
+  and `env_logger` drops its `regex` filter feature (`RUST_LOG` directives
+  still work; a `/regex` message filter is matched as a plain substring).
+  Unique crates in the normal dependency tree: 359 → 329; release binary
+  (x86_64 Linux): 23.4 MB → 20.1 MB. Proxy (`HTTP(S)_PROXY` / `NO_PROXY`)
+  and TLS behave as before: they come from the default HTTPS client, which
+  is unchanged.
+
 ## [0.38.0] - 2026-09-29
 
 This release removes the spellings 0.37 deprecated, puts a warning on the

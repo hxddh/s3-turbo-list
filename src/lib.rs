@@ -26,10 +26,11 @@ pub mod error; // FlatRuntimeError, error code constants
 pub mod filter_expr; // FilterExpr — compiled --filter expressions
 mod flat_cut; // flat key-range cut search (startup bisection + runtime splits)
 pub mod hints;
-mod list_page; // ListObjectsV2 <Contents> fast path used by tasks_s3::flat_list
+mod list_page; // ListObjectsV2 <Contents> fast path used by tasks_s3::chain::flat_list
 pub mod local_tools;
 pub mod mon;
 pub mod profiles;
+pub mod startup; // startup partitioning probes (drives auto_hints)
 pub mod stats;
 pub mod tasks_s3;
 pub mod trace; // S3CompatEvent, S3TraceWriter, JsonlTraceWriter, trace_writer_for_target
