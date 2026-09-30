@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-// ── Cached hints format ────────────────────────────────────
+// ── TOML hints-file format ─────────────────────────────────
 
+// The format earlier versions wrote as their hints cache; runs no longer read
+// or write a cache, but `--hints-file` (and `doctor`) still accept such a file.
 // `#[serde(default)]` on the whole struct (no `deny_unknown_fields`) keeps older
 // cache files readable: fields that earlier versions wrote (total_objects,
 // scan_mode, estimate_mode, and the long-removed sampled-scan fields) are simply
@@ -22,9 +24,8 @@ pub struct HintsCache {
 // First-run hints without any user action: a small BFS of delimiter
 // probes (one ListObjectsV2 page each) discovers real CommonPrefix
 // boundaries so the run starts with parallel segments instead of the
-// single-segment fallback. Results are written to the conventional
-// hints cache so later runs (including --resume) reload the exact same
-// boundaries through the existing cache path.
+// single-segment fallback. Every run discovers afresh: nothing is cached,
+// and a --resume run lists the ranges its checkpoint records instead.
 
 /// Maximum BFS depth for startup discovery probes.
 const STARTUP_DISCOVERY_MAX_DEPTH: usize = 3;

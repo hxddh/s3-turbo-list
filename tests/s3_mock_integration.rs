@@ -2167,7 +2167,7 @@ estimate_mode = "full"
 }
 
 #[test]
-fn local_mock_no_auto_hints_skips_conventional_cache() {
+fn local_mock_no_auto_hints_ignores_a_leftover_hints_cache() {
     let server = MockS3Server::start(|request, _sequence| {
         if request.query.contains_key("start-after") {
             return MockResponse::error(
@@ -2464,13 +2464,13 @@ fn local_mock_sdk_retries_transient_list_error() {
 
 // ── --start-after single-chain guarantees ──────────────────
 //
-// A cached conventional hints file must not fan a --start-after run out into
+// A leftover hints cache file must not fan a --start-after run out into
 // multiple segments: every segment would override its start with the CLI key
-// and list overlapping ranges, duplicating output rows. The cache is skipped
+// and list overlapping ranges, duplicating output rows. The file is ignored
 // (single chain); explicit --hints-file and --resume are rejected up front.
 
 #[test]
-fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
+fn local_mock_start_after_ignores_a_leftover_hints_cache_and_lists_single_chain() {
     // Real-S3 semantics: sorted keys, honor start-after, single page.
     let server = MockS3Server::start(move |request, _sequence| {
         let start_after = request
@@ -2490,8 +2490,8 @@ fn local_mock_start_after_ignores_cached_hints_and_lists_single_chain() {
     let config = dir.path().join("config.toml");
     let parquet = dir.path().join("out.parquet");
     write_fast_config(&config);
-    // Conventional startup-discovery cache (cwd-relative), as written by a
-    // previous run of the same bucket: two segments split at "m/".
+    // A hints cache (cwd-relative) as older versions wrote for the same
+    // bucket: two segments split at "m/". Runs no longer read it.
     std::fs::write(
         dir.path().join("us-east-1_mock-bucket_hints.toml"),
         r#"bucket = "mock-bucket"
@@ -2842,7 +2842,7 @@ fn local_mock_retry_resumes_after_common_prefixes_only_page() {
 // the flat key range up front (the same partitioner diff sides use) instead
 // of starting single-segment and ramping via runtime splits. The first run
 // must list in parallel segments with every key emitted exactly once, and
-// the boundaries must land in the conventional hints cache.
+// nothing may be cached in the working directory.
 #[test]
 fn local_mock_list_flat_namespace_prepartitions_at_startup() {
     let keys: Vec<String> = (0..200).map(|i| format!("obj-{:04}", i)).collect();
@@ -3065,14 +3065,15 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
     assert!(probes <= 120, "{} bisection probes", probes);
 }
 
-// ── Conventional hints cache scoping ────────────────────────
+// ── Leftover hints cache files ──────────────────────────────
 //
 // A hierarchical run rolls every key under a CommonPrefix and a page's
-// CommonPrefixes are not range-filtered, so cached segments would each
+// CommonPrefixes are not range-filtered, so segments from a leftover cache
+// file would each
 // re-list the same prefix set — N× the requests, N× the reported
 // CommonPrefix count, and no parallelism to show for it.
 #[test]
-fn local_mock_delimiter_run_ignores_conventional_hints_cache() {
+fn local_mock_delimiter_run_ignores_a_leftover_hints_cache() {
     let server = MockS3Server::start(move |request, _sequence| {
         let start_after = request
             .query

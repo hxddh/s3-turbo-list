@@ -910,8 +910,8 @@ pub(crate) fn listing_prefix(cli: &Cli) -> String {
 /// ranges, duplicating output rows. Reject explicit multi-segment inputs.
 /// A `--delimiter` listing is one hierarchical segment: CommonPrefixes are not
 /// bounded by a segment's key range, so boundaries from `--hints-file` made
-/// neighbouring segments drop or repeat folder rows. Runtime splitting and the
-/// hints cache were already off for delimiter runs; the explicit file was the
+/// neighbouring segments drop or repeat folder rows. Runtime splitting and
+/// startup discovery are off for delimiter runs; the explicit file was the
 /// remaining way in.
 pub(crate) fn validate_delimiter_hints_command(cli: &Cli) {
     if matches!(cli.cmd, Commands::List { .. })

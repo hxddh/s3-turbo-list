@@ -220,8 +220,8 @@ pub(crate) fn build_plan_report(
             target_endpoint
         ));
     }
-    // Only runs that can never fan out get this warning. A run without cached
-    // hints still partitions (startup discovery, then runtime splitting), and
+    // Only runs that can never fan out get this warning. A run without a
+    // hints file still partitions (startup discovery, then runtime splitting), and
     // so does --no-auto-hints (runtime splitting alone).
     let never_fans_out = matches!(
         hints.source.as_str(),
