@@ -6,6 +6,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ManifestSummaryReport {
+    pub schema_version: &'static str,
     pub status: String,
     pub manifest_file: String,
     pub tool_version: Option<String>,
@@ -14,6 +15,7 @@ pub struct ManifestSummaryReport {
     pub elapsed_secs: Option<f64>,
     pub command: Vec<String>,
     pub output_format: Option<String>,
+    /// Deprecated (0.39; removed in 0.40): `output_format == "summary"`.
     pub summary_only: bool,
     pub received_objects: u64,
     pub streamed_rows: u64,
@@ -45,6 +47,8 @@ pub struct ManifestOutputSummary {
     pub hints_file: Option<String>,
     pub trace_compat: Option<String>,
     pub log_file: Option<String>,
+    /// compat-probe's `-o` report file (null for list and diff runs).
+    pub report_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,10 +111,15 @@ pub fn manifest_summary(
     let output_format = value
         .get("inputs")
         .and_then(|v| json_string(v, "output_format"));
-    let summary_only = metrics
-        .get("summary_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `metrics.summary_only` is deprecated (removed in 0.40): the output
+    // format says it; manifests without one fall back to the old flag.
+    let summary_only = match output_format.as_deref() {
+        Some(format) => format == "summary",
+        None => metrics
+            .get("summary_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
     let row_check_applies = manifest_row_check_applies(output_format.as_deref(), summary_only);
     let parquet_rows_match_streamed_rows =
         row_check_applies.then_some(streamed_rows == parquet_rows);
@@ -200,6 +209,7 @@ pub fn manifest_summary(
     let check_summary = manifest_check_summary(check_passed, &checks, &artifacts);
 
     Ok(ManifestSummaryReport {
+        schema_version: crate::agent::AGENT_SCHEMA_VERSION,
         status: "success".to_string(),
         manifest_file: path.to_string(),
         tool_version: json_string(&value, "tool_version"),
@@ -253,6 +263,9 @@ pub fn manifest_summary(
             log_file: value
                 .get("outputs")
                 .and_then(|v| json_string(v, "log_file")),
+            report_file: value
+                .get("outputs")
+                .and_then(|v| json_string(v, "report_file")),
         },
         artifacts,
         warnings: value

@@ -23,7 +23,14 @@ def main() -> int:
     print(f"received_objects: {metrics.get('received_objects')}")
     print(f"streamed_rows: {metrics.get('streamed_rows')}")
     print(f"bytes_total: {metrics.get('bytes_total')}")
-    print(f"summary_only: {metrics.get('summary_only')}")
+    # metrics.summary_only is deprecated (removed in 0.40): read the output
+    # format instead, falling back to the flag for manifests without one.
+    output_format = (manifest.get("inputs") or {}).get("output_format")
+    if output_format is not None:
+        print(f"output_format: {output_format}")
+        print(f"summary_only: {output_format == 'summary'}")
+    else:
+        print(f"summary_only: {metrics.get('summary_only')}")
     print(f"parquet_rows: {metrics.get('parquet_rows')}")
     print(f"ks_entries: {metrics.get('ks_entries')}")
 

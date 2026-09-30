@@ -305,20 +305,21 @@ python3 examples/inspect-trace.py trace.jsonl          # summary
 ### Trace event fields
 
 Each line is one `S3CompatEvent`.  Optional fields (`?`) are omitted when
-absent.  `profile` is deprecated (0.38; removed in 0.39): read `provider`.
+absent.  The field `profile` (a copy of `provider`) was removed in 0.39.
+Listing requests and compat-probe requests are traced; startup discovery,
+flat-namespace bisection and runtime split probes are not.
 
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | string | ISO 8601 wall-clock time of the call. |
 | `operation` | string | S3 operation (e.g. `"ListObjectsV2"`, `"HeadBucket"`), or `"ListObjectsV2SegmentSummary"` for a completed segment. |
-| `provider` | string? | Provider preset name (e.g. `"bos"`, `"minio"`). |
-| `profile` | string? | Deprecated: the same value as `provider`. |
+| `provider` | string? | Provider preset name (e.g. `"bos"`, `"minio"`); absent without `--provider` / `s3.provider`. |
 | `endpoint_url` | string | Endpoint URL used for the request. |
 | `region` | string? | Region the request was signed for. |
 | `addressing_style` | string | `"path"`, `"virtual"`, or `"auto"`. |
 | `bucket` | string | Target bucket. |
 | `prefix` | string | Listing prefix. |
-| `delimiter` | string? | Delimiter sent with the request.  The listing default is `""` (recursive), which is omitted from requests and from the event; hierarchical runs and structural probes send `"/"`. |
+| `delimiter` | string? | The run's delimiter.  Listing events always carry it: `""` for the recursive default (which is not sent with the request), `"/"` for a `--delimiter '/'` run.  compat-probe events omit it. |
 | `start_after` | string? | `start-after` parameter, if sent. |
 | `max_keys` | int? | `max-keys` parameter, if sent. |
 | `continuation_token` | string? | Continuation token the request sent (absent on a chain's first page). |

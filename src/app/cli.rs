@@ -4,10 +4,10 @@ use super::*;
 
 // Only the endpoint options are global. Every other option belongs to the
 // commands that use it, so clap rejects a misplaced flag itself and each
-// command's --help lists only what it takes. Run options written before the
+// command's --help lists only what it takes. A run option written before the
 // command name (`s3-turbo-list --output-dir out list …`, the pre-0.37
-// spelling, deprecated in 0.38 and removed in 0.39) are moved behind it by
-// `hoist_command_flags` before parsing, with a deprecation warning.
+// spelling, removed in 0.39) is a usage error that names the command it must
+// follow (`misplaced_option`).
 
 #[derive(Parser)]
 #[command(name = "s3-turbo-list")]
@@ -38,11 +38,11 @@ pub(crate) struct GlobalArgs {
     #[arg(long, global = true, help_heading = "Endpoint")]
     pub(crate) provider: Option<String>,
 
-    /// Custom S3 endpoint URL (`--endpoint`: deprecated alias)
+    /// S3-compatible endpoint URL (default: the provider's, or AWS S3)
     #[arg(
         long = "endpoint-url",
+        value_name = "URL",
         global = true,
-        alias = "endpoint",
         help_heading = "Endpoint"
     )]
     pub(crate) endpoint: Option<String>,
@@ -274,16 +274,6 @@ pub(crate) enum Commands {
         /// Check that this trace file can be created
         #[arg(long)]
         trace_compat: Option<String>,
-
-        /// Deprecated: --json
-        #[arg(long, hide = true)]
-        agent: bool,
-        /// Deprecated: the default output is the compact form
-        #[arg(long, hide = true)]
-        simple: bool,
-        /// Deprecated: suggestions are printed when something is wrong
-        #[arg(long, hide = true)]
-        fix_suggestions: bool,
     },
 
     /// Summarize a run manifest, or --check it (exit 6 on a mismatch)
@@ -299,10 +289,6 @@ pub(crate) enum Commands {
         /// artifacts via exit code
         #[arg(long)]
         check: bool,
-
-        /// Deprecated: --json
-        #[arg(long, hide = true)]
-        agent: bool,
     },
 
     /// Provider quickstarts: aws, minio, bos, r2, b2, oss
@@ -352,9 +338,6 @@ pub(crate) struct Cli {
     pub(crate) agent: bool,
     pub(crate) dry_run: bool,
     pub(crate) run_manifest: Option<String>,
-    /// Deprecated spellings used on this command line: each is printed as
-    /// `warning: deprecated …` and recorded in the plan/manifest warnings.
-    pub(crate) deprecated: Vec<String>,
 }
 
 impl Cli {
@@ -391,7 +374,6 @@ impl Cli {
             agent: false,
             dry_run: false,
             run_manifest: None,
-            deprecated: Vec::new(),
         };
         let mut groups = None;
         match &mut cli.cmd {
@@ -442,44 +424,18 @@ impl Cli {
                 cli.trace_compat = trace_compat.clone();
             }
             Commands::Doctor {
-                json,
                 hints_file,
                 filter,
                 output_dir,
                 output_parquet_file,
                 trace_compat,
-                agent,
-                simple,
-                fix_suggestions,
+                ..
             } => {
-                if *agent {
-                    cli.deprecated
-                        .push("doctor --agent (use doctor --json)".to_string());
-                }
-                if *simple {
-                    cli.deprecated.push(
-                        "doctor --simple (a no-op: the output is always compact)".to_string(),
-                    );
-                }
-                if *fix_suggestions {
-                    cli.deprecated.push(
-                        "doctor --fix-suggestions (a no-op: suggestions are always printed)"
-                            .to_string(),
-                    );
-                }
-                *json |= *agent;
                 cli.hints_file = hints_file.clone();
                 cli.filter = filter.clone();
                 cli.output_dir = output_dir.clone();
                 cli.output_parquet_file = output_parquet_file.clone();
                 cli.trace_compat = trace_compat.clone();
-            }
-            Commands::ManifestSummary { json, agent, .. } => {
-                if *agent {
-                    cli.deprecated
-                        .push("manifest-summary --agent (use --json)".to_string());
-                }
-                *json |= *agent;
             }
             _ => {}
         }
@@ -504,15 +460,6 @@ impl Cli {
             cli.trace_compat = automation.trace_compat;
         }
         cli
-    }
-
-    /// The deprecation warnings for the plan / manifest `warnings`, in the
-    /// wording printed on stderr (without its `warning: ` prefix).
-    pub(crate) fn deprecation_warnings(&self) -> Vec<String> {
-        self.deprecated
-            .iter()
-            .map(|spelling| format!("deprecated {}; it will be removed in 0.39", spelling))
-            .collect()
     }
 }
 
@@ -580,61 +527,6 @@ pub(crate) fn find_command(args: &[String]) -> Option<(usize, clap::Command)> {
     None
 }
 
-/// Move command options written before the command name behind it:
-/// `s3-turbo-list --output-dir out list --bucket b` was the documented
-/// spelling while every option was global, and scripts use it. Global
-/// (endpoint) options stay where they are; an option the command does not
-/// take is left in place for clap to reject. Returns the rewritten argv and
-/// the options that were moved (deprecated: removed in 0.39).
-pub(crate) fn hoist_command_flags(
-    args: Vec<std::ffi::OsString>,
-) -> (Vec<std::ffi::OsString>, Vec<String>) {
-    let command = CliArgs::command();
-    let top_level: Vec<&clap::Arg> = command.get_arguments().collect();
-    let strs: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let Some((at, sub)) = find_command(&strs) else {
-        return (args, Vec::new());
-    };
-    let sub_args: Vec<&clap::Arg> = sub.get_arguments().collect();
-    let mut kept = vec![args[0].clone()];
-    let mut moved = Vec::new();
-    let mut moved_names = Vec::new();
-    let mut index = 1;
-    while index < at {
-        let token = strs[index].as_str();
-        let global = if token.starts_with('-') {
-            classify_option(&top_level, token)
-        } else {
-            None
-        };
-        let local = match global {
-            None if token.starts_with('-') => classify_option(&sub_args, token),
-            _ => None,
-        };
-        let (target, value) = match (global, local) {
-            (Some(value), _) => (&mut kept, value),
-            (None, Some(value)) => {
-                moved_names.push(token.split_once('=').map_or(token, |(n, _)| n).to_string());
-                (&mut moved, value)
-            }
-            (None, None) => (&mut kept, false),
-        };
-        target.push(args[index].clone());
-        if value && index + 1 < at {
-            index += 1;
-            target.push(args[index].clone());
-        }
-        index += 1;
-    }
-    kept.push(args[at].clone());
-    kept.extend(moved);
-    kept.extend(args[at + 1..].iter().cloned());
-    (kept, moved_names)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ListOutputFormat {
     Parquet,
@@ -682,83 +574,205 @@ impl From<ListOutputFormat> for data_map::ListTextOutputFormat {
 
 // ── Main ───────────────────────────────────────────────────
 
+/// The command definition as parsed, `--help`ed, completed and rendered as a
+/// man page. The endpoint options are global for the commands that load the
+/// config; the local tools (`manifest-summary`, `guide`, `completions`,
+/// `man`) accept and ignore them, as before, but do not list them in their
+/// `--help`.
+pub(crate) fn cli_command() -> clap::Command {
+    let command = CliArgs::command();
+    let globals: Vec<clap::Arg> = command
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .map(|arg| arg.clone().global(false).hide(true))
+        .collect();
+    ["manifest-summary", "guide", "completions", "man"]
+        .into_iter()
+        .fold(command, |command, name| {
+            command.mut_subcommand(name, |sub| sub.args(globals.iter().cloned()))
+        })
+}
+
+/// Spellings removed in 0.38 and 0.39, and what replaces each: a usage error
+/// that names one gets the replacement appended.
+const REMOVED_SPELLINGS: &[(&str, &str)] = &[
+    ("--endpoint", "removed in 0.39: use --endpoint-url"),
+    (
+        "--agent",
+        "doctor --agent and manifest-summary --agent were removed in 0.39: use --json",
+    ),
+    (
+        "--simple",
+        "removed in 0.39: the doctor output is always compact",
+    ),
+    (
+        "--fix-suggestions",
+        "removed in 0.39: doctor always prints suggestions",
+    ),
+    ("--profile", "removed in 0.38: use --provider"),
+    (
+        "--summary-only",
+        "removed in 0.38: use --output-format summary",
+    ),
+    (
+        "--plan-json",
+        "removed in 0.38: redirect the plan instead (--dry-run > plan.json)",
+    ),
+    ("--debug-s3", "removed in 0.38: use --trace-compat -"),
+    (
+        "--continuation-token",
+        "removed in 0.38: use --resume or --start-after",
+    ),
+    (
+        "--output-ks-file",
+        "removed in 0.38: the KeySpace file is always <parquet stem>.ks",
+    ),
+    (
+        "--output-log-file",
+        "removed in 0.38: --log writes <name>.log beside the outputs",
+    ),
+    (
+        "init-config",
+        "removed in 0.38: write the TOML config by hand (see docs/providers.md)",
+    ),
+];
+
+/// The replacement for a removed spelling a usage error names.
+fn removed_spelling_hint(error: &clap::Error) -> Option<&'static str> {
+    use clap::error::{ContextKind, ContextValue};
+    let named = [ContextKind::InvalidArg, ContextKind::InvalidSubcommand]
+        .into_iter()
+        .find_map(|kind| match error.get(kind) {
+            Some(ContextValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })?;
+    let name = named
+        .split_once('=')
+        .map_or(named.as_str(), |(name, _)| name);
+    REMOVED_SPELLINGS
+        .iter()
+        .find(|(spelling, _)| *spelling == name)
+        .map(|(_, hint)| *hint)
+}
+
+/// The first option written before the command name that the command takes
+/// (`s3-turbo-list --output-dir out list …`, the pre-0.37 spelling, removed
+/// in 0.39), as a message that says where it goes.
+fn misplaced_option(strs: &[String], at: usize, sub: &clap::Command) -> Option<String> {
+    let command = CliArgs::command();
+    let top_level: Vec<&clap::Arg> = command.get_arguments().collect();
+    let sub_args: Vec<&clap::Arg> = sub.get_arguments().collect();
+    let mut index = 1;
+    while index < at {
+        let token = strs[index].as_str();
+        index += 1;
+        if !token.starts_with('-') {
+            continue;
+        }
+        if let Some(takes_value) = classify_option(&top_level, token) {
+            index += usize::from(takes_value);
+            continue;
+        }
+        classify_option(&sub_args, token)?;
+        let name = token.split_once('=').map_or(token, |(name, _)| name);
+        let globals: Vec<String> = top_level
+            .iter()
+            .filter(|arg| arg.is_global_set())
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{}", long)))
+            .collect();
+        return Some(format!(
+            "option '{}' must follow the command name `{}` (options before the command name \
+             were removed in 0.39; only {} may come first)",
+            name,
+            sub.get_name(),
+            globals.join(", ")
+        ));
+    }
+    None
+}
+
 /// Parse the command line. A usage error under `--agent` also prints the
 /// failed-run JSON, like every other failure before a run starts, and one
 /// under `doctor --json` prints doctor's JSON.
 pub(crate) fn parse_cli() -> Cli {
-    let (argv, moved) = hoist_command_flags(std::env::args_os().collect());
+    use clap::FromArgMatches;
+    use clap::error::ErrorKind;
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let strs: Vec<String> = argv
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let command = find_command(&strs).map(|(at, sub)| (at, sub.get_name().to_string()));
-    match CliArgs::try_parse_from(&argv) {
-        Ok(args) => {
-            let mut cli = Cli::from_args(args);
-            if !moved.is_empty() {
-                let name = command.as_ref().map_or("the command", |(_, name)| name);
-                cli.deprecated.insert(
-                    0,
-                    format!(
-                        "spelling with options before the command name ({}): write them after `{}`",
-                        moved.join(", "),
-                        name
-                    ),
-                );
+    let e = match cli_command()
+        .try_get_matches_from(&argv)
+        .and_then(|matches| CliArgs::from_arg_matches(&matches))
+    {
+        Ok(args) => return Cli::from_args(args),
+        Err(e) => e,
+    };
+    if matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        e.exit()
+    }
+    let command = find_command(&strs);
+    let misplaced = command
+        .as_ref()
+        .filter(|_| e.kind() == ErrorKind::UnknownArgument)
+        .and_then(|(at, sub)| misplaced_option(&strs, *at, sub));
+    let hint = removed_spelling_hint(&e);
+    let rendered = e.to_string();
+    let first = rendered
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("error: ");
+    let reason = match (&misplaced, hint) {
+        (Some(message), _) => message.clone(),
+        (None, Some(hint)) => format!("{} ({})", first, hint),
+        (None, None) => first.to_string(),
+    };
+    let print_error = || match &misplaced {
+        Some(message) => eprintln!("error: {}\n\nFor more information, try '--help'.", message),
+        None => {
+            let _ = e.print();
+            if let Some(hint) = hint {
+                eprintln!("note: {}", hint);
             }
-            // clap does not say which spelling matched the hidden alias.
-            let uses_endpoint_alias = strs
-                .iter()
-                .skip(1)
-                .take_while(|arg| arg.as_str() != "--")
-                .any(|arg| arg == "--endpoint" || arg.starts_with("--endpoint="));
-            if uses_endpoint_alias {
-                cli.deprecated
-                    .push("option --endpoint (use --endpoint-url)".to_string());
-            }
-            cli
         }
-        Err(e) => {
-            use clap::error::ErrorKind;
-            let usage_error = !matches!(
-                e.kind(),
-                ErrorKind::DisplayHelp
-                    | ErrorKind::DisplayVersion
-                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            );
-            // Route on the command the same scan as hoisting finds, and on
-            // flags written after it — never on raw strings anywhere in argv
-            // (`list --bucket doctor --json` is a list usage error).
-            if let (true, Some((at, name))) = (usage_error, command.as_ref()) {
-                let has = |flag: &str| {
-                    strs[at + 1..]
-                        .iter()
-                        .take_while(|arg| arg.as_str() != "--")
-                        .any(|arg| arg == flag)
-                };
-                let rendered = e.to_string();
-                let first = rendered.lines().next().unwrap_or_default();
-                let reason = first.trim_start_matches("error: ");
-                match name.as_str() {
-                    // `doctor --json` promises JSON on stdout for every
-                    // config error.
-                    "doctor" if has("--json") || has("--agent") => {
-                        let _ = DOCTOR_JSON.set(true);
-                        exit_doctor_check_error("cli", reason);
-                    }
-                    "list" | "diff" | "compat-probe" if has("--agent") => {
-                        let _ = e.print();
-                        let _ = RUN_COMMAND.set(true);
-                        let _ = AGENT_RUN.set(true);
-                        run_failure_epilogue(agent::ExitCode::CliConfig, reason);
-                        std::process::exit(agent::ExitCode::CliConfig.code());
-                    }
-                    _ => {}
-                }
+    };
+    // Route on the command found by skipping option values, never on raw
+    // strings anywhere in argv (`list --bucket doctor --json` is a list
+    // usage error). A run command's `--agent` counts on either side of its
+    // name: `s3-turbo-list --agent list …` is a misplaced option, and the
+    // agent still gets its JSON result.
+    if let Some((at, sub)) = command.as_ref() {
+        let args = || {
+            strs.iter()
+                .enumerate()
+                .skip(1)
+                .take_while(|(_, arg)| arg.as_str() != "--")
+        };
+        match sub.get_name() {
+            // `doctor --json` promises JSON on stdout for every config error.
+            "doctor" if args().any(|(index, arg)| index > *at && arg == "--json") => {
+                let _ = DOCTOR_JSON.set(true);
+                exit_doctor_check_error("cli", &reason);
             }
-            e.exit()
+            "list" | "diff" | "compat-probe" if args().any(|(_, arg)| arg == "--agent") => {
+                print_error();
+                let _ = RUN_COMMAND.set(true);
+                let _ = AGENT_RUN.set(true);
+                run_failure_epilogue(agent::ExitCode::CliConfig, &reason);
+                std::process::exit(agent::ExitCode::CliConfig.code());
+            }
+            _ => {}
         }
     }
+    print_error();
+    std::process::exit(e.exit_code())
 }
 
 /// Set the command's region (both sides of a diff) where none was given.
@@ -779,15 +793,26 @@ pub(crate) fn fill_default_region(cmd: &mut Commands, default_region: &str) {
     }
 }
 
+/// `--agent` prints the run manifest on stdout, which tsv and ndjson reserve
+/// for rows: the run stops with exit 2, and its dry-run plan is `blocked`.
+pub(crate) fn agent_output_format_conflict(cli: &Cli) -> Option<String> {
+    let format = list_output_format(cli)?;
+    (cli.agent && format.writes_stdout_rows()).then(|| {
+        format!(
+            "--agent writes the run manifest to stdout and cannot be combined with \
+             --output-format {}; use --run-manifest instead",
+            format
+        )
+    })
+}
+
 pub(crate) fn validate_output_format_command(cli: &Cli) {
-    let Some(format) = list_output_format(cli) else {
+    if cli.dry_run {
+        // The plan reports it (`blocked`) and the dry run exits 2 after it.
         return;
-    };
-    if cli.agent && !cli.dry_run && format.writes_stdout_rows() {
-        exit_before_run(
-            agent::ExitCode::CliConfig,
-            "--agent writes the run manifest to stdout and cannot be combined with --output-format tsv or ndjson; use --run-manifest instead".to_string(),
-        );
+    }
+    if let Some(problem) = agent_output_format_conflict(cli) {
+        exit_before_run(agent::ExitCode::CliConfig, problem);
     }
 }
 

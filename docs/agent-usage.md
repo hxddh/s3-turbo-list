@@ -8,19 +8,15 @@ themselves; this page is the contract.
 Options follow the command name
 (`s3-turbo-list list --bucket b --region r --output-dir out`).  Only
 `--config`, `--provider`, `--endpoint-url`, and `--addressing-style` are
-global and may appear on either side.  The pre-0.37 spelling with other
-options before the command name is still accepted until 0.39, with a
-deprecation warning (see [Deprecations](#deprecations)).
+global and may appear on either side.  Any other option before the command
+name is a usage error (exit `2`) that names the command it must follow;
+`s3-turbo-list --agent list …` still gets the run-failure JSON below.
 
-## Deprecations
+## Removed in 0.39
 
-A deprecated spelling keeps working for one release and says so twice: a
-`warning: deprecated …; it will be removed in 0.39` line on stderr, and the
-same text (without `warning: `) in the JSON a consumer reads — the plan's
-and the manifest's `warnings`, `config_source.warnings` for config keys, and
-a `deprecated` `warn` check in `doctor`.  Under `--agent` the stderr line is
-left out (stderr stays quiet); the JSON still carries it.  Deprecated in
-0.38, removed in 0.39:
+These were deprecated in 0.38 (with a warning on stderr and in the JSON).
+Each spelling is now a usage error, and each config key an unknown key
+(exit `2`), whose message names the replacement:
 
 - Options other than the global ones written before the command name
   (`s3-turbo-list --output-dir out list …`): write them after it.
@@ -29,6 +25,15 @@ left out (stderr stays quiet); the JSON still carries it.  Deprecated in
 - `--endpoint` (use `--endpoint-url`), `doctor --agent` and
   `manifest-summary --agent` (use `--json`), and the no-op
   `doctor --simple` and `doctor --fix-suggestions`.
+- The JSON fields `inputs.profile` and `inputs.continuation_token` (plans
+  and manifests), `resolved_config.s3.profile_known` and
+  `resolved_config.s3.profile_warnings` (use `provider_known` and
+  `provider_warnings`), and the trace field `profile` (use `provider`).
+
+With nothing left to report, deprecation warnings are gone from stderr, the
+plan and manifest `warnings`, and `doctor`'s checks; `config_source.warnings`
+stays, always empty.  Checkpoints written by 0.37 (identity field `profile`)
+still load and resume.
 
 ## No-cloud preflight
 
@@ -75,8 +80,7 @@ option (`cli`), all exit `2`.  Such an early exit prints a shorter report:
 holding the one `error` check, plus `config_source` and `resolved_config`
 once the config file has been read (a usage error or a config file that
 does not parse comes before that).  The message is also printed once on
-stderr.  The human format is one compact list; the pre-0.37 `--simple` and
-`--fix-suggestions` are deprecated no-ops.
+stderr.  The human format is one compact list.
 
 An explicit `--config` path that does not exist is an error (exit `2`) for
 every command that loads config, `doctor` and `--dry-run` included.
@@ -96,20 +100,22 @@ s3-turbo-list list --bucket my-bucket --region us-east-1 \
 ```
 
 Top-level fields: `schema_version`, `tool_version`, `status`, `command`,
+`cwd` (the working directory relative paths resolve against; since 0.39),
 `network`, `inputs`, `outputs`, `config_source`, `resolved_config`, `hints`,
 `checkpoint`, `file_conflicts`, `warnings`.
 
 `status` is `ok`, or `blocked` when a problem would stop the real run: an
 explicit `--hints-file` it cannot load (exit `2`; `hints.valid: false`, the
-reason in `hints.warnings`), a provider setup problem (exit `3`) or an output
-the run cannot create — a path under an existing file, or in a read-only
-directory (exit `5`); the reason is in `warnings`.  A blocked plan is still
+reason in `hints.warnings`), `--agent` with `--output-format tsv` or
+`ndjson` (exit `2`: stdout would hold both rows and the manifest), a
+provider setup problem (exit `3`) or an output the run cannot create — a
+path under an existing file, or in a read-only directory (exit `5`); the
+reason is in `warnings`.  A blocked plan is still
 printed, then the dry run exits with that code and prints
 `s3-turbo-list: run blocked (exit N): <reason>` on stderr, so it predicts
 the run's exit class.  `warnings` is empty in the normal case: it carries
-deprecations, problems, and notes about options that have no effect (such
-as an explicit `--delimiter ''`, or output paths with
-`--output-format summary`).  Writability is
+problems, and notes about options that have no effect (such as an explicit
+`--delimiter ''`, or output paths with `--output-format summary`).  Writability is
 judged with `access(2)`, so it is right for root as well.  Warnings also flag
 an existing output file the run would overwrite, a `--prefix` starting with
 `/`, and a missing region (`blocked` when `AWS_EC2_METADATA_DISABLED=true`
@@ -136,9 +142,14 @@ error).
 | `diff_per_side_automatic` | `diff`: each side partitioned up front and listed in parallel. |
 | `not_applicable` | `compat-probe`: a fixed set of probe requests, no partitioning. |
 
-For `diff`, `single_chain`, `delimiter_single_segment`, and
+`hints.note` says in words how that source partitions the run (for
+example, that startup discovery partitions from the bucket's structure); it
+is informational.  `hints.warnings` is empty except for an explicit
+`--hints-file`, where it carries the file's problems.  For `diff`,
+`single_chain`, `delimiter_single_segment`, and
 `disabled_single_segment_fallback` leave each side one serial segment (diff
-never splits at runtime), and carry the single-chain warning.
+never splits at runtime): the note names the option that does it, and the
+plan's `warnings` says that `--concurrency` adds no parallelism.
 
 `checkpoint` describes resumability:
 
@@ -158,21 +169,23 @@ never splits at runtime), and carry the single-chain warning.
 `resolved_config.s3.provider` hold the preset's canonical lowercase name.
 
 The `command` array preserves the invoked argument shape with sensitive
-values redacted (`--endpoint-url`, `--endpoint`, `--continuation-token`, and
-`user:password@` in endpoint URLs; `resolved_config` redacts the latter too).
+values redacted (`--endpoint-url`, and the removed `--endpoint` and
+`--continuation-token`, and `user:password@` in endpoint URLs;
+`resolved_config` redacts the latter too).
 Use `inputs`, `outputs`, and `config_source` for exact values.
 
 ### Deprecated fields
 
 Kept for one release, then removed; do not branch on them:
 
-- `inputs.profile` (same value as `inputs.provider`) and
-  `inputs.continuation_token` (always `null`: `--continuation-token` was
-  removed in 0.38).
-- `resolved_config.s3.profile_known` and `resolved_config.s3.profile_warnings`
-  (use `provider_known` and `provider_warnings`).
-- The trace event field `profile` (use `provider`).
+- `metrics.summary_only` in the manifest, and `summary_only` in
+  `manifest-summary --json` (deprecated in 0.39, removed in 0.40): use
+  `inputs.output_format == "summary"` (`output_format` in
+  `manifest-summary`).  `manifest-summary` derives its `summary_only` from
+  the output format, and falls back to `metrics.summary_only` only for a
+  manifest without one.
 
+Removed in 0.39 (deprecated in 0.38): see [Removed in 0.39](#removed-in-039).
 Removed in 0.38 (deprecated in 0.37): `resolved_config.s3.profile`,
 `resolved_config.s3.force_path_style`, `resolved_config.s3.debug_s3`, and
 `checkpoint.completed_segments` / `checkpoint.total_segments`.
@@ -237,7 +250,20 @@ rows add up to `metrics.parquet_rows`.  For `summary`, `tsv`, and `ndjson`
 manifests, Parquet row equality is reported as not applicable.
 
 Relative artifact paths resolve against the manifest's `cwd`, then the
-current directory, then the manifest's directory.  With `--json`, the
+current directory, then the manifest's directory.
+
+`manifest-summary --json` prints one object: `schema_version`, `status`
+(`success` once the manifest was read; `check_passed` carries the verdict),
+`manifest_file`, `tool_version` (the run's, from the manifest; `null` if it
+has none), `run_status`, `exit_code`, `elapsed_secs`, `command`,
+`output_format`, `summary_only` (deprecated, above), the counters
+(`received_objects`, `streamed_rows`, `parquet_rows`, `ks_entries`,
+`bytes_total`, `unique_prefixes`), `parquet_rows_match_streamed_rows`
+(`null` when not applicable), `top_prefixes`, `outputs` (`parquet_file`,
+`ks_file`, `hints_file`, `trace_compat`, `log_file`, `report_file`),
+`artifacts`, `warnings`, `check_passed`, `check`, and `checks`.  A manifest
+it cannot read or parse exits `2` with `{schema_version, tool_version,
+status: "error", error}` on stdout.  With `--json`, the
 top-level `check` object gives pass/fail counts, artifact counts, and
 row/schema/exit-code status values; its `parquet_schema_check` is the worst
 status across every Parquet artifact.  Individual checks in `checks` are
@@ -305,6 +331,19 @@ parse.  A `list` run that failed mid-listing (exit `4`) leaves a structurally
 valid Parquet file holding only the keys it reached.  A failed `diff` removes
 its outputs, since a partial merge cannot describe both sides.  Only treat
 outputs as complete on exit `0`.
+
+## compat-probe under --agent
+
+`compat-probe --agent` keeps stderr quiet (no log; no trace unless
+`--trace-compat` names a file) and prints the probe report on stdout, or
+writes it to the `-o` file with stdout left empty.  The report carries
+`schema_version`, `tool_version`, `status` (`success` or `failed`),
+`exit_code`, and `warnings` (always present) beside its probe fields; the
+field reference is in [providers.md](providers.md#report).  An
+`incompatible` endpoint exits `3` or `4` with the run line
+`s3-turbo-list: run failed (exit N): compat-probe found the endpoint
+incompatible: …`; a failure before the first request (no endpoint, a bad
+option) prints the minimal JSON result above instead of a report.
 
 ## Filters
 
