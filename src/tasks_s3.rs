@@ -233,8 +233,10 @@ enum SplitProbe {
 }
 
 /// One delimiter probe per ancestor rung; returns the middle CommonPrefix
-/// strictly inside `(cursor, end)`. When the range has no prefix structure,
-/// falls back to a flat-range cut near the middle of the remaining keys.
+/// strictly inside `(cursor, end)`. When no rung has one and the rung pages
+/// together hold every remaining key of the range, cuts at their median;
+/// otherwise falls back to a flat-range cut near the middle of the remaining
+/// keys.
 async fn probe_split_candidate(
     ctx: &S3TaskContext,
     listing_prefix: &str,
@@ -242,10 +244,18 @@ async fn probe_split_candidate(
     end: Option<&str>,
     flat_high: &FlatHigh,
 ) -> SplitProbe {
-    for dir in ancestor_dirs(cursor, listing_prefix)
-        .into_iter()
-        .take(SPLIT_PROBE_MAX_RUNGS)
-    {
+    let dirs = ancestor_dirs(cursor, listing_prefix);
+    // When the ladder reaches the listing prefix, every key left in the range
+    // is either under a CommonPrefix some rung returns or a file directly in a
+    // rung (a `<Contents>` of its page): a key after the cursor under a prefix
+    // that sorts before the cursor is under one of the cursor's own ancestors,
+    // which a deeper rung lists.  So when no rung has a CommonPrefix inside
+    // the range and no rung page is truncated, the rung pages' in-range keys
+    // are all of them — no flat-cut probes needed.
+    let mut complete = dirs.len() <= SPLIT_PROBE_MAX_RUNGS;
+    let mut known: Vec<String> = Vec::new();
+    for dir in dirs.into_iter().take(SPLIT_PROBE_MAX_RUNGS) {
+        let slot = ParsedPageSlot::default();
         let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
         let send = ctx
             .s3_client
@@ -254,12 +264,12 @@ async fn probe_split_candidate(
             .prefix(&dir)
             .start_after(cursor)
             .delimiter("/")
-            // Only CommonPrefixes matter here, but at the leaf rung the page
-            // is up to 1000 `<Contents>`: let the fast parser strip them (the
-            // SDK's per-object deserializer made these probes ~15% of a
-            // listing's CPU). The parsed rows are simply dropped.
+            // At the leaf rung the page is up to 1000 `<Contents>`: let the
+            // fast parser take them (the SDK's per-object deserializer made
+            // these probes ~15% of a listing's CPU).  The rows only matter
+            // when no rung has a CommonPrefix to cut at (see above).
             .customize()
-            .interceptor(FastContentsInterceptor::new(ParsedPageSlot::default()))
+            .interceptor(FastContentsInterceptor::new(slot.clone()))
             .send();
         let response = match timeout_at(Instant::now() + timeout_dur, send).await {
             Ok(Ok(r)) => r,
@@ -283,9 +293,39 @@ async fn probe_split_candidate(
             candidates.sort();
             return SplitProbe::Cut(candidates.swap_remove(candidates.len() / 2));
         }
+        if complete {
+            // A truncated page, or one the fast parser left to the SDK, does
+            // not show every key: fall back to the flat cut.
+            match (response.is_truncated(), slot.take()) {
+                (Some(false), Some(rows)) => known.extend(
+                    rows.into_iter()
+                        .map(|(key, _)| String::from(key.as_str()))
+                        .filter(|k| k.as_str() > cursor && end.is_none_or(|e| k.as_str() < e)),
+                ),
+                _ => complete = false,
+            }
+        }
+    }
+    if complete {
+        // With fewer than two keys in hand, take the flat cut as before
+        // rather than retire the segment on the rung pages' word.
+        if let Some(cut) = median_cut(known) {
+            return SplitProbe::Cut(cut);
+        }
     }
 
     probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high).await
+}
+
+/// The median of a range's remaining keys, all of them in hand (the lower
+/// median, so both halves keep at least one key); `None` below two keys.
+fn median_cut(mut keys: Vec<String>) -> Option<String> {
+    keys.sort_unstable();
+    keys.dedup();
+    match keys.len() {
+        0 | 1 => None,
+        n => Some(keys.swap_remove((n - 1) / 2)),
+    }
 }
 
 /// Near-maximal real key of the listing, shared by a run's split probes: an
@@ -1619,6 +1659,22 @@ fn epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_median_cut_splits_known_keys_in_half() {
+        let keys = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let cut = |v: &[&str]| median_cut(keys(v));
+        assert_eq!(cut(&[]), None);
+        assert_eq!(cut(&["a/1"]), None);
+        assert_eq!(cut(&["a/1", "a/1"]), None);
+        // The lower median: the parent keeps "a/1", the child gets "a/2".
+        assert_eq!(cut(&["a/2", "a/1"]), Some("a/1".into()));
+        assert_eq!(cut(&["a/3", "a/1", "b", "a/2"]), Some("a/2".into()));
+        assert_eq!(
+            cut(&["a/5", "a/1", "a/4", "a/2", "a/3"]),
+            Some("a/3".into())
+        );
+    }
 
     #[test]
     fn test_ancestor_dirs_ladder() {

@@ -1346,7 +1346,8 @@ async fn startup_boundaries(
                 Vec::new()
             } else {
                 info!("Startup discovery found no prefix structure — bisecting flat key space");
-                discover_flat_boundaries_via_client(client, bucket, prefix, flat_target, timeout_secs)
+                let first = discovery.first_keys.get(prefix).cloned();
+                discover_flat_boundaries_via_client(client, bucket, prefix, flat_target, first, timeout_secs)
                     .await
             }
         } => Some(boundaries),
@@ -1370,6 +1371,7 @@ pub(crate) async fn refine_flat_leaves(
 ) -> Vec<String> {
     let mut boundaries = discovery.boundaries;
     let leaves = discovery.flat_leaves;
+    let first_keys = discovery.first_keys;
     if leaves.is_empty() || boundaries.len() >= flat_target {
         return boundaries;
     }
@@ -1390,7 +1392,15 @@ pub(crate) async fn refine_flat_leaves(
             .map(|(i, leaf)| (leaf, per_leaf + usize::from(i < extra)))
             .filter(|(_, target)| *target > 0)
             .map(|(leaf, target)| {
-                discover_flat_boundaries_via_client(client, bucket, leaf, target, timeout_secs)
+                let first = first_keys.get(leaf.as_str()).cloned();
+                discover_flat_boundaries_via_client(
+                    client,
+                    bucket,
+                    leaf,
+                    target,
+                    first,
+                    timeout_secs,
+                )
             }),
     )
     .await;
@@ -1408,11 +1418,12 @@ pub(crate) async fn discover_flat_boundaries_via_client(
     bucket: &str,
     prefix: &str,
     target: usize,
+    first_key: Option<String>,
     timeout_secs: u64,
 ) -> Vec<String> {
     let probe_bucket = bucket.to_string();
     let probe_prefix = prefix.to_string();
-    auto_hints::discover_flat_boundaries(prefix, target, |start_after| {
+    auto_hints::discover_flat_boundaries(prefix, target, first_key, |start_after| {
         let client = client.clone();
         let bucket = probe_bucket.clone();
         let prefix = probe_prefix.clone();

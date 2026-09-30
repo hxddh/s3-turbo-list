@@ -52,6 +52,10 @@ pub struct StartupDiscovery {
     /// when discovery found fewer boundaries than it wants (`data/part-…`
     /// under a single top-level `data/`).
     pub flat_leaves: Vec<String>,
+    /// First key of each probed prefix whose page held no CommonPrefixes
+    /// (the root of a flat namespace, and every flat leaf): flat bisection
+    /// anchors on it instead of spending a `max-keys=1` round-trip to find it.
+    pub first_keys: std::collections::HashMap<String, String>,
 }
 
 impl StartupDiscovery {
@@ -111,6 +115,11 @@ pub async fn discover_startup_boundaries(
                     .collect(),
                 truncated: response.is_truncated().unwrap_or(false),
                 keys: response.contents().len(),
+                first_key: response
+                    .contents()
+                    .first()
+                    .and_then(|o| o.key())
+                    .map(str::to_string),
             })
         }
     })
@@ -123,6 +132,8 @@ pub struct ProbePage {
     pub prefixes: Vec<String>,
     pub truncated: bool,
     pub keys: usize,
+    /// First `<Contents>` key of the page, if any.
+    pub first_key: Option<String>,
 }
 
 /// BFS over CommonPrefixes via an injected probe (one request per call).
@@ -144,6 +155,7 @@ where
     let mut root_page_truncated = true;
     let mut root_page_keys = 0usize;
     let mut flat_leaves: Vec<String> = Vec::new();
+    let mut first_keys = std::collections::HashMap::new();
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -163,6 +175,13 @@ where
                     } else if page.truncated && page.prefixes.is_empty() {
                         flat_leaves.push(parent.clone());
                     }
+                    // A page without CommonPrefixes starts with the prefix's
+                    // first key (a CommonPrefix could sort before it).
+                    if page.prefixes.is_empty() {
+                        if let Some(first) = page.first_key {
+                            first_keys.insert(parent.clone(), first);
+                        }
+                    }
                     for child in &page.prefixes {
                         boundaries.insert(child.clone());
                     }
@@ -181,11 +200,27 @@ where
     }
 
     StartupDiscovery {
-        boundaries: boundaries.into_iter().collect(),
+        boundaries: cap_boundaries(boundaries.into_iter().collect(), target_boundaries),
         root_page_truncated,
         root_page_keys,
         flat_leaves,
+        first_keys,
     }
+}
+
+/// A BFS level adds every CommonPrefix it finds, so a wide tree overshoots
+/// the target by orders of magnitude (64 prefixes x 1,000 subdirectories =
+/// 64,000 segments).  Every segment costs at least one page request, and its
+/// last page is mostly keys past its end, so keep `target` of them, evenly
+/// spaced.  Any subset of real boundaries is still a valid partition.
+fn cap_boundaries(boundaries: Vec<String>, target: usize) -> Vec<String> {
+    let n = boundaries.len();
+    if target == 0 || n <= target {
+        return boundaries;
+    }
+    (1..=target)
+        .map(|i| boundaries[i * n / (target + 1)].clone())
+        .collect()
 }
 
 // ── Flat-namespace partitioning ────────────────────────────
@@ -210,7 +245,8 @@ const FLAT_CUTS_PER_RANGE: usize = 7;
 /// Discover key-space boundaries for a flat namespace by recursively
 /// bisecting the key range. `probe(start_after)` returns the first key
 /// strictly after `start_after` within the listing prefix (or the first key
-/// of all when `None`). Returns up to `target_boundaries` sorted boundaries;
+/// of all when `None`). `first_key`, when the caller already saw the range's first
+/// key (startup discovery's page of the same prefix), saves that probe. Returns up to `target_boundaries` sorted boundaries;
 /// empty means an empty range or no cuttable structure (single segment).
 ///
 /// Each cut lands near the middle of its range's keys (see `flat_cut`): the
@@ -222,6 +258,7 @@ const FLAT_CUTS_PER_RANGE: usize = 7;
 pub async fn discover_flat_boundaries<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
+    first_key: Option<String>,
     probe: F,
 ) -> Vec<String>
 where
@@ -240,10 +277,14 @@ where
             request.await
         }
     };
-    // Anchor on the first real key; an empty range yields no boundaries.
-    let first = match probe(None).await {
-        Ok(Some(key)) => key,
-        _ => return Vec::new(),
+    // Anchor on the first real key (discovery's page already returned it, when
+    // the caller has it); an empty range yields no boundaries.
+    let first = match first_key {
+        Some(key) => key,
+        None => match probe(None).await {
+            Ok(Some(key)) => key,
+            _ => return Vec::new(),
+        },
     };
     let cut_probe = |start_after: String| probe(Some(start_after));
 
@@ -389,6 +430,7 @@ estimate_mode = "structural"
                     prefixes: children,
                     truncated,
                     keys: 0,
+                    first_key: None,
                 })
             }
         })
@@ -462,7 +504,7 @@ estimate_mode = "structural"
     // Simulate S3 `max_keys=1`: the first key strictly after `start_after`
     // (or the very first key when `None`) from a sorted key set.
     async fn run_flat(keys: Vec<String>, prefix: &str, target: usize) -> Vec<String> {
-        discover_flat_boundaries(prefix, target, |start_after| {
+        discover_flat_boundaries(prefix, target, None, |start_after| {
             let keys = keys.clone();
             async move {
                 let next = match start_after {
@@ -552,7 +594,7 @@ estimate_mode = "structural"
 
         let probe_in_flight = Arc::clone(&in_flight);
         let probe_max = Arc::clone(&max_in_flight);
-        let boundaries = discover_flat_boundaries("key", 8, |start_after| {
+        let boundaries = discover_flat_boundaries("key", 8, None, |start_after| {
             let keys = keys.clone();
             let in_flight = Arc::clone(&probe_in_flight);
             let max_in_flight = Arc::clone(&probe_max);
@@ -605,6 +647,96 @@ estimate_mode = "structural"
     }
 
     #[tokio::test]
+    async fn test_startup_discovery_caps_an_overshooting_level() {
+        // Four prefixes of 250 subdirectories each: the second level alone
+        // brings 1,000 boundaries for a target of 16.
+        let subdirs: Vec<Vec<String>> = ["a/", "b/", "c/", "d/"]
+            .iter()
+            .map(|p| (0..250).map(|i| format!("{p}{i:03}/")).collect())
+            .collect();
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(
+            String::new(),
+            vec!["a/".into(), "b/".into(), "c/".into(), "d/".into()],
+        );
+        for (p, children) in ["a/", "b/", "c/", "d/"].iter().zip(&subdirs) {
+            tree.insert(p.to_string(), children.clone());
+        }
+        let all: Vec<String> = {
+            let mut v: Vec<String> = tree.values().flatten().cloned().collect();
+            v.sort();
+            v
+        };
+        let boundaries = run_discovery(tree, "", 16).await;
+        assert_eq!(boundaries.len(), 16);
+        assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+        assert!(boundaries.iter().all(|b| all.binary_search(b).is_ok()));
+        // Evenly spaced over the discovered set: no gap much wider than n/16.
+        let idx: Vec<usize> = boundaries
+            .iter()
+            .map(|b| all.binary_search(b).unwrap())
+            .collect();
+        let widest = idx.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(widest <= all.len() / 16 + 1, "widest gap {widest}");
+    }
+
+    #[tokio::test]
+    async fn test_startup_discovery_keeps_first_key_of_pages_without_prefixes() {
+        let discovery = discover_with_probe("", 16, |p| async move {
+            Ok(ProbePage {
+                prefixes: if p.is_empty() {
+                    vec!["data/".to_string()]
+                } else {
+                    Vec::new()
+                },
+                truncated: true,
+                keys: 1000,
+                first_key: Some(format!("{p}first")),
+            })
+        })
+        .await;
+        assert_eq!(discovery.flat_leaves, vec!["data/"]);
+        // The root page had a CommonPrefix, which could sort before its first
+        // key: only the flat leaf's first key is kept.
+        assert_eq!(discovery.first_keys.len(), 1);
+        assert_eq!(discovery.first_keys["data/"], "data/first");
+    }
+
+    #[tokio::test]
+    async fn test_flat_boundaries_reuse_a_known_first_key() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let keys: Vec<String> = (0..5_000).map(|i| format!("obj-{i:06}")).collect();
+        let anchor_probes = Arc::new(AtomicUsize::new(0));
+        let run = |first: Option<String>| {
+            let keys = keys.clone();
+            let anchor_probes = Arc::clone(&anchor_probes);
+            async move {
+                discover_flat_boundaries("", 16, first, |start_after| {
+                    let keys = keys.clone();
+                    let anchor_probes = Arc::clone(&anchor_probes);
+                    async move {
+                        Ok(match start_after {
+                            None => {
+                                anchor_probes.fetch_add(1, Ordering::SeqCst);
+                                keys.first().cloned()
+                            }
+                            Some(sa) => keys.iter().find(|k| k.as_str() > sa.as_str()).cloned(),
+                        })
+                    }
+                })
+                .await
+            }
+        };
+        let probed = run(None).await;
+        assert_eq!(anchor_probes.load(Ordering::SeqCst), 1);
+        let reused = run(Some(keys[0].clone())).await;
+        assert_eq!(anchor_probes.load(Ordering::SeqCst), 1, "no anchor probe");
+        assert_eq!(probed, reused);
+        assert_eq!(reused.len(), 16);
+    }
+
+    #[tokio::test]
     async fn test_startup_discovery_respects_listing_prefix() {
         let tree = fake_tree(&[("logs/", &["logs/2025/", "logs/2026/"])]);
         let boundaries = run_discovery(tree, "logs/", 16).await;
@@ -619,6 +751,7 @@ estimate_mode = "structural"
                     prefixes: vec!["a/".to_string(), "b/".to_string()],
                     truncated: true,
                     keys: 0,
+                    first_key: None,
                 })
             } else {
                 Err("probe failed".to_string())
@@ -644,6 +777,7 @@ estimate_mode = "structural"
             root_page_truncated: false,
             root_page_keys: 500,
             flat_leaves: Vec::new(),
+            first_keys: Default::default(),
         };
         // The probe returned the whole listing in one page, and the run's page
         // size can too.
@@ -663,6 +797,7 @@ estimate_mode = "structural"
             root_page_truncated: true,
             root_page_keys: 1000,
             flat_leaves: Vec::new(),
+            first_keys: Default::default(),
         };
         assert!(!truncated.is_single_page_listing(None));
         // Structure found: partitioned by boundaries, not by this shortcut.
@@ -671,6 +806,7 @@ estimate_mode = "structural"
             root_page_truncated: false,
             root_page_keys: 3,
             flat_leaves: Vec::new(),
+            first_keys: Default::default(),
         };
         assert!(!structured.is_single_page_listing(None));
     }

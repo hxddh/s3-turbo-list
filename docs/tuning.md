@@ -18,7 +18,12 @@ Where boundaries come from, in precedence order:
    probes (one ListObjectsV2 page each, at most 3 levels deep) finds real
    `CommonPrefixes` boundaries at run start.  It runs on every run and costs
    at most a second or two of startup, so first runs list in parallel with no
-   prior steps.  Nothing is cached: there is no hints file in the working
+   prior steps.  A probed level adds every prefix it finds, so a wide tree
+   (64 prefixes of 1,000 subdirectories each) can find far more boundaries
+   than the target of two per worker; the set is then thinned to the target,
+   evenly spaced.  Every segment costs at least one page request, and its last
+   page is mostly keys past its end, so tens of thousands of tiny segments
+   would cost far more requests than the listing itself.  Nothing is cached: there is no hints file in the working
    directory (0.37 removed the `<region>_<bucket>[_<hash>]_hints.toml`
    cache).
 3. **Startup bisection** — when discovery finds no `CommonPrefixes` (a flat
@@ -29,7 +34,9 @@ Where boundaries come from, in precedence order:
    a number, other characters over the alphabet the keys use), truncated
    right after it, so long constant suffixes such as
    `obj-000000123.snappy.parquet` do not skew it.  The first, open-ended range
-   estimates the namespace's highest key with a few concurrent probe rounds.
+   estimates the namespace's highest key with a few concurrent probe rounds
+   (its low end is the first key of discovery's own page, so finding it
+   costs no probe).
    Bisection then runs in waves: each wave cuts every open range at up to
    seven evenly spaced candidates at once (one probe each, all ranges
    concurrently), so a 64-boundary partition takes two waves instead of
@@ -69,7 +76,11 @@ Boundaries are also adjusted **at runtime**: when a list run has idle
 concurrency and one segment proves to be a long tail, the segment splits
 cooperatively — the right half becomes a new parallel child segment,
 recursively.  Split points come from a delimiter probe when the remaining
-range has `CommonPrefixes` structure; for flat ranges (no `/` structure), the
+range has `CommonPrefixes` structure.  When none of those probes finds a
+prefix inside the range but their pages, together, hold every key left in it
+(the ladder reached the listing prefix and no page was truncated — the tail of
+a leaf directory), the cut is the median of those keys, with no further
+probes.  Otherwise, for flat ranges (no `/` structure), the
 cut is placed near the middle of the range between the segment's cursor and
 its end (or the listing's estimated highest key, for the last segment) the
 same way startup bisection places it, and validated with single-key probes, so
