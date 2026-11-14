@@ -178,7 +178,7 @@ pub async fn run_compat_probe(
         None,
     )
     .await;
-    results.push(pagination_probe_result(&client, &target, trace_writer, res, &mut evt).await);
+    results.push(pagination_probe_result(client, &target, trace_writer, res, &mut evt).await);
 
     let overall = CompatProbeReport::overall_status_for(&results);
     CompatProbeReport {

@@ -132,7 +132,9 @@ impl ObjectColumns {
     }
 }
 
-/// Column builders for a batch of rows.
+/// Column builders for a batch of rows. One lives per writer, so the size
+/// difference between the variants does not matter.
+#[allow(clippy::large_enum_variant)]
 enum RowBatch {
     List {
         key: StringBuilder,

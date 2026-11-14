@@ -669,9 +669,7 @@ fn decode_page_keys(
 /// common case, found with one memchr pass) or does not decode to UTF-8.
 pub(crate) fn url_decode_key(encoded: &str) -> Option<String> {
     let bytes = encoded.as_bytes();
-    if memchr::memchr2(b'%', b'+', bytes).is_none() {
-        return None;
-    }
+    memchr::memchr2(b'%', b'+', bytes)?;
     let hex = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
