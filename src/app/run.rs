@@ -53,17 +53,17 @@ pub fn plan(job: &Job, result: &mut RunResult) {
     }
 }
 
-/// Ctrl-C / SIGTERM: stop the listing gracefully.
-fn install_interrupt_handler() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), Failure> {
-    let quit = Arc::new(AtomicBool::new(false));
+/// Ctrl-C / SIGTERM: stop the listing gracefully. Quitting through the
+/// global state wakes every task waiting on it at once.
+fn install_interrupt_handler(g_state: &core::GlobalState) -> Result<Arc<AtomicBool>, Failure> {
     let interrupted = Arc::new(AtomicBool::new(false));
-    let (q, i) = (quit.clone(), interrupted.clone());
+    let (g, i) = (g_state.clone(), interrupted.clone());
     ctrlc::set_handler(move || {
-        q.store(true, Ordering::SeqCst);
         i.store(true, Ordering::SeqCst);
+        g.quit();
     })
     .map_err(|e| Failure::internal(format!("cannot install the signal handler: {}", e)))?;
-    Ok((quit, interrupted))
+    Ok(interrupted)
 }
 
 /// What the listing reports back for the commit step.
@@ -88,8 +88,10 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         }
     };
 
-    let (quit, interrupted) = match install_interrupt_handler() {
-        Ok(handles) => handles,
+    let tasks = if job.mode == RunMode::BiDir { 4 } else { 3 };
+    let g_state = core::GlobalState::new(Arc::new(AtomicBool::new(false)), tasks);
+    let interrupted = match install_interrupt_handler(&g_state) {
+        Ok(interrupted) => interrupted,
         Err(f) => return fail(result, f),
     };
     let mut cfg = EngineConfig::from_env();
@@ -111,8 +113,6 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         );
     }
 
-    let tasks = if job.mode == RunMode::BiDir { 4 } else { 3 };
-    let g_state = core::GlobalState::new(quit, tasks);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cfg.runtime.worker_threads)

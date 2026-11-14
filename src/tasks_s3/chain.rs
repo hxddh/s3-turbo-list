@@ -135,9 +135,7 @@ pub(super) async fn flat_list_run_to_complete(
 
 /// Resolves once the run has been asked to stop (Ctrl-C / SIGTERM).
 pub(super) async fn quit_signalled(ctx: &S3TaskContext) {
-    while !ctx.is_quit() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    ctx.g_state.quit_signalled().await
 }
 
 /// Delay before the Nth consecutive retry of one segment: exponential from
@@ -214,7 +212,7 @@ async fn flat_list(
     let mut next_start = start_after.to_string();
     let emit_common_prefixes = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
         && !ctx.delimiter.as_deref().unwrap_or("").is_empty();
-    let mut is_ended = false;
+    let mut is_ended;
     let mut page_count: u32 = 0;
     let mut object_count: usize = 0;
     let mut common_prefixes_count: usize = 0;
@@ -287,11 +285,6 @@ async fn flat_list(
                 let cp_count = objects.common_prefixes().len() as i32;
                 common_prefixes_count =
                     common_prefixes_count.saturating_add(objects.common_prefixes().len());
-                let last_common_prefix = objects
-                    .common_prefixes()
-                    .last()
-                    .and_then(|cp| cp.prefix())
-                    .map(str::to_string);
 
                 // Emit trace event for this page.
                 let emit_page = |contents_count: usize, first: Option<&str>, last: Option<&str>| {
@@ -329,7 +322,7 @@ async fn flat_list(
 
                 // Either path moves each key's String into the batch; the
                 // fast path's rows already are the batch.
-                let mut batch: Vec<(ObjectKey, ObjectProps)> = match parsed {
+                let batch: Vec<(ObjectKey, ObjectProps)> = match parsed {
                     Some(rows) => rows,
                     None => objects
                         .contents
@@ -344,92 +337,36 @@ async fn flat_list(
                         .collect(),
                 };
 
-                // ListObjectsV2 returns keys in ascending UTF-8 byte order,
-                // after the request's start-after. Every range cut, the
-                // resume cursor and the diff merge rely on it; an endpoint
-                // that repeats or reorders keys would otherwise duplicate or
-                // silently drop them.
-                if let Some(violation) = order_violation(&batch, &next_start) {
-                    return Err(FlatRuntimeError::new(
+                let prefixes: Vec<String> = objects
+                    .common_prefixes
+                    .take()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|cp| cp.prefix)
+                    .collect();
+                let shaped = shape_page(
+                    batch,
+                    prefixes,
+                    &mut next_start,
+                    start_after,
+                    until.as_deref(),
+                    ctx.dir,
+                    emit_common_prefixes,
+                )
+                .map_err(|violation| {
+                    FlatRuntimeError::new(
                         ERROR_INCONSISTENT_LISTING,
                         format!(
                             "ListObjectsV2 returned keys out of order ({}); the endpoint \
                              breaks the S3 listing contract",
                             violation
                         ),
-                        next_start,
-                    ));
-                }
-
-                // Segment ranges are (start_after, end_before].  The next
-                // segment starts with start_after=end_before, so excluding
-                // equality here would drop a real object whose key equals
-                // the boundary.
-                if let Some(end) = until.as_deref() {
-                    if let Some(cut) = batch.iter().position(|(key, _)| end < key.as_str()) {
-                        debug!("Segment boundary reached at key: {}", batch[cut].0);
-                        batch.truncate(cut);
-                        is_ended = true;
-                    }
-                }
-                for (_, props) in batch.iter_mut() {
-                    props.set_dir(ctx.dir);
-                }
-                object_count = object_count.saturating_add(batch.len());
-
-                // A hierarchical (--delimiter) list run exists to show what
-                // is at this level, "folders" included: emit each
-                // CommonPrefix as a row (Key = the prefix, Size 0, no ETag),
-                // merged into key order with the page's objects. They used
-                // to be counted for the trace and dropped, so a bucket of
-                // only folders listed as empty. (Diff compares objects, so it
-                // does not emit them.)
-                if emit_common_prefixes {
-                    let prefixes: Vec<(ObjectKey, ObjectProps)> = objects
-                        .common_prefixes
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|cp| cp.prefix)
-                        // A chain restarted at a CommonPrefix (retry, resume)
-                        // sends start-after=<prefix>; the keys under it sort
-                        // after it and roll up into the same prefix, so the
-                        // server returns it again. It was emitted already.
-                        // Only that one prefix: a --start-after inside a
-                        // folder (a/b/c) sorts after the folder's prefix
-                        // (a/), which the server rightly returns and which
-                        // was never emitted.
-                        .filter(|cp| cp.as_str() != start_after)
-                        .filter(|cp| {
-                            !is_ended && until.as_deref().is_none_or(|end| cp.as_str() <= end)
-                        })
-                        .map(|cp| (cp.into(), ObjectProps::new_common_prefix(ctx.dir)))
-                        .collect();
-                    if !prefixes.is_empty() {
-                        let objects_part = std::mem::take(&mut batch);
-                        batch = merge_by_key(objects_part, prefixes);
-                    }
-                }
-
-                // Remember the last processed key for resume-on-error.
-                // Some S3-compatible providers omit KeyCount, so this must
-                // not depend on provider pagination metadata.
-                if let Some((key, _)) = batch.last() {
-                    next_start.clear();
-                    next_start.push_str(key.as_str());
-                }
-                // Delimiter pages can hold only CommonPrefixes; advance the
-                // resume cursor over them too, or a retry restarts from many
-                // pages back and re-lists them. Safe: a prefix string sorts
-                // before every key it covers, and its keys are rolled up into
-                // the prefix (never emitted), so nothing is skipped.
-                if !is_ended {
-                    if let Some(cp) = &last_common_prefix {
-                        if cp.as_str() > next_start.as_str() {
-                            next_start.clear();
-                            next_start.push_str(cp);
-                        }
-                    }
-                }
+                        next_start.clone(),
+                    )
+                })?;
+                let batch = shaped.batch;
+                is_ended = shaped.ended;
+                object_count = object_count.saturating_add(shaped.objects);
                 control.record_page(&next_start);
 
                 // A split proposal is decided here, at a page boundary,
@@ -622,6 +559,84 @@ fn merge_by_key(
     merged
 }
 
+/// What one page contributes to its segment.
+#[derive(Debug)]
+struct ShapedPage {
+    /// The rows to send: objects (and, for a `--delimiter` list, folder
+    /// rows) in key order, cut at the segment's end.
+    batch: Vec<(ObjectKey, ObjectProps)>,
+    /// The page reached past the segment's end: the segment is complete.
+    ended: bool,
+    /// Objects among the rows (folder rows excluded).
+    objects: usize,
+}
+
+/// Shape one page of a segment — no I/O, so every rule here is unit-tested
+/// directly:
+///
+/// - keys must ascend, after `cursor` (the page's request position);
+/// - segment ranges are `(start_after, until]`: the first key past `until`
+///   ends the segment (a key equal to it belongs here, not to the next);
+/// - a `--delimiter` list emits each CommonPrefix as a folder row merged
+///   into key order — except the one equal to `start_after`, which a chain
+///   restarted at a CommonPrefix gets back and already emitted;
+/// - `cursor` advances to the last row, and over trailing CommonPrefixes
+///   (a page can hold only prefixes; a retry must not re-list them).
+fn shape_page(
+    mut batch: Vec<(ObjectKey, ObjectProps)>,
+    prefixes: Vec<String>,
+    cursor: &mut String,
+    start_after: &str,
+    until: Option<&str>,
+    dir: u8,
+    emit_common_prefixes: bool,
+) -> Result<ShapedPage, String> {
+    if let Some(violation) = order_violation(&batch, cursor) {
+        return Err(violation);
+    }
+    let mut ended = false;
+    if let Some(end) = until
+        && let Some(cut) = batch.iter().position(|(key, _)| end < key.as_str())
+    {
+        debug!("Segment boundary reached at key: {}", batch[cut].0);
+        batch.truncate(cut);
+        ended = true;
+    }
+    for (_, props) in batch.iter_mut() {
+        props.set_dir(dir);
+    }
+    let objects = batch.len();
+    let last_prefix = prefixes.last().cloned();
+    if emit_common_prefixes {
+        let folders: Vec<(ObjectKey, ObjectProps)> = prefixes
+            .into_iter()
+            .filter(|cp| cp.as_str() != start_after)
+            .filter(|cp| !ended && until.is_none_or(|end| cp.as_str() <= end))
+            .map(|cp| (cp.into(), ObjectProps::new_common_prefix(dir)))
+            .collect();
+        if !folders.is_empty() {
+            batch = merge_by_key(std::mem::take(&mut batch), folders);
+        }
+    }
+    if let Some((key, _)) = batch.last() {
+        cursor.clear();
+        cursor.push_str(key.as_str());
+    }
+    // Safe: a prefix sorts before every key it covers, and its keys are
+    // rolled up into it (never emitted), so nothing is skipped.
+    if !ended
+        && let Some(cp) = last_prefix
+        && cp.as_str() > cursor.as_str()
+    {
+        *cursor = cp;
+    }
+    Ok(ShapedPage {
+        batch,
+        ended,
+        objects,
+    })
+}
+
 /// The first ordering violation of a page: a key not after the cursor the
 /// page was requested from, or not after its predecessor.
 fn order_violation(batch: &[(ObjectKey, ObjectProps)], cursor: &str) -> Option<String> {
@@ -667,6 +682,83 @@ fn decode_page_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(keys: &[&str]) -> Vec<(ObjectKey, ObjectProps)> {
+        keys.iter()
+            .map(|k| (ObjectKey::from(*k), ObjectProps::default()))
+            .collect()
+    }
+
+    fn keys(page: &ShapedPage) -> Vec<&str> {
+        page.batch.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn shape_page_cuts_after_the_segment_end_inclusively() {
+        let mut cursor = String::new();
+        let page = shape_page(
+            rows(&["a", "b", "c"]),
+            vec![],
+            &mut cursor,
+            "",
+            Some("b"),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&page),
+            ["a", "b"],
+            "a key equal to the end belongs here"
+        );
+        assert!(page.ended);
+        assert_eq!(cursor, "b");
+    }
+
+    #[test]
+    fn shape_page_rejects_keys_not_after_the_cursor() {
+        let mut cursor = "b".to_string();
+        assert!(shape_page(rows(&["b", "c"]), vec![], &mut cursor, "", None, 0, false).is_err());
+        assert_eq!(cursor, "b", "a rejected page does not move the cursor");
+    }
+
+    #[test]
+    fn shape_page_merges_folders_and_skips_the_restart_prefix() {
+        let mut cursor = "a/".to_string();
+        let page = shape_page(
+            rows(&["b.txt"]),
+            vec!["a/".into(), "c/".into()],
+            &mut cursor,
+            "a/",
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(keys(&page), ["b.txt", "c/"]);
+        assert_eq!(page.objects, 1);
+        assert_eq!(cursor, "c/");
+    }
+
+    #[test]
+    fn shape_page_advances_over_a_page_of_only_prefixes() {
+        let mut cursor = String::new();
+        let page = shape_page(
+            vec![],
+            vec!["x/".into(), "y/".into()],
+            &mut cursor,
+            "",
+            None,
+            0,
+            false,
+        )
+        .unwrap();
+        assert!(
+            page.batch.is_empty(),
+            "diff and recursive lists emit no folder rows"
+        );
+        assert_eq!(cursor, "y/");
+    }
 
     #[test]
     fn url_decode_key_follows_form_encoding() {

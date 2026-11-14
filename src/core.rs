@@ -564,6 +564,8 @@ pub struct GlobalState {
     /// exits at once instead of on its next poll (which held every small run
     /// open for up to a full poll interval).
     pub state_notify: Arc<tokio::sync::Notify>,
+    /// Woken (all waiters) when the run is asked to stop.
+    quit_notify: Arc<tokio::sync::Notify>,
     pub output_error_count: Arc<AtomicUsize>,
     /// What the data map wrote, published when it finalizes.
     pub data: Arc<Mutex<DataSummary>>,
@@ -651,6 +653,7 @@ impl GlobalState {
             first_fatal_error: Arc::new(Mutex::new(None)),
             first_output_error: Arc::new(Mutex::new(None)),
             state_notify: Arc::new(tokio::sync::Notify::new()),
+            quit_notify: Arc::new(tokio::sync::Notify::new()),
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data: Arc::new(Mutex::new(DataSummary::default())),
             diff_merge_complete: Arc::new(AtomicBool::new(false)),
@@ -759,9 +762,25 @@ impl GlobalState {
     pub fn is_running(&self, mask: usize) -> bool {
         self.state.load(Ordering::SeqCst) & mask != 0
     }
+    /// Ask every task to stop. Safe to call from any thread, including a
+    /// signal handler.
     pub fn quit(&self) {
         self.quit.store(true, Ordering::SeqCst);
         self.state_notify.notify_one();
+        self.quit_notify.notify_waiters();
+    }
+
+    /// Resolves once the run has been asked to stop: an await, not a poll.
+    pub async fn quit_signalled(&self) {
+        loop {
+            let notified = self.quit_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_quit() {
+                return;
+            }
+            notified.await;
+        }
     }
     pub fn is_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
