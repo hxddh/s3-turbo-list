@@ -27,7 +27,7 @@ meaning.
 | 3 | setup | `auth.*`, `config.*`, `endpoint.*` | Fix credentials, bucket, region or endpoint. |
 | 4 | retryable | `net.*` | Retry later, or with a lower `-c`. |
 | 5 | output | `output.*` | Fix the output location (space, permissions, closed pipe). |
-| 130 | interrupted | `interrupted` | `list -o DIR`: rerun with `--resume`. |
+| 130 | interrupted | `interrupted` | `list -o DIR`: rerun with `--resume` (an `-o s3://` run: rerun). |
 
 `error.retryable` is `true` exactly for exit 4 and 130.
 
@@ -69,15 +69,15 @@ Every key below is always present; `null` means "does not apply".
 | Key | |
 |---|---|
 | `format` | `parquet`, `ndjson` or `none` |
-| `path` | the dataset directory, `-`, or `null` |
-| `files` | committed parts of the dataset, including earlier resumed runs': `[{path, rows, bytes}]` |
+| `path` | the dataset directory, `s3://bucket/prefix/`, `-`, or `null` |
+| `files` | committed parts of the dataset, including earlier resumed runs': `[{path, rows, bytes}]` (`s3://` URLs for an S3 output) |
 | `rows` | rows this run wrote |
 
 `stats`:
 
 | Key | |
 |---|---|
-| `objects` | objects listed (a diff: distinct keys compared) |
+| `objects` | objects listed (a diff: distinct keys compared; `--versions`: versions and delete markers) |
 | `folders` | folder rows of a `--delimiter` listing |
 | `bytes` | total object size (a diff: of the differing keys) |
 | `elapsed_secs` | wall time |
@@ -85,14 +85,20 @@ Every key below is always present; `null` means "does not apply".
 | `timeouts` | requests that timed out and were retried |
 | `top_prefixes` | the 10 directories (key prefix up to the last `/`) with the most objects: `[{prefix, objects, bytes}]` |
 
-`diff`: `{left_only, right_only, changed, equal}` — key counts.
+`diff`: `{left_only, right_only, changed, equal, verified_equal,
+unverified}` — key counts. `verified_equal` (included in `equal`) and
+`unverified` (included in `changed`) are the same-size pairs with different
+ETags that `--compare checksum` proved equal or could not settle; both are 0
+in the other modes.
 
 `resume`: `{resumed, checkpoint, remaining_ranges}` — `resumed` is true when
 this run continued a checkpoint; `checkpoint` is the path of the checkpoint
 left for `--resume` (null when the listing is complete).
 
 `plan` (dry run): `partitioning` (`startup_discovery`, `single_segment`,
-`checkpoint`), `partitioning_reason`, `concurrency`, `max_keys`,
+`checkpoint`), `partitioning_reason`, `concurrency`, `compare` (`etag`,
+`size`, `checksum`; null for `list`), `versions` (bool; null for `diff`),
+`max_keys`,
 `resume_ranges`, `first_part`, `region` (how the region will be chosen).
 
 `check`: `credentials` (`{found, expires_at}` or `{found: false, error}`),
@@ -111,8 +117,8 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 | `usage.invalid_endpoint` | 2 | The endpoint is not an `http(s)://` URL. |
 | `usage.invalid_output` | 2 | `-o` value not allowed here (e.g. `diff -o -`). |
 | `usage.output_not_a_directory` | 2 | `-o` names an existing file. |
-| `usage.output_not_empty` | 2 | `-o DIR` is not empty (the hint says whether it holds a resumable run). |
-| `usage.resume_needs_output` | 2 | `--resume` without `-o DIR`. |
+| `usage.output_not_empty` | 2 | `-o DIR` is not empty (the hint says whether it holds a resumable run), or `-o s3://…` already holds objects. |
+| `usage.resume_needs_output` | 2 | `--resume` without a local `-o DIR` (an S3 output is not resumable). |
 | `usage.no_checkpoint` | 2 | `--resume` into a directory without a checkpoint. |
 | `usage.checkpoint_mismatch` | 2 | The checkpoint belongs to another run (bucket, prefix, endpoint or options). |
 | `usage.checkpoint_unreadable` | 2 | The checkpoint cannot be read. |
@@ -129,7 +135,7 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 | `net.timeout` | 4 | Requests kept timing out. |
 | `net.unavailable` | 4 | The endpoint kept failing (5xx). |
 | `net.error` | 4 | Other transport or unclassified service errors. |
-| `output.write_failed` | 5 | Writing the dataset, stdout or the result file failed. |
+| `output.write_failed` | 5 | Writing the dataset (a file or an S3 upload), stdout or the result file failed. |
 | `internal.error`, `internal.panic` | 1 | A bug. |
 | `interrupted` | 130 | SIGINT / SIGTERM. |
 
@@ -147,7 +153,16 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 A run that fails removes its temporary parts and leaves the directory as it
 was (and removes it if it created it and it is empty). The Parquet schemas
 are in the [README](../README.md#output); each file's key-value metadata has
-`s3tl.schema` = `s3tl.list/1` or `s3tl.diff/1`.
+`s3tl.schema` = `s3tl.list/1`, `s3tl.list-versions/1` or `s3tl.diff/1`.
+
+## S3 output (`-o s3://bucket/prefix/`)
+
+The prefix must hold no objects. Parts are multipart uploads while the run
+writes them and become objects only at commit: a successful run completes
+them all (all or nothing) and then writes `prefix/_result.json`, so a reader
+that waits for `_result.json` never sees a partial dataset. A failed or
+interrupted run aborts its uploads and writes nothing. There is no
+checkpoint and no `--resume`.
 
 ## Recipes
 
@@ -170,8 +185,9 @@ s3tl list s3://b/p/ -o run/ --dry-run | jq .plan
 
 ## Trace events (`--trace`)
 
-One JSON object per line, per ListObjectsV2 request (startup and split
-probes are not traced): `timestamp`, `operation`, `endpoint_url` (redacted),
+One JSON object per line, per listing request (startup and split
+probes are not traced): `timestamp`, `operation` (`ListObjectsV2`, or
+`ListObjectVersions` with `--versions`), `endpoint_url` (redacted),
 `region`, `addressing_style`, `bucket`, `prefix`, `delimiter` (always
 present; `""` for a recursive listing), `start_after`, `max_keys`,
 `continuation_token`, `http_status`, `s3_error_code`, `s3_error_message`,

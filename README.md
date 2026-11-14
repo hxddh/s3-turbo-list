@@ -7,7 +7,10 @@ machine-readable result for every run.
 s3tl list s3://my-bucket/logs/ -o out/          # Parquet dataset in out/
 s3tl list s3://my-bucket/ -o - | jq .key        # NDJSON rows on stdout
 s3tl list s3://my-bucket/                       # count objects and bytes only
+s3tl list s3://my-bucket/ -o s3://reports/inv/  # Parquet dataset written to S3
+s3tl list s3://my-bucket/ --versions -o v/      # every version and delete marker
 s3tl diff s3://src/data/ s3://dst/data/ -o d/   # keys that differ, to Parquet
+s3tl diff s3://src/ s3://dst/ --compare checksum  # settle ETag mismatches by checksum
 s3tl check s3://my-bucket/                      # can I list this, and how?
 ```
 
@@ -35,7 +38,7 @@ automatically.
 | Command | What it does |
 |---|---|
 | `s3tl list S3_URL` | List every object under `s3://bucket[/prefix]`. |
-| `s3tl diff S3_URL S3_URL` | Compare two prefixes key by key (size and ETag). |
+| `s3tl diff S3_URL S3_URL` | Compare two prefixes key by key (size and ETag, or see `--compare`). |
 | `s3tl check [S3_URL]` | Show the credentials, region, endpoint and proxy a run would use; with an S3 URL, probe the endpoint with a few requests. |
 
 Options:
@@ -43,17 +46,20 @@ Options:
 | Option | Meaning |
 |---|---|
 | `-o DIR` | Write a Parquet dataset to `DIR` (must be absent or empty). |
+| `-o s3://bucket/prefix/` | Write the Parquet dataset to an S3 prefix (must hold no objects); committed only when the run succeeds. |
 | `-o -` | `list`: stream NDJSON rows to stdout. |
 | *(no `-o`)* | Statistics only: object count, bytes, top prefixes (a diff: the counts). |
 | `--delimiter /` | `list`: one level only, with one row per folder. |
 | `--resume` | `list`: continue an interrupted run into the same `-o DIR`. |
+| `--versions` | `list`: every version and delete marker (ListObjectVersions), newest first within a key. |
+| `--compare etag\|size\|checksum` | `diff`: how keys on both sides compare (default `etag`; see [Output](#output)). |
 | `--endpoint-url URL` | An S3-compatible endpoint (MinIO, R2, OSS, BOS, ...). |
 | `--target-endpoint-url URL` | `diff`: the right side's endpoint, for cross-provider diffs. |
 | `--path-style` | Path-style addressing (automatic for IP and `localhost` endpoints). |
 | `--region REGION` | Signing region; defaults to the bucket's region on AWS, else `AWS_REGION`, else `us-east-1`. |
 | `-c N` | Maximum concurrent requests (default 100). An upper bound: the run stops adding parallelism once the bucket is at its request-rate ceiling. |
 | `--dry-run` | Print the plan as the result, without contacting S3. |
-| `--trace FILE` | Record every ListObjectsV2 request as JSONL (`-` for stderr). |
+| `--trace FILE` | Record every listing request as JSONL (`-` for stderr). |
 | `-v`, `-vv` | Progress and diagnostics on stderr. |
 
 ## The result
@@ -64,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.0.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.1.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
@@ -119,11 +125,16 @@ duckdb.sql("select count(*), sum(size) from 'out/part-*.parquet'")
 | `key` | string | |
 | `size` | uint64 | bytes |
 | `last_modified` | timestamp (ms, UTC) | null for folder rows |
-| `etag` | string | hex MD5, with `-N` for multipart uploads; null when the endpoint sent none, or a non-MD5 form |
+| `etag` | string | hex MD5, with `-N` for multipart uploads; another vendor's form verbatim (quotes removed); null when the endpoint sent none |
 | `storage_class` | string | null when the endpoint sent none |
 
 A `--delimiter` listing adds one row per folder: the key ends with the
 delimiter, size is 0, and the other columns are null.
+
+`list --versions` (`s3tl.list-versions/1`) adds three columns: `version_id`
+(string; `"null"` for an object written before versioning was enabled),
+`is_latest` (bool) and `is_delete_marker` (bool). A delete marker has size
+0 and a null `etag` and `storage_class`. Rows of a key are newest first.
 
 `diff` compares keys relative to each side's prefix, so
 `s3tl diff s3://a/2025/ s3://b/archive/2025/` matches `a/2025/x` with
@@ -132,11 +143,32 @@ delimiter, size is 0, and the other columns are null.
 (`left_only`, `right_only` or `changed`), then `left_size`,
 `left_last_modified`, `left_etag`, `right_size`, `right_last_modified`,
 `right_etag` (null for the side a key is missing from). Equal keys are only
-counted, in the result's `diff.equal`. A key is `changed` when its size or
-ETag differs, or when either side has no comparable ETag.
+counted, in the result's `diff.equal`. `--compare` decides when a key is
+`changed`:
+
+- `etag` (default): its size or ETag differs, or either side has no ETag.
+- `size`: its size differs (ETags are ignored).
+- `checksum`: like `etag`, then each same-size pair whose ETags differ is
+  settled by the checksums the store keeps (one HeadObject per side with
+  checksum mode on). Multipart uploads and SSE-KMS give the same bytes
+  different ETags; their full-object checksums still agree. A pair proven
+  equal counts as equal (and in `diff.verified_equal`); a pair the
+  checksums cannot settle (no algorithm in common, or composite per-part
+  checksums) stays `changed` and counts in `diff.unverified`.
 
 NDJSON rows (`-o -`) have the `list` columns:
-`{"key":"logs/a.gz","size":123,"last_modified":"2026-05-17T00:00:00.123Z","etag":"…","storage_class":"STANDARD"}`.
+`{"key":"logs/a.gz","size":123,"last_modified":"2026-05-17T00:00:00.123Z","etag":"…","storage_class":"STANDARD"}`;
+with `--versions` they add `"version_id"`, `"is_latest"` and
+`"is_delete_marker"`.
+
+`-o s3://bucket/prefix/` writes the same dataset to S3: each part streams
+into a multipart upload while it is written (no local disk needed), and
+nothing is visible until the run succeeds. The commit completes every
+upload, all or nothing, and writes `_result.json` last; a failed or
+interrupted run aborts its uploads. The prefix must hold no objects, the
+output bucket uses the source's endpoint and credentials, and an S3 output
+is not resumable. A bucket lifecycle rule that aborts incomplete multipart
+uploads covers a run that is killed outright.
 
 ## Interrupt and resume
 
@@ -152,8 +184,9 @@ s3tl list s3://my-bucket/ -o out/ --resume   # out/ now holds every key once
 ```
 
 A checkpoint is only accepted by the run it belongs to (same bucket, prefix,
-endpoint and options). A run that fails leaves the directory as it was before
-it started. `diff` and outputs other than a directory do not checkpoint.
+endpoint and options, `--versions` included). A run that fails leaves the
+directory as it was before it started. `diff` and outputs other than a local
+directory do not checkpoint.
 
 ## Performance
 
@@ -177,7 +210,9 @@ listings, are a single request chain. Details in
 
 ## Providers
 
-Any endpoint that implements ListObjectsV2 works. Examples for AWS, MinIO,
+Any endpoint that implements ListObjectsV2 works (`--versions` needs
+ListObjectVersions, `-o s3://` multipart uploads, `--compare checksum`
+HeadObject checksums). Examples for AWS, MinIO,
 Cloudflare R2, Backblaze B2, Alibaba OSS and Baidu BOS are in
 [docs/providers.md](docs/providers.md). Before a large run against a new
 endpoint, `s3tl check s3://bucket/` sends a handful of requests and reports

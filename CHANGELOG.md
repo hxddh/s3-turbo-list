@@ -5,6 +5,40 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-14
+
+### Added
+- `list --versions`: every version and delete marker (ListObjectVersions),
+  partitioned and split like any listing, newest version first within a
+  key. Parquet schema `s3tl.list-versions/1` adds `version_id`,
+  `is_latest` and `is_delete_marker`; NDJSON rows gain the same keys.
+  Checkpoints record `versions`, so a resume cannot mix the two kinds of
+  listing.
+- `-o s3://bucket/prefix/`: write the Parquet dataset (list or diff) to S3.
+  Parts stream into multipart uploads (no local disk); the commit completes
+  them all or none and writes `_result.json` last; a failed or interrupted
+  run aborts them. The prefix must be empty; not resumable.
+- `diff --compare etag|size|checksum`. `checksum` settles same-size pairs
+  whose ETags differ by the stored checksums (HeadObject, checksum mode),
+  so multipart re-uploads and SSE-KMS copies of the same bytes compare
+  equal. The result's `diff` gains `verified_equal` and `unverified`; the
+  plan gains `compare` and `versions`.
+
+### Changed
+- ETags in another vendor's format (not hex MD5) are kept verbatim instead
+  of becoming null, and `diff` compares them as text.
+- The release-tag workflow's schedule backstop runs once a day.
+
+### Fixed
+- When a finished listing's checkpoint could not be removed, its parts were
+  left committed next to a checkpoint that would list them again on
+  `--resume`; the parts are now taken back and the run fails with
+  `output.write_failed`.
+- Startup and split probes send `encoding-type=url` too, so keys XML cannot
+  carry no longer break partitioning.
+- Cancellation is awaited instead of polled, so an interrupt stops idle
+  segment chains at once.
+
 ## [1.0.0] - 2026-11-14
 
 1.0 is a redesign for speed, a small surface and automation. It is not
