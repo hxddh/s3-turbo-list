@@ -75,10 +75,7 @@ async fn merge_full(
     let writer = tokio::io::BufWriter::new(file);
     let mut parquet = AsyncParquetOutput::new(writer, Layout::Diff);
     let outcome = run_diff_merge(
-        DiffStreamSides {
-            left: vec![lrx],
-            right: vec![rrx],
-        },
+        DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
         Some(&mut parquet),
         || false,
     )
@@ -281,9 +278,11 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_diff_merge(DiffStreamSides { left, right }, Some(&mut parquet), || {
-            false
-        }),
+        run_diff_merge(
+            DiffStreamSides::from_receivers(left, right),
+            Some(&mut parquet),
+            || false,
+        ),
     )
     .await
     .expect("diff merge over many parallel segments must not hang")
@@ -351,10 +350,7 @@ async fn test_merge_without_output_only_counts() {
     rtx.send(vec![right_obj("b", 1, [1; 16])]).await.unwrap();
     drop((ltx, rtx));
     let outcome = run_diff_merge::<tokio::io::Sink>(
-        DiffStreamSides {
-            left: vec![lrx],
-            right: vec![rrx],
-        },
+        DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
         None,
         || false,
     )
@@ -501,10 +497,7 @@ async fn test_merge_stops_consuming_input_after_writer_failure() {
     let mut parquet =
         AsyncParquetOutput::with_settings(FailingWriter, Layout::Diff, 512, "uncompressed", 0);
     let err = run_diff_merge(
-        DiffStreamSides {
-            left: vec![rx],
-            right: vec![],
-        },
+        DiffStreamSides::from_receivers(vec![rx], vec![]),
         Some(&mut parquet),
         || false,
     )
@@ -548,10 +541,7 @@ async fn test_merge_aborts_when_the_run_is_failing() {
 
     let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), Layout::Diff);
     let err = run_diff_merge(
-        DiffStreamSides {
-            left: vec![lrx],
-            right: vec![rrx],
-        },
+        DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
         Some(&mut parquet),
         || true,
     )
@@ -574,10 +564,7 @@ async fn test_merge_completes_when_not_aborted() {
 
     let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), Layout::Diff);
     let outcome = run_diff_merge(
-        DiffStreamSides {
-            left: vec![lrx],
-            right: vec![rrx],
-        },
+        DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
         Some(&mut parquet),
         || false,
     )
@@ -641,10 +628,7 @@ async fn test_merge_fails_when_run_aborts_as_the_last_segment_ends() {
     // and 1), exactly when the failing segment is the last one on its side.
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let err = run_diff_merge(
-        DiffStreamSides {
-            left: vec![lrx],
-            right: vec![rrx],
-        },
+        DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
         Some(&mut parquet),
         move || {
             let calls = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

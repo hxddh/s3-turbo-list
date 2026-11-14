@@ -1,13 +1,13 @@
 //! Listing tasks: the list-mode reactor and the diff sides, both built on
 //! one ListObjectsV2 continuation chain per key-range segment.
 //!
-//! - `reactor`: list mode's concurrency controller (segments, runtime
-//!   splits, resume ranges).
+//! - `reactor`: the concurrency controller of a list run or a diff side
+//!   (segments, runtime splits, resume ranges).
 //! - `split`: adaptive long-tail splitting (segment control, split probes,
 //!   the fan-out governor).
 //! - `chain`: one segment run to completion, with retry.
 //! - `sdk_error`: SDK error classification and trace events.
-//! - `diff`: parallel per-side listing for diff.
+//! - `diff`: diff-side constants.
 
 mod chain;
 mod diff;
@@ -15,8 +15,8 @@ mod reactor;
 mod sdk_error;
 mod split;
 
-pub use diff::{DIFF_SEGMENT_CHANNEL_CAP, diff_list_side_task};
-pub use reactor::flat_list_main_task;
+pub use diff::DIFF_SEGMENT_CHANNEL_CAP;
+pub use reactor::{diff_side_task, flat_list_main_task};
 
 /// What a segment task's `JoinError` means for the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,6 +9,7 @@ use log::info;
 use s3tl::checkpoint::{Checkpoint, ResumeProgress};
 use s3tl::config::EngineConfig;
 use s3tl::core::{self, ObjectKey, ObjectProps, RunMode};
+use s3tl::segment_order::SegmentOrder;
 use s3tl::{data_map, mon, startup, tasks_s3, trace};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -401,14 +402,15 @@ async fn spawn_diff(
         left_bounds.len() + 1,
         right_bounds.len() + 1
     );
-    let channels = |n: usize| -> (Vec<_>, Vec<_>) {
-        (0..n)
-            .map(|_| tokio::sync::mpsc::channel::<Batch>(tasks_s3::DIFF_SEGMENT_CHANNEL_CAP))
-            .unzip()
-    };
-    let (left_tx, left_rx) = channels(left_bounds.len() + 1);
-    let (right_tx, right_rx) = channels(right_bounds.len() + 1);
-    // Each segment task swaps in its own sender.
+    let left_order = Arc::new(SegmentOrder::new(
+        left_bounds.len() + 1,
+        tasks_s3::DIFF_SEGMENT_CHANNEL_CAP,
+    ));
+    let right_order = Arc::new(SegmentOrder::new(
+        right_bounds.len() + 1,
+        tasks_s3::DIFF_SEGMENT_CHANNEL_CAP,
+    ));
+    // Each segment task takes its own sender from the order.
     let (placeholder, _) = tokio::sync::mpsc::channel(1);
     let left_ctx = contexts.side(
         &job.source,
@@ -426,31 +428,35 @@ async fn spawn_diff(
     let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
     let concurrency = job.concurrency;
     let (left_prefix, right_prefix) = (job.source.url.prefix.clone(), target.url.prefix.clone());
+    let order = left_order.clone();
     set.spawn(async move {
-        tasks_s3::diff_list_side_task(
+        let hints = core::KeySpaceHints::new_from(&left_bounds);
+        tasks_s3::diff_side_task(
             &left_ctx,
             &left_prefix,
             concurrency,
-            &left_bounds,
-            left_tx,
+            hints,
+            order,
             Some(left_head_rx),
         )
         .await
     });
+    let order = right_order.clone();
     set.spawn(async move {
-        tasks_s3::diff_list_side_task(
+        let hints = core::KeySpaceHints::new_from(&right_bounds);
+        tasks_s3::diff_side_task(
             &right_ctx,
             &right_prefix,
             concurrency,
-            &right_bounds,
-            right_tx,
+            hints,
+            order,
             Some(right_head_rx),
         )
         .await
     });
     let sides = data_map::DiffStreamSides {
-        left: left_rx,
-        right: right_rx,
+        left: left_order,
+        right: right_order,
     };
     let heads = data_map::DiffMergeHeads {
         left: left_head_tx,

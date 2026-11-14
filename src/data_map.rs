@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
 use crate::core::{self, DataMapContext, MatchResult, ObjectKey, ObjectProps};
+use crate::segment_order::SegmentOrder;
 use crate::utils::{DiffRow, DiffStatus};
 
 // ── Output direction flags ─────────────────────────────────
@@ -1078,73 +1079,86 @@ fn top_prefixes(prefix_stats: &PrefixStats, limit: usize) -> Vec<core::PrefixMet
 // — and streams rows straight to Parquet.  Memory is bounded by the
 // channel buffers instead of the combined object count.
 
-/// Per-side, segment-ordered receivers for the two diff sides.  Segments
-/// are static key-space partitions, so draining the receivers in index
-/// order yields one globally ordered stream per side while the segments
-/// themselves list in parallel (bounded by each channel's small capacity,
-/// which acts as the prefetch window).
+/// The two diff sides: each side's segments in key order (see
+/// `segment_order`), read one after another as one ascending stream while the
+/// segments themselves list in parallel, each into a small bounded channel
+/// (the prefetch window).
 pub struct DiffStreamSides {
-    pub left: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
-    pub right: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+    pub left: Arc<SegmentOrder>,
+    pub right: Arc<SegmentOrder>,
 }
 
-/// Where the merge publishes the index of the segment it is reading on each
-/// side, so the listing can hold back segments too far ahead of it
-/// (`tasks_s3::diff_list_side_task`).
+impl DiffStreamSides {
+    /// Sides over fixed receivers, in order (tests, benchmarks).
+    pub fn from_receivers(
+        left: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+        right: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+    ) -> Self {
+        Self {
+            left: Arc::new(SegmentOrder::from_receivers(left)),
+            right: Arc::new(SegmentOrder::from_receivers(right)),
+        }
+    }
+}
+
+/// Where the merge publishes the static segment it is reading on each side
+/// (for a split child, the static segment it descends from), so the listing
+/// can hold back segments too far ahead of it.
 pub struct DiffMergeHeads {
     pub left: tokio::sync::watch::Sender<usize>,
     pub right: tokio::sync::watch::Sender<usize>,
 }
 
 struct DiffSideStream {
+    order: Arc<SegmentOrder>,
+    /// The segment being read (`None`: the side is exhausted).
+    current: Option<usize>,
     rx: Option<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
-    pending: std::vec::IntoIter<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
     buf: std::collections::VecDeque<(ObjectKey, ObjectProps)>,
     closed: bool,
     last_key: Option<String>,
     name: &'static str,
     received_batches: usize,
     received_objects: usize,
-    segment: usize,
     head: Option<tokio::sync::watch::Sender<usize>>,
 }
 
 impl DiffSideStream {
     fn new(
-        receivers: Vec<tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>>,
+        order: Arc<SegmentOrder>,
         name: &'static str,
         head: Option<tokio::sync::watch::Sender<usize>>,
     ) -> Self {
-        let mut pending = receivers.into_iter();
-        let rx = pending.next();
+        let current = order.first();
+        let rx = current.and_then(|id| order.take_receiver(id));
         Self {
+            order,
+            current,
             rx,
-            pending,
             buf: std::collections::VecDeque::new(),
             closed: false,
             last_key: None,
             name,
             received_batches: 0,
             received_objects: 0,
-            segment: 0,
             head,
         }
     }
 
-    /// Receive the next batch, advancing through the segment receivers in
-    /// index order as each segment's channel closes.
+    /// Receive the next batch, moving to the next segment in key order as
+    /// each segment's channel closes.
     async fn recv_next(&mut self) -> Option<Vec<(ObjectKey, ObjectProps)>> {
         loop {
-            let rx = self.rx.as_mut()?;
-            match rx.recv().await {
-                Some(batch) => return Some(batch),
-                None => {
-                    self.rx = self.pending.next();
-                    self.segment += 1;
-                    if let Some(head) = &self.head {
-                        head.send_replace(self.segment);
-                    }
-                }
+            let id = self.current?;
+            if let Some(rx) = self.rx.as_mut()
+                && let Some(batch) = rx.recv().await
+            {
+                return Some(batch);
+            }
+            self.current = self.order.successor(id).await;
+            self.rx = self.current.and_then(|next| self.order.take_receiver(next));
+            if let (Some(head), Some(next)) = (&self.head, self.current) {
+                head.send_replace(self.order.root(next));
             }
         }
     }

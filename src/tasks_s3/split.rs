@@ -47,6 +47,8 @@ const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
 pub(super) struct SplitRange {
     pub(super) start: String,
     pub(super) end: Option<String>,
+    /// The segment this range was split off (its keys follow the parent's).
+    pub(super) parent: usize,
 }
 
 pub(super) type SplitSender = tokio::sync::mpsc::UnboundedSender<SplitRange>;
@@ -158,6 +160,7 @@ impl SegmentControl {
         Some(SplitRange {
             start: proposed,
             end: old_end,
+            parent: 0, // set by the segment that accepts the split
         })
     }
 }

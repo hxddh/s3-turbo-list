@@ -1,5 +1,8 @@
-//! List mode's reactor: runs the segments under the concurrency limit,
-//! fans out with runtime splits, and records the resume ranges on exit.
+//! The reactor: runs a side's segments under the concurrency limit, fans
+//! out with runtime splits, and (list mode) records the resume ranges on
+//! exit. A diff side runs the same reactor with an ordered output: every
+//! segment writes to its own channel, linked into the side's
+//! `SegmentOrder` so the merge reads the side in key order.
 
 use super::chain::flat_list_run_to_complete;
 use super::split::{
@@ -9,6 +12,7 @@ use super::split::{
 use super::{JoinFailure, classify_join_failure};
 use crate::core;
 use crate::core::{KeySpaceHints, S3TaskContext};
+use crate::segment_order::{SealOnDrop, SegmentOrder};
 use log::{error, info};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -32,7 +36,36 @@ pub async fn flat_list_main_task(
     flat_concurrency: usize,
     hints: KeySpaceHints,
 ) {
-    flat_reactor_task(ctx, start_prefix, flat_concurrency, hints).await
+    flat_reactor_task(ctx, start_prefix, flat_concurrency, hints, None, None).await
+}
+
+/// Upper bound on concurrently listing segments per diff side.
+const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+/// Static segments a diff side may start ahead of the one the merge is
+/// reading. With the channel capacity this bounds a side's buffered batches
+/// whatever the segment count.
+const DIFF_SIDE_LOOKAHEAD_SEGMENTS: usize = 16;
+
+/// List one diff side: its static segments (`hints`), split at runtime like
+/// list mode, each segment writing to its channel in `order`. Any segment
+/// failure fails the run.
+pub async fn diff_side_task(
+    ctx: &S3TaskContext,
+    start_prefix: &str,
+    concurrency: usize,
+    hints: KeySpaceHints,
+    order: Arc<SegmentOrder>,
+    merge_head: Option<tokio::sync::watch::Receiver<usize>>,
+) {
+    flat_reactor_task(
+        ctx,
+        start_prefix,
+        concurrency.clamp(1, DIFF_SIDE_MAX_CONCURRENCY),
+        hints,
+        Some(order),
+        merge_head,
+    )
+    .await
 }
 
 // ── Reactor: controls concurrency via JoinSet ──────────────
@@ -42,20 +75,23 @@ async fn flat_reactor_task(
     start_prefix: &str,
     flat_concurrency: usize,
     mut hints: KeySpaceHints,
+    order: Option<Arc<SegmentOrder>>,
+    mut merge_head: Option<tokio::sync::watch::Receiver<usize>>,
 ) {
+    // However the reactor ends, a merge waiting on this side is released.
+    let _seal = order.as_deref().map(SealOnDrop);
     ctx.start();
     ctx.g_state.wait_to_start().await;
 
     info!("Flat List S3 Task — {} — started", ctx.s3_bucket_name);
     tokio::task::yield_now().await;
 
-    // Adaptive splitting only applies to plain list runs: diff uses a fixed,
-    // key-ordered segment set per side (the merge needs it static). A
-    // --delimiter run is excluded for the reason hints are: a page's
-    // CommonPrefixes are not range-bounded, so a split parent would keep
-    // paging past its cut, re-listing the child's prefixes.
-    let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
-        && ctx.delimiter.as_deref().unwrap_or("").is_empty();
+    // A --delimiter run is never split: a page's CommonPrefixes are not
+    // range-bounded, so a split parent would keep paging past its cut,
+    // re-listing the child's prefixes.
+    let allow_split = ctx.delimiter.as_deref().unwrap_or("").is_empty();
+    // A static segment held back until the merge catches up (diff).
+    let mut held: Option<core::KeySpacePair> = None;
 
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();
     let mut set = tokio::task::JoinSet::new();
@@ -64,12 +100,22 @@ async fn flat_reactor_task(
     let mut starts: HashMap<usize, String> = HashMap::new();
     let mut unfinished: HashMap<usize, Arc<SegmentControl>> = HashMap::new();
     let mut completed_pieces = 0usize;
-    let mut pending_children: Vec<SplitRange> = Vec::new();
+    // Split children not yet started, with the index each was given when it
+    // was received (and, for a diff side, linked after its parent).
+    let mut pending_children: Vec<(usize, SplitRange)> = Vec::new();
     // Children need indices no original segment uses: on a resume the set is
     // sparse, and a reused index would let a child's control replace its
     // namesake's in `controls` — then the split parent completes looking
     // unsplit and gets checkpointed while the child's range is still unlisted.
     let mut next_child_index = hints.index_end();
+    let mut link_child = |range: SplitRange, pending: &mut Vec<(usize, SplitRange)>| {
+        let index = next_child_index;
+        next_child_index += 1;
+        if let Some(order) = &order {
+            order.insert_after(range.parent, index);
+        }
+        pending.push((index, range));
+    };
     let mut split_count = 0usize;
     let flat_high: FlatHigh = Arc::new(Mutex::new(None));
     let mut retired_pages = 0u64;
@@ -82,6 +128,7 @@ async fn flat_reactor_task(
     // the end of the run (and Ctrl-C) by up to its request timeouts. They
     // are aborted when the reactor exits.
     let mut probes = tokio::task::JoinSet::new();
+    let mut remaining_held: Vec<core::KeySpacePair> = Vec::new();
     let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -90,20 +137,36 @@ async fn flat_reactor_task(
         // Nothing new starts once the run is asked to stop — an interrupt
         // during startup discovery used to be followed by a full first fill.
         while set.len() < flat_concurrency && !ctx.is_quit() {
-            let (index, start, end, from_hints) = if let Some(child) = pending_children.pop() {
-                let index = next_child_index;
-                next_child_index += 1;
-                (index, child.start, child.end, false)
-            } else if let Some(pair) = hints.next() {
-                (pair.index, pair.start, pair.end, true)
-            } else {
-                break;
-            };
+            let (index, start, end, from_hints) =
+                if let Some((index, child)) = pending_children.pop() {
+                    (index, child.start, child.end, false)
+                } else if let Some(pair) = held.take().or_else(|| hints.next()) {
+                    if let Some(head) = &merge_head
+                        && pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS
+                    {
+                        held = Some(pair);
+                        break;
+                    }
+                    (pair.index, pair.start, pair.end, true)
+                } else {
+                    break;
+                };
 
+            let mut task_ctx = ctx.clone();
+            if let Some(order) = &order {
+                match order.take_sender(index) {
+                    Some(sender) => task_ctx.data_map_channel = sender,
+                    None => {
+                        error!("diff segment {} has no channel", index);
+                        ctx.g_state.inc_fatal_error();
+                        ctx.g_state.quit();
+                        break;
+                    }
+                }
+            }
             let control = Arc::new(SegmentControl::new(end));
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
-            let task_ctx = ctx.clone();
             let start_prefix = start_prefix.to_string();
             let task_split_tx = allow_split.then(|| split_tx.clone());
 
@@ -134,14 +197,14 @@ async fn flat_reactor_task(
         let mut drained = false;
         while let Ok(range) = split_rx.try_recv() {
             split_count += 1;
-            pending_children.push(range);
+            link_child(range, &mut pending_children);
             drained = true;
         }
         if drained && !ctx.is_quit() {
             continue;
         }
 
-        if set.is_empty() && pending_children.is_empty() {
+        if set.is_empty() && pending_children.is_empty() && held.is_none() {
             // Every segment task has joined, so every cloned sender is dropped
             // and every `send` has completed — the batches are in the channel.
             // Returning drops the last sender, and the data map receives all of
@@ -175,6 +238,15 @@ async fn flat_reactor_task(
                     if outcome.completed && outcome.from_hints {
                         hints.finish(outcome.index);
                     }
+                    // Every split this segment sent is queued by now: link
+                    // them, then let the merge move past it.
+                    if let Some(order) = &order {
+                        while let Ok(range) = split_rx.try_recv() {
+                            split_count += 1;
+                            link_child(range, &mut pending_children);
+                        }
+                        order.seal(outcome.index);
+                    }
                 }
                 Some(Err(e)) => {
                     match classify_join_failure(e.is_cancelled(), ctx.is_quit()) {
@@ -201,7 +273,18 @@ async fn flat_reactor_task(
                         range.start,
                         range.end.as_deref().unwrap_or("<end>"),
                     );
-                    pending_children.push(range);
+                    link_child(range, &mut pending_children);
+                }
+            },
+            changed = async {
+                match merge_head.as_mut() {
+                    Some(head) => head.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if held.is_some() => {
+                if changed.is_err() {
+                    // The merge is gone; stop gating (the sends will fail).
+                    merge_head = None;
                 }
             },
             _ = split_check.tick() => {
@@ -231,6 +314,7 @@ async fn flat_reactor_task(
                 if allow_split
                     && set.len() < cap
                     && pending_children.is_empty()
+                    && held.is_none()
                     && hints.is_empty()
                 {
                     let idle = cap - set.len();
@@ -264,7 +348,10 @@ async fn flat_reactor_task(
             // Children split off before or during the abort are unlisted
             // ranges: they belong in the resume ranges.
             while let Ok(range) = split_rx.try_recv() {
-                pending_children.push(range);
+                link_child(range, &mut pending_children);
+            }
+            if let Some(pair) = held.take() {
+                remaining_held.push(pair);
             }
             info!("Flat List S3 Task — {} — aborted", ctx.s3_bucket_name);
             break;
@@ -273,10 +360,16 @@ async fn flat_reactor_task(
 
     probes.abort_all();
     controls.extend(unfinished);
+    let mut unstarted: Vec<SplitRange> = pending_children.into_iter().map(|(_, r)| r).collect();
+    unstarted.extend(remaining_held.into_iter().map(|pair| SplitRange {
+        start: pair.start,
+        end: pair.end,
+        parent: pair.index,
+    }));
     *ctx.resume_progress.lock().unwrap() = Some(resume_progress(
         &controls,
         &starts,
-        pending_children,
+        unstarted,
         &mut hints,
         completed_pieces,
     ));
