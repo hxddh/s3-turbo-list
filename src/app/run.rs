@@ -31,6 +31,7 @@ pub fn plan(job: &Job, result: &mut RunResult) {
         "partitioning_reason": reason,
         "concurrency": job.concurrency,
         "compare": job.target.as_ref().map(|_| format!("{:?}", job.compare).to_lowercase()),
+        "versions": job.target.is_none().then_some(job.versions),
         "max_keys": job.max_keys,
         "resume_ranges": job.resume_from.as_ref().map(|c| c.remaining.len()),
         "first_part": job.first_part,
@@ -235,6 +236,7 @@ impl Contexts<'_> {
             addressing_style: if side.path_style { "path" } else { "virtual" },
             delimiter: Some(&self.job.delimiter),
             max_keys: self.job.max_keys,
+            versions: self.job.versions,
         })
     }
 }
@@ -359,7 +361,9 @@ async fn spawn_list(
             set.spawn(async move { data_map::data_map_task_list_stdout(data_ctx).await });
         }
         Output::Dir(dir) => {
-            let (dir, first, output) = (dir.clone(), job.first_part, contexts.cfg.output.clone());
+            let (dir, first) = (dir.clone(), job.first_part);
+            let mut output = contexts.cfg.output.clone();
+            output.versions = job.versions;
             set.spawn(async move {
                 data_map::data_map_task_list_streaming(data_ctx, dir, first, output).await
             });

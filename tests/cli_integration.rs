@@ -527,6 +527,7 @@ fn list_dry_run_plans_without_touching_anything() {
             "partitioning_reason": null,
             "concurrency": 8,
             "compare": null,
+            "versions": false,
             "max_keys": null,
             "resume_ranges": null,
             "first_part": 0,

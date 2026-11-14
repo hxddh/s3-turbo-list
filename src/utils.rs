@@ -1,6 +1,8 @@
 use arrow_array::RecordBatch;
 use arrow_array::array::ArrayRef;
-use arrow_array::builder::{StringBuilder, TimestampMillisecondBuilder, UInt64Builder};
+use arrow_array::builder::{
+    BooleanBuilder, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
@@ -20,12 +22,16 @@ use crate::core::{ObjectKey, ObjectProps};
 pub const SCHEMA_METADATA_KEY: &str = "s3tl.schema";
 pub const LIST_SCHEMA: &str = "s3tl.list/1";
 pub const DIFF_SCHEMA: &str = "s3tl.diff/1";
+pub const LIST_VERSIONS_SCHEMA: &str = "s3tl.list-versions/1";
 
 /// Which of the two output schemas a writer produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// `key, size, last_modified, etag, storage_class`.
     List,
+    /// The list columns plus `version_id, is_latest, is_delete_marker`
+    /// (`list --versions`).
+    ListVersions,
     /// `key, status, left_size, left_last_modified, left_etag, right_size,
     /// right_last_modified, right_etag`.
     Diff,
@@ -64,13 +70,21 @@ fn timestamp_type() -> DataType {
 
 fn schema_for(layout: Layout) -> SchemaRef {
     let fields = match layout {
-        Layout::List => vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("size", DataType::UInt64, false),
-            Field::new("last_modified", timestamp_type(), true),
-            Field::new("etag", DataType::Utf8, true),
-            Field::new("storage_class", DataType::Utf8, true),
-        ],
+        Layout::List | Layout::ListVersions => {
+            let mut fields = vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("size", DataType::UInt64, false),
+                Field::new("last_modified", timestamp_type(), true),
+                Field::new("etag", DataType::Utf8, true),
+                Field::new("storage_class", DataType::Utf8, true),
+            ];
+            if layout == Layout::ListVersions {
+                fields.push(Field::new("version_id", DataType::Utf8, true));
+                fields.push(Field::new("is_latest", DataType::Boolean, false));
+                fields.push(Field::new("is_delete_marker", DataType::Boolean, false));
+            }
+            fields
+        }
         Layout::Diff => vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, false),
@@ -128,6 +142,35 @@ impl ObjectColumns {
     }
 }
 
+/// The three version columns of a `list --versions` row.
+struct VersionColumns {
+    version_id: StringBuilder,
+    is_latest: BooleanBuilder,
+    is_delete_marker: BooleanBuilder,
+}
+
+impl VersionColumns {
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            version_id: StringBuilder::with_capacity(rows, rows.saturating_mul(32)),
+            is_latest: BooleanBuilder::with_capacity(rows),
+            is_delete_marker: BooleanBuilder::with_capacity(rows),
+        }
+    }
+
+    fn append(&mut self, props: &ObjectProps) {
+        self.version_id.append_option(props.version_id());
+        self.is_latest.append_value(props.is_latest());
+        self.is_delete_marker.append_value(props.is_delete_marker());
+    }
+
+    fn finish(mut self, columns: &mut Vec<ArrayRef>) {
+        columns.push(Arc::new(self.version_id.finish()));
+        columns.push(Arc::new(self.is_latest.finish()));
+        columns.push(Arc::new(self.is_delete_marker.finish()));
+    }
+}
+
 /// Column builders for a batch of rows. One lives per writer, so the size
 /// difference between the variants does not matter.
 #[allow(clippy::large_enum_variant)]
@@ -136,6 +179,8 @@ enum RowBatch {
         key: StringBuilder,
         object: ObjectColumns,
         storage_class: StringBuilder,
+        /// `version_id, is_latest, is_delete_marker` (`ListVersions` only).
+        versions: Option<VersionColumns>,
         rows: usize,
     },
     Diff {
@@ -152,10 +197,12 @@ impl RowBatch {
         // Builders grow as needed: cap the up-front reservation.
         let reserve = rows.min(65_536);
         match layout {
-            Layout::List => RowBatch::List {
+            Layout::List | Layout::ListVersions => RowBatch::List {
                 key: StringBuilder::with_capacity(reserve, reserve.saturating_mul(40)),
                 object: ObjectColumns::with_capacity(reserve),
                 storage_class: StringBuilder::with_capacity(reserve, reserve.saturating_mul(8)),
+                versions: (layout == Layout::ListVersions)
+                    .then(|| VersionColumns::with_capacity(reserve)),
                 rows: 0,
             },
             Layout::Diff => RowBatch::Diff {
@@ -179,6 +226,7 @@ impl RowBatch {
             key,
             object,
             storage_class,
+            versions,
             rows,
         } = self
         else {
@@ -189,6 +237,9 @@ impl RowBatch {
         match props.storage_class_name() {
             Some(name) => storage_class.append_value(name),
             None => storage_class.append_null(),
+        }
+        if let Some(versions) = versions {
+            versions.append(props);
         }
         *rows += 1;
     }
@@ -218,11 +269,15 @@ impl RowBatch {
                 mut key,
                 object,
                 mut storage_class,
+                versions,
                 ..
             } => {
                 columns.push(Arc::new(key.finish()));
                 object.finish(&mut columns);
                 columns.push(Arc::new(storage_class.finish()));
+                if let Some(versions) = versions {
+                    versions.finish(&mut columns);
+                }
             }
             RowBatch::Diff {
                 mut key,
@@ -288,13 +343,14 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
                 SCHEMA_METADATA_KEY.to_string(),
                 match layout {
                     Layout::List => LIST_SCHEMA,
+                    Layout::ListVersions => LIST_VERSIONS_SCHEMA,
                     Layout::Diff => DIFF_SCHEMA,
                 }
                 .to_string(),
             )]));
         // Keys and ETags are near-unique per row: a dictionary never pays for
         // itself, and building one hashes every value until it overflows.
-        for column in ["key", "etag", "left_etag", "right_etag"] {
+        for column in ["key", "etag", "left_etag", "right_etag", "version_id"] {
             props = props.set_column_dictionary_enabled(ColumnPath::from(column), false);
         }
         let writer =

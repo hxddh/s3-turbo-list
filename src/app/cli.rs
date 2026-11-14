@@ -39,6 +39,9 @@ pub enum Command {
         /// Continue an interrupted run into the same output directory
         #[arg(long)]
         resume: bool,
+        /// List every version and delete marker (ListObjectVersions)
+        #[arg(long, conflicts_with = "delimiter")]
+        versions: bool,
     },
     /// Compare two prefixes key by key; writes only keys that differ
     Diff {

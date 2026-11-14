@@ -72,11 +72,13 @@ pub struct Job {
     pub creates_dir: bool,
     /// `diff --compare`.
     pub compare: s3tl::core::CompareMode,
+    /// `list --versions`.
+    pub versions: bool,
 }
 
 impl Job {
     pub fn identity(&self) -> CheckpointIdentity {
-        identity_of(&self.source, &self.delimiter, self.max_keys)
+        identity_of(&self.source, &self.delimiter, self.max_keys, self.versions)
     }
 
     /// Whether the run uses startup discovery, and why not if it does not.
@@ -120,13 +122,19 @@ impl Job {
     }
 }
 
-fn identity_of(side: &SideSpec, delimiter: &str, max_keys: Option<i32>) -> CheckpointIdentity {
+fn identity_of(
+    side: &SideSpec,
+    delimiter: &str,
+    max_keys: Option<i32>,
+    versions: bool,
+) -> CheckpointIdentity {
     CheckpointIdentity {
         bucket: side.url.bucket.clone(),
         prefix: side.url.prefix.clone(),
         endpoint_url: side.endpoint.clone(),
         delimiter: delimiter.to_string(),
         max_keys,
+        versions,
     }
 }
 
@@ -312,20 +320,25 @@ fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
 pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
     let g = &cli.global;
     let mut compare_mode = s3tl::core::CompareMode::default();
+    let mut list_versions = false;
     let (mode, source, target, output, delimiter, resume) = match &cli.cmd {
         Command::List {
             source,
             output,
             delimiter,
             resume,
-        } => (
-            RunMode::List,
-            side(source, g.endpoint_url.as_deref(), cli)?,
-            None,
-            output.as_deref(),
-            delimiter.clone().unwrap_or_default(),
-            *resume,
-        ),
+            versions,
+        } => {
+            list_versions = *versions;
+            (
+                RunMode::List,
+                side(source, g.endpoint_url.as_deref(), cli)?,
+                None,
+                output.as_deref(),
+                delimiter.clone().unwrap_or_default(),
+                *resume,
+            )
+        }
         Command::Diff {
             source,
             target,
@@ -379,6 +392,7 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         first_part: 0,
         creates_dir: false,
         compare: compare_mode,
+        versions: list_versions,
     };
 
     if resume {

@@ -223,7 +223,11 @@ async fn list_output_worker(
     let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::with_settings(
         buf_writer,
-        crate::utils::Layout::List,
+        if output_config.versions {
+            crate::utils::Layout::ListVersions
+        } else {
+            crate::utils::Layout::List
+        },
         output_config.row_group_size,
         &output_config.compression,
         output_config.compression_level,
@@ -846,7 +850,7 @@ fn render_text_row(
     match props.etag_text(&mut buf) {
         None => out.extend_from_slice(b"null"),
         // Hex is plain ASCII; another vendor's ETag may need escaping.
-        Some(etag) if props.etag_other.is_some() => serde_json::to_writer(&mut *out, etag)?,
+        Some(etag) if props.etag_other().is_some() => serde_json::to_writer(&mut *out, etag)?,
         Some(etag) => {
             out.push(b'"');
             out.extend_from_slice(etag.as_bytes());
@@ -857,6 +861,23 @@ fn render_text_row(
     match props.storage_class_name() {
         None => out.extend_from_slice(b"null"),
         Some(name) => serde_json::to_writer(&mut *out, name)?,
+    }
+    if props.is_versioned() {
+        out.extend_from_slice(b",\"version_id\":");
+        match props.version_id() {
+            None => out.extend_from_slice(b"null"),
+            Some(id) => serde_json::to_writer(&mut *out, id)?,
+        }
+        out.extend_from_slice(if props.is_latest() {
+            b",\"is_latest\":true"
+        } else {
+            b",\"is_latest\":false"
+        });
+        out.extend_from_slice(if props.is_delete_marker() {
+            b",\"is_delete_marker\":true"
+        } else {
+            b",\"is_delete_marker\":false"
+        });
     }
     out.extend_from_slice(b"}\n");
     Ok(())

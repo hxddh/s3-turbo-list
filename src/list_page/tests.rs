@@ -32,7 +32,7 @@ fn view(p: &ObjectProps) -> PropsView {
     (
         p.flags,
         p.status,
-        (u16::from(p.storage_class) << 8) | u16::from(p.pad),
+        (u16::from(p.storage_class) << 8) | u16::from(p.vflags),
         p.etag_parts,
         p.last_modified,
         p.size,
@@ -49,7 +49,7 @@ fn rows_view(rows: &[(ObjectKey, ObjectProps)]) -> Vec<(String, PropsView)> {
 /// The verbatim (non-MD5) ETags of rows, which `PropsView` leaves out.
 fn other_etags(rows: &[(ObjectKey, ObjectProps)]) -> Vec<Option<String>> {
     rows.iter()
-        .map(|(_, p)| p.etag_other.as_deref().cloned())
+        .map(|(_, p)| p.etag_other().map(str::to_string))
         .collect()
 }
 
@@ -379,7 +379,7 @@ fn etag_rules_match_object_props_from() {
             (
                 expected.etag_md5,
                 expected.etag_parts,
-                expected.etag_other.clone()
+                expected.etag_other().map(str::to_string)
             ),
             "{etag}"
         );

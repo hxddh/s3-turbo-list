@@ -216,8 +216,7 @@ pub(crate) fn epoch_millis_to_u64(ms: i64) -> u64 {
 
 /// ETag text (entity-unescaped) → its MD5, part count and verbatim other
 /// form, by the same rules as `ObjectProps::from(&Object)`.
-#[allow(clippy::box_collection)] // the thin `ObjectProps::etag_other`
-fn parse_etag(raw: &str) -> ([u8; 16], u32, Option<Box<String>>) {
+fn parse_etag(raw: &str) -> ([u8; 16], u32, Option<String>) {
     crate::core::parse_etag(raw)
 }
 
@@ -661,7 +660,6 @@ enum Field {
 
 /// One `<Contents>` element, starting just after its start tag.  Returns the
 /// row and the index after `</Contents>`.
-#[allow(clippy::box_collection)] // the thin `ObjectProps::etag_other`
 fn parse_contents(
     text: &str,
     mut pos: usize,
@@ -671,7 +669,7 @@ fn parse_contents(
     let b = text.as_bytes();
     let mut key: Option<String> = None;
     let mut last_modified: Option<i64> = None;
-    let mut etag: Option<([u8; 16], u32, Option<Box<String>>)> = None;
+    let mut etag: Option<([u8; 16], u32, Option<String>)> = None;
     let mut size: Option<i64> = None;
     let mut storage_class: Option<u8> = None;
 
@@ -766,7 +764,7 @@ fn parse_contents(
                     Some(inner) => {
                         let (md5, parts) = crate::core::parse_etag_inner(inner.as_bytes());
                         let other = (parts == 0 && md5 == [0u8; 16] && !inner.is_empty())
-                            .then(|| Box::new(inner.to_string()));
+                            .then(|| inner.to_string());
                         (md5, parts, other)
                     }
                     None => parse_etag(value!()),
@@ -792,7 +790,7 @@ fn parse_contents(
     if let Some((md5, parts, other)) = etag {
         props.etag_md5 = md5;
         props.etag_parts = parts;
-        props.etag_other = other;
+        props.set_etag_other(other);
     }
     props.last_modified = last_modified.map_or(0, epoch_millis_to_u64);
     props.size = size.map_or(0, |s| s.max(0) as u64);

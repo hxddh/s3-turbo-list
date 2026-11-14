@@ -31,17 +31,21 @@ pub(super) async fn flat_list_run_to_complete(
     let mut start_after = start.to_string();
     let mut retry_attempt: u32 = 0;
     loop {
-        match flat_list(
-            ctx,
-            segment_index,
-            prefix,
-            &start_after,
-            control,
-            split_tx,
-            retry_attempt,
-        )
-        .await
-        {
+        let attempt = if ctx.versions {
+            versions_list(ctx, prefix, &start_after, control, split_tx, retry_attempt).await
+        } else {
+            flat_list(
+                ctx,
+                segment_index,
+                prefix,
+                &start_after,
+                control,
+                split_tx,
+                retry_attempt,
+            )
+            .await
+        };
+        match attempt {
             Ok(()) => return true,
             Err(err) => {
                 // Errors induced by shutdown (aborted siblings, the data-map
@@ -557,6 +561,220 @@ fn merge_by_key(
         merged.extend(next);
     }
     merged
+}
+
+// ── ListObjectVersions chain (`list --versions`) ───────────
+
+/// One segment of a `--versions` listing: every version and delete marker
+/// of the keys in `(start_after, end]`, newest version of a key first.
+///
+/// Pages follow `NextKeyMarker` / `NextVersionIdMarker`. A key's versions
+/// can span pages, so the trailing key of a truncated page is held back
+/// until the next page shows it ended: every batch sent ends on a key
+/// boundary, and the resume cursor (the last key sent) never splits a key's
+/// versions — a retry or `--resume` from it lists the next key whole.
+async fn versions_list(
+    ctx: &S3TaskContext,
+    prefix: &str,
+    start_after: &str,
+    control: &SegmentControl,
+    split_tx: Option<&SplitSender>,
+    retry_attempt: u32,
+) -> Result<(), FlatRuntimeError> {
+    let mut next_start = start_after.to_string();
+    let mut key_marker = start_after.to_string();
+    let mut version_marker: Option<String> = None;
+    let mut held: Vec<(ObjectKey, ObjectProps)> = Vec::new();
+    loop {
+        let mut request = ctx
+            .s3_client
+            .list_object_versions()
+            .bucket(&ctx.s3_bucket_name)
+            .prefix(prefix)
+            .encoding_type(aws_sdk_s3::types::EncodingType::Url);
+        if !key_marker.is_empty() {
+            request = request.key_marker(&key_marker);
+        }
+        if let Some(v) = &version_marker {
+            request = request.version_id_marker(v);
+        }
+        if let Some(mk) = ctx.max_keys {
+            request = request.max_keys(mk);
+        }
+        let page_start = Instant::now();
+        let res = timeout_at(
+            Instant::now() + Duration::from_secs(ctx.operation_timeout_secs),
+            request.send(),
+        )
+        .await;
+        let traced = TracedRequest {
+            prefix,
+            start_after,
+            continuation_token: version_marker.as_deref(),
+            retry_attempt,
+            latency_ms: page_start.elapsed().as_millis() as u64,
+        };
+        let page = match res {
+            Err(_) => {
+                ctx.g_state.inc_task_next_stream_timeout();
+                return Err(FlatRuntimeError::new(
+                    ERROR_S3_NEXT_STREAM_TIMEOUT,
+                    "ListObjectVersions stream timeout".into(),
+                    next_start,
+                ));
+            }
+            Ok(Err(sdk_err)) => {
+                return handle_sdk_error(sdk_err, &next_start, ctx, traced);
+            }
+            Ok(Ok(page)) => page,
+        };
+        let url = page.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+        let decode = |k: &str| crate::list_page::response_key(url, k);
+        let truncated = page.is_truncated() == Some(true);
+        write_trace(
+            ctx,
+            traced.event(ctx, 200).map(|mut event| {
+                event.is_truncated = truncated;
+                event.contents_count =
+                    Some((page.versions().len() + page.delete_markers().len()) as i32);
+                event
+            }),
+        );
+
+        let mut rows: Vec<(ObjectKey, ObjectProps, i64)> = Vec::new();
+        for v in page.versions() {
+            let Some(key) = v.key() else { continue };
+            let mut props =
+                ObjectProps::new_open(0, v.size().map_or(0, |s| s.max(0) as u64), [0; 16]);
+            if let Some(etag) = v.e_tag() {
+                props.set_etag(etag);
+            }
+            let ms = v
+                .last_modified()
+                .and_then(|t| t.to_millis().ok())
+                .unwrap_or(0);
+            props.set_last_modified_millis(core::epoch_millis_u64(ms));
+            if let Some(class) = v.storage_class() {
+                props.set_storage_class(class.as_str());
+            }
+            props.set_version(
+                v.version_id().map(str::to_string),
+                v.is_latest() == Some(true),
+                false,
+            );
+            rows.push((ObjectKey::from(decode(key)), props, ms));
+        }
+        for m in page.delete_markers() {
+            let Some(key) = m.key() else { continue };
+            let mut props = ObjectProps::new_open(0, 0, [0; 16]);
+            let ms = m
+                .last_modified()
+                .and_then(|t| t.to_millis().ok())
+                .unwrap_or(0);
+            props.set_last_modified_millis(core::epoch_millis_u64(ms));
+            props.set_version(
+                m.version_id().map(str::to_string),
+                m.is_latest() == Some(true),
+                true,
+            );
+            rows.push((ObjectKey::from(decode(key)), props, ms));
+        }
+        // Versions and delete markers come as two lists: merge them by key,
+        // newest first within a key.
+        rows.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(b.2.cmp(&a.2)));
+        let mut rows: Vec<(ObjectKey, ObjectProps)> =
+            rows.into_iter().map(|(k, p, _)| (k, p)).collect();
+
+        // Keys never go backwards, and a fresh key marker means keys after it.
+        let floor = held.last().map_or(next_start.as_str(), |(k, _)| k.as_str());
+        let fresh = version_marker.is_none() && held.is_empty();
+        if let Some((first, _)) = rows.first()
+            && (first.as_str() < floor || (fresh && first.as_str() == floor && !floor.is_empty()))
+        {
+            return Err(FlatRuntimeError::new(
+                ERROR_INCONSISTENT_LISTING,
+                format!(
+                    "ListObjectVersions returned keys out of order ('{}' after '{}')",
+                    first, floor
+                ),
+                next_start,
+            ));
+        }
+        if rows.windows(2).any(|w| w[1].0.as_str() < w[0].0.as_str()) {
+            return Err(FlatRuntimeError::new(
+                ERROR_INCONSISTENT_LISTING,
+                "ListObjectVersions returned keys out of order within a page".into(),
+                next_start,
+            ));
+        }
+
+        let mut batch = std::mem::take(&mut held);
+        batch.append(&mut rows);
+        let until = control.current_end();
+        let mut ended = false;
+        if let Some(end) = until.as_deref()
+            && let Some(cut) = batch.iter().position(|(k, _)| end < k.as_str())
+        {
+            batch.truncate(cut);
+            ended = true;
+        }
+        if truncated
+            && !ended
+            && let Some((last, _)) = batch.last()
+        {
+            let last = last.as_str().to_string();
+            let split_at = batch
+                .iter()
+                .rposition(|(k, _)| k.as_str() != last)
+                .map_or(0, |i| i + 1);
+            held = batch.split_off(split_at);
+        }
+        for (_, props) in batch.iter_mut() {
+            props.set_dir(ctx.dir);
+        }
+        for (_, props) in held.iter_mut() {
+            props.set_dir(ctx.dir);
+        }
+        // Splits may cut only past every key seen, held ones included.
+        let seen = held
+            .last()
+            .or(batch.last())
+            .map_or(next_start.clone(), |(k, _)| k.as_str().to_string());
+        if let Some((key, _)) = batch.last() {
+            next_start = key.as_str().to_string();
+        }
+        control.record_page(&seen);
+        if let (Some(tx), false) = (split_tx, ended || ctx.is_quit()) {
+            if let Some(mut child) = control.try_accept_split() {
+                child.parent = 0;
+                let _ = tx.send(child);
+            }
+        }
+        if !batch.is_empty() {
+            if let Err(e) = ctx.data_map_channel.send(batch).await {
+                return Err(FlatRuntimeError::new(
+                    ERROR_S3_CLIENT_GENERIC,
+                    format!("Data map channel closed: {}", e),
+                    next_start,
+                ));
+            }
+        }
+        if !next_start.is_empty() {
+            control.record_sent(&next_start);
+        }
+        if ended || !truncated {
+            return Ok(());
+        }
+        key_marker = page.next_key_marker().map(decode).unwrap_or_default();
+        version_marker = page.next_version_id_marker().map(str::to_string);
+        if key_marker.is_empty() {
+            return Err(FlatRuntimeError::new(
+                ERROR_S3_CLIENT_GENERIC,
+                "truncated ListObjectVersions page without NextKeyMarker".into(),
+                next_start,
+            ));
+        }
+    }
 }
 
 /// What one page contributes to its segment.

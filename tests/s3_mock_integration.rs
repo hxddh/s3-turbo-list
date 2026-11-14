@@ -4530,3 +4530,244 @@ fn local_mock_list_routes_through_http_proxy_from_environment() {
     assert_eq!(stderr_result(&stderr)["error"]["retryable"], true);
     assert_eq!(server.requests().len(), before);
 }
+
+// ── list --versions (ListObjectVersions) ────────────────────
+
+/// One version or delete marker: `(key, version_id, epoch_secs, latest,
+/// delete_marker)`.
+type MockVersion = (&'static str, &'static str, u64, bool, bool);
+
+/// Versions of a small bucket in ListObjectVersions order (key ascending,
+/// newest first). `b` is deleted (its latest version is a delete marker);
+/// `c d` needs URL encoding.
+const MOCK_VERSIONS: &[MockVersion] = &[
+    ("a", "a-3", 3_000, true, false),
+    ("a", "a-2", 2_000, false, false),
+    ("a", "a-1", 1_000, false, false),
+    ("b", "b-dm", 5_000, true, true),
+    ("b", "b-1", 4_000, false, false),
+    ("c d", "cd-1", 6_000, true, false),
+    ("e", "null", 7_000, true, false),
+];
+
+/// A ListObjectVersions response over `MOCK_VERSIONS` honouring
+/// `prefix`, `key-marker`, `version-id-marker` and `max-keys`; any other
+/// GET is answered as ListObjectsV2 over the current (non-deleted) keys, so
+/// startup discovery probes work.
+fn emulated_versions(q: &BTreeMap<String, String>) -> String {
+    let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
+    let max_keys: usize = q
+        .get("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let key_marker = q.get("key-marker").map(String::as_str).unwrap_or("");
+    let version_marker = q.get("version-id-marker").map(String::as_str);
+    let mut entries: Vec<&MockVersion> = MOCK_VERSIONS
+        .iter()
+        .filter(|v| v.0.starts_with(prefix))
+        .collect();
+    let start = match version_marker {
+        Some(marker) => entries
+            .iter()
+            .position(|v| v.0 == key_marker && v.1 == marker)
+            .map_or(entries.len(), |i| i + 1),
+        None => entries
+            .iter()
+            .position(|v| v.0 > key_marker)
+            .unwrap_or(entries.len()),
+    };
+    entries.drain(..start);
+    let truncated = entries.len() > max_keys;
+    entries.truncate(max_keys);
+    let mut body = String::new();
+    for (key, id, secs, latest, dm) in &entries {
+        let modified = format!(
+            "2026-01-01T{:02}:{:02}:00.000Z",
+            secs / 3600,
+            secs / 60 % 60
+        );
+        if *dm {
+            body.push_str(&format!(
+                "<DeleteMarker><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest>\
+                 <LastModified>{}</LastModified></DeleteMarker>",
+                form_encode(key),
+                id,
+                latest,
+                modified
+            ));
+        } else {
+            body.push_str(&format!(
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest>\
+                 <LastModified>{}</LastModified><ETag>\"{:032x}\"</ETag><Size>{}</Size>\
+                 <StorageClass>STANDARD</StorageClass></Version>",
+                form_encode(key),
+                id,
+                latest,
+                modified,
+                secs,
+                secs / 1000
+            ));
+        }
+    }
+    let next = match (truncated, entries.last()) {
+        (true, Some(last)) => format!(
+            "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>{}</NextVersionIdMarker>",
+            form_encode(last.0),
+            last.1
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult>\
+         <Name>mock-bucket</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys>\
+         <EncodingType>url</EncodingType><IsTruncated>{}</IsTruncated>{}{}</ListVersionsResult>",
+        form_encode(prefix),
+        max_keys,
+        truncated,
+        next,
+        body
+    )
+}
+
+fn versions_server() -> MockS3Server {
+    MockS3Server::start(|request, _sequence| {
+        if request.query.contains_key("versions") {
+            assert_eq!(query(&request, "encoding-type"), Some("url"));
+            return MockResponse::ok_xml(emulated_versions(&request.query));
+        }
+        let mut current: Vec<String> = Vec::new();
+        for (key, _, _, latest, dm) in MOCK_VERSIONS {
+            if *latest && !*dm {
+                current.push(key.to_string());
+            }
+        }
+        MockResponse::ok_xml(emulated_list(&current, &request.query))
+    })
+}
+
+/// `(key, version_id, is_latest, is_delete_marker)` of every expected row.
+fn expected_versions() -> Vec<(String, String, bool, bool)> {
+    MOCK_VERSIONS
+        .iter()
+        .map(|(k, id, _, latest, dm)| (k.to_string(), id.to_string(), *latest, *dm))
+        .collect()
+}
+
+#[test]
+fn local_mock_versions_lists_every_version_across_pages() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    // Two entries a page: `a`'s three versions span pages, and the delete
+    // marker of `b` shares a page with a version of `a`.
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket",
+            "--versions",
+            "--no-auto-hints",
+            "--max-keys",
+            "2",
+            "-o",
+            "-",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "{}", stderr);
+    let rows = ndjson_rows(&stdout);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["version_id"].as_str().unwrap().to_string(),
+                r["is_latest"].as_bool().unwrap(),
+                r["is_delete_marker"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(got, expected_versions());
+    // A delete marker has no size, ETag or storage class.
+    assert_eq!(rows[3]["size"], 0);
+    assert_eq!(rows[3]["etag"], Value::Null);
+    assert_eq!(rows[4]["etag"], format!("{:032x}", 4_000));
+    let result = stderr_result(&stderr);
+    assert_eq!(result["stats"]["objects"], 7);
+
+    let requests = server.requests();
+    assert!(requests.iter().all(|r| r.query.contains_key("versions")));
+    assert!(requests.iter().all(|r| !r.query.contains_key("list-type")));
+    // Each page continues from the markers of the one before.
+    assert_eq!(query(&requests[1], "key-marker"), Some("a"));
+    assert_eq!(query(&requests[1], "version-id-marker"), Some("a-2"));
+}
+
+#[test]
+fn local_mock_versions_partitioned_dataset_has_the_versions_schema() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket",
+            "--versions",
+            "--max-keys",
+            "1",
+            "-c",
+            "4",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["output"]["rows"], 7);
+    assert_eq!(
+        schema_tag(&part_files(&out)[0]).as_deref(),
+        Some("s3tl.list-versions/1")
+    );
+    let keys = dataset_keys(&out);
+    let ids: Vec<String> = dataset_strings(&out, "version_id")
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    let mut got: Vec<(String, String)> = keys.into_iter().zip(ids).collect();
+    got.sort();
+    let mut want: Vec<(String, String)> = expected_versions()
+        .into_iter()
+        .map(|(k, id, _, _)| (k, id))
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+    let batches = dataset_batches(&out);
+    let deleted: usize = batches
+        .iter()
+        .map(|b| {
+            let col = b
+                .column_by_name("is_delete_marker")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap()
+                .clone();
+            (0..col.len()).filter(|i| col.value(*i)).count()
+        })
+        .sum();
+    assert_eq!(deleted, 1);
+}
+
+#[test]
+fn versions_and_delimiter_are_exclusive() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &["s3://mock-bucket", "--versions", "--delimiter", "/"],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.invalid_argument");
+    assert!(server.requests().is_empty());
+}

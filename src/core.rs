@@ -134,7 +134,6 @@ impl std::fmt::Display for ObjectKey {
 /// Compact object metadata.  Layout is carefully aligned for cache-line behaviour.
 #[repr(align(8))]
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::box_collection)] // `etag_other`: a thin pointer, see there
 pub struct ObjectProps {
     #[serde(skip)]
     pub(crate) flags: u8,
@@ -143,9 +142,9 @@ pub struct ObjectProps {
     /// `storage_class_code` of the object's StorageClass (0: none).
     #[serde(skip)]
     pub(crate) storage_class: u8,
+    /// `VFLAG_*`: version flags of a `--versions` row.
     #[serde(skip)]
-    #[allow(dead_code)] // explicit padding: keeps the layout of this hot struct fixed
-    pub(crate) pad: u8,
+    pub(crate) vflags: u8,
     #[serde(skip)]
     pub(crate) etag_parts: u32,
     /// LastModified in milliseconds since the epoch (0: unknown).
@@ -153,13 +152,30 @@ pub struct ObjectProps {
     pub size: u64,
     #[serde(skip)]
     pub(crate) etag_md5: [u8; 16],
-    /// An ETag that is not `<md5>[-<parts>]` (another vendor's format),
-    /// verbatim without its quotes; `None` in the common case, so the hot
-    /// path never allocates for it.
-    /// (A thin `Box<String>`: 8 bytes in this hot struct, not 16.)
+    /// The rare per-object strings (a non-MD5 ETag, a version ID) behind
+    /// one thin pointer: `None` in the common case, so the hot path never
+    /// allocates and the struct stays 48 bytes.
     #[serde(skip)]
-    pub(crate) etag_other: Option<Box<String>>,
+    pub(crate) extra: Option<Box<ObjectExtra>>,
 }
+
+/// The rare per-object strings of an `ObjectProps`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectExtra {
+    /// An ETag that is not `<md5>[-<parts>]` (another vendor's format),
+    /// verbatim without its quotes.
+    pub etag_other: Option<String>,
+    /// The version of a `--versions` row (`null` for an unversioned bucket's
+    /// objects, which S3 reports as version `null`).
+    pub version_id: Option<String>,
+}
+
+/// `ObjectProps::vflags`: the newest version of its key.
+const VFLAG_LATEST: u8 = 0b01;
+/// `ObjectProps::vflags`: a delete marker, not an object.
+const VFLAG_DELETE_MARKER: u8 = 0b10;
+/// The row came from ListObjectVersions (`list --versions`).
+const VFLAG_VERSIONED: u8 = 0b100;
 
 impl ObjectProps {
     /// Create a new ObjectProps with OPEN status and the given direction flags.
@@ -169,12 +185,12 @@ impl ObjectProps {
             flags: dir,
             status: OBJECT_PROPS_STATUS_OPEN,
             storage_class: 0,
-            pad: 0,
+            vflags: 0,
             etag_parts: 0,
             last_modified: 0,
             size,
             etag_md5: etag,
-            etag_other: None,
+            extra: None,
         }
     }
 
@@ -222,12 +238,63 @@ impl ObjectProps {
             && suffix.iter().all(|&x| x == 0)
             && aligned.iter().all(|&x| x == 0)
             && self.etag_parts == 0
-            && self.etag_other.is_none()
+            && self.etag_other().is_none()
     }
 
     /// Set the ETag from its text as the endpoint sent it.
     pub fn set_etag(&mut self, text: &str) {
-        (self.etag_md5, self.etag_parts, self.etag_other) = parse_etag(text);
+        let other;
+        (self.etag_md5, self.etag_parts, other) = parse_etag(text);
+        self.set_etag_other(other);
+    }
+
+    /// A non-MD5 ETag, verbatim.
+    pub fn etag_other(&self) -> Option<&str> {
+        self.extra.as_ref()?.etag_other.as_deref()
+    }
+
+    pub(crate) fn set_etag_other(&mut self, value: Option<String>) {
+        self.update_extra(|extra| extra.etag_other = value);
+    }
+
+    /// The version ID of a `--versions` row.
+    pub fn version_id(&self) -> Option<&str> {
+        self.extra.as_ref()?.version_id.as_deref()
+    }
+
+    /// Mark the row as one version of its key.
+    pub fn set_version(&mut self, id: Option<String>, latest: bool, delete_marker: bool) {
+        self.vflags = VFLAG_VERSIONED
+            | (if latest { VFLAG_LATEST } else { 0 })
+            | (if delete_marker {
+                VFLAG_DELETE_MARKER
+            } else {
+                0
+            });
+        self.update_extra(|extra| extra.version_id = id);
+    }
+
+    /// Whether the row is one version of a `list --versions` listing.
+    pub fn is_versioned(&self) -> bool {
+        self.vflags & VFLAG_VERSIONED != 0
+    }
+
+    pub fn is_latest(&self) -> bool {
+        self.vflags & VFLAG_LATEST != 0
+    }
+
+    pub fn is_delete_marker(&self) -> bool {
+        self.vflags & VFLAG_DELETE_MARKER != 0
+    }
+
+    /// Change the extra strings, allocating only when one is set and
+    /// freeing the box when none is left.
+    fn update_extra(&mut self, change: impl FnOnce(&mut ObjectExtra)) {
+        let mut extra = self.extra.take().map(|b| *b).unwrap_or_default();
+        change(&mut extra);
+        if extra != ObjectExtra::default() {
+            self.extra = Some(Box::new(extra));
+        }
     }
 
     /// The ETag as written to outputs: hex MD5 (`-N` for multipart), another
@@ -236,8 +303,8 @@ impl ObjectProps {
         if self.is_common_prefix() {
             return None;
         }
-        if let Some(other) = &self.etag_other {
-            return Some(other.as_str());
+        if let Some(other) = self.etag_other() {
+            return Some(other);
         }
         if self.is_etag_not_avail() {
             return None;
@@ -326,14 +393,14 @@ impl ObjectProps {
     }
 
     pub fn classify_pair(left: &ObjectProps, right: &ObjectProps) -> MatchResult {
-        let same_etag = match (&left.etag_other, &right.etag_other) {
+        let same_etag = match (left.etag_other(), right.etag_other()) {
             (None, None) => {
                 !left.is_etag_not_avail()
                     && !right.is_etag_not_avail()
                     && left.etag() == right.etag()
             }
             // Another vendor's format: equal only verbatim.
-            (Some(a), Some(b)) => a.as_str() == b.as_str(),
+            (Some(a), Some(b)) => a == b,
             _ => false,
         };
         if left.size != right.size || !same_etag {
@@ -435,15 +502,14 @@ pub(crate) fn epoch_secs() -> u64 {
 /// diff compares as text); empty is "not available". Decoding goes through a
 /// scratch buffer: decoding in place left a partial digest that two
 /// different malformed ETags could share — and diff then called them equal.
-#[allow(clippy::box_collection)] // the thin `ObjectProps::etag_other`
-pub(crate) fn parse_etag(text: &str) -> ([u8; 16], u32, Option<Box<String>>) {
+pub(crate) fn parse_etag(text: &str) -> ([u8; 16], u32, Option<String>) {
     let inner = text
         .strip_prefix('"')
         .and_then(|t| t.strip_suffix('"'))
         .unwrap_or(text);
     let (md5, parts) = parse_etag_inner(inner.as_bytes());
     let decoded = parts != 0 || md5 != [0u8; 16];
-    let other = (!decoded && !inner.is_empty()).then(|| Box::new(inner.to_string()));
+    let other = (!decoded && !inner.is_empty()).then(|| inner.to_string());
     (md5, parts, other)
 }
 
@@ -512,13 +578,19 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
         // slices it as bytes, so a multi-byte character cannot panic it.
         let (etag_md5, etag_parts, etag_other) =
             item.e_tag().map_or(([0u8; 16], 0, None), parse_etag);
+        let extra = etag_other.map(|etag_other| {
+            Box::new(ObjectExtra {
+                etag_other: Some(etag_other),
+                version_id: None,
+            })
+        });
         Self {
             flags: OBJECT_PROPS_FLAG_S3_GP_BUCKET,
             status: OBJECT_PROPS_STATUS_OPEN,
             storage_class: item
                 .storage_class()
                 .map_or(0, |c| storage_class_code(c.as_str())),
-            pad: 0,
+            vflags: 0,
             etag_parts,
             last_modified: item
                 .last_modified()
@@ -526,7 +598,7 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
                 .map_or(0, epoch_millis_u64),
             size: item.size().map_or(0, |x| x.max(0) as u64),
             etag_md5,
-            etag_other,
+            extra,
         }
     }
 }
@@ -912,6 +984,8 @@ pub struct S3TaskContext {
     pub addressing_style: String,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
+    /// List every version (ListObjectVersions) instead of current objects.
+    pub versions: bool,
     pub max_attempts: u32,
     /// Seed for the pause between consecutive retries of one segment. Shared
     /// with the SDK's own backoff setting; the app layer owns the retry that
@@ -938,6 +1012,7 @@ pub struct TaskContextParams<'a> {
     pub addressing_style: &'a str,
     pub delimiter: Option<&'a str>,
     pub max_keys: Option<i32>,
+    pub versions: bool,
 }
 
 impl S3TaskContext {
@@ -995,6 +1070,7 @@ impl S3TaskContext {
             addressing_style: p.addressing_style.to_string(),
             delimiter: p.delimiter.map(str::to_string),
             max_keys: p.max_keys,
+            versions: p.versions,
             max_attempts: p.s3_config.max_attempts.max(1),
             initial_backoff_secs: p.s3_config.initial_backoff_secs,
             operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
@@ -1506,7 +1582,7 @@ mod tests {
         let y = ObjectProps::from(&object_with_etag(&format!("\"ab{}\"", "Y".repeat(30))));
         assert_eq!(z.etag_md5, [0; 16]);
         assert_eq!(
-            z.etag_other.as_deref().map(String::as_str),
+            z.etag_other(),
             Some(format!("ab{}", "Z".repeat(30)).as_str())
         );
         assert_eq!(ObjectProps::classify_pair(&z, &y), MatchResult::Astrisk);
@@ -1515,7 +1591,7 @@ mod tests {
         let bad_parts = ObjectProps::from(&object_with_etag(&format!("\"{}-x1\"", digest)));
         assert_eq!(bad_parts.etag_md5, [0; 16]);
         assert_eq!(
-            bad_parts.etag_other.as_deref().map(String::as_str),
+            bad_parts.etag_other(),
             Some(format!("{}-x1", digest).as_str())
         );
     }
@@ -1562,10 +1638,7 @@ mod tests {
         let etag = format!("\u{65e5}{}", "a".repeat(31)); // 34 bytes, byte 1 is mid-char
         assert_eq!(etag.len(), 34);
         let props = ObjectProps::from(&object_with_etag(&etag));
-        assert_eq!(
-            props.etag_other.as_deref().map(String::as_str),
-            Some(etag.as_str())
-        );
+        assert_eq!(props.etag_other(), Some(etag.as_str()));
     }
 
     #[test]
@@ -1577,7 +1650,7 @@ mod tests {
         assert_eq!(etag.as_bytes()[33], b'-');
         let props = ObjectProps::from(&object_with_etag(&etag));
         assert_eq!(props.etag_md5, [0; 16]);
-        assert!(props.etag_other.is_some());
+        assert!(props.etag_other().is_some());
     }
 
     #[test]
@@ -1593,7 +1666,7 @@ mod tests {
         let quoted = ObjectProps::from(&object_with_etag(&format!("\"{}\"", digest)));
         let unquoted = ObjectProps::from(&object_with_etag(digest));
         assert_eq!(unquoted.etag(), quoted.etag());
-        assert!(unquoted.etag_other.is_none());
+        assert!(unquoted.etag_other().is_none());
         // Empty is unavailable, which diff reports as a difference.
         assert!(ObjectProps::from(&object_with_etag("\"\"")).is_etag_not_avail());
         assert!(ObjectProps::from(&object_with_etag("")).is_etag_not_avail());
@@ -1610,11 +1683,7 @@ mod tests {
             ("W/\"abc\"", "W/\"abc\""),
         ] {
             let props = ObjectProps::from(&object_with_etag(etag));
-            assert_eq!(
-                props.etag_other.as_deref().map(String::as_str),
-                Some(kept),
-                "{etag:?}"
-            );
+            assert_eq!(props.etag_other(), Some(kept), "{etag:?}");
             assert!(!props.is_etag_not_avail());
             let mut buf = [0u8; 43];
             assert_eq!(props.etag_text(&mut buf), Some(kept));

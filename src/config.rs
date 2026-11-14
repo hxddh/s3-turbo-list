@@ -61,6 +61,8 @@ pub struct OutputConfig {
     pub row_group_size: usize,
     pub compression: String,
     pub compression_level: u32,
+    /// Write the `s3tl.list-versions/1` schema (`list --versions`).
+    pub versions: bool,
 }
 
 impl Default for OutputConfig {
@@ -69,6 +71,7 @@ impl Default for OutputConfig {
             row_group_size: 100_000,
             compression: "zstd".to_string(),
             compression_level: 1,
+            versions: false,
         }
     }
 }
