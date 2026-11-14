@@ -1,10 +1,11 @@
 use arrow_array::RecordBatch;
 use arrow_array::array::ArrayRef;
-use arrow_array::builder::{StringBuilder, UInt8Builder, UInt64Builder};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::builder::{StringBuilder, TimestampMillisecondBuilder, UInt64Builder};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding};
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
 use std::str::FromStr;
@@ -13,161 +14,312 @@ use tokio::io::AsyncWrite;
 
 use crate::core::{ObjectKey, ObjectProps};
 
-// ── AsyncParquetOutput ─────────────────────────────────────
+// ── Output schemas ─────────────────────────────────────────
 
-pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
-    schema_ref: SchemaRef,
-    writer: AsyncArrowWriter<W>,
-    ks_path: String,
-    total_rows: usize,
-    row_group_size: usize,
-    list_batch: Option<ListParquetBatch>,
+/// Parquet key-value metadata key naming the schema of a file.
+pub const SCHEMA_METADATA_KEY: &str = "s3tl.schema";
+pub const LIST_SCHEMA: &str = "s3tl.list/1";
+pub const DIFF_SCHEMA: &str = "s3tl.diff/1";
+
+/// Which of the two output schemas a writer produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// `key, size, last_modified, etag, storage_class`.
+    List,
+    /// `key, status, left_size, left_last_modified, left_etag, right_size,
+    /// right_last_modified, right_etag`.
+    Diff,
 }
 
-struct ListParquetBatch {
-    key_builder: StringBuilder,
-    size_builder: UInt64Builder,
-    last_modified_builder: UInt64Builder,
-    etag_builder: StringBuilder,
-    diff_flag_builder: UInt8Builder,
-    rows: usize,
+/// How a key differs between the two sides of a diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffStatus {
+    LeftOnly,
+    RightOnly,
+    Changed,
 }
 
-impl ListParquetBatch {
+impl DiffStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiffStatus::LeftOnly => "left_only",
+            DiffStatus::RightOnly => "right_only",
+            DiffStatus::Changed => "changed",
+        }
+    }
+}
+
+/// One row of a diff output.
+#[derive(Debug, Clone)]
+pub struct DiffRow {
+    pub key: ObjectKey,
+    pub status: DiffStatus,
+    pub left: Option<ObjectProps>,
+    pub right: Option<ObjectProps>,
+}
+
+fn timestamp_type() -> DataType {
+    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+}
+
+fn schema_for(layout: Layout) -> SchemaRef {
+    let fields = match layout {
+        Layout::List => vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("last_modified", timestamp_type(), true),
+            Field::new("etag", DataType::Utf8, true),
+            Field::new("storage_class", DataType::Utf8, true),
+        ],
+        Layout::Diff => vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("left_size", DataType::UInt64, true),
+            Field::new("left_last_modified", timestamp_type(), true),
+            Field::new("left_etag", DataType::Utf8, true),
+            Field::new("right_size", DataType::UInt64, true),
+            Field::new("right_last_modified", timestamp_type(), true),
+            Field::new("right_etag", DataType::Utf8, true),
+        ],
+    };
+    Arc::new(Schema::new(fields))
+}
+
+/// `last_modified` of a row: `null` when the endpoint sent none (and for
+/// folder rows).
+fn last_modified_of(props: &ObjectProps) -> Option<i64> {
+    let ms = props.last_modified_millis();
+    (ms != 0).then_some(ms as i64)
+}
+
+/// The three per-object columns of a row, appended together.
+struct ObjectColumns {
+    size: UInt64Builder,
+    last_modified: TimestampMillisecondBuilder,
+    etag: StringBuilder,
+}
+
+impl ObjectColumns {
     fn with_capacity(rows: usize) -> Self {
         Self {
-            key_builder: StringBuilder::with_capacity(rows, rows.saturating_mul(40)),
-            size_builder: UInt64Builder::with_capacity(rows),
-            last_modified_builder: UInt64Builder::with_capacity(rows),
-            etag_builder: StringBuilder::with_capacity(rows, rows.saturating_mul(36)),
-            diff_flag_builder: UInt8Builder::with_capacity(rows),
-            rows: 0,
+            size: UInt64Builder::with_capacity(rows),
+            last_modified: TimestampMillisecondBuilder::with_capacity(rows).with_timezone("UTC"),
+            etag: StringBuilder::with_capacity(rows, rows.saturating_mul(34)),
         }
     }
 
-    fn append(&mut self, key: &ObjectKey, props: &ObjectProps, diff_flag: u8) {
-        let mut etag_buf = [0u8; 43];
-        self.key_builder.append_value(key.as_str());
-        self.size_builder.append_value(props.size());
-        self.last_modified_builder
-            .append_value(props.last_modified());
-        let etag = props.write_etag_to_buffer(&mut etag_buf);
-        self.etag_builder.append_value(etag);
-        self.diff_flag_builder.append_value(diff_flag);
-        self.rows += 1;
+    fn append(&mut self, props: Option<&ObjectProps>) {
+        let Some(props) = props else {
+            self.size.append_null();
+            self.last_modified.append_null();
+            self.etag.append_null();
+            return;
+        };
+        self.size.append_value(props.size());
+        self.last_modified.append_option(last_modified_of(props));
+        if props.is_common_prefix() || props.is_etag_not_avail() {
+            self.etag.append_null();
+        } else {
+            let mut buf = [0u8; 43];
+            self.etag.append_value(props.write_etag_to_buffer(&mut buf));
+        }
     }
 
-    fn finish(mut self, schema_ref: SchemaRef) -> Result<RecordBatch, String> {
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.key_builder.finish()) as ArrayRef,
-            Arc::new(self.size_builder.finish()) as ArrayRef,
-            Arc::new(self.last_modified_builder.finish()) as ArrayRef,
-            Arc::new(self.etag_builder.finish()) as ArrayRef,
-            Arc::new(self.diff_flag_builder.finish()) as ArrayRef,
-        ];
-        RecordBatch::try_new(schema_ref, columns).map_err(|e| format!("RecordBatch error: {}", e))
+    fn finish(mut self, columns: &mut Vec<ArrayRef>) {
+        columns.push(Arc::new(self.size.finish()));
+        columns.push(Arc::new(self.last_modified.finish()));
+        columns.push(Arc::new(self.etag.finish()));
     }
 }
 
-impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
-    pub fn new(buf_wr: W, ks_path: &str) -> Self {
-        Self::new_with_options(buf_wr, ks_path, 10000, "gzip", 6)
+/// Column builders for a batch of rows.
+enum RowBatch {
+    List {
+        key: StringBuilder,
+        object: ObjectColumns,
+        storage_class: StringBuilder,
+        rows: usize,
+    },
+    Diff {
+        key: StringBuilder,
+        status: StringBuilder,
+        left: ObjectColumns,
+        right: ObjectColumns,
+        rows: usize,
+    },
+}
+
+impl RowBatch {
+    fn with_capacity(layout: Layout, rows: usize) -> Self {
+        // Builders grow as needed: cap the up-front reservation.
+        let reserve = rows.min(65_536);
+        match layout {
+            Layout::List => RowBatch::List {
+                key: StringBuilder::with_capacity(reserve, reserve.saturating_mul(40)),
+                object: ObjectColumns::with_capacity(reserve),
+                storage_class: StringBuilder::with_capacity(reserve, reserve.saturating_mul(8)),
+                rows: 0,
+            },
+            Layout::Diff => RowBatch::Diff {
+                key: StringBuilder::with_capacity(reserve, reserve.saturating_mul(40)),
+                status: StringBuilder::with_capacity(reserve, reserve.saturating_mul(9)),
+                left: ObjectColumns::with_capacity(reserve),
+                right: ObjectColumns::with_capacity(reserve),
+                rows: 0,
+            },
+        }
     }
 
-    pub fn new_with_options(
+    fn rows(&self) -> usize {
+        match self {
+            RowBatch::List { rows, .. } | RowBatch::Diff { rows, .. } => *rows,
+        }
+    }
+
+    fn append_list(&mut self, k: &ObjectKey, props: &ObjectProps) {
+        let RowBatch::List {
+            key,
+            object,
+            storage_class,
+            rows,
+        } = self
+        else {
+            unreachable!("list row appended to a diff batch");
+        };
+        key.append_value(k.as_str());
+        object.append(Some(props));
+        match props.storage_class_name() {
+            Some(name) => storage_class.append_value(name),
+            None => storage_class.append_null(),
+        }
+        *rows += 1;
+    }
+
+    fn append_diff(&mut self, row: &DiffRow) {
+        let RowBatch::Diff {
+            key,
+            status,
+            left,
+            right,
+            rows,
+        } = self
+        else {
+            unreachable!("diff row appended to a list batch");
+        };
+        key.append_value(row.key.as_str());
+        status.append_value(row.status.as_str());
+        left.append(row.left.as_ref());
+        right.append(row.right.as_ref());
+        *rows += 1;
+    }
+
+    fn finish(self, schema: SchemaRef) -> Result<RecordBatch, String> {
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(8);
+        match self {
+            RowBatch::List {
+                mut key,
+                object,
+                mut storage_class,
+                ..
+            } => {
+                columns.push(Arc::new(key.finish()));
+                object.finish(&mut columns);
+                columns.push(Arc::new(storage_class.finish()));
+            }
+            RowBatch::Diff {
+                mut key,
+                mut status,
+                left,
+                right,
+                ..
+            } => {
+                columns.push(Arc::new(key.finish()));
+                columns.push(Arc::new(status.finish()));
+                left.finish(&mut columns);
+                right.finish(&mut columns);
+            }
+        }
+        RecordBatch::try_new(schema, columns).map_err(|e| format!("RecordBatch error: {}", e))
+    }
+}
+
+// ── AsyncParquetOutput ─────────────────────────────────────
+
+/// A streaming Parquet writer for one output file.
+pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
+    layout: Layout,
+    schema_ref: SchemaRef,
+    writer: AsyncArrowWriter<W>,
+    total_rows: usize,
+    row_group_size: usize,
+    batch: Option<RowBatch>,
+}
+
+impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
+    /// A writer with the default settings (tests, benchmarks).
+    pub fn new(buf_wr: W, layout: Layout) -> Self {
+        let defaults = crate::config::OutputConfig::default();
+        Self::with_settings(
+            buf_wr,
+            layout,
+            defaults.row_group_size,
+            &defaults.compression,
+            defaults.compression_level,
+        )
+    }
+
+    pub fn with_settings(
         buf_wr: W,
-        ks_path: &str,
+        layout: Layout,
         row_group_size: usize,
         compression_name: &str,
         compression_level: u32,
     ) -> Self {
-        let field_key = Field::new("Key", DataType::Utf8, false);
-        let field_size = Field::new("Size", DataType::UInt64, false);
-        let field_last_modified = Field::new("LastModified", DataType::UInt64, false);
-        let field_etag = Field::new("ETag", DataType::Utf8, false);
-        let field_diff_flag = Field::new("DiffFlag", DataType::UInt8, false);
-
-        let schema_ref = Arc::new(Schema::new(vec![
-            field_key,
-            field_size,
-            field_last_modified,
-            field_etag,
-            field_diff_flag,
-        ]));
-
+        let schema_ref = schema_for(layout);
         let compression = parse_compression(compression_name, compression_level);
-        let writer_props = WriterProperties::builder()
+        let mut props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_encoding(Encoding::PLAIN)
             // Chunk-level statistics instead of the per-page default: readers
-            // of these listings scan whole files, so page-level min/max on the
-            // near-unique Key/ETag strings costs encode CPU without buying
-            // pruning. Chunk keeps coarse row-group pruning intact.
+            // scan whole files, so page-level min/max on near-unique strings
+            // costs encode CPU without buying pruning.
             .set_statistics_enabled(EnabledStatistics::Chunk)
-            // Key and ETag are near-unique per row: a dictionary never pays
-            // for itself, and building one means hashing every value until
-            // the dictionary page overflows and the writer falls back to
-            // plain anyway. Size, LastModified and DiffFlag keep it.
-            .set_column_dictionary_enabled(ColumnPath::from("Key"), false)
-            .set_column_dictionary_enabled(ColumnPath::from("ETag"), false)
             .set_compression(compression)
             .set_max_row_group_row_count(Some(row_group_size.max(1)))
-            .build();
-
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                SCHEMA_METADATA_KEY.to_string(),
+                match layout {
+                    Layout::List => LIST_SCHEMA,
+                    Layout::Diff => DIFF_SCHEMA,
+                }
+                .to_string(),
+            )]));
+        // Keys and ETags are near-unique per row: a dictionary never pays for
+        // itself, and building one hashes every value until it overflows.
+        for column in ["key", "etag", "left_etag", "right_etag"] {
+            props = props.set_column_dictionary_enabled(ColumnPath::from(column), false);
+        }
         let writer =
-            AsyncArrowWriter::try_new(buf_wr, Arc::clone(&schema_ref), Some(writer_props)).unwrap();
-
+            AsyncArrowWriter::try_new(buf_wr, Arc::clone(&schema_ref), Some(props.build()))
+                .expect("the output schema is valid");
         Self {
+            layout,
             schema_ref,
             writer,
-            ks_path: ks_path.to_string(),
             total_rows: 0,
             row_group_size: row_group_size.max(1),
-            list_batch: None,
+            batch: None,
         }
-    }
-
-    pub fn ks_path(&self) -> &str {
-        &self.ks_path
     }
 
     pub fn total_rows(&self) -> usize {
-        self.total_rows
-            + self
-                .list_batch
-                .as_ref()
-                .map(|batch| batch.rows)
-                .unwrap_or(0)
+        self.total_rows + self.batch.as_ref().map_or(0, RowBatch::rows)
     }
 
-    /// Write rows that each carry their own DiffFlag as one record batch.
-    /// Diff rows arrive in merged key order; keeping the flag per row (rather
-    /// than one batch per flag) is what keeps the file in that order.
-    pub async fn write_flagged_rows(
-        &mut self,
-        rows: Vec<(ObjectKey, ObjectProps, u8)>,
-    ) -> Result<(), String> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut batch = ListParquetBatch::with_capacity(rows.len());
-        for (key, props, flag) in &rows {
-            batch.append(key, props, *flag);
-        }
-        let count = batch.rows;
-        let record_batch = batch.finish(Arc::clone(&self.schema_ref))?;
-        self.writer
-            .write(&record_batch)
-            .await
-            .map_err(|e| format!("Parquet write error: {}", e))?;
-        self.total_rows += count;
-        Ok(())
-    }
-
+    /// Write the rows of a list batch that `include` accepts.
     pub async fn write_list_batch_filtered<F>(
         &mut self,
         v: Vec<(ObjectKey, ObjectProps)>,
-        diff_flag: u8,
         mut include: F,
     ) -> Result<usize, String>
     where
@@ -178,36 +330,36 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
             if !include(key, props) {
                 continue;
             }
-
-            self.ensure_list_batch();
+            let (layout, cap) = (self.layout, self.row_group_size);
             let batch = self
-                .list_batch
-                .as_mut()
-                .expect("list batch must exist after ensure");
-            batch.append(key, props, diff_flag);
+                .batch
+                .get_or_insert_with(|| RowBatch::with_capacity(layout, cap));
+            batch.append_list(key, props);
             count += 1;
-
-            if batch.rows >= self.row_group_size {
-                self.flush_list_batch().await?;
+            if batch.rows() >= self.row_group_size {
+                self.flush().await?;
             }
         }
         Ok(count)
     }
 
-    fn ensure_list_batch(&mut self) {
-        if self.list_batch.is_none() {
-            self.list_batch = Some(ListParquetBatch::with_capacity(self.row_group_size));
+    /// Write diff rows (in merged key order) as one record batch.
+    pub async fn write_diff_rows(&mut self, rows: Vec<DiffRow>) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
         }
+        let mut batch = RowBatch::with_capacity(self.layout, rows.len());
+        for row in &rows {
+            batch.append_diff(row);
+        }
+        self.write_batch(batch).await
     }
 
-    async fn flush_list_batch(&mut self) -> Result<(), String> {
-        let Some(batch) = self.list_batch.take() else {
-            return Ok(());
-        };
-        if batch.rows == 0 {
+    async fn write_batch(&mut self, batch: RowBatch) -> Result<(), String> {
+        let rows = batch.rows();
+        if rows == 0 {
             return Ok(());
         }
-        let rows = batch.rows;
         let record_batch = batch.finish(Arc::clone(&self.schema_ref))?;
         self.writer
             .write(&record_batch)
@@ -217,8 +369,15 @@ impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
         Ok(())
     }
 
+    async fn flush(&mut self) -> Result<(), String> {
+        match self.batch.take() {
+            Some(batch) => self.write_batch(batch).await,
+            None => Ok(()),
+        }
+    }
+
     pub async fn close(mut self) -> Result<(), String> {
-        self.flush_list_batch().await?;
+        self.flush().await?;
         self.writer
             .close()
             .await

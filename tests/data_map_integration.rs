@@ -1,11 +1,12 @@
 // Integration tests for the streaming diff merge (data_map::run_diff_merge):
-// classification, ordering guard, KS output, and Parquet DiffFlag content.
+// classification, ordering guard, and the diff Parquet's rows (differing
+// keys only, with both sides' values).
 
 use s3tl::core::{
     ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
 };
 use s3tl::data_map::{DiffMergeOutcome, DiffStreamSides, run_diff_merge};
-use s3tl::utils::AsyncParquetOutput;
+use s3tl::utils::{AsyncParquetOutput, Layout};
 
 type Batch = Vec<(ObjectKey, ObjectProps)>;
 
@@ -24,11 +25,33 @@ fn right_obj(key: &str, size: u64, etag: [u8; 16]) -> (ObjectKey, ObjectProps) {
 }
 
 /// Run the merge over in-memory batches; returns the outcome plus the
-/// (key, DiffFlag) rows read back from the Parquet bytes.
+/// (key, status) rows read back from the Parquet bytes.
 async fn merge(
     left_batches: Vec<Batch>,
     right_batches: Vec<Batch>,
-) -> Result<(DiffMergeOutcome, Vec<(String, u8)>), String> {
+) -> Result<(DiffMergeOutcome, Vec<(String, String)>), String> {
+    let (outcome, rows) = merge_full(left_batches, right_batches).await?;
+    Ok((
+        outcome,
+        rows.into_iter().map(|r| (r.key, r.status)).collect(),
+    ))
+}
+
+/// One diff output row as read back.
+#[derive(Debug, PartialEq)]
+struct Row {
+    key: String,
+    status: String,
+    left_size: Option<u64>,
+    right_size: Option<u64>,
+    left_etag: Option<String>,
+    right_etag: Option<String>,
+}
+
+async fn merge_full(
+    left_batches: Vec<Batch>,
+    right_batches: Vec<Batch>,
+) -> Result<(DiffMergeOutcome, Vec<Row>), String> {
     let (ltx, lrx) = tokio::sync::mpsc::channel(8);
     let (rtx, rrx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
@@ -50,13 +73,13 @@ async fn merge(
     let parquet_path = dir.path().join("diff.parquet");
     let file = tokio::fs::File::create(&parquet_path).await.unwrap();
     let writer = tokio::io::BufWriter::new(file);
-    let mut parquet = AsyncParquetOutput::new(writer, "unused.ks");
+    let mut parquet = AsyncParquetOutput::new(writer, Layout::Diff);
     let outcome = run_diff_merge(
         DiffStreamSides {
             left: vec![lrx],
             right: vec![rrx],
         },
-        &mut parquet,
+        Some(&mut parquet),
         || false,
     )
     .await?;
@@ -67,27 +90,43 @@ async fn merge(
         .unwrap()
         .build()
         .unwrap();
+    use arrow::array::{Array, StringArray, UInt64Array};
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch.unwrap();
-        let keys = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        let flags = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt8Array>()
-            .unwrap();
+        let col = |name: &str| batch.column_by_name(name).unwrap().clone();
+        let strings = |name: &str| {
+            let c = col(name);
+            let a = c.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                .collect::<Vec<_>>()
+        };
+        let sizes = |name: &str| {
+            let c = col(name);
+            let a = c.as_any().downcast_ref::<UInt64Array>().unwrap().clone();
+            (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                .collect::<Vec<_>>()
+        };
+        let (keys, statuses) = (strings("key"), strings("status"));
+        let (left_size, right_size) = (sizes("left_size"), sizes("right_size"));
+        let (left_etag, right_etag) = (strings("left_etag"), strings("right_etag"));
         for i in 0..batch.num_rows() {
-            rows.push((keys.value(i).to_string(), flags.value(i)));
+            rows.push(Row {
+                key: keys[i].clone().unwrap(),
+                status: statuses[i].clone().unwrap(),
+                left_size: left_size[i],
+                right_size: right_size[i],
+                left_etag: left_etag[i].clone(),
+                right_etag: right_etag[i].clone(),
+            });
         }
     }
     // The file itself must be in merged key order (not re-sorted here): readers
     // merge-join it and prune on the Key column's statistics.
     assert!(
-        rows.windows(2).all(|w| w[0].0 <= w[1].0),
+        rows.windows(2).all(|w| w[0].key <= w[1].key),
         "diff Parquet rows are not in key order: {:?}",
         rows
     );
@@ -114,18 +153,18 @@ async fn test_merge_classifies_all_diff_flags() {
     assert_eq!(outcome.plus, 1);
     assert_eq!(outcome.minus, 1);
     assert_eq!(outcome.astrisk, 2);
-    assert_eq!(outcome.rows, 5);
+    assert_eq!(outcome.rows, 4, "equal keys are counted, not written");
     assert_eq!(outcome.received_objects, 8);
     assert_eq!(outcome.unique_prefixes(), 3);
 
+    let s = |k: &str, f: &str| (k.to_string(), f.to_string());
     assert_eq!(
         rows,
         vec![
-            ("a/equal.txt".to_string(), 0),
-            ("a/left_only.txt".to_string(), 1),
-            ("b/changed_etag.txt".to_string(), 3),
-            ("b/changed_size.txt".to_string(), 3),
-            ("c/right_only.txt".to_string(), 2),
+            s("a/left_only.txt", "left_only"),
+            s("b/changed_etag.txt", "changed"),
+            s("b/changed_size.txt", "changed"),
+            s("c/right_only.txt", "right_only"),
         ]
     );
 }
@@ -137,7 +176,7 @@ async fn test_merge_unavailable_etag_is_astrisk() {
     let right = vec![vec![right_obj("k.txt", 100, [0; 16])]];
     let (outcome, rows) = merge(left, right).await.unwrap();
     assert_eq!(outcome.astrisk, 1);
-    assert_eq!(rows, vec![("k.txt".to_string(), 3)]);
+    assert_eq!(rows, vec![("k.txt".to_string(), "changed".to_string())]);
 }
 
 #[tokio::test]
@@ -151,7 +190,7 @@ async fn test_merge_handles_uneven_batches_and_one_empty_side() {
     let (outcome, rows) = merge(left, vec![]).await.unwrap();
     assert_eq!(outcome.plus, 4);
     assert_eq!(outcome.rows, 4);
-    assert!(rows.iter().all(|(_, flag)| *flag == 1));
+    assert!(rows.iter().all(|(_, status)| status == "left_only"));
 }
 
 #[tokio::test]
@@ -180,7 +219,7 @@ async fn test_merge_same_side_duplicate_keeps_latest() {
     let right = vec![vec![right_obj("dup.txt", 2, [2; 16])]];
     let (outcome, rows) = merge(left, right).await.unwrap();
     assert_eq!(outcome.equal, 1, "latest duplicate entry should win");
-    assert_eq!(rows, vec![("dup.txt".to_string(), 0)]);
+    assert!(rows.is_empty(), "equal keys are not written");
 }
 
 /// Guards the parallel-diff completion contract: the merge consumes each
@@ -238,11 +277,11 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
     let parquet_path = dir.path().join("diff.parquet");
     let file = tokio::fs::File::create(&parquet_path).await.unwrap();
     let writer = tokio::io::BufWriter::new(file);
-    let mut parquet = AsyncParquetOutput::new(writer, "unused.ks");
+    let mut parquet = AsyncParquetOutput::new(writer, Layout::Diff);
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_diff_merge(DiffStreamSides { left, right }, &mut parquet, || false),
+        run_diff_merge(DiffStreamSides { left, right }, Some(&mut parquet), || false),
     )
     .await
     .expect("diff merge over many parallel segments must not hang")
@@ -250,30 +289,78 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
     parquet.close().await.unwrap();
 
     let total = SEGMENTS * KEYS_PER_SEGMENT;
-    assert_eq!(outcome.rows, total, "every key should produce one row");
+    assert_eq!(outcome.rows, 0, "identical sides write no rows");
     assert_eq!(
         outcome.equal, total,
         "identical sides should classify every key equal"
     );
     assert_eq!(outcome.received_objects, total * 2);
-    assert_eq!(outcome.unique_prefixes(), SEGMENTS);
+    assert_eq!(outcome.unique_prefixes(), 0, "prefix stats cover differing keys");
 }
 
 #[tokio::test]
-async fn test_merge_writes_ks_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let ks_path = dir.path().join("diff.ks");
-
+async fn test_diff_rows_carry_both_sides() {
     let left = vec![vec![
-        left_obj("a/1", 1, [1; 16]),
-        left_obj("a/2", 1, [1; 16]),
-        left_obj("b/1", 1, [1; 16]),
+        left_obj("a", 1, [1; 16]),
+        left_obj("b", 5, [2; 16]),
     ]];
-    let (outcome, _rows) = merge(left, vec![]).await.unwrap();
-    let entries = outcome.write_ks(ks_path.to_str().unwrap()).await.unwrap();
-    assert_eq!(entries, 2);
-    let content = std::fs::read_to_string(&ks_path).unwrap();
-    assert_eq!(content, "\"a/\",\"2\"\n\"b/\",\"1\"\n");
+    let right = vec![vec![
+        right_obj("b", 7, [3; 16]),
+        right_obj("c", 9, [4; 16]),
+    ]];
+    let (_, rows) = merge_full(left, right).await.unwrap();
+    let hex = |b: u8| Some(format!("{:02x}", b).repeat(16));
+    assert_eq!(
+        rows,
+        vec![
+            Row {
+                key: "a".into(),
+                status: "left_only".into(),
+                left_size: Some(1),
+                right_size: None,
+                left_etag: hex(1),
+                right_etag: None,
+            },
+            Row {
+                key: "b".into(),
+                status: "changed".into(),
+                left_size: Some(5),
+                right_size: Some(7),
+                left_etag: hex(2),
+                right_etag: hex(3),
+            },
+            Row {
+                key: "c".into(),
+                status: "right_only".into(),
+                left_size: None,
+                right_size: Some(9),
+                left_etag: None,
+                right_etag: hex(4),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_merge_without_output_only_counts() {
+    let (ltx, lrx) = tokio::sync::mpsc::channel(8);
+    let (rtx, rrx) = tokio::sync::mpsc::channel(8);
+    ltx.send(vec![left_obj("a", 1, [1; 16]), left_obj("b", 1, [1; 16])])
+        .await
+        .unwrap();
+    rtx.send(vec![right_obj("b", 1, [1; 16])]).await.unwrap();
+    drop((ltx, rtx));
+    let outcome = run_diff_merge::<tokio::io::Sink>(
+        DiffStreamSides {
+            left: vec![lrx],
+            right: vec![rrx],
+        },
+        None,
+        || false,
+    )
+    .await
+    .unwrap();
+    assert_eq!((outcome.plus, outcome.equal, outcome.rows), (1, 1, 1));
 }
 
 // ── Quit-path drain (interrupt + --resume data-loss guard) ─────────────
@@ -323,17 +410,16 @@ async fn test_list_streaming_quit_drains_buffered_batches() {
     g_state.quit();
 
     let dir = tempfile::tempdir().unwrap();
-    let parquet_path = dir.path().join("quit.parquet");
-    let ks_path = dir.path().join("quit.ks");
     let ctx = DataMapContext::new(rx, g_state.clone());
     s3tl::data_map::data_map_task_list_streaming(
         ctx,
-        ks_path.to_str().unwrap(),
-        parquet_path.to_str().unwrap(),
+        dir.path().to_path_buf(),
+        0,
         OutputConfig::default(),
     )
     .await;
     drop(tx);
+    let parquet_path = s3tl::data_map::tmp_part_path(dir.path(), 0);
 
     let std_file = std::fs::File::open(&parquet_path).unwrap();
     let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std_file)
@@ -413,13 +499,13 @@ async fn test_merge_stops_consuming_input_after_writer_failure() {
     // arrow writer to hit the failing sink on the first flushed batch
     // instead of buffering it in memory.
     let mut parquet =
-        AsyncParquetOutput::new_with_options(FailingWriter, "unused.ks", 512, "uncompressed", 0);
+        AsyncParquetOutput::with_settings(FailingWriter, Layout::Diff, 512, "uncompressed", 0);
     let err = run_diff_merge(
         DiffStreamSides {
             left: vec![rx],
             right: vec![],
         },
-        &mut parquet,
+        Some(&mut parquet),
         || false,
     )
     .await
@@ -460,13 +546,13 @@ async fn test_merge_aborts_when_the_run_is_failing() {
             .await;
     });
 
-    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), "unused.ks");
+    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), Layout::Diff);
     let err = run_diff_merge(
         DiffStreamSides {
             left: vec![lrx],
             right: vec![rrx],
         },
-        &mut parquet,
+        Some(&mut parquet),
         || true,
     )
     .await
@@ -486,13 +572,13 @@ async fn test_merge_completes_when_not_aborted() {
         let _ = ltx.send(vec![left_obj("a.txt", 1, [0u8; 16])]).await;
     });
 
-    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), "unused.ks");
+    let mut parquet = AsyncParquetOutput::new(tokio::io::sink(), Layout::Diff);
     let outcome = run_diff_merge(
         DiffStreamSides {
             left: vec![lrx],
             right: vec![rrx],
         },
-        &mut parquet,
+        Some(&mut parquet),
         || false,
     )
     .await
@@ -548,7 +634,7 @@ async fn test_merge_fails_when_run_aborts_as_the_last_segment_ends() {
     let file = tokio::fs::File::create(dir.path().join("d.parquet"))
         .await
         .unwrap();
-    let mut parquet = AsyncParquetOutput::new(tokio::io::BufWriter::new(file), "unused.ks");
+    let mut parquet = AsyncParquetOutput::new(tokio::io::BufWriter::new(file), Layout::Diff);
     let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = aborted.clone();
     // The abort lands after the loop's last top-of-iteration check (calls 0
@@ -559,7 +645,7 @@ async fn test_merge_fails_when_run_aborts_as_the_last_segment_ends() {
             left: vec![lrx],
             right: vec![rrx],
         },
-        &mut parquet,
+        Some(&mut parquet),
         move || {
             let calls = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if calls >= 2 {

@@ -139,11 +139,15 @@ pub struct ObjectProps {
     pub(crate) flags: u8,
     #[serde(skip)]
     pub(crate) status: u8,
+    /// `storage_class_code` of the object's StorageClass (0: none).
+    #[serde(skip)]
+    pub(crate) storage_class: u8,
     #[serde(skip)]
     #[allow(dead_code)] // explicit padding: keeps the layout of this hot struct fixed
-    pub(crate) pad: u16,
+    pub(crate) pad: u8,
     #[serde(skip)]
     pub(crate) etag_parts: u32,
+    /// LastModified in milliseconds since the epoch (0: unknown).
     pub last_modified: u64,
     pub size: u64,
     #[serde(skip)]
@@ -157,6 +161,7 @@ impl ObjectProps {
         Self {
             flags: dir,
             status: OBJECT_PROPS_STATUS_OPEN,
+            storage_class: 0,
             pad: 0,
             etag_parts: 0,
             last_modified: 0,
@@ -185,8 +190,22 @@ impl ObjectProps {
     pub fn size(&self) -> u64 {
         self.size
     }
-    pub fn last_modified(&self) -> u64 {
+    /// LastModified in milliseconds since the epoch (0: unknown).
+    pub fn last_modified_millis(&self) -> u64 {
         self.last_modified
+    }
+
+    pub fn set_last_modified_millis(&mut self, ms: u64) {
+        self.last_modified = ms;
+    }
+
+    /// The object's StorageClass, when the endpoint sent one.
+    pub fn storage_class_name(&self) -> Option<&'static str> {
+        storage_class_name(self.storage_class)
+    }
+
+    pub fn set_storage_class(&mut self, name: &str) {
+        self.storage_class = storage_class_code(name);
     }
 
     pub fn is_etag_not_avail(&self) -> bool {
@@ -274,12 +293,81 @@ impl ObjectProps {
     }
 }
 
-/// Seconds since the epoch as stored in `LastModified`. Timestamps before
-/// 1970 (Go-based stores send the zero time `0001-01-01T00:00:00Z`) clamp to
-/// 0: the old `as u64` cast wrapped them to ~1.8e19, which filters on
-/// `last_modified` could not compare, so both `>` and `<` kept every row.
-pub(crate) fn epoch_secs_u64(secs: i64) -> u64 {
-    secs.max(0) as u64
+/// Milliseconds since the epoch as stored in `last_modified`. Timestamps
+/// before 1970 (Go-based stores send the zero time `0001-01-01T00:00:00Z`)
+/// clamp to 0 ("unknown") instead of wrapping around.
+pub(crate) fn epoch_millis_u64(ms: i64) -> u64 {
+    ms.max(0) as u64
+}
+
+// ── Storage classes ────────────────────────────────────────
+
+/// StorageClass values S3 defines; their code is index + 1.
+const KNOWN_STORAGE_CLASSES: [&str; 11] = [
+    "STANDARD",
+    "REDUCED_REDUNDANCY",
+    "GLACIER",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "DEEP_ARCHIVE",
+    "OUTPOSTS",
+    "GLACIER_IR",
+    "SNOW",
+    "EXPRESS_ONEZONE",
+];
+
+/// Code for every class beyond the interning limit.
+const OTHER_STORAGE_CLASS: u8 = u8::MAX;
+
+/// Vendor storage classes seen in this process (codes after the known
+/// ones). Names are leaked: a bucket uses a handful of classes at most, and
+/// the table is bounded by the code space.
+static EXTRA_STORAGE_CLASSES: std::sync::RwLock<Vec<&'static str>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// The one-byte code of a StorageClass name (0: none).
+pub fn storage_class_code(name: &str) -> u8 {
+    if name.is_empty() {
+        return 0;
+    }
+    if let Some(i) = KNOWN_STORAGE_CLASSES.iter().position(|k| *k == name) {
+        return i as u8 + 1;
+    }
+    let base = KNOWN_STORAGE_CLASSES.len() + 1;
+    if let Some(i) = EXTRA_STORAGE_CLASSES
+        .read()
+        .unwrap()
+        .iter()
+        .position(|k| *k == name)
+    {
+        return (base + i) as u8;
+    }
+    let mut extra = EXTRA_STORAGE_CLASSES.write().unwrap();
+    if let Some(i) = extra.iter().position(|k| *k == name) {
+        return (base + i) as u8;
+    }
+    if base + extra.len() >= OTHER_STORAGE_CLASS as usize {
+        return OTHER_STORAGE_CLASS;
+    }
+    extra.push(Box::leak(name.to_string().into_boxed_str()));
+    (base + extra.len() - 1) as u8
+}
+
+/// The StorageClass name of a code (`None` for 0).
+pub fn storage_class_name(code: u8) -> Option<&'static str> {
+    match code {
+        0 => None,
+        OTHER_STORAGE_CLASS => Some("OTHER"),
+        c if (c as usize) <= KNOWN_STORAGE_CLASSES.len() => {
+            Some(KNOWN_STORAGE_CLASSES[c as usize - 1])
+        }
+        c => EXTRA_STORAGE_CLASSES
+            .read()
+            .unwrap()
+            .get(c as usize - KNOWN_STORAGE_CLASSES.len() - 1)
+            .copied(),
+    }
 }
 
 /// The current time in whole seconds since the epoch (0 if the clock is set
@@ -379,10 +467,16 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
         Self {
             flags: OBJECT_PROPS_FLAG_S3_GP_BUCKET,
             status: OBJECT_PROPS_STATUS_OPEN,
+            storage_class: item
+                .storage_class()
+                .map_or(0, |c| storage_class_code(c.as_str())),
             pad: 0,
             etag_parts,
-            last_modified: item.last_modified().map_or(0, |x| epoch_secs_u64(x.secs())),
-            size: item.size().map_or(0, |x| x as u64),
+            last_modified: item
+                .last_modified()
+                .and_then(|x| x.to_millis().ok())
+                .map_or(0, epoch_millis_u64),
+            size: item.size().map_or(0, |x| x.max(0) as u64),
             etag_md5,
         }
     }
@@ -1020,6 +1114,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_classes_roundtrip_including_vendor_names() {
+        assert_eq!(storage_class_code(""), 0);
+        assert_eq!(storage_class_name(0), None);
+        for name in ["STANDARD", "GLACIER_IR", "EXPRESS_ONEZONE"] {
+            assert_eq!(storage_class_name(storage_class_code(name)), Some(name));
+        }
+        let vendor = storage_class_code("ARCHIVE_COLD_X");
+        assert!(vendor as usize > KNOWN_STORAGE_CLASSES.len());
+        assert_eq!(storage_class_code("ARCHIVE_COLD_X"), vendor);
+        assert_eq!(storage_class_name(vendor), Some("ARCHIVE_COLD_X"));
+    }
+
+    #[test]
+    fn object_conversion_keeps_millis_and_storage_class() {
+        let object = aws_sdk_s3::types::Object::builder()
+            .key("k")
+            .last_modified(aws_sdk_s3::primitives::DateTime::from_millis(1_767_225_600_123))
+            .storage_class(aws_sdk_s3::types::ObjectStorageClass::StandardIa)
+            .build();
+        let props = ObjectProps::from(&object);
+        assert_eq!(props.last_modified_millis(), 1_767_225_600_123);
+        assert_eq!(props.storage_class_name(), Some("STANDARD_IA"));
+    }
+
+    #[test]
     fn decode_hex16_matches_the_hex_crate_for_every_byte_at_every_position() {
         let base = *b"0123456789abcdefABCDEF0123456789";
         for pos in 0..32 {
@@ -1309,7 +1428,7 @@ mod tests {
             .key("k")
             .last_modified(aws_sdk_s3::primitives::DateTime::from_secs(-62_135_596_800))
             .build();
-        assert_eq!(ObjectProps::from(&object).last_modified(), 0);
+        assert_eq!(ObjectProps::from(&object).last_modified_millis(), 0);
     }
 
     #[test]

@@ -8,13 +8,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
 use crate::core::{self, DataMapContext, MatchResult, ObjectKey, ObjectProps};
+use crate::utils::{DiffRow, DiffStatus};
 
 // ── Output direction flags ─────────────────────────────────
 
-const OUTPUT_FLAG_EQUAL: u8 = 0;
-const OUTPUT_FLAG_PLUS: u8 = 1;
-const OUTPUT_FLAG_MINUS: u8 = 2;
-const OUTPUT_FLAG_ASTRISK: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct ListStreamingStats {
@@ -224,9 +221,9 @@ async fn list_output_worker(
         }
     };
     let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
-    let mut parquet = crate::utils::AsyncParquetOutput::new_with_options(
+    let mut parquet = crate::utils::AsyncParquetOutput::with_settings(
         buf_writer,
-        &part_path,
+        crate::utils::Layout::List,
         output_config.row_group_size,
         &output_config.compression,
         output_config.compression_level,
@@ -753,7 +750,7 @@ async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     // manifest metrics agree across parquet/tsv/ndjson/summary-only runs; the
     // matching KS prefix counts are kept by the coordinator.
     let written = parquet
-        .write_list_batch_filtered(batch, OUTPUT_FLAG_EQUAL, |_key, props| {
+        .write_list_batch_filtered(batch, |_key, props| {
             let include = props.include_in_list_output();
             if include {
                 stats.bytes_total = stats.bytes_total.saturating_add(props.size());
@@ -793,7 +790,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         rows += 1;
         bytes = bytes.saturating_add(props.size());
 
-        if let Err(e) = render_text_row(&mut out, key.as_str(), props.size(), props.last_modified())
+        if let Err(e) = render_text_row(&mut out, key.as_str(), &props)
         {
             log::error!("NDJSON serialization error for '{}': {}", key, e);
             return false;
@@ -820,25 +817,86 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
     true
 }
 
-/// Render one NDJSON list row. Hand-rolled (no `fmt` machinery or per-row
-/// struct serialization) because it runs once per object on the stdout hot
-/// path; the bytes are identical to `serde_json`'s rendering.
+/// Render one NDJSON list row:
+/// `{"key":..,"size":..,"last_modified":"…Z"|null,"etag":..|null,"storage_class":..|null}`
+/// — the Parquet list schema's columns. Hand-rolled (no per-row struct
+/// serialization) because it runs once per object on the stdout hot path.
 fn render_text_row(
     out: &mut Vec<u8>,
     key: &str,
-    size: u64,
-    last_modified: u64,
+    props: &ObjectProps,
 ) -> Result<(), serde_json::Error> {
     let mut ints = itoa::Buffer::new();
-    // Only the key needs JSON string escaping.
-    out.extend_from_slice(b"{\"k\":");
+    // Only the key needs JSON string escaping; the other strings are ASCII
+    // without quotes or backslashes (hex ETags, S3 storage class names).
+    out.extend_from_slice(b"{\"key\":");
     serde_json::to_writer(&mut *out, key)?;
-    out.extend_from_slice(b",\"s\":");
-    out.extend_from_slice(ints.format(size).as_bytes());
-    out.extend_from_slice(b",\"m\":");
-    out.extend_from_slice(ints.format(last_modified).as_bytes());
+    out.extend_from_slice(b",\"size\":");
+    out.extend_from_slice(ints.format(props.size()).as_bytes());
+    out.extend_from_slice(b",\"last_modified\":");
+    match props.last_modified_millis() {
+        0 => out.extend_from_slice(b"null"),
+        ms => {
+            out.push(b'"');
+            push_rfc3339_millis(out, ms);
+            out.push(b'"');
+        }
+    }
+    out.extend_from_slice(b",\"etag\":");
+    if props.is_common_prefix() || props.is_etag_not_avail() {
+        out.extend_from_slice(b"null");
+    } else {
+        let mut buf = [0u8; 43];
+        out.push(b'"');
+        out.extend_from_slice(props.write_etag_to_buffer(&mut buf).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b",\"storage_class\":");
+    match props.storage_class_name() {
+        None => out.extend_from_slice(b"null"),
+        Some(name) => serde_json::to_writer(&mut *out, name)?,
+    }
     out.extend_from_slice(b"}\n");
     Ok(())
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` of epoch milliseconds (civil-from-days,
+/// Howard Hinnant's algorithm), without chrono's formatting machinery.
+fn push_rfc3339_millis(out: &mut Vec<u8>, ms: u64) {
+    let secs = ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let mut two = |v: u64, out: &mut Vec<u8>| {
+        out.push(b'0' + (v / 10) as u8);
+        out.push(b'0' + (v % 10) as u8);
+    };
+    let year = year.clamp(0, 9999) as u64;
+    two(year / 100, out);
+    two(year % 100, out);
+    out.push(b'-');
+    two(month as u64, out);
+    out.push(b'-');
+    two(day as u64, out);
+    out.push(b'T');
+    two(rem / 3600, out);
+    out.push(b':');
+    two(rem / 60 % 60, out);
+    out.push(b':');
+    two(rem % 60, out);
+    out.push(b'.');
+    let frac = ms % 1000;
+    out.push(b'0' + (frac / 100) as u8);
+    two(frac % 100, out);
+    out.push(b'Z');
 }
 
 fn ingest_list_summary_batch(
@@ -1141,14 +1199,12 @@ impl DiffSideStream {
     }
 }
 
-/// Buffered streaming row sink: rows accumulate in merge (key) order, each
-/// with its DiffFlag, and flush as Parquet batches; per-prefix counts feed the
-/// KS file.  (Buffering per flag instead wrote each flag's rows in clumps, so
-/// a diff file was not in key order and its Key statistics could not prune.)
+/// Buffered streaming row sink: differing rows accumulate in merge (key)
+/// order and flush as Parquet batches, so the file stays in key order.
 struct DiffRowSink {
     /// Whether rows are handed to a writer (`false`: counts only).
     write: bool,
-    buf: Vec<(ObjectKey, ObjectProps, u8)>,
+    buf: Vec<DiffRow>,
     prefix_stats: PrefixStats,
     // Merged rows arrive in key order, so consecutive rows share a prefix:
     // fold runs instead of a hash lookup per row, as the list paths do.
@@ -1158,7 +1214,6 @@ struct DiffRowSink {
     minus: usize,
     astrisk: usize,
     equal: usize,
-    ignored: usize,
 }
 
 const DIFF_SINK_FLUSH_ROWS: usize = 8192;
@@ -1168,7 +1223,7 @@ const DIFF_SINK_FLUSH_ROWS: usize = 8192;
 const DIFF_WRITE_PIPELINE_CAP: usize = 4;
 
 /// A flushed row batch on its way to the Parquet writer loop.
-type DiffWriteBatch = Vec<(ObjectKey, ObjectProps, u8)>;
+type DiffWriteBatch = Vec<DiffRow>;
 
 impl DiffRowSink {
     fn new(write: bool) -> Self {
@@ -1182,36 +1237,34 @@ impl DiffRowSink {
             minus: 0,
             astrisk: 0,
             equal: 0,
-            ignored: 0,
         }
     }
 
+    /// Count an equal key; it is never written.
+    fn push_equal(&mut self) {
+        self.equal += 1;
+    }
+
+    /// Count a differing key and queue its row.
     async fn push(
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
-        flag: u8,
-        key: ObjectKey,
-        props: ObjectProps,
+        row: DiffRow,
     ) -> Result<(), String> {
-        match flag {
-            OUTPUT_FLAG_PLUS => self.plus += 1,
-            OUTPUT_FLAG_MINUS => self.minus += 1,
-            OUTPUT_FLAG_ASTRISK => self.astrisk += 1,
-            _ => {
-                // Equal keys are counted, never written: the output holds
-                // only differences.
-                self.equal += 1;
-                return Ok(());
-            }
+        match row.status {
+            DiffStatus::LeftOnly => self.plus += 1,
+            DiffStatus::RightOnly => self.minus += 1,
+            DiffStatus::Changed => self.astrisk += 1,
         }
         // Prefix stats (bytes, top prefixes) describe the differing rows.
+        let size = row.left.as_ref().or(row.right.as_ref()).map_or(0, |p| p.size());
         self.prefix_run
-            .add(&mut self.prefix_stats, key.prefix(), props.size());
+            .add(&mut self.prefix_stats, row.key.prefix(), size);
         self.rows += 1;
         if !self.write {
             return Ok(());
         }
-        self.buf.push((key, props, flag));
+        self.buf.push(row);
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
             let batch = std::mem::replace(&mut self.buf, Vec::with_capacity(DIFF_SINK_FLUSH_ROWS));
             send_to_writer(writer_tx, batch).await?;
@@ -1294,24 +1347,38 @@ async fn merge_diff_streams(
         match order {
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
-                sink.push(writer_tx, OUTPUT_FLAG_PLUS, key, props).await?;
+                let row = DiffRow {
+                    key,
+                    status: DiffStatus::LeftOnly,
+                    left: Some(props),
+                    right: None,
+                };
+                sink.push(writer_tx, row).await?;
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
-                sink.push(writer_tx, OUTPUT_FLAG_MINUS, key, props).await?;
+                let row = DiffRow {
+                    key,
+                    status: DiffStatus::RightOnly,
+                    left: None,
+                    right: Some(props),
+                };
+                sink.push(writer_tx, row).await?;
             }
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
                 let (_rkey, right_props) = right.buf.pop_front().expect("filled");
                 match core::ObjectProps::classify_pair(&left_props, &right_props) {
                     MatchResult::Astrisk => {
-                        sink.push(writer_tx, OUTPUT_FLAG_ASTRISK, key, left_props)
-                            .await?;
+                        let row = DiffRow {
+                            key,
+                            status: DiffStatus::Changed,
+                            left: Some(left_props),
+                            right: Some(right_props),
+                        };
+                        sink.push(writer_tx, row).await?;
                     }
-                    _ => {
-                        sink.push(writer_tx, OUTPUT_FLAG_EQUAL, key, left_props)
-                            .await?;
-                    }
+                    _ => sink.push_equal(),
                 }
             }
         }
@@ -1339,7 +1406,6 @@ pub struct DiffMergeOutcome {
     pub minus: usize,
     pub astrisk: usize,
     pub equal: usize,
-    pub ignored: usize,
     pub received_batches: usize,
     pub received_objects: usize,
     pub bytes_total: u64,
@@ -1403,7 +1469,6 @@ pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
             minus: sink.minus,
             astrisk: sink.astrisk,
             equal: sink.equal,
-            ignored: sink.ignored,
             received_batches: left.received_batches + right.received_batches,
             received_objects: left.received_objects + right.received_objects,
             bytes_total,
@@ -1419,7 +1484,7 @@ pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
         let Some(parquet) = parquet.as_deref_mut() else {
             continue;
         };
-        if let Err(e) = parquet.write_flagged_rows(batch).await {
+        if let Err(e) = parquet.write_diff_rows(batch).await {
             write_error = Some(e);
             break;
         }
@@ -1456,9 +1521,9 @@ pub async fn data_map_task_diff_streaming(
     let mut parquet = match &part_path {
         None => None,
         Some(path) => match tokio::fs::File::create(path).await {
-            Ok(file) => Some(crate::utils::AsyncParquetOutput::new_with_options(
+            Ok(file) => Some(crate::utils::AsyncParquetOutput::with_settings(
                 tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, file),
-                &path.display().to_string(),
+                crate::utils::Layout::Diff,
                 output_config.row_group_size,
                 &output_config.compression,
                 output_config.compression_level,
@@ -1577,26 +1642,62 @@ mod tests {
     ];
 
     #[test]
-    fn text_rows_match_the_formatted_renderings_byte_for_byte() {
+    fn text_rows_match_serde_renderings_byte_for_byte() {
         #[derive(serde::Serialize)]
         struct Row<'a> {
-            k: &'a str,
-            s: u64,
-            m: u64,
+            key: &'a str,
+            size: u64,
+            last_modified: Option<String>,
+            etag: Option<String>,
+            storage_class: Option<&'a str>,
         }
+        let dir = crate::core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE;
         for key in AWKWARD_KEYS {
-            for (size, mtime) in [(0, 0), (1, 1_767_225_600), (u64::MAX, u64::MAX)] {
+            for (size, ms, class) in [
+                (0, 0, ""),
+                (1, 1_767_225_600_123, "STANDARD"),
+                (u64::MAX, 253_402_300_799_999, "GLACIER"),
+            ] {
+                let mut props = crate::core::ObjectProps::new_open(dir, size, [0xab; 16]);
+                props.set_last_modified_millis(ms);
+                props.set_storage_class(class);
                 let mut ndjson = Vec::new();
-                render_text_row(&mut ndjson, key, size, mtime).unwrap();
+                render_text_row(&mut ndjson, key, &props).unwrap();
                 let mut want = serde_json::to_vec(&Row {
-                    k: key,
-                    s: size,
-                    m: mtime,
+                    key,
+                    size,
+                    last_modified: (ms != 0).then(|| {
+                        chrono::DateTime::from_timestamp_millis(ms as i64)
+                            .unwrap()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string()
+                    }),
+                    etag: Some("ab".repeat(16)),
+                    storage_class: (!class.is_empty()).then_some(class),
                 })
                 .unwrap();
                 want.push(b'\n');
-                assert_eq!(ndjson, want, "ndjson row for {key:?}");
+                assert_eq!(
+                    String::from_utf8_lossy(&ndjson),
+                    String::from_utf8_lossy(&want),
+                    "ndjson row for {key:?}"
+                );
             }
+        }
+    }
+
+    #[test]
+    fn rfc3339_formatting_matches_chrono_across_the_calendar() {
+        let mut ms: u64 = 0;
+        while ms < 4_102_444_800_000 {
+            let mut out = Vec::new();
+            super::push_rfc3339_millis(&mut out, ms);
+            let want = chrono::DateTime::from_timestamp_millis(ms as i64)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+            assert_eq!(String::from_utf8(out).unwrap(), want);
+            ms += 86_399_997; // walks every day boundary and leap year
         }
     }
 

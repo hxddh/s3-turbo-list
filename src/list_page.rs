@@ -199,12 +199,12 @@ impl http_body::Body for StripContentsBody {
 
 // ── Field conversions (mirror `ObjectProps::from(&Object)`) ─
 
-/// Epoch seconds → the `last_modified` column: the same conversion as
+/// Epoch milliseconds → the `last_modified` column: the same conversion as
 /// `ObjectProps::from(&Object)` (pre-1970 clamps to 0), so both paths agree —
 /// which the differential test checks.
 #[inline]
-pub(crate) fn epoch_secs_to_u64(secs: i64) -> u64 {
-    crate::core::epoch_secs_u64(secs)
+pub(crate) fn epoch_millis_to_u64(ms: i64) -> u64 {
+    crate::core::epoch_millis_u64(ms)
 }
 
 /// ETag text (entity-unescaped) → `(etag_md5, etag_parts)` by the same rules
@@ -213,22 +213,23 @@ fn parse_etag(raw: &str) -> ([u8; 16], u32) {
     crate::core::parse_etag_bytes(raw)
 }
 
-/// Whole epoch seconds of an RFC 3339 timestamp, as the SDK parses
+/// Epoch milliseconds of an RFC 3339 timestamp, as the SDK parses
 /// `LastModified` (`DateTime::from_str(.., DateTimeWithOffset)`, then
-/// `secs()`, which floors).  `None` where the SDK would reject the value.
-fn parse_timestamp_secs(s: &str) -> Option<i64> {
-    if let Some(secs) = parse_canonical_timestamp(s.as_bytes()) {
-        return Some(secs);
+/// `to_millis()`, which truncates sub-millisecond digits).  `None` where the
+/// SDK would reject the value.
+fn parse_timestamp_millis(s: &str) -> Option<i64> {
+    if let Some(ms) = parse_canonical_timestamp(s.as_bytes()) {
+        return Some(ms);
     }
-    DateTime::from_str(s, DateTimeFormat::DateTimeWithOffset)
-        .ok()
-        .map(|dt| dt.secs())
+    let dt = DateTime::from_str(s, DateTimeFormat::DateTimeWithOffset).ok()?;
+    Some(dt.to_millis().unwrap_or(0))
 }
 
 /// The form S3 endpoints actually send — `YYYY-MM-DDTHH:MM:SS[.f{1,9}]Z`,
 /// year 1970 or later, every field in range — parsed without the SDK's
-/// general RFC 3339 parser.  Anything else returns `None` and is left to
-/// `DateTime::from_str`, so unusual input keeps the SDK's exact semantics.
+/// general RFC 3339 parser, to epoch milliseconds.  Anything else returns
+/// `None` and is left to `DateTime::from_str`, so unusual input keeps the
+/// SDK's exact semantics.
 fn parse_canonical_timestamp(b: &[u8]) -> Option<i64> {
     if b.len() < 20
         || b[4] != b'-'
@@ -241,6 +242,7 @@ fn parse_canonical_timestamp(b: &[u8]) -> Option<i64> {
         return None;
     }
     let fraction = &b[19..b.len() - 1];
+    let mut millis = 0i64;
     if !fraction.is_empty() {
         let digits = &fraction[1..];
         if fraction[0] != b'.'
@@ -249,6 +251,9 @@ fn parse_canonical_timestamp(b: &[u8]) -> Option<i64> {
             || !digits.iter().all(u8::is_ascii_digit)
         {
             return None;
+        }
+        for i in 0..3 {
+            millis = millis * 10 + digits.get(i).map_or(0, |d| i64::from(d - b'0'));
         }
     }
     let num = |range: std::ops::Range<usize>| -> Option<i64> {
@@ -286,7 +291,7 @@ fn parse_canonical_timestamp(b: &[u8]) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000 + millis)
 }
 
 // ── XML text ───────────────────────────────────────────────
@@ -638,8 +643,9 @@ enum Field {
     LastModified,
     ETag,
     Size,
+    StorageClass,
     /// A child the SDK reads as text but that does not affect a row
-    /// (`StorageClass`, `ChecksumAlgorithm`, ... and unknown elements).
+    /// (`ChecksumAlgorithm`, ... and unknown elements).
     Other,
     Owner,
     RestoreStatus,
@@ -658,6 +664,7 @@ fn parse_contents(
     let mut last_modified: Option<i64> = None;
     let mut etag: Option<([u8; 16], u32)> = None;
     let mut size: Option<i64> = None;
+    let mut storage_class: Option<u8> = None;
 
     loop {
         // Fields are usually back to back: skip the search when `pos` is
@@ -688,6 +695,7 @@ fn parse_contents(
             b"LastModified" => Field::LastModified,
             b"ETag" => Field::ETag,
             b"Size" => Field::Size,
+            b"StorageClass" => Field::StorageClass,
             b"Owner" => Field::Owner,
             b"RestoreStatus" => Field::RestoreStatus,
             _ => Field::Other,
@@ -733,7 +741,7 @@ fn parse_contents(
                 if last_modified.is_some() {
                     return None;
                 }
-                last_modified = Some(parse_timestamp_secs(value!())?);
+                last_modified = Some(parse_timestamp_millis(value!())?);
             }
             Field::ETag => {
                 if etag.is_some() {
@@ -756,6 +764,11 @@ fn parse_contents(
                 }
                 size = Some(value!().parse::<i64>().ok()?);
             }
+            // A repeated StorageClass is legal for the SDK (the last one
+            // wins), as it was when this field was ignored.
+            Field::StorageClass => {
+                storage_class = Some(crate::core::storage_class_code(value!()));
+            }
             _ if has_ref => validate_text(raw, scratch)?,
             _ => {}
         }
@@ -766,8 +779,9 @@ fn parse_contents(
         props.etag_md5 = md5;
         props.etag_parts = parts;
     }
-    props.last_modified = last_modified.map_or(0, epoch_secs_to_u64);
-    props.size = size.map_or(0, |s| s as u64);
+    props.last_modified = last_modified.map_or(0, epoch_millis_to_u64);
+    props.size = size.map_or(0, |s| s.max(0) as u64);
+    props.storage_class = storage_class.unwrap_or(0);
     Some(((ObjectKey::from(key?), props), pos))
 }
 
@@ -814,7 +828,7 @@ fn parse_struct(
                     value.parse::<bool>().ok()?;
                 }
                 b"RestoreExpiryDate" => {
-                    parse_timestamp_secs(value)?;
+                    parse_timestamp_millis(value)?;
                 }
                 _ => {}
             }
