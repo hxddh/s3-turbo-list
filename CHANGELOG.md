@@ -5,7 +5,7 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-11-14
 
 1.0 is a redesign for speed, a small surface and automation. It is not
 compatible with 0.x command lines, outputs or checkpoints. The binary is now
