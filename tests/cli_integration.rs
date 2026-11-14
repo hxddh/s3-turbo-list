@@ -296,13 +296,18 @@ fn output_rules_are_usage_errors() {
     );
 
     // --resume continues a dataset directory.
-    for output in [&[][..], &["-o", "-"]] {
-        usage_error(
-            &[&e[..], &["list", "s3://b", "--resume"], output].concat(),
-            dir.path(),
-            "usage.resume_needs_output",
-        );
-    }
+    usage_error(
+        &[&e[..], &["list", "s3://b", "--resume"]].concat(),
+        dir.path(),
+        "usage.resume_needs_output",
+    );
+    // With -o - the result is on stderr, stdout being the data channel.
+    let (code, result) = stderr_result(
+        &[&e[..], &["list", "s3://b", "--resume", "-o", "-"]].concat(),
+        dir.path(),
+    );
+    assert_eq!(code, 2);
+    assert_eq!(result["error"]["code"], "usage.resume_needs_output");
 
     // A fresh run needs an absent or empty directory.
     let full = dir.path().join("full");
@@ -532,8 +537,9 @@ fn list_dry_run_plans_without_touching_anything() {
 #[test]
 fn list_dry_run_reports_how_it_would_partition_and_sign() {
     let dir = tempfile::tempdir().unwrap();
-    // NDJSON on stdout; a delimiter listing is one chain.
-    let result = plan(
+    // NDJSON on stdout (so the plan is on stderr); a delimiter listing is
+    // one chain.
+    let (code, result) = stderr_result(
         &[
             "list",
             "s3://b",
@@ -546,8 +552,9 @@ fn list_dry_run_reports_how_it_would_partition_and_sign() {
             "--dry-run",
         ],
         dir.path(),
-        &[],
     );
+    assert_eq!(code, 0);
+    assert_eq!(result["status"], "planned");
     assert_eq!(result["output"]["format"], "ndjson");
     assert_eq!(result["output"]["path"], "-");
     assert_eq!(result["plan"]["partitioning"], "single_segment");
@@ -784,5 +791,53 @@ fn endpoint_userinfo_is_redacted_in_results() {
             args,
             result
         );
+    }
+}
+
+/// A run with `-o -`: stdout must be empty and the result is the last line
+/// of stderr.
+fn stderr_result(args: &[&str], cwd: &Path) -> (i32, Value) {
+    let (code, stdout, stderr) = run_in(cwd, args, &[]);
+    assert!(stdout.is_empty(), "{:?}: stdout {:?}", args, stdout);
+    let last = stderr.lines().last().unwrap_or_default();
+    let result: Value = serde_json::from_str(last).unwrap_or_else(|e| {
+        panic!(
+            "{:?}: last stderr line is not JSON ({}): {}",
+            args, e, stderr
+        )
+    });
+    assert_eq!(result["schema"], "s3tl.result/1");
+    for key in RESULT_KEYS {
+        assert!(result.get(key).is_some(), "missing key {}: {}", key, result);
+    }
+    (code, result)
+}
+
+#[test]
+fn stdout_stays_a_data_channel_with_dash_output_even_on_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        &["list", "not-a-url", "-o", "-"][..],
+        &[
+            "list",
+            "s3://b/",
+            "-o",
+            "-",
+            "--endpoint-url",
+            ENDPOINT,
+            "--dry-run",
+        ],
+    ] {
+        let (code, stdout, stderr) = run_in(dir.path(), args, &[]);
+        assert!(stdout.is_empty(), "{:?}: stdout {:?}", args, stdout);
+        let last = stderr.lines().last().unwrap_or_default();
+        let result: Value = serde_json::from_str(last).unwrap_or_else(|e| {
+            panic!(
+                "{:?}: last stderr line is not JSON ({}): {}",
+                args, e, stderr
+            )
+        });
+        assert_eq!(result["schema"], "s3tl.result/1");
+        assert_eq!(result["exit_code"], code, "{}", result);
     }
 }

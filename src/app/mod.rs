@@ -59,17 +59,26 @@ fn dispatch(cli: &cli::Cli) -> Outcome {
     if matches!(cli.cmd, cli::Command::Check { .. }) {
         return check::run(cli);
     }
+    // `-o -` reserves stdout for rows: the result goes to stderr on every
+    // path, including a job that fails before streaming anything.
+    let stdout_is_data = matches!(&cli.cmd, cli::Command::List { output: Some(o), .. } if o == "-");
     let mut result = RunResult::new(cli.cmd.name());
     let job = match job::prepare(cli) {
         Ok(job) => job,
         Err(failure) => {
             result.fail(failure);
-            return Outcome::plain(result);
+            return Outcome {
+                stdout_is_data,
+                ..Outcome::plain(result)
+            };
         }
     };
     if cli.global.dry_run {
         run::plan(&job, &mut result);
-        return Outcome::plain(result);
+        return Outcome {
+            stdout_is_data,
+            ..Outcome::plain(result)
+        };
     }
     run::execute(job, result)
 }

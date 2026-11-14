@@ -11,7 +11,7 @@ use s3tl::config::EngineConfig;
 use s3tl::core::{self, ObjectKey, ObjectProps, RunMode};
 use s3tl::segment_order::SegmentOrder;
 use s3tl::{data_map, mon, startup, tasks_s3, trace};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -491,9 +491,10 @@ async fn join_all(set: &mut tokio::task::JoinSet<()>, g_state: &core::GlobalStat
 /// final name, fsync the directory. Empty parts are dropped, unless the
 /// dataset would otherwise have no file at all (readers need one to see the
 /// schema).
-fn commit_parts(dir: &Path, parts: &[core::OutputPart]) -> Result<(), String> {
+fn commit_parts(dir: &Path, parts: &[core::OutputPart]) -> Result<Vec<PathBuf>, String> {
     let has_committed = !super::job::committed_parts(dir).is_empty();
     let total: usize = parts.iter().map(|p| p.rows).sum();
+    let mut published: Vec<PathBuf> = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         let tmp = data_map::tmp_part_path(dir, part.index);
         let keep = part.rows > 0 || (total == 0 && !has_committed && i == 0);
@@ -501,13 +502,31 @@ fn commit_parts(dir: &Path, parts: &[core::OutputPart]) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp);
             continue;
         }
+        let target = dir.join(data_map::part_file_name(part.index));
         let commit = || -> std::io::Result<()> {
             std::fs::File::open(&tmp)?.sync_all()?;
-            std::fs::rename(&tmp, dir.join(data_map::part_file_name(part.index)))
+            std::fs::rename(&tmp, &target)
         };
-        commit().map_err(|e| format!("cannot commit {}: {}", tmp.display(), e))?;
+        if let Err(e) = commit() {
+            // All or nothing: un-publish what this commit already renamed.
+            unpublish(dir, &published);
+            return Err(format!("cannot commit {}: {}", tmp.display(), e));
+        }
+        published.push(target);
     }
-    s3tl::utils::sync_dir(dir).map_err(|e| format!("cannot sync {}: {}", dir.display(), e))
+    if let Err(e) = s3tl::utils::sync_dir(dir) {
+        unpublish(dir, &published);
+        return Err(format!("cannot sync {}: {}", dir.display(), e));
+    }
+    Ok(published)
+}
+
+/// Remove parts this run published, restoring the dataset it started from.
+fn unpublish(dir: &Path, published: &[PathBuf]) {
+    for path in published {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = s3tl::utils::sync_dir(dir);
 }
 
 /// A failed run leaves the dataset as it was before it: its temp parts are
@@ -584,47 +603,69 @@ fn finish(
             Some(f) => f.exit == ExitCode::Interrupted && job.mode == RunMode::List,
         };
         if keep {
-            if let Err(e) = commit_parts(dir, &data.parts) {
-                failure = Some(Failure::output(e));
-                cleanup_failed_output(&job, &data.parts);
-            } else {
-                result_dir = Some(dir.to_path_buf());
-                if failure.is_none() {
-                    if job.mode == RunMode::List
-                        && let Err(e) = Checkpoint::remove(dir)
-                    {
-                        result.warnings.push(format!(
-                            "the run finished but its checkpoint could not be removed ({}); \
-                             delete {} before reusing the directory",
-                            e,
-                            Checkpoint::path(dir).display()
-                        ));
+            match commit_parts(dir, &data.parts) {
+                Err(e) => {
+                    failure = Some(Failure::output(e));
+                    cleanup_failed_output(&job, &data.parts);
+                    if job.resume_from.is_some() {
+                        result_dir = Some(dir.to_path_buf());
                     }
-                } else {
-                    let progress = listing
-                        .resume_slot
-                        .as_ref()
-                        .and_then(|slot| slot.lock().unwrap().take());
-                    match progress {
-                        Some(progress) => {
-                            let remaining = progress.remaining.len();
-                            match Checkpoint::new(job.identity(), progress.remaining).save(dir) {
-                                Ok(()) => {
-                                    checkpoint_saved = Some((
-                                        Checkpoint::path(dir).display().to_string(),
-                                        remaining,
-                                    ))
+                }
+                Ok(published) => {
+                    result_dir = Some(dir.to_path_buf());
+                    if failure.is_none() {
+                        if job.mode == RunMode::List
+                            && let Err(e) = Checkpoint::remove(dir)
+                        {
+                            result.warnings.push(format!(
+                                "the run finished but its checkpoint could not be removed ({}); \
+                             delete {} before reusing the directory",
+                                e,
+                                Checkpoint::path(dir).display()
+                            ));
+                        }
+                    } else {
+                        let progress = listing
+                            .resume_slot
+                            .as_ref()
+                            .and_then(|slot| slot.lock().unwrap().take());
+                        let saved = match progress {
+                            Some(progress) => {
+                                let remaining = progress.remaining.len();
+                                Checkpoint::new(job.identity(), progress.remaining)
+                                    .save(dir)
+                                    .map(|()| remaining)
+                            }
+                            None => Err("no resume progress was recorded".to_string()),
+                        };
+                        match saved {
+                            Ok(remaining) => {
+                                checkpoint_saved =
+                                    Some((Checkpoint::path(dir).display().to_string(), remaining))
+                            }
+                            Err(e) => {
+                                // The checkpoint did not advance: published parts
+                                // would be listed again by the next --resume, so
+                                // the dataset goes back to what that checkpoint
+                                // describes.
+                                unpublish(dir, &published);
+                                let resumable = job.resume_from.is_some();
+                                if !resumable {
+                                    result_dir = None;
+                                    cleanup_failed_output(&job, &[]);
                                 }
-                                Err(e) => result.warnings.push(format!(
-                                    "{}; --resume would continue from the previous checkpoint, \
-                                     if any",
+                                let f = Failure::output(format!(
+                                    "interrupted, and the checkpoint could not be saved ({}); this \
+                                 run's parts were removed so the dataset stays consistent",
                                     e
-                                )),
+                                ));
+                                failure = Some(if resumable {
+                                    f.hint("--resume continues from the previous checkpoint")
+                                } else {
+                                    f.hint("rerun into an empty directory")
+                                });
                             }
                         }
-                        None => result
-                            .warnings
-                            .push("no resume progress was recorded".to_string()),
                     }
                 }
             }
@@ -685,5 +726,52 @@ fn finish(
         result,
         stdout_is_data,
         result_dir,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(index: usize, rows: usize) -> core::OutputPart {
+        core::OutputPart { index, rows }
+    }
+
+    #[test]
+    fn commit_publishes_all_parts_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in [0, 1] {
+            std::fs::write(data_map::tmp_part_path(dir.path(), i), b"x").unwrap();
+        }
+        // Part 2's temp file is missing: its commit fails after 0 and 1
+        // were renamed, and both must be taken back.
+        let err = commit_parts(dir.path(), &[part(0, 1), part(1, 1), part(2, 1)]).unwrap_err();
+        assert!(err.contains("cannot commit"), "{}", err);
+        for i in [0, 1, 2] {
+            assert!(!dir.path().join(data_map::part_file_name(i)).exists());
+        }
+
+        for i in [0, 1] {
+            std::fs::write(data_map::tmp_part_path(dir.path(), i), b"x").unwrap();
+        }
+        let published = commit_parts(dir.path(), &[part(0, 1), part(1, 1)]).unwrap();
+        assert_eq!(published.len(), 2);
+        assert!(published.iter().all(|p| p.exists()));
+        unpublish(dir.path(), &published);
+        assert!(published.iter().all(|p| !p.exists()));
+    }
+
+    #[test]
+    fn empty_parts_are_dropped_unless_the_dataset_would_be_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in [0, 1] {
+            std::fs::write(data_map::tmp_part_path(dir.path(), i), b"x").unwrap();
+        }
+        let published = commit_parts(dir.path(), &[part(0, 0), part(1, 0)]).unwrap();
+        assert_eq!(
+            published,
+            vec![dir.path().join(data_map::part_file_name(0))]
+        );
+        assert!(!data_map::tmp_part_path(dir.path(), 1).exists());
     }
 }
