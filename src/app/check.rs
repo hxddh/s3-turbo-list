@@ -195,6 +195,9 @@ pub fn run(cli: &Cli) -> Outcome {
     match report {
         Ok((report, failure)) => {
             result.check = Some(report);
+            if dry_run {
+                result.status = super::result::Status::Planned;
+            }
             if let Some(f) = failure {
                 result.fail(f);
             }

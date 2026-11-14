@@ -123,6 +123,7 @@ pub async fn run_compat_probe(
         || async {
             client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(bucket)
                 .prefix(prefix)
                 .max_keys(1)
@@ -141,6 +142,7 @@ pub async fn run_compat_probe(
         || async {
             client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(bucket)
                 .prefix(prefix)
                 .delimiter("/")
@@ -160,6 +162,7 @@ pub async fn run_compat_probe(
         || async {
             let resp = client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(bucket)
                 .prefix(prefix)
                 .max_keys(3)
@@ -281,6 +284,7 @@ async fn pagination_second_page_result(
                     async move {
                         client
                             .list_objects_v2()
+                            .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                             .bucket(target.bucket)
                             .prefix(target.prefix)
                             .max_keys(3)

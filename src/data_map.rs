@@ -1086,6 +1086,10 @@ fn top_prefixes(prefix_stats: &PrefixStats, limit: usize) -> Vec<core::PrefixMet
 pub struct DiffStreamSides {
     pub left: Arc<SegmentOrder>,
     pub right: Arc<SegmentOrder>,
+    /// Each side's listing prefix: keys are compared, and written, relative
+    /// to it, so `s3://a/x/` diffs against `s3://b/y/` key by key.
+    pub left_prefix: String,
+    pub right_prefix: String,
 }
 
 impl DiffStreamSides {
@@ -1097,6 +1101,8 @@ impl DiffStreamSides {
         Self {
             left: Arc::new(SegmentOrder::from_receivers(left)),
             right: Arc::new(SegmentOrder::from_receivers(right)),
+            left_prefix: String::new(),
+            right_prefix: String::new(),
         }
     }
 }
@@ -1316,12 +1322,27 @@ async fn send_to_writer(
         .map_err(|_| "diff Parquet writer stopped (write error)".to_string())
 }
 
+/// `key` without its side's listing prefix (every listed key starts with it).
+fn relative(key: &str, strip: usize) -> &str {
+    key.get(strip..).unwrap_or(key)
+}
+
+fn relative_key(key: ObjectKey, strip: usize) -> ObjectKey {
+    if strip == 0 {
+        key
+    } else {
+        ObjectKey::from(relative(key.as_str(), strip).to_string())
+    }
+}
+
 /// Merge the two ordered diff streams into the sink, handing flushed row
 /// batches to the Parquet writer loop. Returns Err on ordering violations
 /// or when the writer stopped.
 async fn merge_diff_streams(
     left: &mut DiffSideStream,
     right: &mut DiffSideStream,
+    // Bytes of each side's listing prefix (keys are compared without it).
+    strip: (usize, usize),
     writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     sink: &mut DiffRowSink,
     aborted: &(dyn Fn() -> bool + Send + Sync),
@@ -1358,13 +1379,14 @@ async fn merge_diff_streams(
             (true, true) => {
                 let lk = &left.buf.front().expect("filled").0;
                 let rk = &right.buf.front().expect("filled").0;
-                lk.as_str().cmp(rk.as_str())
+                relative(lk.as_str(), strip.0).cmp(relative(rk.as_str(), strip.1))
             }
         };
 
         match order {
             std::cmp::Ordering::Less => {
                 let (key, props) = left.buf.pop_front().expect("filled");
+                let key = relative_key(key, strip.0);
                 let row = DiffRow {
                     key,
                     status: DiffStatus::LeftOnly,
@@ -1375,6 +1397,7 @@ async fn merge_diff_streams(
             }
             std::cmp::Ordering::Greater => {
                 let (key, props) = right.buf.pop_front().expect("filled");
+                let key = relative_key(key, strip.1);
                 let row = DiffRow {
                     key,
                     status: DiffStatus::RightOnly,
@@ -1385,6 +1408,7 @@ async fn merge_diff_streams(
             }
             std::cmp::Ordering::Equal => {
                 let (key, left_props) = left.buf.pop_front().expect("filled");
+                let key = relative_key(key, strip.0);
                 let (_rkey, right_props) = right.buf.pop_front().expect("filled");
                 match core::ObjectProps::classify_pair(&left_props, &right_props) {
                     MatchResult::Astrisk => {
@@ -1468,12 +1492,16 @@ pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
         tokio::sync::mpsc::channel::<DiffWriteBatch>(DIFF_WRITE_PIPELINE_CAP);
 
     let write = parquet.is_some();
+    let strip = (sides.left_prefix.len(), sides.right_prefix.len());
     let merge_task = tokio::spawn(async move {
         let mut left = DiffSideStream::new(sides.left, "left", left_head);
         let mut right = DiffSideStream::new(sides.right, "right", right_head);
         let mut sink = DiffRowSink::new(write);
 
-        merge_diff_streams(&mut left, &mut right, &writer_tx, &mut sink, &aborted).await?;
+        merge_diff_streams(
+            &mut left, &mut right, strip, &writer_tx, &mut sink, &aborted,
+        )
+        .await?;
         sink.flush_all(&writer_tx).await?;
 
         let bytes_total = sink

@@ -58,3 +58,9 @@ tempfile = "3"
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# The output-pipeline benchmark (docs/development.md); its tests run with
+# `cargo test`.
+[[example]]
+name = "bench_local"
+test = true

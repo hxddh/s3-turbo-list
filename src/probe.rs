@@ -13,16 +13,22 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// Default limit when the run did not set one (tests, benchmarks).
-const DEFAULT_PROBE_CONCURRENCY: usize = 64;
+/// Upper bound on concurrent probes (and the limit when the run set none).
+const DEFAULT_PROBE_CONCURRENCY: usize = 512;
 /// Pause before retrying a throttled probe.
 const THROTTLE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 static PROBE_PERMITS: OnceLock<Semaphore> = OnceLock::new();
 
-/// Set the probe concurrency limit (once, before the first probe).
-pub fn set_concurrency(limit: usize) {
-    let _ = PROBE_PERMITS.set(Semaphore::new(limit.clamp(1, DEFAULT_PROBE_CONCURRENCY)));
+/// Set the probe limit from the run's concurrency (once, before the first
+/// probe): three probes per listing slot. Probes are single-key or
+/// single-page requests and startup bisection wants many at once; tying them
+/// to `-c` still keeps a deliberately low `-c` gentle on the endpoint.
+pub fn set_concurrency(concurrency: usize) {
+    let limit = concurrency
+        .saturating_mul(3)
+        .clamp(1, DEFAULT_PROBE_CONCURRENCY);
+    let _ = PROBE_PERMITS.set(Semaphore::new(limit));
 }
 
 fn permits() -> &'static Semaphore {

@@ -80,25 +80,37 @@ fn usage_error(err: clap::Error) -> i32 {
     use clap::error::ErrorKind;
     if matches!(
         err.kind(),
-        ErrorKind::DisplayHelp
-            | ErrorKind::DisplayVersion
-            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     ) {
         let _ = err.print();
-        return if err.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
-            ExitCode::Usage.code()
-        } else {
-            0
-        };
+        return 0;
     }
     let rendered = err.render().to_string();
-    let message = rendered
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("invalid command line")
-        .trim_start_matches("error: ")
-        .to_string();
-    let mut result = RunResult::new("unknown");
+    let message = if err.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        "no command given: expected list, diff or check".to_string()
+    } else {
+        // The error and its details, without the usage block clap appends.
+        rendered
+            .lines()
+            .map(str::trim)
+            .take_while(|l| !l.starts_with("Usage:") && !l.starts_with("For more information"))
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+    // The command, when the command line named one.
+    let command = std::env::args()
+        .skip(1)
+        .find_map(|arg| match arg.as_str() {
+            "list" => Some("list"),
+            "diff" => Some("diff"),
+            "check" => Some("check"),
+            _ => None,
+        })
+        .unwrap_or("unknown");
+    let mut result = RunResult::new(command);
     result.fail(
         Failure::usage("usage.invalid_argument", message).hint("run `s3tl --help` for usage"),
     );
@@ -204,6 +216,7 @@ fn init_logging(verbose: u8) {
     });
     env_logger::Builder::new()
         .parse_filters(&filter)
+        .format_timestamp_millis()
         .target(env_logger::Target::Stderr)
         .init();
 }

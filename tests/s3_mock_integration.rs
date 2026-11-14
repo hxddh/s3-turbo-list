@@ -3207,7 +3207,9 @@ fn local_mock_check_resolves_the_proxy_for_the_bucket_host() {
         dir.path(),
         &[("HTTPS_PROXY", "http://proxy.example.test:3128")],
     );
-    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let result = result_of(&stdout);
+    assert_eq!(result["status"], "planned", "{}", result);
     let check = &result["check"];
     assert_eq!(check["path_style"], false);
     assert!(
@@ -3229,7 +3231,8 @@ fn local_mock_check_resolves_the_proxy_for_the_bucket_host() {
             ("NO_PROXY", ".s3.us-west-2.amazonaws.com"),
         ],
     );
-    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
+    let result = result_of(&stdout);
     assert_eq!(result["check"]["proxy"], Value::Null, "{}", result);
 }
 
@@ -4136,8 +4139,8 @@ fn local_mock_diff_identical_sides_write_no_rows() {
 fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
     // The right side lives on another endpoint (--target-endpoint-url).
     // "same" is identical, "size" and "etag" differ, so both are changed
-    // rows with each side's columns filled. (Keys are compared verbatim,
-    // so both sides use the same prefix.)
+    // rows with each side's columns filled. The sides use different
+    // prefixes: keys are compared, and written, relative to each side's.
     let left = MockS3Server::start(|request, _| {
         assert!(request.path.starts_with("/src"), "{}", request.path);
         let body = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>src</Name><Prefix>p/</Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>p/etag</Key><LastModified>2026-05-17T00:00:00.123Z</LastModified><ETag>&quot;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&quot;</ETag><Size>5</Size></Contents><Contents><Key>p/same</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;cccccccccccccccccccccccccccccccc&quot;</ETag><Size>7</Size></Contents><Contents><Key>p/size</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;dddddddddddddddddddddddddddddddd&quot;</ETag><Size>1</Size></Contents></ListBucketResult>"#;
@@ -4145,7 +4148,7 @@ fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
     });
     let right = MockS3Server::start(|request, _| {
         assert!(request.path.starts_with("/dst"), "{}", request.path);
-        let body = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>dst</Name><Prefix>p/</Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>p/etag</Key><LastModified>2026-05-17T00:00:00.123Z</LastModified><ETag>&quot;bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&quot;</ETag><Size>5</Size></Contents><Contents><Key>p/same</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;cccccccccccccccccccccccccccccccc&quot;</ETag><Size>7</Size></Contents><Contents><Key>p/size</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;dddddddddddddddddddddddddddddddd&quot;</ETag><Size>2</Size></Contents></ListBucketResult>"#;
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>dst</Name><Prefix>q/</Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>q/etag</Key><LastModified>2026-05-17T00:00:00.123Z</LastModified><ETag>&quot;bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&quot;</ETag><Size>5</Size></Contents><Contents><Key>q/same</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;cccccccccccccccccccccccccccccccc&quot;</ETag><Size>7</Size></Contents><Contents><Key>q/size</Key><LastModified>2026-05-17T00:00:00.000Z</LastModified><ETag>&quot;dddddddddddddddddddddddddddddddd&quot;</ETag><Size>2</Size></Contents></ListBucketResult>"#;
         MockResponse::ok_xml(body.to_string())
     });
     let dir = tempfile::tempdir().unwrap();
@@ -4155,7 +4158,7 @@ fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
         "diff",
         &[
             "s3://src/p/",
-            "s3://dst/p/",
+            "s3://dst/q/",
             "--target-endpoint-url",
             &right.endpoint(),
             "--no-auto-hints",
@@ -4172,7 +4175,7 @@ fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
     assert_eq!(result["source"]["endpoint_url"], left.endpoint());
     assert_eq!(result["target"]["endpoint_url"], right.endpoint());
     assert_eq!(result["target"]["bucket"], "dst");
-    assert_eq!(dataset_keys(&out), vec!["p/etag", "p/size"]);
+    assert_eq!(dataset_keys(&out), vec!["etag", "size"]);
     assert_eq!(
         dataset_strings(&out, "status"),
         vec![Some("changed".to_string()), Some("changed".to_string())]

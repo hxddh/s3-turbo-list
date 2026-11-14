@@ -271,12 +271,17 @@ fn remove_stale_temp_parts(dir: &Path) {
 fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
     match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory || dir.is_file() => {
-            Err(Failure::usage(
-                "usage.output_not_a_directory",
-                format!("output '{}' exists and is not a directory", dir.display()),
-            ))
-        }
+        Err(_) if dir.is_file() => Err(Failure::usage(
+            "usage.output_not_a_directory",
+            format!("output '{}' exists and is not a directory", dir.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Err(Failure::usage(
+            "usage.output_not_a_directory",
+            format!(
+                "output '{}' cannot be created: a parent path is not a directory",
+                dir.display()
+            ),
+        )),
         Err(e) => Err(Failure::output(format!(
             "cannot read output directory '{}': {}",
             dir.display(),

@@ -458,6 +458,8 @@ async fn spawn_diff(
     let sides = data_map::DiffStreamSides {
         left: left_order,
         right: right_order,
+        left_prefix: job.source.url.prefix.clone(),
+        right_prefix: target.url.prefix.clone(),
     };
     let heads = data_map::DiffMergeHeads {
         left: left_head_tx,

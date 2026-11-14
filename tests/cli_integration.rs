@@ -215,6 +215,24 @@ fn command_line_parse_errors_are_usage_errors_with_a_result() {
         "{}",
         result
     );
+    // The whole error, naming what is missing, and the command it is for.
+    let result = usage_error(&["list"], dir.path(), "usage.invalid_argument");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<S3_URL>"),
+        "{}",
+        result
+    );
+    assert_eq!(result["command"], "list");
+    // No command at all: help on stderr, and a usage-error result.
+    let (code, stdout, stderr) = run_in(dir.path(), &[], &[]);
+    assert_eq!(code, 2, "{}", stderr);
+    assert!(stderr.contains("Usage:"), "{}", stderr);
+    let result = one_result(&stdout);
+    assert_eq!(result["error"]["code"], "usage.invalid_argument");
+    assert_eq!(result["command"], "unknown");
 }
 
 #[test]
