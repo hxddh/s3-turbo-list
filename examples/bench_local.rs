@@ -114,7 +114,7 @@ fn main() {
                     } else {
                         data_map::data_map_task_list_streaming(
                             ctx,
-                            path,
+                            s3tl::s3_output::PartSink::Dir(path),
                             0,
                             OutputConfig::default(),
                         )

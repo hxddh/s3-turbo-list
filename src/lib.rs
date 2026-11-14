@@ -17,7 +17,7 @@
 // Public to integration tests (types needed to exercise pipelines):
 pub mod auto_hints;
 pub mod checkpoint;
-pub mod checksum; // diff --compare checksum // CheckpointIdentity, CheckpointJournal, checkpoint_path
+pub mod checksum;
 pub mod compat_probe;
 pub mod config;
 pub mod core; // ObjectKey, ObjectProps, MatchResult, KeySpaceHints, GlobalState, DataMapContext, MonContext, S3TaskContext
@@ -28,6 +28,7 @@ mod list_page; // ListObjectsV2 <Contents> fast path used by tasks_s3::chain::fl
 pub mod mon;
 pub mod probe; // bounded, retried partitioning probes
 pub mod redact; // redact_url
+pub mod s3_output; // diff --compare checksum // CheckpointIdentity, CheckpointJournal, checkpoint_path
 pub mod segment_order; // a diff side's segment order under runtime splits
 pub mod startup; // startup partitioning probes (drives auto_hints)
 pub mod stats;

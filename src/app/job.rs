@@ -39,6 +39,8 @@ pub enum Output {
     Stdout,
     /// A Parquet dataset directory.
     Dir(PathBuf),
+    /// A Parquet dataset under an S3 prefix (`-o s3://bucket/prefix/`).
+    S3(SideSpec),
 }
 
 impl Output {
@@ -112,6 +114,12 @@ impl Job {
                 files: Vec::new(),
                 rows: 0,
             },
+            Output::S3(spec) => OutputInfo {
+                format: "parquet",
+                path: Some(s3_output_url(&spec.url)),
+                files: Vec::new(),
+                rows: 0,
+            },
             Output::Dir(dir) => OutputInfo {
                 format: "parquet",
                 path: Some(dir.display().to_string()),
@@ -135,6 +143,15 @@ fn identity_of(
         delimiter: delimiter.to_string(),
         max_keys,
         versions,
+    }
+}
+
+/// `s3://bucket/prefix/` of an S3 output (the prefix is a folder).
+pub fn s3_output_url(url: &S3Url) -> String {
+    if url.prefix.is_empty() || url.prefix.ends_with('/') {
+        url.url()
+    } else {
+        format!("{}/", url.url())
     }
 }
 
@@ -375,6 +392,9 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
                 "-o needs a directory or '-'",
             ));
         }
+        Some(url) if url.starts_with("s3://") => {
+            Output::S3(side(url, g.endpoint_url.as_deref(), cli)?)
+        }
         Some(dir) => Output::Dir(PathBuf::from(dir)),
     };
 
@@ -399,7 +419,8 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         let Some(dir) = job.output.dir().map(Path::to_path_buf) else {
             return Err(Failure::usage(
                 "usage.resume_needs_output",
-                "--resume continues a Parquet dataset: pass -o with the interrupted run's directory",
+                "--resume continues a local Parquet dataset: pass -o with the interrupted \
+                 run's directory (an S3 output is not resumable)",
             ));
         };
         let checkpoint = Checkpoint::load(&dir, &job.identity()).map_err(|e| match e {

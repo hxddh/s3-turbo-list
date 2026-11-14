@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
 use crate::core::{self, DataMapContext, MatchResult, ObjectKey, ObjectProps};
+use crate::s3_output::PartSink;
 use crate::segment_order::SegmentOrder;
 use crate::utils::{DiffRow, DiffStatus};
 
@@ -59,17 +60,6 @@ const OUTPUT_GROW_MIN_BATCHES: usize = 8;
 /// brittle here — the bounded prefetch buffer masks the bottleneck — so the
 /// governor measures the writers' actual CPU-busy time directly.
 const OUTPUT_GROW_BUSY_FRACTION: f64 = 0.85;
-
-/// Per-writer output buffer between the Parquet encoder and the file. The
-/// `AsyncArrowWriter` already buffers and flushes whole row groups, so this only
-/// coalesces those large, sequential writes into fewer syscalls — past a few MB
-/// it stops affecting throughput (the page cache absorbs the writes, and on the
-/// fast-store path the writers are CPU-bound on encode+compress, not on file
-/// I/O). Sized so the pool's *aggregate* buffer stays bounded as the governor
-/// scales out: `MAX_LIST_OUTPUT_WORKERS` × this is ~256 MB, sane on any machine
-/// with enough cores to reach the cap. (Was a fixed 100 MB per writer, i.e. up
-/// to 3.2 GB once the pool fanned out on a many-core host.)
-const LIST_OUTPUT_WRITER_BUF_BYTES: usize = 8 * core::MB;
 
 /// Upper bound on output writers: the machine's parallelism, hard-capped. More
 /// writers than cores only thrash, since each does CPU-bound encode+compress.
@@ -193,7 +183,7 @@ struct ListWorkerResult {
 async fn list_output_worker(
     mut rx: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
     index: usize,
-    part_path: PathBuf,
+    sink: PartSink,
     output_config: OutputConfig,
     g_state: core::GlobalState,
     busy_nanos: Arc<AtomicU64>,
@@ -205,12 +195,12 @@ async fn list_output_worker(
         bytes_total: 0,
     };
     let mut output_ok = true;
-    let part_path = part_path.display().to_string();
+    let part_path = sink.describe(index);
 
-    let output_file = match tokio::fs::File::create(&part_path).await {
-        Ok(f) => f,
+    let writer = match sink.open(index).await {
+        Ok(w) => w,
         Err(e) => {
-            g_state.note_output_error(format!("cannot create output file {}: {}", part_path, e));
+            g_state.note_output_error(e);
             g_state.inc_output_error();
             return ListWorkerResult {
                 index,
@@ -220,9 +210,8 @@ async fn list_output_worker(
             };
         }
     };
-    let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::with_settings(
-        buf_writer,
+        writer,
         if output_config.versions {
             crate::utils::Layout::ListVersions
         } else {
@@ -263,11 +252,11 @@ async fn list_output_worker(
     }
 }
 
-/// Stream a list run into Parquet parts `first_index..` of `out_dir`
-/// (written as temp files; see `tmp_part_path`).
+/// Stream a list run into Parquet parts `first_index..` of `sink`
+/// (uncommitted until the run commits them).
 pub async fn data_map_task_list_streaming(
     mut ctx: DataMapContext,
-    out_dir: PathBuf,
+    sink: PartSink,
     first_index: usize,
     output_config: OutputConfig,
 ) {
@@ -289,7 +278,7 @@ pub async fn data_map_task_list_streaming(
         let handle = tokio::spawn(list_output_worker(
             w_rx,
             first_index + index,
-            tmp_part_path(&out_dir, first_index + index),
+            sink.clone(),
             output_config.clone(),
             ctx.g_state.clone(),
             Arc::clone(&busy_nanos),
@@ -360,7 +349,7 @@ pub async fn data_map_task_list_streaming(
                         handles.push(tokio::spawn(list_output_worker(
                             w_rx,
                             first_index + index,
-                            tmp_part_path(&out_dir, first_index + index),
+                            sink.clone(),
                             output_config.clone(),
                             ctx.g_state.clone(),
                             Arc::clone(&busy_nanos),
@@ -742,7 +731,7 @@ where
     }
 }
 
-async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
+async fn ingest_list_streaming_batch<W: parquet::arrow::async_writer::AsyncFileWriter>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
@@ -1476,7 +1465,7 @@ impl DiffMergeOutcome {
 /// with it in one loop; the bounded channel between them is the pipeline
 /// depth. The `&mut parquet` contract is unchanged — all rows are written
 /// before this returns.
-pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
+pub async fn run_diff_merge<W: parquet::arrow::async_writer::AsyncFileWriter>(
     sides: DiffStreamSides,
     parquet: Option<&mut crate::utils::AsyncParquetOutput<W>>,
     aborted: impl Fn() -> bool + Send + Sync + 'static,
@@ -1551,7 +1540,7 @@ async fn verify_batch(
 
 /// [`run_diff_merge`] with the merge's segment position published and the
 /// compare mode set.
-pub async fn run_diff_merge_with<W: tokio::io::AsyncWrite + Unpin + Send>(
+pub async fn run_diff_merge_with<W: parquet::arrow::async_writer::AsyncFileWriter>(
     sides: DiffStreamSides,
     heads: Option<DiffMergeHeads>,
     mut parquet: Option<&mut crate::utils::AsyncParquetOutput<W>>,
@@ -1648,13 +1637,13 @@ pub async fn run_diff_merge_with<W: tokio::io::AsyncWrite + Unpin + Send>(
 }
 
 /// The diff data map: merge both sides and write the differing keys to
-/// Parquet part 0 of `out_dir` (a temp file; see `tmp_part_path`), or only
-/// count them when `out_dir` is `None`.
+/// Parquet part 0 of `sink` (uncommitted until the run commits it), or only
+/// count them when `sink` is `None`.
 pub async fn data_map_task_diff_streaming(
     g_state: core::GlobalState,
     sides: DiffStreamSides,
     heads: Option<DiffMergeHeads>,
-    out_dir: Option<PathBuf>,
+    sink: Option<PartSink>,
     output_config: OutputConfig,
     options: DiffOptions,
 ) {
@@ -1663,23 +1652,18 @@ pub async fn data_map_task_diff_streaming(
 
     info!("Data Map Task — diff streaming started");
 
-    let part_path = out_dir.as_deref().map(|dir| tmp_part_path(dir, 0));
-    let mut parquet = match &part_path {
+    let mut parquet = match &sink {
         None => None,
-        Some(path) => match tokio::fs::File::create(path).await {
-            Ok(file) => Some(crate::utils::AsyncParquetOutput::with_settings(
-                tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, file),
+        Some(sink) => match sink.open(0).await {
+            Ok(writer) => Some(crate::utils::AsyncParquetOutput::with_settings(
+                writer,
                 crate::utils::Layout::Diff,
                 output_config.row_group_size,
                 &output_config.compression,
                 output_config.compression_level,
             )),
             Err(e) => {
-                g_state.note_output_error(format!(
-                    "cannot create output file {}: {}",
-                    path.display(),
-                    e
-                ));
+                g_state.note_output_error(e);
                 g_state.inc_output_error();
                 g_state.data_map_task_complete();
                 g_state.quit();
@@ -1727,11 +1711,11 @@ pub async fn data_map_task_diff_streaming(
         g_state.set_diff_merge_complete();
     }
     if outcome.is_none()
-        && let Some(path) = &part_path
+        && let Some(sink) = &sink
     {
         // A partial merge describes part of one side against an unfinished
         // other side; it parses, which is what makes it dangerous.
-        let _ = tokio::fs::remove_file(path).await;
+        sink.discard(0).await;
     }
 
     if let Some(outcome) = outcome {
@@ -1742,7 +1726,7 @@ pub async fn data_map_task_diff_streaming(
             bytes: outcome.bytes_total,
             rows_written: parquet_rows,
             top_prefixes: top_prefixes(&outcome.prefix_stats, TOP_PREFIXES),
-            parts: if part_path.is_some() {
+            parts: if sink.is_some() {
                 vec![core::OutputPart {
                     index: 0,
                     rows: parquet_rows,

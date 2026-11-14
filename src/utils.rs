@@ -6,13 +6,13 @@ use arrow_array::builder::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use log::{info, warn};
 use parquet::arrow::async_writer::AsyncArrowWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::AsyncWrite;
 
 use crate::core::{ObjectKey, ObjectProps};
 
@@ -299,7 +299,7 @@ impl RowBatch {
 // ── AsyncParquetOutput ─────────────────────────────────────
 
 /// A streaming Parquet writer for one output file.
-pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
+pub struct AsyncParquetOutput<W: AsyncFileWriter> {
     layout: Layout,
     schema_ref: SchemaRef,
     writer: AsyncArrowWriter<W>,
@@ -308,7 +308,7 @@ pub struct AsyncParquetOutput<W: AsyncWrite + Unpin + Send> {
     batch: Option<RowBatch>,
 }
 
-impl<W: AsyncWrite + Unpin + Send> AsyncParquetOutput<W> {
+impl<W: AsyncFileWriter> AsyncParquetOutput<W> {
     /// A writer with the default settings (tests, benchmarks).
     pub fn new(buf_wr: W, layout: Layout) -> Self {
         let defaults = crate::config::OutputConfig::default();

@@ -30,6 +30,8 @@ struct RecordedRequest {
     query: BTreeMap<String, String>,
     /// Header names lowercased.
     headers: BTreeMap<String, String>,
+    /// The request body (`Content-Length` bytes).
+    body: Vec<u8>,
 }
 
 struct MockResponse {
@@ -272,23 +274,37 @@ fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
         }
     }
 
-    let request = String::from_utf8_lossy(&buf);
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let request = String::from_utf8_lossy(&buf[..header_end]).into_owned();
     let mut lines = request.lines();
     let first_line = lines.next()?;
     let mut parts = first_line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?;
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
-    let headers = lines
+    let headers: BTreeMap<String, String> = lines
         .take_while(|line| !line.is_empty())
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect();
+    let length: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = buf[header_end..buf.len().min(header_end + length)].to_vec();
     Some(RecordedRequest {
         method,
         path: path.to_string(),
         query: parse_query(raw_query),
         headers,
+        body,
     })
 }
 
@@ -4770,4 +4786,230 @@ fn versions_and_delimiter_are_exclusive() {
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     failed_result(code, &stdout, &stderr, 2, "usage.invalid_argument");
     assert!(server.requests().is_empty());
+}
+
+// ── -o s3:// (multipart uploads) ────────────────────────────
+
+/// An in-memory bucket for S3 output: objects, open multipart uploads, and
+/// the source listing (`src/` keys) served from `keys`.
+#[derive(Default)]
+struct MockStore {
+    objects: BTreeMap<String, Vec<u8>>,
+    uploads: BTreeMap<String, (String, BTreeMap<u32, Vec<u8>>)>,
+    next_upload: usize,
+    aborted: usize,
+}
+
+fn store_server(
+    store: Arc<Mutex<MockStore>>,
+    keys: Vec<String>,
+    fail_complete: bool,
+) -> MockS3Server {
+    MockS3Server::start(move |request, _sequence| {
+        let key = request
+            .path
+            .trim_start_matches('/')
+            .split_once('/')
+            .map(|(_, k)| percent_decode(k))
+            .unwrap_or_default();
+        let mut store = store.lock().unwrap();
+        match request.method.as_str() {
+            "GET" => {
+                let prefix = query(&request, "prefix").unwrap_or("");
+                if prefix.starts_with("src/") {
+                    return MockResponse::ok_xml(emulated_list(&keys, &request.query));
+                }
+                let existing: Vec<String> = store
+                    .objects
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                MockResponse::ok_xml(emulated_list(&existing, &request.query))
+            }
+            "POST" if request.query.contains_key("uploads") => {
+                store.next_upload += 1;
+                let id = format!("upload-{}", store.next_upload);
+                store
+                    .uploads
+                    .insert(id.clone(), (key.clone(), BTreeMap::new()));
+                MockResponse::ok_xml(format!(
+                    "<InitiateMultipartUploadResult><Bucket>out-bucket</Bucket><Key>{}</Key>\
+                     <UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+                    xml_escape(&key),
+                    id
+                ))
+            }
+            "PUT" if request.query.contains_key("partNumber") => {
+                let id = query(&request, "uploadId").unwrap().to_string();
+                let number: u32 = query(&request, "partNumber").unwrap().parse().unwrap();
+                let upload = store.uploads.get_mut(&id).expect("known upload");
+                upload.1.insert(number, request.body.clone());
+                MockResponse::empty_ok()
+            }
+            "POST" if request.query.contains_key("uploadId") => {
+                if fail_complete {
+                    return MockResponse::error(500, "InternalError", "complete failed");
+                }
+                let id = query(&request, "uploadId").unwrap().to_string();
+                let (key, parts) = store.uploads.remove(&id).expect("known upload");
+                let body: Vec<u8> = parts.into_values().flatten().collect();
+                store.objects.insert(key.clone(), body);
+                MockResponse::ok_xml(format!(
+                    "<CompleteMultipartUploadResult><Key>{}</Key><ETag>\"x\"</ETag>\
+                     </CompleteMultipartUploadResult>",
+                    xml_escape(&key)
+                ))
+            }
+            "DELETE" if request.query.contains_key("uploadId") => {
+                let id = query(&request, "uploadId").unwrap().to_string();
+                store.uploads.remove(&id);
+                store.aborted += 1;
+                MockResponse::empty_ok()
+            }
+            "DELETE" => {
+                store.objects.remove(&key);
+                MockResponse::empty_ok()
+            }
+            "PUT" => {
+                store.objects.insert(key, request.body.clone());
+                MockResponse::empty_ok()
+            }
+            other => panic!("unexpected {} {}", other, request.path),
+        }
+    })
+}
+
+fn parquet_keys(bytes: &[u8]) -> Vec<String> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let col = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        out.extend((0..col.len()).map(|i| col.value(i).to_string()));
+    }
+    out
+}
+
+fn source_keys() -> Vec<String> {
+    (0..50).map(|i| format!("src/k{:03}", i)).collect()
+}
+
+#[test]
+fn local_mock_s3_output_commits_parts_and_result_last() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/run1",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["output"]["format"], "parquet");
+    assert_eq!(result["output"]["path"], "s3://mock-bucket/out/run1/");
+    assert_eq!(result["output"]["rows"], 50);
+    let files = result["output"]["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|f| {
+        f["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("s3://mock-bucket/out/run1/part-")
+    }));
+
+    let store = store.lock().unwrap();
+    assert!(
+        store.uploads.is_empty(),
+        "every upload completed or aborted"
+    );
+    let mut keys = Vec::new();
+    for (name, body) in &store.objects {
+        if name.ends_with(".parquet") {
+            assert!(name.starts_with("out/run1/part-"), "{}", name);
+            keys.extend(parquet_keys(body));
+        }
+    }
+    keys.sort();
+    assert_eq!(keys, source_keys());
+    let stored: Value = serde_json::from_slice(&store.objects["out/run1/_result.json"]).unwrap();
+    assert_eq!(stored["ok"], true);
+    assert_eq!(stored["output"]["rows"], 50);
+    // `_result.json` is written after the last part completed.
+    let requests = server.requests();
+    let last_put = requests
+        .iter()
+        .rposition(|r| r.method == "PUT" && r.path.ends_with("_result.json"))
+        .unwrap();
+    let last_complete = requests
+        .iter()
+        .rposition(|r| r.method == "POST" && r.query.contains_key("uploadId"))
+        .unwrap();
+    assert!(last_complete < last_put);
+}
+
+#[test]
+fn local_mock_s3_output_refuses_a_non_empty_prefix() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    store
+        .lock()
+        .unwrap()
+        .objects
+        .insert("out/old.txt".into(), b"x".to_vec());
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &["s3://mock-bucket/src/", "-o", "s3://mock-bucket/out/"],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.output_not_empty");
+    assert!(server.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn local_mock_s3_output_failed_commit_leaves_nothing() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let server = store_server(Arc::clone(&store), source_keys(), true);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 5, "output.write_failed");
+    let store = store.lock().unwrap();
+    assert!(store.objects.is_empty(), "{:?}", store.objects.keys());
+    assert!(store.uploads.is_empty());
+    assert!(store.aborted >= 1);
+}
+
+#[test]
+fn s3_output_is_not_resumable() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = strings(&["list", "s3://b/p", "-o", "s3://b/out/", "--resume"]);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.resume_needs_output");
 }

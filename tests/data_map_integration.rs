@@ -409,7 +409,7 @@ async fn test_list_streaming_quit_drains_buffered_batches() {
     let ctx = DataMapContext::new(rx, g_state.clone());
     s3tl::data_map::data_map_task_list_streaming(
         ctx,
-        dir.path().to_path_buf(),
+        s3tl::s3_output::PartSink::Dir(dir.path().to_path_buf()),
         0,
         OutputConfig::default(),
     )
