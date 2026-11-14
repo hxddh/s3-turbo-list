@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s3-turbo-list — release environment checker
+# s3tl — release environment checker
 # ---------------------------------------------------------------------------
 # Checks local prerequisites for a release build.  Does not install anything,
 # does not run cloud commands, does not modify system packages.
@@ -9,7 +9,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
-echo "=== s3-turbo-list Release Environment ==="
+echo "=== s3tl Release Environment ==="
 echo ""
 
 # ── OS information ────────────────────────────────────────
@@ -134,14 +134,14 @@ check_not_contains() {
 
 check_contains "CHANGELOG.md" "^## \\[${VERSION//./\\.}\\]" "CHANGELOG section for $VERSION"
 check_contains "Cargo.lock" "^version = \"${VERSION//./\\.}\"$" "Cargo.lock contains crate version $VERSION"
-check_contains "INSTALL.md" "s3-turbo-list-<version>-linux-x86_64" "INSTALL templated linux x86_64 asset"
-check_contains "INSTALL.md" "s3-turbo-list-<version>-linux-aarch64" "INSTALL templated linux aarch64 asset"
-check_contains "docs/releasing.md" "s3-turbo-list-<version>-linux-aarch64" "releasing templated linux aarch64 asset"
+check_contains "INSTALL.md" "s3tl-<version>-linux-x86_64" "INSTALL templated linux x86_64 asset"
+check_contains "INSTALL.md" "s3tl-<version>-linux-aarch64" "INSTALL templated linux aarch64 asset"
+check_contains "docs/releasing.md" "s3tl-<version>-linux-aarch64" "releasing templated linux aarch64 asset"
 check_contains "AGENTS.md" "latest git tag / GitHub Release" "AGENTS release source of truth"
 check_contains ".github/workflows/release-assets.yml" "Validate tag matches Cargo.toml version" "release workflow tag/version guard"
 check_not_contains ".github/workflows/release-assets.yml" "default: 'v[0-9]+\\.[0-9]+\\.[0-9]+'" "hard-coded workflow default tag"
-check_not_contains "INSTALL.md" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded INSTALL release asset names"
-check_not_contains "docs/releasing.md" "s3-turbo-list-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded releasing asset names"
+check_not_contains "INSTALL.md" "s3tl-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded INSTALL release asset names"
+check_not_contains "docs/releasing.md" "s3tl-[0-9]+\\.[0-9]+\\.[0-9]+-(linux|macos)" "hard-coded releasing asset names"
 
 if [ -x "scripts/verify-release-assets.sh" ]; then
   echo "ok:      release asset verifier executable"
@@ -157,12 +157,12 @@ else
 fi
 
 if awk '
-  $0 == "name = \"s3-turbo-list\"" { in_pkg=1; next }
+  $0 == "name = \"s3tl\"" { in_pkg=1; next }
   in_pkg && $0 ~ /^version = / { print; exit }
 ' Cargo.lock | grep -qx "version = \"$VERSION\""; then
-  echo "ok:      Cargo.lock s3-turbo-list package version"
+  echo "ok:      Cargo.lock s3tl package version"
 else
-  echo "MISSING: Cargo.lock s3-turbo-list package version $VERSION"
+  echo "MISSING: Cargo.lock s3tl package version $VERSION"
   CHECK_FAILED=1
 fi
 

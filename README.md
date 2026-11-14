@@ -125,7 +125,10 @@ duckdb.sql("select count(*), sum(size) from 'out/part-*.parquet'")
 A `--delimiter` listing adds one row per folder: the key ends with the
 delimiter, size is 0, and the other columns are null.
 
-`diff` writes only the keys that differ (`s3tl.diff/1`): `key`, `status`
+`diff` compares keys relative to each side's prefix, so
+`s3tl diff s3://a/2025/ s3://b/archive/2025/` matches `a/2025/x` with
+`b/archive/2025/x`. It writes only the keys that differ (`s3tl.diff/1`):
+`key` (relative to the prefixes), `status`
 (`left_only`, `right_only` or `changed`), then `left_size`,
 `left_last_modified`, `left_etag`, `right_size`, `right_last_modified`,
 `right_etag` (null for the side a key is missing from). Equal keys are only

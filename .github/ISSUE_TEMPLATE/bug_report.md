@@ -1,13 +1,13 @@
 ---
 name: Bug report
-about: Report a bug in s3-turbo-list
+about: Report a bug in s3tl
 title: "[Bug] "
 labels: bug
 assignees: ''
 ---
 
 **Version / commit**
-<!-- Output of `s3-turbo-list --version` or the git commit hash. -->
+<!-- Output of `s3tl --version` or the git commit hash. -->
 
 **OS / architecture**
 <!-- e.g. Ubuntu 22.04 x86_64, macOS 14 arm64 -->

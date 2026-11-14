@@ -103,17 +103,17 @@ jobs:
         run: |
           TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
-          ASSET="s3-turbo-list-${VERSION}-${{ matrix.platform }}"
+          ASSET="s3tl-${VERSION}-${{ matrix.platform }}"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
           echo "asset=${ASSET}"
 
-      - name: cargo build --release
-        run: cargo build --release
+      - name: cargo build --release --locked
+        run: cargo build --release --locked
 
       - name: Rename and verify binary
         run: |
-          cp target/release/s3-turbo-list "$ASSET"
+          cp target/release/s3tl "$ASSET"
           chmod +x "$ASSET"
           ./"$ASSET" --version
           ./"$ASSET" --help > help.txt
@@ -122,7 +122,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.platform }}
-          path: s3-turbo-list-*-${{ matrix.platform }}
+          path: s3tl-*-${{ matrix.platform }}
 
   finalize:
     name: Finalize release assets
@@ -178,18 +178,18 @@ jobs:
           VERSION="${TAG#v}"
 
           # Collect all new binaries from the build matrix
-          find artifacts -type f -name 's3-turbo-list-*' ! -name '*.sha256' -exec cp {} flat/ \;
+          find artifacts -type f -name 's3tl-*' ! -name '*.sha256' -exec cp {} flat/ \;
 
           # The linux-aarch64 asset is normally built by the matrix on the
           # ubuntu-24.04-arm runner. As a fallback (e.g. arm runners
           # unavailable), accept a pre-uploaded release asset built on an
           # external arm64 host.
-          if [ ! -s "flat/s3-turbo-list-${VERSION}-linux-aarch64" ]; then
+          if [ ! -s "flat/s3tl-${VERSION}-linux-aarch64" ]; then
             if ! gh release download "${{ inputs.tag }}" \
               --repo hxddh/s3-turbo-list \
               --dir flat \
-              --pattern "s3-turbo-list-${VERSION}-linux-aarch64"; then
-              echo "::error::Missing s3-turbo-list-${VERSION}-linux-aarch64 from both the build matrix and the release. Build and upload the arm64 asset, then rerun."
+              --pattern "s3tl-${VERSION}-linux-aarch64"; then
+              echo "::error::Missing s3tl-${VERSION}-linux-aarch64 from both the build matrix and the release. Build and upload the arm64 asset, then rerun."
               exit 1
             fi
           fi
@@ -201,10 +201,10 @@ jobs:
           TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
           expected=(
-            "s3-turbo-list-${VERSION}-linux-aarch64"
-            "s3-turbo-list-${VERSION}-linux-x86_64"
-            "s3-turbo-list-${VERSION}-macos-aarch64"
-            "s3-turbo-list-${VERSION}-macos-x86_64"
+            "s3tl-${VERSION}-linux-aarch64"
+            "s3tl-${VERSION}-linux-x86_64"
+            "s3tl-${VERSION}-macos-aarch64"
+            "s3tl-${VERSION}-macos-x86_64"
           )
 
           for asset in "${expected[@]}"; do
@@ -214,10 +214,10 @@ jobs:
             fi
           done
 
-          actual_count="$(find flat -maxdepth 1 -type f -name "s3-turbo-list-${VERSION}-*" | wc -l | tr -d ' ')"
+          actual_count="$(find flat -maxdepth 1 -type f -name "s3tl-${VERSION}-*" | wc -l | tr -d ' ')"
           if [ "$actual_count" != "4" ]; then
             echo "::error::Expected exactly 4 platform binaries, found ${actual_count}"
-            find flat -maxdepth 1 -type f -name "s3-turbo-list-${VERSION}-*" -print
+            find flat -maxdepth 1 -type f -name "s3tl-${VERSION}-*" -print
             exit 1
           fi
 
@@ -227,10 +227,10 @@ jobs:
           TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
           expected=(
-            "s3-turbo-list-${VERSION}-linux-aarch64"
-            "s3-turbo-list-${VERSION}-linux-x86_64"
-            "s3-turbo-list-${VERSION}-macos-aarch64"
-            "s3-turbo-list-${VERSION}-macos-x86_64"
+            "s3tl-${VERSION}-linux-aarch64"
+            "s3tl-${VERSION}-linux-x86_64"
+            "s3tl-${VERSION}-macos-aarch64"
+            "s3tl-${VERSION}-macos-x86_64"
           )
           sha256sum "${expected[@]}" > SHA256SUMS
           line_count="$(wc -l < SHA256SUMS | tr -d ' ')"
@@ -242,7 +242,7 @@ jobs:
           cat SHA256SUMS
           echo "=== Verification ==="
           sha256sum -c SHA256SUMS
-          sha256sum "s3-turbo-list-${VERSION}-linux-aarch64" > "s3-turbo-list-${VERSION}-linux-aarch64.sha256"
+          sha256sum "s3tl-${VERSION}-linux-aarch64" > "s3tl-${VERSION}-linux-aarch64.sha256"
           ls -lh
 
       - name: List flat directory for debugging
@@ -254,13 +254,13 @@ jobs:
           echo "=== linux-aarch64 SHA256 content ==="
           TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
-          cat "flat/s3-turbo-list-${VERSION}-linux-aarch64.sha256"
+          cat "flat/s3tl-${VERSION}-linux-aarch64.sha256"
 
       - name: Upload new assets to release
         run: |
           cd flat
           gh release upload "${{ inputs.tag }}" \
-            s3-turbo-list-* \
+            s3tl-* \
             SHA256SUMS \
             --repo hxddh/s3-turbo-list \
             --clobber

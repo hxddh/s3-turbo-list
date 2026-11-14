@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest a feature for s3-turbo-list
+about: Suggest a feature for s3tl
 title: "[Feature] "
 labels: enhancement
 assignees: ''

@@ -5,9 +5,9 @@
 - [ ] `cargo clippy --all-targets -- -D warnings` passes.
 - [ ] `cargo test` passes (all tests).
 - [ ] `cargo build` succeeds.
-- [ ] Documentation updated if behaviour changed (`README.md`, `CHANGELOG.md`, `docs/`).
+- [ ] Documentation updated if behaviour changed (`README.md`, `CHANGELOG.md`, `docs/`); the result contract (`docs/agent-usage.md`) only grows.
 - [ ] No credentials, access keys, secret keys, session tokens, or private keys in the diff.
 - [ ] No real production bucket names in code, tests, examples, or comments.
 - [ ] Cloud resources created during validation have been cleaned up.
-- [ ] Endpoint compatibility impact has been considered (compat-probe or trace where appropriate).
+- [ ] Endpoint compatibility impact has been considered (`s3tl check` or `--trace` where appropriate).
 - [ ] Known limitations in `README.md` updated if this PR introduces or resolves one.
