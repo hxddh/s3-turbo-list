@@ -94,6 +94,7 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
     };
     let mut cfg = EngineConfig::from_env();
     cfg.runtime.max_concurrency = job.concurrency;
+    s3tl::probe::set_concurrency(job.concurrency);
     cfg.s3.force_path_style = job.source.path_style;
     cfg.s3.endpoint_url = job.source.endpoint.clone();
 

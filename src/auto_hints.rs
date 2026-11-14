@@ -92,26 +92,19 @@ pub async fn discover_startup_boundaries(
             // the first object was listed).  Only the first and last key and
             // the count are kept.
             let slot = crate::list_page::ParsedPageSlot::default();
-            let send = client
-                .list_objects_v2()
-                .bucket(&bucket)
-                .prefix(&p)
-                .delimiter("/")
-                .customize()
-                .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
-                .send();
-            // Startup discovery runs before the first object is listed; a
-            // stalled endpoint must not hang the run there. Same watchdog the
-            // runtime split probes use.
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                send,
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|e| crate::error::concise_sdk_error(&e))?,
-                Err(_) => return Err("probe timed out".to_string()),
-            };
+            // Startup discovery runs before the first object is listed; the
+            // probe's watchdog keeps a stalled endpoint from hanging it.
+            let response = crate::probe::send(timeout_secs, || {
+                client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&p)
+                    .delimiter("/")
+                    .customize()
+                    .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
+                    .send()
+            })
+            .await?;
             // The parser's rows, or the SDK's when it left the page to them.
             let (keys, first_key, last_key) = match slot.take() {
                 Some(rows) => (

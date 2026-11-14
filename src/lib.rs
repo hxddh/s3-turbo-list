@@ -25,6 +25,7 @@ pub mod error; // FlatRuntimeError, error code constants
 mod flat_cut; // flat key-range cut search (startup bisection + runtime splits)
 mod list_page; // ListObjectsV2 <Contents> fast path used by tasks_s3::chain::flat_list
 pub mod mon;
+pub mod probe; // bounded, retried partitioning probes
 pub mod redact; // redact_url
 pub mod segment_order; // a diff side's segment order under runtime splits
 pub mod startup; // startup partitioning probes (drives auto_hints)
