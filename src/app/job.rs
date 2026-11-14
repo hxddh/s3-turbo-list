@@ -70,6 +70,8 @@ pub struct Job {
     /// Whether this run created the output directory (removed again when a
     /// failed run leaves it empty).
     pub creates_dir: bool,
+    /// `diff --compare`.
+    pub compare: s3tl::core::CompareMode,
 }
 
 impl Job {
@@ -309,6 +311,7 @@ fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
 /// Build the job for a list or diff command.
 pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
     let g = &cli.global;
+    let mut compare_mode = s3tl::core::CompareMode::default();
     let (mode, source, target, output, delimiter, resume) = match &cli.cmd {
         Command::List {
             source,
@@ -328,7 +331,9 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
             target,
             output,
             target_endpoint_url,
+            compare,
         } => {
+            compare_mode = (*compare).into();
             if output.as_deref() == Some("-") {
                 return Err(Failure::usage(
                     "usage.invalid_output",
@@ -373,6 +378,7 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         resume_from: None,
         first_part: 0,
         creates_dir: false,
+        compare: compare_mode,
     };
 
     if resume {

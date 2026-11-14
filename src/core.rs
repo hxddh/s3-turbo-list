@@ -310,6 +310,21 @@ impl ObjectProps {
     /// Streaming-diff classification of a key present on both sides: a
     /// size mismatch, an unavailable ETag on either side, or an ETag
     /// mismatch is `Astrisk` (changed); everything else is `Equal`.
+    /// [`ObjectProps::classify_pair`] under a compare mode: `Size` ignores
+    /// ETags; `Etag` and `Checksum` classify by size and ETag (checksum
+    /// verification happens later, on the changed pairs).
+    pub fn classify_pair_with(
+        mode: CompareMode,
+        left: &ObjectProps,
+        right: &ObjectProps,
+    ) -> MatchResult {
+        match mode {
+            CompareMode::Size if left.size == right.size => MatchResult::Equal,
+            CompareMode::Size => MatchResult::Astrisk,
+            CompareMode::Etag | CompareMode::Checksum => Self::classify_pair(left, right),
+        }
+    }
+
     pub fn classify_pair(left: &ObjectProps, right: &ObjectProps) -> MatchResult {
         let same_etag = match (&left.etag_other, &right.etag_other) {
             (None, None) => {
@@ -603,6 +618,25 @@ pub struct DiffCounts {
     pub right_only: usize,
     pub changed: usize,
     pub equal: usize,
+    /// `--compare checksum`: pairs whose ETags differed but whose stored
+    /// checksums proved them equal (included in `equal`).
+    pub verified_equal: usize,
+    /// `--compare checksum`: changed pairs the checksums could not settle
+    /// (no comparable checksum, or the HeadObject failed).
+    pub unverified: usize,
+}
+
+/// How a diff decides that a key present on both sides changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompareMode {
+    /// Size and ETag (the default).
+    #[default]
+    Etag,
+    /// Size only.
+    Size,
+    /// Size and ETag, then the stored checksums for pairs whose sizes match
+    /// but whose ETags differ (multipart or SSE copies of the same bytes).
+    Checksum,
 }
 
 /// What the data map saw and wrote.

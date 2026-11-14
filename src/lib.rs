@@ -16,7 +16,8 @@
 
 // Public to integration tests (types needed to exercise pipelines):
 pub mod auto_hints;
-pub mod checkpoint; // CheckpointIdentity, CheckpointJournal, checkpoint_path
+pub mod checkpoint;
+pub mod checksum; // diff --compare checksum // CheckpointIdentity, CheckpointJournal, checkpoint_path
 pub mod compat_probe;
 pub mod config;
 pub mod core; // ObjectKey, ObjectProps, MatchResult, KeySpaceHints, GlobalState, DataMapContext, MonContext, S3TaskContext

@@ -526,6 +526,7 @@ fn list_dry_run_plans_without_touching_anything() {
             "partitioning": "startup_discovery",
             "partitioning_reason": null,
             "concurrency": 8,
+            "compare": null,
             "max_keys": null,
             "resume_ranges": null,
             "first_part": 0,
@@ -840,4 +841,33 @@ fn stdout_stays_a_data_channel_with_dash_output_even_on_errors() {
         assert_eq!(result["schema"], "s3tl.result/1");
         assert_eq!(result["exit_code"], code, "{}", result);
     }
+}
+
+#[test]
+fn diff_compare_mode_is_planned_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = [
+        "diff",
+        "s3://a/",
+        "s3://b/",
+        "--endpoint-url",
+        ENDPOINT,
+        "--dry-run",
+    ];
+    let result = plan(&base, dir.path(), &[]);
+    assert_eq!(result["plan"]["compare"], "etag");
+    for mode in ["size", "checksum"] {
+        let result = plan(&[&base[..], &["--compare", mode]].concat(), dir.path(), &[]);
+        assert_eq!(result["plan"]["compare"], mode);
+    }
+    usage_error(
+        &[&base[..], &["--compare", "md5"]].concat(),
+        dir.path(),
+        "usage.invalid_argument",
+    );
+    usage_error(
+        &["list", "s3://a/", "--compare", "size"],
+        dir.path(),
+        "usage.invalid_argument",
+    );
 }

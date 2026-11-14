@@ -4054,7 +4054,7 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     assert_eq!(result["command"], "diff");
     assert_eq!(
         result["diff"],
-        json!({"left_only": 1, "right_only": 1, "changed": 0, "equal": 2})
+        json!({"left_only": 1, "right_only": 1, "changed": 0, "equal": 2, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["target"]["bucket"], "right");
     assert_eq!(result["output"]["rows"], 2);
@@ -4130,7 +4130,7 @@ fn local_mock_diff_identical_sides_write_no_rows() {
     let result = ok_result(code, &stdout, &stderr);
     assert_eq!(
         result["diff"],
-        json!({"left_only": 0, "right_only": 0, "changed": 0, "equal": 3})
+        json!({"left_only": 0, "right_only": 0, "changed": 0, "equal": 3, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["stats"]["objects"], 3, "distinct keys compared");
     assert_eq!(result["output"]["rows"], 0);
@@ -4172,7 +4172,7 @@ fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
     let result = ok_result(code, &stdout, &stderr);
     assert_eq!(
         result["diff"],
-        json!({"left_only": 0, "right_only": 0, "changed": 2, "equal": 1})
+        json!({"left_only": 0, "right_only": 0, "changed": 2, "equal": 1, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["source"]["endpoint_url"], left.endpoint());
     assert_eq!(result["target"]["endpoint_url"], right.endpoint());

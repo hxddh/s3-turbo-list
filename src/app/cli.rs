@@ -54,6 +54,11 @@ pub enum Command {
         /// Endpoint of the right side (default: --endpoint-url)
         #[arg(long, value_name = "URL")]
         target_endpoint_url: Option<String>,
+        /// How keys on both sides compare: size+ETag, size only, or
+        /// size+ETag then stored checksums for same-size pairs whose ETags
+        /// differ (one HeadObject per side for each such pair)
+        #[arg(long, value_enum, default_value_t = Compare::Etag)]
+        compare: Compare,
     },
     /// Check credentials, endpoint and proxy; with S3_URL, probe the endpoint
     Check {
@@ -61,6 +66,24 @@ pub enum Command {
         #[arg(value_name = "S3_URL")]
         source: Option<String>,
     },
+}
+
+/// `diff --compare`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compare {
+    Etag,
+    Size,
+    Checksum,
+}
+
+impl From<Compare> for s3tl::core::CompareMode {
+    fn from(c: Compare) -> Self {
+        match c {
+            Compare::Etag => Self::Etag,
+            Compare::Size => Self::Size,
+            Compare::Checksum => Self::Checksum,
+        }
+    }
 }
 
 #[derive(Args, Debug)]

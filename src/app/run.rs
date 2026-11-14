@@ -30,6 +30,7 @@ pub fn plan(job: &Job, result: &mut RunResult) {
         "partitioning": partitioning,
         "partitioning_reason": reason,
         "concurrency": job.concurrency,
+        "compare": job.target.as_ref().map(|_| format!("{:?}", job.compare).to_lowercase()),
         "max_keys": job.max_keys,
         "resume_ranges": job.resume_from.as_ref().map(|c| c.remaining.len()),
         "first_part": job.first_part,
@@ -468,8 +469,37 @@ async fn spawn_diff(
     let g_state = contexts.g_state.clone();
     let out_dir = job.output.dir().map(Path::to_path_buf);
     let output = contexts.cfg.output.clone();
+    let verifier = (job.compare == core::CompareMode::Checksum).then(|| {
+        let side = |spec: &SideSpec, region: &str| s3tl::checksum::Side {
+            client: core::build_s3_client(
+                contexts.sdk,
+                Some(region),
+                spec.endpoint.as_deref(),
+                spec.path_style,
+            ),
+            bucket: spec.url.bucket.clone(),
+            prefix: spec.url.prefix.clone(),
+        };
+        s3tl::checksum::verifier(
+            side(&job.source, source_region),
+            side(target, target_region),
+            contexts.cfg.s3.operation_timeout_secs,
+        )
+    });
+    let options = data_map::DiffOptions {
+        compare: job.compare,
+        verifier,
+    };
     set.spawn(async move {
-        data_map::data_map_task_diff_streaming(g_state, sides, Some(heads), out_dir, output).await
+        data_map::data_map_task_diff_streaming(
+            g_state,
+            sides,
+            Some(heads),
+            out_dir,
+            output,
+            options,
+        )
+        .await
     });
 }
 

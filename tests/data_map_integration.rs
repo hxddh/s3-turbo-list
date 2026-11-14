@@ -642,3 +642,68 @@ async fn test_merge_fails_when_run_aborts_as_the_last_segment_ends() {
     .unwrap_err();
     assert!(err.contains("aborted"), "{}", err);
 }
+
+#[tokio::test]
+async fn test_compare_modes_size_and_checksum() {
+    use s3tl::core::CompareMode;
+    use s3tl::data_map::{DiffOptions, run_diff_merge_with};
+    use std::sync::Arc;
+
+    async fn run(options: DiffOptions) -> DiffMergeOutcome {
+        let (ltx, lrx) = tokio::sync::mpsc::channel(8);
+        let (rtx, rrx) = tokio::sync::mpsc::channel(8);
+        ltx.send(vec![
+            left_obj("a", 5, [1; 16]), // same size, ETag differs
+            left_obj("b", 5, [2; 16]), // same size, ETag differs
+            left_obj("c", 5, [3; 16]), // size differs
+        ])
+        .await
+        .unwrap();
+        rtx.send(vec![
+            right_obj("a", 5, [9; 16]),
+            right_obj("b", 5, [8; 16]),
+            right_obj("c", 6, [3; 16]),
+        ])
+        .await
+        .unwrap();
+        drop((ltx, rtx));
+        run_diff_merge_with::<tokio::io::Sink>(
+            DiffStreamSides::from_receivers(vec![lrx], vec![rrx]),
+            None,
+            None,
+            options,
+            || false,
+        )
+        .await
+        .unwrap()
+    }
+
+    let etag = run(DiffOptions::default()).await;
+    assert_eq!((etag.astrisk, etag.equal), (3, 0));
+
+    let size = run(DiffOptions {
+        compare: CompareMode::Size,
+        verifier: None,
+    })
+    .await;
+    assert_eq!((size.astrisk, size.equal), (1, 2), "only c's size differs");
+
+    // The verifier proves "a" equal, cannot settle "b"; "c" (sizes differ)
+    // is never asked about.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let checksum = run(DiffOptions {
+        compare: CompareMode::Checksum,
+        verifier: Some(Arc::new(move |key: String| {
+            log.lock().unwrap().push(key.clone());
+            Box::pin(async move { (key == "a").then_some(true) })
+        })),
+    })
+    .await;
+    assert_eq!((checksum.astrisk, checksum.equal), (2, 1));
+    assert_eq!((checksum.verified_equal, checksum.unverified), (1, 1));
+    assert_eq!(checksum.rows, 2);
+    let mut asked = asked.lock().unwrap().clone();
+    asked.sort();
+    assert_eq!(asked, vec!["a".to_string(), "b".to_string()]);
+}
