@@ -281,7 +281,9 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_diff_merge(DiffStreamSides { left, right }, Some(&mut parquet), || false),
+        run_diff_merge(DiffStreamSides { left, right }, Some(&mut parquet), || {
+            false
+        }),
     )
     .await
     .expect("diff merge over many parallel segments must not hang")
@@ -295,19 +297,17 @@ async fn test_merge_many_parallel_segments_does_not_deadlock() {
         "identical sides should classify every key equal"
     );
     assert_eq!(outcome.received_objects, total * 2);
-    assert_eq!(outcome.unique_prefixes(), 0, "prefix stats cover differing keys");
+    assert_eq!(
+        outcome.unique_prefixes(),
+        0,
+        "prefix stats cover differing keys"
+    );
 }
 
 #[tokio::test]
 async fn test_diff_rows_carry_both_sides() {
-    let left = vec![vec![
-        left_obj("a", 1, [1; 16]),
-        left_obj("b", 5, [2; 16]),
-    ]];
-    let right = vec![vec![
-        right_obj("b", 7, [3; 16]),
-        right_obj("c", 9, [4; 16]),
-    ]];
+    let left = vec![vec![left_obj("a", 1, [1; 16]), left_obj("b", 5, [2; 16])]];
+    let right = vec![vec![right_obj("b", 7, [3; 16]), right_obj("c", 9, [4; 16])]];
     let (_, rows) = merge_full(left, right).await.unwrap();
     let hex = |b: u8| Some(format!("{:02x}", b).repeat(16));
     assert_eq!(

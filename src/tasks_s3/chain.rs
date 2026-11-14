@@ -169,11 +169,17 @@ async fn flat_list(
     split_tx: Option<&SplitSender>,
     retry_attempt: u32,
 ) -> Result<(), FlatRuntimeError> {
+    // `encoding-type=url`: keys come back percent-encoded, so a key holding
+    // a character XML 1.0 cannot carry (U+0001..U+001F) still lists instead
+    // of failing every page that contains it. Keys are decoded below
+    // (`decode_url_keys`); an endpoint that ignores the parameter answers
+    // without `<EncodingType>` and is read as-is.
     let mut request = ctx
         .s3_client
         .list_objects_v2()
         .bucket(&ctx.s3_bucket_name)
-        .prefix(prefix);
+        .prefix(prefix)
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url);
 
     // Only set start_after when non-empty.
     if !start_after.is_empty() {
@@ -260,14 +266,18 @@ async fn flat_list(
                 ));
             }
             Ok(Err(sdk_err)) => {
-                error!("S3 API error: {:?}", sdk_err);
                 return handle_sdk_error(sdk_err, &next_start, ctx, traced);
             }
             Ok(Ok(response)) => {
                 let mut objects = response;
                 // Rows the fast path parsed; `None` means this page fell back
                 // to the SDK's own `Contents`.
-                let parsed = parsed_slot.take();
+                let mut parsed = parsed_slot.take();
+                let url_encoded =
+                    objects.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+                if url_encoded {
+                    decode_page_keys(&mut objects, parsed.as_mut());
+                }
 
                 // Extract pagination metadata for trace.
                 let is_truncated_reported = objects.is_truncated();
@@ -333,6 +343,23 @@ async fn flat_list(
                         })
                         .collect(),
                 };
+
+                // ListObjectsV2 returns keys in ascending UTF-8 byte order,
+                // after the request's start-after. Every range cut, the
+                // resume cursor and the diff merge rely on it; an endpoint
+                // that repeats or reorders keys would otherwise duplicate or
+                // silently drop them.
+                if let Some(violation) = order_violation(&batch, &next_start) {
+                    return Err(FlatRuntimeError::new(
+                        ERROR_INCONSISTENT_LISTING,
+                        format!(
+                            "ListObjectsV2 returned keys out of order ({}); the endpoint \
+                             breaks the S3 listing contract",
+                            violation
+                        ),
+                        next_start,
+                    ));
+                }
 
                 // Segment ranges are (start_after, end_before].  The next
                 // segment starts with start_after=end_before, so excluding
@@ -444,8 +471,10 @@ async fn flat_list(
                 }
 
                 // Next page, or the end of the listing.  A fresh, non-empty
-                // token continues the chain (as the paginator did, whatever
-                // IsTruncated says).  Without one the listing ends — unless
+                // token continues the chain unless the page said
+                // IsTruncated=false (an endpoint that hands out a token on
+                // every final page would otherwise page forever).  Without
+                // one the listing ends — unless
                 // the endpoint said there is more: IsTruncated=true with no
                 // usable token, or the token it was just sent handed back
                 // (not explicitly IsTruncated=false), is a truncated page that
@@ -455,7 +484,7 @@ async fn flat_list(
                 // failing the run if the endpoint is stuck.
                 let next_token = next_token.filter(|token| !token.is_empty());
                 let repeated = next_token.is_some() && next_token == page_token;
-                if !repeated && next_token.is_some() {
+                if !repeated && next_token.is_some() && is_truncated_reported != Some(false) {
                     page_token = next_token;
                     continue;
                 }
@@ -592,9 +621,124 @@ fn merge_by_key(
     merged
 }
 
+/// The first ordering violation of a page: a key not after the cursor the
+/// page was requested from, or not after its predecessor.
+fn order_violation(batch: &[(ObjectKey, ObjectProps)], cursor: &str) -> Option<String> {
+    let mut prev = cursor;
+    for (key, _) in batch {
+        if key.as_str() <= prev {
+            return Some(format!("'{}' after '{}'", key.as_str(), prev));
+        }
+        prev = key.as_str();
+    }
+    None
+}
+
+/// Decode the `encoding-type=url` fields the run reads: object keys (fast
+/// path rows or SDK contents) and CommonPrefixes.
+fn decode_page_keys(
+    objects: &mut aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+    parsed: Option<&mut Vec<(ObjectKey, ObjectProps)>>,
+) {
+    match parsed {
+        Some(rows) => {
+            for (key, _) in rows.iter_mut() {
+                if let Some(decoded) = url_decode_key(key.as_str()) {
+                    *key = ObjectKey::from(decoded);
+                }
+            }
+        }
+        None => {
+            for object in objects.contents.iter_mut().flatten() {
+                if let Some(decoded) = object.key.as_deref().and_then(url_decode_key) {
+                    object.key = Some(decoded);
+                }
+            }
+        }
+    }
+    for cp in objects.common_prefixes.iter_mut().flatten() {
+        if let Some(decoded) = cp.prefix.as_deref().and_then(url_decode_key) {
+            cp.prefix = Some(decoded);
+        }
+    }
+}
+
+/// A key as S3 encodes it with `encoding-type=url` (form encoding: `+` is a
+/// space, `%XX` a byte), decoded; `None` when it needs no decoding (the
+/// common case, found with one memchr pass) or does not decode to UTF-8.
+pub(crate) fn url_decode_key(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    if memchr::memchr2(b'%', b'+', bytes).is_none() {
+        return None;
+    }
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_decode_key_follows_form_encoding() {
+        assert_eq!(url_decode_key("plain/key.txt"), None);
+        assert_eq!(url_decode_key("a+b").as_deref(), Some("a b"));
+        assert_eq!(url_decode_key("a%2Bb").as_deref(), Some("a+b"));
+        assert_eq!(url_decode_key("ctl%01x").as_deref(), Some("ctl\u{1}x"));
+        assert_eq!(url_decode_key("%E4%B8%AD").as_deref(), Some("中"));
+        assert_eq!(url_decode_key("100%").as_deref(), Some("100%"));
+        assert_eq!(url_decode_key("%zz%4").as_deref(), Some("%zz%4"));
+        assert_eq!(url_decode_key("%FF"), None, "not UTF-8: kept as sent");
+    }
+
+    #[test]
+    fn order_violation_checks_cursor_and_succession() {
+        let rows = |keys: &[&str]| -> Vec<(ObjectKey, ObjectProps)> {
+            keys.iter()
+                .map(|k| (ObjectKey::from(*k), ObjectProps::default()))
+                .collect()
+        };
+        assert_eq!(order_violation(&rows(&["b", "c"]), "a"), None);
+        assert_eq!(order_violation(&rows(&["a"]), ""), None);
+        assert!(
+            order_violation(&rows(&["a"]), "a").is_some(),
+            "repeat of the cursor"
+        );
+        assert!(order_violation(&rows(&["c", "b"]), "a").is_some());
+        assert!(order_violation(&rows(&["b", "b"]), "a").is_some());
+    }
 
     #[test]
     fn test_retry_backoff_grows_then_caps() {

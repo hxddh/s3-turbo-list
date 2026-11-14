@@ -13,6 +13,7 @@ pub const RESULT_SCHEMA: &str = "s3tl.result/1";
 
 /// Process exit codes; each is a class an automated caller can branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Success` documents code 0; results start out successful
 pub enum ExitCode {
     Success = 0,
     /// A bug: please report it.

@@ -1130,7 +1130,9 @@ mod tests {
     fn object_conversion_keeps_millis_and_storage_class() {
         let object = aws_sdk_s3::types::Object::builder()
             .key("k")
-            .last_modified(aws_sdk_s3::primitives::DateTime::from_millis(1_767_225_600_123))
+            .last_modified(aws_sdk_s3::primitives::DateTime::from_millis(
+                1_767_225_600_123,
+            ))
             .storage_class(aws_sdk_s3::types::ObjectStorageClass::StandardIa)
             .build();
         let props = ObjectProps::from(&object);

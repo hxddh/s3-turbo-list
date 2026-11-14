@@ -12,7 +12,6 @@ use crate::utils::{DiffRow, DiffStatus};
 
 // ── Output direction flags ─────────────────────────────────
 
-
 #[derive(Debug, Clone, Copy)]
 struct ListStreamingStats {
     received_batches: usize,
@@ -790,8 +789,7 @@ async fn ingest_list_stdout_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
         rows += 1;
         bytes = bytes.saturating_add(props.size());
 
-        if let Err(e) = render_text_row(&mut out, key.as_str(), &props)
-        {
+        if let Err(e) = render_text_row(&mut out, key.as_str(), &props) {
             log::error!("NDJSON serialization error for '{}': {}", key, e);
             return false;
         }
@@ -875,7 +873,7 @@ fn push_rfc3339_millis(out: &mut Vec<u8>, ms: u64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    let mut two = |v: u64, out: &mut Vec<u8>| {
+    let two = |v: u64, out: &mut Vec<u8>| {
         out.push(b'0' + (v / 10) as u8);
         out.push(b'0' + (v % 10) as u8);
     };
@@ -1167,9 +1165,8 @@ impl DiffSideStream {
                         match self.last_key.as_mut() {
                             Some(prev) if key.as_str() < prev.as_str() => {
                                 return Err(format!(
-                                    "{} listing returned keys out of order ('{}' after '{}'); \
-                                     diff requires S3 lexicographic ordering",
-                                    self.name, key, prev
+                                    "{} listing returned keys {} ('{}' after '{}')",
+                                    self.name, DIFF_ORDER_VIOLATION, key, prev
                                 ));
                             }
                             Some(prev) if key.as_str() == prev.as_str() => {
@@ -1218,6 +1215,9 @@ struct DiffRowSink {
 
 const DIFF_SINK_FLUSH_ROWS: usize = 8192;
 
+/// Marks a merge error caused by a side's keys arriving out of order.
+const DIFF_ORDER_VIOLATION: &str = "out of order";
+
 /// Batches queued between the merge task and the Parquet writer loop — the
 /// pipeline depth that lets classification run ahead of encode+compress.
 const DIFF_WRITE_PIPELINE_CAP: usize = 4;
@@ -1257,7 +1257,11 @@ impl DiffRowSink {
             DiffStatus::Changed => self.astrisk += 1,
         }
         // Prefix stats (bytes, top prefixes) describe the differing rows.
-        let size = row.left.as_ref().or(row.right.as_ref()).map_or(0, |p| p.size());
+        let size = row
+            .left
+            .as_ref()
+            .or(row.right.as_ref())
+            .map_or(0, |p| p.size());
         self.prefix_run
             .add(&mut self.prefix_stats, row.key.prefix(), size);
         self.rows += 1;
@@ -1552,12 +1556,15 @@ pub async fn data_map_task_diff_streaming(
     {
         Ok(outcome) => Some(outcome),
         Err(e) => {
-            log::error!("Diff merge failed: {}", e);
+            log::debug!("Diff merge failed: {}", e);
             // A merge stopped because the run is quitting (a side failed
-            // or the run was interrupted) is explained by that error;
-            // anything else (an ordering violation, a write error) is an
-            // output failure with this message as its reason.
-            if !g_state.is_quit() {
+            // or the run was interrupted) is explained by that error. An
+            // ordering violation is the endpoint breaking the listing
+            // contract; anything else (a write error) is an output failure.
+            if e.contains(DIFF_ORDER_VIOLATION) {
+                g_state.record_fatal_error(crate::error::ERROR_INCONSISTENT_LISTING, e);
+                g_state.quit();
+            } else if !g_state.is_quit() {
                 g_state.note_output_error(format!("diff merge failed: {}", e));
                 output_ok = false;
             }

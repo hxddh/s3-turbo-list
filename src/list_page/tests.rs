@@ -82,7 +82,10 @@ fn parses_rows_and_strips_contents() {
     let (flags, status, pad, parts, lm, size, md5) = rows[0].1;
     let template = ObjectProps::from(&aws_sdk_s3::types::Object::builder().build());
     // STANDARD (code 1) in the storage-class byte, no padding.
-    assert_eq!((flags, status, pad), (template.flags, template.status, 1 << 8));
+    assert_eq!(
+        (flags, status, pad),
+        (template.flags, template.status, 1 << 8)
+    );
     assert_eq!(parts, 0);
     assert_eq!(lm, 1_778_976_000_000); // 2026-05-17T00:00:00Z
     assert_eq!(size, 7);
