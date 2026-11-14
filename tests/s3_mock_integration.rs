@@ -5013,3 +5013,40 @@ fn s3_output_is_not_resumable() {
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     failed_result(code, &stdout, &stderr, 2, "usage.resume_needs_output");
 }
+
+#[test]
+fn local_mock_s3_output_assembles_multi_part_uploads_in_order() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let keys: Vec<String> = (0..20_000).map(|i| format!("src/key-{:06}", i)).collect();
+    let server = store_server(Arc::clone(&store), keys.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    // 1 KiB upload parts: every part file is many upload parts.
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("S3TL_UPLOAD_PART_BYTES", "1024")]);
+    ok_result(code, &stdout, &stderr);
+    let uploads = server
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PUT" && r.query.contains_key("partNumber"))
+        .count();
+    assert!(uploads > 4, "{} upload parts", uploads);
+    let store = store.lock().unwrap();
+    let mut got = Vec::new();
+    for (name, body) in &store.objects {
+        if name.ends_with(".parquet") {
+            got.extend(parquet_keys(body));
+        }
+    }
+    got.sort();
+    assert_eq!(got, keys);
+}

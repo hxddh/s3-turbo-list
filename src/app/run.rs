@@ -266,7 +266,9 @@ async fn run_listing(
         }
     };
     let s3_output = match &job.output {
-        Output::S3(spec) => Some(open_s3_output(&sdk, spec, timeout).await?),
+        Output::S3(spec) => {
+            Some(open_s3_output(&sdk, spec, timeout, cfg.output.upload_part_bytes).await?)
+        }
         _ => None,
     };
     let sink = match &job.output {
@@ -321,6 +323,7 @@ async fn open_s3_output(
     sdk: &aws_config::SdkConfig,
     spec: &SideSpec,
     timeout: u64,
+    part_bytes: usize,
 ) -> Result<Arc<S3Output>, Failure> {
     let region = resolve_region(sdk, spec, timeout).await?;
     let client = core::build_s3_client(
@@ -329,7 +332,13 @@ async fn open_s3_output(
         spec.endpoint.as_deref(),
         spec.path_style,
     );
-    let out = S3Output::new(client, &spec.url.bucket, &spec.url.prefix, timeout);
+    let out = S3Output::new(
+        client,
+        &spec.url.bucket,
+        &spec.url.prefix,
+        timeout,
+        part_bytes,
+    );
     match out.is_empty().await {
         Ok(true) => Ok(out),
         Ok(false) => Err(Failure::usage(

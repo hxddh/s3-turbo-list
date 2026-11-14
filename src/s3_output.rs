@@ -21,9 +21,6 @@ use tokio::task::JoinSet;
 
 use crate::core::OutputPart;
 
-/// Size of each multipart upload part (S3 needs at least 5 MiB for every
-/// part but the last).
-const UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 /// Upload parts in flight per writer.
 const UPLOADS_IN_FLIGHT: usize = 4;
 /// Per-writer output buffer between the Parquet encoder and the file (local parts only; S3 parts buffer upload parts instead). The
@@ -111,6 +108,9 @@ pub struct S3Output {
     /// Ends in `/` unless empty.
     prefix: String,
     timeout: Duration,
+    /// Size of each upload part but the last (S3 needs at least 5 MiB;
+    /// `OutputConfig::upload_part_bytes`).
+    part_bytes: usize,
     /// Uploads by part index: opened, then filled in when the part is done.
     uploads: Mutex<BTreeMap<usize, Upload>>,
 }
@@ -135,6 +135,7 @@ impl S3Output {
         bucket: &str,
         prefix: &str,
         timeout_secs: u64,
+        part_bytes: usize,
     ) -> Arc<Self> {
         let prefix = if prefix.is_empty() || prefix.ends_with('/') {
             prefix.to_string()
@@ -146,6 +147,7 @@ impl S3Output {
             bucket: bucket.to_string(),
             prefix,
             timeout: Duration::from_secs(timeout_secs.max(1)),
+            part_bytes: part_bytes.max(1),
             uploads: Mutex::new(BTreeMap::new()),
         })
     }
@@ -414,8 +416,9 @@ impl AsyncFileWriter for S3PartWriter {
     fn write(&mut self, bs: Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
         Box::pin(async move {
             self.buf.extend_from_slice(&bs);
-            while self.buf.len() >= UPLOAD_PART_BYTES {
-                let body = self.buf.split_to(UPLOAD_PART_BYTES).freeze();
+            let part_bytes = self.out.part_bytes;
+            while self.buf.len() >= part_bytes {
+                let body = self.buf.split_to(part_bytes).freeze();
                 self.upload(body);
                 while self.in_flight.len() >= UPLOADS_IN_FLIGHT {
                     self.join_one().await.map_err(external)?;
