@@ -182,7 +182,7 @@ The workflow requires a dated CHANGELOG section (`## [X.Y.Z] - YYYY-MM-DD`; `- U
 tags are a no-op), and dispatches the release-assets build after tagging, so
 one dispatch releases the version prepared on main.
 
-`release-tag.yml` also runs on a schedule as release-on-version-bump
+`release-tag.yml` also runs once a day (03:17 UTC) as a release-on-version-bump backstop; the push to main is what normally releases
 (maintainer-authorized): once main carries a Cargo.toml version with a
 dated CHANGELOG section and no tag, the next scheduled run creates the tag
 and dispatches the asset build.  Pushing a prepared release to main is

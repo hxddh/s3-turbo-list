@@ -617,12 +617,19 @@ fn finish(
                         if job.mode == RunMode::List
                             && let Err(e) = Checkpoint::remove(dir)
                         {
-                            result.warnings.push(format!(
-                                "the run finished but its checkpoint could not be removed ({}); \
-                             delete {} before reusing the directory",
-                                e,
-                                Checkpoint::path(dir).display()
-                            ));
+                            // A checkpoint left behind would make a later
+                            // --resume list its ranges again: take this run's
+                            // parts back so the dataset still matches it.
+                            unpublish(dir, &published);
+                            failure = Some(
+                                Failure::output(format!(
+                                    "the listing finished but its checkpoint could not be \
+                                     removed ({}); this run's parts were removed so the \
+                                     dataset stays consistent",
+                                    e
+                                ))
+                                .hint("--resume continues from the checkpoint"),
+                            );
                         }
                     } else {
                         let progress = listing

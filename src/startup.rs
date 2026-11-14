@@ -181,6 +181,7 @@ fn single_key_probe(
         let resp = crate::probe::send(timeout_secs, || {
             let mut req = client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(&bucket)
                 .prefix(&prefix)
                 .max_keys(1);
@@ -190,10 +191,11 @@ fn single_key_probe(
             req.send()
         })
         .await?;
+        let url = resp.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         Ok(resp
             .contents()
             .first()
             .and_then(|o| o.key())
-            .map(str::to_string))
+            .map(|k| crate::list_page::response_key(url, k)))
     }
 }

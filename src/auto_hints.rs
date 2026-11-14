@@ -97,6 +97,7 @@ pub async fn discover_startup_boundaries(
             let response = crate::probe::send(timeout_secs, || {
                 client
                     .list_objects_v2()
+                    .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                     .bucket(&bucket)
                     .prefix(&p)
                     .delimiter("/")
@@ -105,17 +106,18 @@ pub async fn discover_startup_boundaries(
                     .send()
             })
             .await?;
+            let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+            let dec = |k: &str| crate::list_page::response_key(url, k);
             // The parser's rows, or the SDK's when it left the page to them.
             let (keys, first_key, last_key) = match slot.take() {
                 Some(rows) => (
                     rows.len(),
-                    rows.first().map(|(k, _)| k.as_str().to_string()),
-                    rows.last().map(|(k, _)| k.as_str().to_string()),
+                    rows.first().map(|(k, _)| dec(k.as_str())),
+                    rows.last().map(|(k, _)| dec(k.as_str())),
                 ),
                 None => {
-                    let key = |o: Option<&aws_sdk_s3::types::Object>| {
-                        o.and_then(|o| o.key()).map(str::to_string)
-                    };
+                    let key =
+                        |o: Option<&aws_sdk_s3::types::Object>| o.and_then(|o| o.key()).map(dec);
                     let contents = response.contents();
                     (contents.len(), key(contents.first()), key(contents.last()))
                 }
@@ -125,7 +127,7 @@ pub async fn discover_startup_boundaries(
                     .common_prefixes()
                     .iter()
                     .filter_map(|cp| cp.prefix())
-                    .map(str::to_string)
+                    .map(dec)
                     .collect(),
                 truncated: response.is_truncated().unwrap_or(false),
                 keys,

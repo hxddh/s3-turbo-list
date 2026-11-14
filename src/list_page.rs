@@ -845,3 +845,54 @@ fn parse_struct(
 
 #[cfg(test)]
 mod tests;
+
+/// A key as S3 encodes it with `encoding-type=url` (form encoding: `+` is a
+/// space, `%XX` a byte), decoded; `None` when it needs no decoding (the
+/// common case, found with one memchr pass) or does not decode to UTF-8.
+pub(crate) fn url_decode_key(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    memchr::memchr2(b'%', b'+', bytes)?;
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `key` as a request with `encoding-type=url` sent it back: decoded when
+/// the response says it is URL-encoded (`url`), else as-is.
+pub(crate) fn response_key(url: bool, key: &str) -> String {
+    match url {
+        true => url_decode_key(key).unwrap_or_else(|| key.to_string()),
+        false => key.to_string(),
+    }
+}
