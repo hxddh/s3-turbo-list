@@ -1,23 +1,24 @@
 # Releases are driven by this version field: see docs/releasing.md.
 [package]
-name = "s3-turbo-list"
-version = "0.39.0"
+name = "s3tl"
+version = "1.0.0"
 edition = "2024"
 authors = ["S3 Turbo List Contributors"]
+repository = "https://github.com/hxddh/s3-turbo-list"
+publish = false
 rust-version = "1.94.1"
-description = "High-performance concurrent Amazon S3 bucket listing with adaptive key-space partitioning"
+description = "Fast S3-compatible bucket listing and diffing to Parquet, built for agents"
 license = "Apache-2.0"
 
 [dependencies]
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
-clap_mangen = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "io-std"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
 aws-smithy-runtime-api = "1"
+aws-credential-types = "1"
 # ListObjectsV2 fast path (src/list_page.rs): wraps the response body
 # (`SdkBody::from_body_1_x`) and scans it with memchr.
 aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
@@ -36,27 +37,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 itoa = "1"
 foldhash = "0.2"
-# Proxy-decision reporting in doctor / run logs: the same env matcher the SDK's
+# Proxy-decision reporting in `check`: the same env matcher the SDK's
 # HTTP client builds from HTTP(S)_PROXY / ALL_PROXY / NO_PROXY.
 hyper-util = { version = "0.1", features = ["client-proxy"] }
 http = "1"
-toml = "1"
-
-# `access(2)` for the dry run's output-writability check: mode bits say
-# read-only to a root user who can write anyway (containers, CI).
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 # Integration tests read Parquet outputs back through `arrow::array`.
 arrow = "60"
 tempfile = "3"
 
-# The output-pipeline benchmark (the former hidden `benchmark-local`
-# subcommand); its tests run with `cargo test`.
-[[example]]
-name = "bench_local"
-test = true
 
 # Release artifacts ship from `cargo build --release` (see the release workflow),
 # so optimize that profile for a lean, fast binary: strip symbols, enable
@@ -68,3 +58,9 @@ test = true
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# The output-pipeline benchmark (docs/development.md); its tests run with
+# `cargo test`.
+[[example]]
+name = "bench_local"
+test = true

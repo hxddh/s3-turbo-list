@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s3-turbo-list — published release asset verifier
+# s3tl — published release asset verifier
 # ---------------------------------------------------------------------------
 # Downloads a GitHub release into /tmp, verifies the expected asset set and
 # SHA256SUMS, then runs --version and --help for the current platform binary.
@@ -38,17 +38,17 @@ case "$(uname -m)" in
     ;;
 esac
 
-CURRENT_ASSET="s3-turbo-list-${VERSION}-${OS}-${ARCH}"
+CURRENT_ASSET="s3tl-${VERSION}-${OS}-${ARCH}"
 EXPECTED_ASSETS=(
-  "s3-turbo-list-${VERSION}-linux-aarch64"
-  "s3-turbo-list-${VERSION}-linux-aarch64.sha256"
-  "s3-turbo-list-${VERSION}-linux-x86_64"
-  "s3-turbo-list-${VERSION}-macos-aarch64"
-  "s3-turbo-list-${VERSION}-macos-x86_64"
+  "s3tl-${VERSION}-linux-aarch64"
+  "s3tl-${VERSION}-linux-aarch64.sha256"
+  "s3tl-${VERSION}-linux-x86_64"
+  "s3tl-${VERSION}-macos-aarch64"
+  "s3tl-${VERSION}-macos-x86_64"
   "SHA256SUMS"
 )
 
-echo "=== Verify s3-turbo-list release assets ==="
+echo "=== Verify s3tl release assets ==="
 echo "repo:       ${REPO}"
 echo "tag:        ${TAG}"
 echo "directory:  ${VERIFY_DIR}"
@@ -101,7 +101,7 @@ fi
 
 VERSION_OUTPUT="$(./"$CURRENT_ASSET" --version)"
 echo "version:   ${VERSION_OUTPUT}"
-if [ "$VERSION_OUTPUT" != "s3-turbo-list ${VERSION}" ]; then
+if [ "$VERSION_OUTPUT" != "s3tl ${VERSION}" ]; then
   echo "ERROR: unexpected version output: ${VERSION_OUTPUT}" >&2
   exit 1
 fi

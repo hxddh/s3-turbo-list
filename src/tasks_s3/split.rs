@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 
 // ── Adaptive long-tail splitting ───────────────────────────
 //
@@ -47,6 +47,8 @@ const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
 pub(super) struct SplitRange {
     pub(super) start: String,
     pub(super) end: Option<String>,
+    /// The segment this range was split off (its keys follow the parent's).
+    pub(super) parent: usize,
 }
 
 pub(super) type SplitSender = tokio::sync::mpsc::UnboundedSender<SplitRange>;
@@ -158,6 +160,7 @@ impl SegmentControl {
         Some(SplitRange {
             start: proposed,
             end: old_end,
+            parent: 0, // set by the segment that accepts the split
         })
     }
 }
@@ -215,29 +218,27 @@ async fn probe_split_candidate(
     let mut known: Vec<String> = Vec::new();
     for dir in dirs.into_iter().take(SPLIT_PROBE_MAX_RUNGS) {
         let slot = ParsedPageSlot::default();
-        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
-        let send = ctx
-            .s3_client
-            .list_objects_v2()
-            .bucket(&ctx.s3_bucket_name)
-            .prefix(&dir)
-            .start_after(cursor)
-            .delimiter("/")
-            // At the leaf rung the page is up to 1000 `<Contents>`: let the
-            // fast parser take them (the SDK's per-object deserializer made
-            // these probes ~15% of a listing's CPU).  The rows only matter
-            // when no rung has a CommonPrefix to cut at (see above).
-            .customize()
-            .interceptor(FastContentsInterceptor::new(slot.clone()))
-            .send();
-        let response = match timeout_at(Instant::now() + timeout_dur, send).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                debug!("Split probe failed for prefix '{}': {:?}", dir, e);
-                return SplitProbe::Failed;
-            }
-            Err(_elapsed) => {
-                debug!("Split probe timed out for prefix '{}'", dir);
+        let response = match crate::probe::send(ctx.operation_timeout_secs, || {
+            ctx.s3_client
+                .list_objects_v2()
+                .bucket(&ctx.s3_bucket_name)
+                .prefix(&dir)
+                .start_after(cursor)
+                .delimiter("/")
+                // At the leaf rung the page is up to 1000 `<Contents>`: let
+                // the fast parser take them (the SDK's per-object
+                // deserializer made these probes ~15% of a listing's CPU).
+                // The rows only matter when no rung has a CommonPrefix to
+                // cut at (see above).
+                .customize()
+                .interceptor(FastContentsInterceptor::new(slot.clone()))
+                .send()
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Split probe failed for prefix '{}': {}", dir, e);
                 return SplitProbe::Failed;
             }
         };
@@ -307,24 +308,22 @@ async fn probe_flat_cut(
     flat_high: &FlatHigh,
 ) -> SplitProbe {
     let probe = |candidate: String| async move {
-        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
-        let send = ctx
-            .s3_client
-            .list_objects_v2()
-            .bucket(&ctx.s3_bucket_name)
-            .prefix(listing_prefix)
-            .start_after(&candidate)
-            .max_keys(1)
-            .send();
-        match timeout_at(Instant::now() + timeout_dur, send).await {
-            Ok(Ok(r)) => Ok(r
-                .contents()
-                .first()
-                .and_then(|o| o.key())
-                .map(str::to_string)),
-            Ok(Err(e)) => Err(format!("probe at '{}' failed: {:?}", candidate, e)),
-            Err(_elapsed) => Err(format!("probe at '{}' timed out", candidate)),
-        }
+        let response = crate::probe::send(ctx.operation_timeout_secs, || {
+            ctx.s3_client
+                .list_objects_v2()
+                .bucket(&ctx.s3_bucket_name)
+                .prefix(listing_prefix)
+                .start_after(&candidate)
+                .max_keys(1)
+                .send()
+        })
+        .await
+        .map_err(|e| format!("probe at '{}' failed: {}", candidate, e))?;
+        Ok(response
+            .contents()
+            .first()
+            .and_then(|o| o.key())
+            .map(str::to_string))
     };
     let known_high = flat_high.lock().unwrap().clone();
     match crate::flat_cut::find_flat_cut(listing_prefix, cursor, end, known_high.as_deref(), &probe)

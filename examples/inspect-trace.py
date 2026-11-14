@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize an s3-turbo-list trace JSONL file.
+"""Summarize an s3tl trace JSONL file.
 
 Usage:
     python examples/inspect-trace.py path/to/trace.jsonl

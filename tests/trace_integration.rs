@@ -1,7 +1,5 @@
 // Integration tests for S3CompatEvent JSONL roundtrip and truncated_raw_body fix.
-use s3_turbo_list::trace::{
-    JsonlTraceWriter, S3CompatEvent, S3TraceWriter, trace_writer_for_target,
-};
+use s3tl::trace::{JsonlTraceWriter, S3CompatEvent, S3TraceWriter, trace_writer_for_target};
 
 // ── JSON roundtrip — all required fields present ──────────
 
@@ -15,7 +13,6 @@ fn test_trace_event_jsonl_roundtrip() {
     );
     event.region = Some("us-east-1".into());
     event.addressing_style = "virtual".into();
-    event.set_provider(Some("aws"));
     event.http_status = 200;
     event.retry_attempt = 1;
     event.latency_ms = 42;
@@ -37,8 +34,6 @@ fn test_trace_event_jsonl_roundtrip() {
     assert_eq!(parsed["latency_ms"], 42);
     assert_eq!(parsed["key_count"], 100);
     assert_eq!(parsed["region"], "us-east-1");
-    assert_eq!(parsed["provider"], "aws");
-    assert!(parsed.get("profile").is_none());
     assert_eq!(parsed["is_truncated"], true);
     assert_eq!(parsed["next_continuation_token"], "token-xyz");
     assert_eq!(parsed["contents_count"], 100);

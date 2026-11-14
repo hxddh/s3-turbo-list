@@ -1,6 +1,6 @@
 # Building and Releasing
 
-How to build s3-turbo-list from source, package a release binary into
+How to build s3tl from source, package a release binary into
 `dist/`, and publish a GitHub release.  The release source of truth is the
 latest git tag / GitHub Release.
 
@@ -59,7 +59,7 @@ BUILD_MODE=default ./scripts/build-release.sh
 
 `scripts/build-release.sh` builds with `cargo build --release` (or a
 workaround mode), copies the binary to `dist/` as
-`s3-turbo-list-<version>-<os>-<arch>`, writes a SHA256 checksum, and verifies
+`s3tl-<version>-<os>-<arch>`, writes a SHA256 checksum, and verifies
 the binary with `--help` and `--version`.  It makes no network calls, contacts
 no cloud endpoint, and creates no GitHub release.
 
@@ -80,18 +80,18 @@ Expected output:
 
 ```
 dist/
-├── s3-turbo-list-<version>-linux-x86_64
-├── s3-turbo-list-<version>-linux-x86_64.sha256
-├── s3-turbo-list-<version>-linux-aarch64
-└── s3-turbo-list-<version>-linux-aarch64.sha256
+├── s3tl-<version>-linux-x86_64
+├── s3tl-<version>-linux-x86_64.sha256
+├── s3tl-<version>-linux-aarch64
+└── s3tl-<version>-linux-aarch64.sha256
 ```
 
 Verify locally (no cloud endpoints):
 
 ```bash
 VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-./dist/s3-turbo-list-${VERSION}-linux-aarch64 --version
-./dist/s3-turbo-list-${VERSION}-linux-aarch64 --help
+./dist/s3tl-${VERSION}-linux-aarch64 --version
+./dist/s3tl-${VERSION}-linux-aarch64 --help
 ```
 
 Never embed credentials in the binary, build scripts, or output, and never
@@ -113,7 +113,7 @@ run endpoint validation as part of the release build.
 git grep -nE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_(access_key_id|secret_access_key|session_token)\s*=|AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|ghp_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+' || true
 
 # Real bucket-looking names (manual review)
-git grep -n -E 's3tl-|my-real-|prod-' -- examples docs
+git grep -n -E 'my-real-|prod-' -- examples docs
 ```
 
 Every hit must be a placeholder or false positive: no real credentials or
@@ -159,7 +159,7 @@ Build the linux-aarch64 asset (or any platform asset built outside CI) with
 `scripts/build-release.sh` as described above, using a `BUILD_MODE`
 workaround on Ubuntu 20.04 arm64.
 
-- [ ] `dist/s3-turbo-list-<version>-<os>-<arch>` and its `.sha256` exist.
+- [ ] `dist/s3tl-<version>-<os>-<arch>` and its `.sha256` exist.
 - [ ] `--help` runs and `--version` prints the correct version.
 
 ### 7. Create and push the tag
@@ -178,13 +178,13 @@ gh workflow run release-tag.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
 ```
 
 The `tag` input is optional and defaults to the Cargo.toml version on main.
-The workflow requires a matching CHANGELOG section, is idempotent (existing
+The workflow requires a dated CHANGELOG section (`## [X.Y.Z] - YYYY-MM-DD`; `- Unreleased` never releases), is idempotent (existing
 tags are a no-op), and dispatches the release-assets build after tagging, so
 one dispatch releases the version prepared on main.
 
 `release-tag.yml` also runs on a schedule as release-on-version-bump
 (maintainer-authorized): once main carries a Cargo.toml version with a
-matching CHANGELOG section and no tag, the next scheduled run creates the tag
+dated CHANGELOG section and no tag, the next scheduled run creates the tag
 and dispatches the asset build.  Pushing a prepared release to main is
 therefore sufficient to release.  **A version bump on main is treated as a
 release instruction — keep unreleased version bumps off main.**
@@ -225,7 +225,7 @@ git rev-parse main origin/main "v${VERSION}^{}"
 
 - [ ] Release is not draft and not prerelease.
 - [ ] Release contains four platform binaries, `SHA256SUMS`, and
-      `s3-turbo-list-${VERSION}-linux-aarch64.sha256`.
+      `s3tl-${VERSION}-linux-aarch64.sha256`.
 - [ ] `sha256sum -c SHA256SUMS` reports `OK` for all four binaries.
 - [ ] The current-platform binary prints the correct version, and `--help`
       runs without cloud access.

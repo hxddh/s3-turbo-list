@@ -5,7 +5,7 @@ use crate::core::S3TaskContext;
 use crate::error::*;
 use crate::trace::S3CompatEvent;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
-use log::error;
+use log::debug;
 
 /// One ListObjectsV2 request of a segment's chain, as the compat trace
 /// records it.
@@ -31,7 +31,6 @@ impl TracedRequest<'_> {
             self.prefix,
         );
         event.region = ctx.region.clone();
-        event.set_provider(ctx.provider.as_deref());
         event.addressing_style = ctx.addressing_style.clone();
         event.start_after = (!self.start_after.is_empty()).then(|| self.start_after.to_string());
         event.continuation_token = self.continuation_token.map(str::to_string);
@@ -111,7 +110,7 @@ pub(super) fn handle_sdk_error(
                     }),
             );
 
-            error!(
+            debug!(
                 "Service error: code={:?}, msg={:?}, http={}",
                 s3_code, s3_msg, http_code
             );
@@ -130,7 +129,7 @@ pub(super) fn handle_sdk_error(
             ))
         }
         aws_sdk_s3::error::SdkError::DispatchFailure(dispatch_err) => {
-            error!("Dispatch failure: {:?}", dispatch_err);
+            debug!("Dispatch failure: {:?}", dispatch_err);
 
             let is_timeout = dispatch_err.is_timeout();
             let errno = if is_timeout {
@@ -168,8 +167,28 @@ pub(super) fn handle_sdk_error(
 
             Err(FlatRuntimeError::new(errno, message, next_start.into()))
         }
+        aws_sdk_s3::error::SdkError::TimeoutError(_) => {
+            debug!("SDK timeout");
+            ctx.g_state.inc_s3_client_timeout();
+            let retryable = is_retryable(ERROR_S3_CLIENT_CONNECTION_TIMEOUT);
+            write_trace(
+                ctx,
+                traced.failure(
+                    ctx,
+                    0,
+                    Some("Timeout".into()),
+                    Some("request timed out".into()),
+                    retryable,
+                ),
+            );
+            Err(FlatRuntimeError::new(
+                ERROR_S3_CLIENT_CONNECTION_TIMEOUT,
+                "request timed out".into(),
+                next_start.into(),
+            ))
+        }
         other => {
-            error!("Unhandled SDK error: {:?}", other);
+            debug!("Unhandled SDK error: {:?}", other);
             ctx.g_state.inc_s3_client_generic_error();
 
             // Classified as ERROR_S3_CLIENT_GENERIC below, which the segment

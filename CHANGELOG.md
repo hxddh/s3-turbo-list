@@ -1,9 +1,78 @@
 # Changelog
 
-All notable changes to s3-turbo-list will be documented in this file.
+All notable changes to s3tl (formerly s3-turbo-list) are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] - 2026-11-14
+
+1.0 is a redesign for speed, a small surface and automation. It is not
+compatible with 0.x command lines, outputs or checkpoints. The binary is now
+`s3tl`.
+
+### Changed (breaking)
+- **Command line.** Three commands: `s3tl list S3_URL`, `s3tl diff S3_URL
+  S3_URL`, `s3tl check [S3_URL]`, with `s3://bucket[/prefix]` URLs. Options:
+  `-o DIR|-`, `--delimiter`, `--resume`, `--endpoint-url`,
+  `--target-endpoint-url`, `--path-style`, `--region`, `-c`, `--dry-run`,
+  `--trace`, `-v`. Removed: `--bucket/--prefix/--target-bucket/--target-region`,
+  `--output-dir/--output-parquet-file/--output-format/--compression`,
+  `--filter`, `--hints-file`, `--start-after`, `--log`, `--run-manifest`,
+  `--agent`, `--provider` presets, `--addressing-style`, `--config` and the
+  config file, `doctor`, `compat-probe` (now `check`), `manifest-summary`,
+  `guide`, `completions`, `man`, TSV output and the `.ks` KeySpace file.
+- **One result document.** stdout always carries one JSON result
+  (`s3tl.result/1`) with stable error codes (`auth.expired_token`, …), a
+  `retryable` flag and a hint; with `-o -` it is the last line of stderr.
+  Exit codes: 0, 1 internal, 2 usage, 3 setup, 4 retryable, 5 output, 130
+  interrupted. A panic still produces a result.
+- **Dataset output.** `-o DIR` writes `part-NNNNN.parquet` and
+  `_result.json`; parts are written as hidden temp files, fsynced and renamed
+  on commit. A failed run leaves the directory as it was; `DIR` must be empty
+  unless resuming.
+- **Resume into the same dataset.** `--resume` reads `DIR/_checkpoint.json`
+  (JSON, `s3tl.checkpoint/1`) and appends parts, so the directory ends up
+  holding the complete listing. Only `-o DIR` list runs checkpoint (a
+  statistics-only run's checkpoint can no longer be resumed into Parquet).
+- **Schemas v2.** List: `key, size, last_modified (timestamp ms UTC), etag
+  (nullable), storage_class`. Diff writes only differing keys: `key, status
+  (left_only|right_only|changed), left_*/right_* size, last_modified, etag`,
+  with keys relative to each side's prefix (so different prefixes can be
+  compared). NDJSON rows carry the list columns.
+- **Endpoint and region resolution.** `AWS_ENDPOINT_URL_S3` /
+  `AWS_ENDPOINT_URL` are resolved by s3tl and recorded in results, traces and
+  checkpoints (the SDK used to apply them silently). On AWS the bucket's
+  region is detected from one HeadBucket; path-style is automatic for IP and
+  localhost endpoints.
+
+### Performance
+- `diff` splits each side's segments at runtime, like `list`: a side whose
+  startup partition is too coarse no longer serializes the diff (one static
+  segment per side: 4.80 s → 3.30 s on the local mock).
+- Diff writes only differing keys (1M keys, 1% changed: 6.2M keys/s merged).
+- Partitioning probes share one limit (three per `-c` slot) and retry a
+  throttled probe once instead of dropping it.
+
+### Fixed
+- Keys with characters XML cannot carry (U+0001…U+001F) made every page
+  that held them fail: requests now send `encoding-type=url`.
+- An endpoint returning keys out of order or repeated is detected
+  (`endpoint.inconsistent_listing`) instead of silently duplicating or
+  dropping keys; a token on an `IsTruncated=false` page no longer pages
+  forever.
+- Expired or invalid tokens, unknown access keys, and code-less 401/403/404
+  responses are setup errors (exit 3), not retryable network errors.
+- Endpoint credentials (`user:pass@`, query strings) are redacted
+  everywhere they are shown.
+- An interrupt no longer hides an output or listing failure.
+- Negative `<Size>` values clamp to 0 instead of wrapping.
+
+### Internal
+- New modules: `segment_order` (diff order under splits), `probe` (bounded
+  probes), `redact`; `app/` rewritten (`cli`, `job`, `run`, `check`,
+  `result`). Removed: `agent`, `hints`, `profiles`, `filter_expr`,
+  `local_tools`. CI checks the MSRV and builds with `--locked`.
 
 ## [0.39.0] - 2026-09-30
 

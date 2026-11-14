@@ -1,23 +1,4 @@
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-
-// ── TOML hints-file format ─────────────────────────────────
-
-// The format earlier versions wrote as their hints cache; runs no longer read
-// or write a cache, but `--hints-file` (and `doctor`) still accept such a file.
-// `#[serde(default)]` on the whole struct (no `deny_unknown_fields`) keeps older
-// cache files readable: fields that earlier versions wrote (total_objects,
-// scan_mode, estimate_mode, and the long-removed sampled-scan fields) are simply
-// ignored on load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HintsCache {
-    pub bucket: String,
-    pub region: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    pub boundaries: Vec<String>,
-    pub generated_at: String,
-}
 
 // ── Startup structural discovery ───────────────────────────
 //
@@ -111,26 +92,19 @@ pub async fn discover_startup_boundaries(
             // the first object was listed).  Only the first and last key and
             // the count are kept.
             let slot = crate::list_page::ParsedPageSlot::default();
-            let send = client
-                .list_objects_v2()
-                .bucket(&bucket)
-                .prefix(&p)
-                .delimiter("/")
-                .customize()
-                .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
-                .send();
-            // Startup discovery runs before the first object is listed; a
-            // stalled endpoint must not hang the run there. Same watchdog the
-            // runtime split probes use.
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                send,
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|e| crate::error::concise_sdk_error(&e))?,
-                Err(_) => return Err("probe timed out".to_string()),
-            };
+            // Startup discovery runs before the first object is listed; the
+            // probe's watchdog keeps a stalled endpoint from hanging it.
+            let response = crate::probe::send(timeout_secs, || {
+                client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&p)
+                    .delimiter("/")
+                    .customize()
+                    .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
+                    .send()
+            })
+            .await?;
             // The parser's rows, or the SDK's when it left the page to them.
             let (keys, first_key, last_key) = match slot.take() {
                 Some(rows) => (
@@ -584,43 +558,6 @@ fn share_budget(sizes: &[Option<u64>], page_keys: &[usize], budget: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_hints_cache_round_trip() {
-        let cache = HintsCache {
-            bucket: "bucket".to_string(),
-            region: Some("us-east-1".to_string()),
-            prefix: Some("logs/".to_string()),
-            boundaries: vec!["a/".to_string(), "b/".to_string()],
-            generated_at: "2026-05-16T00:00:00Z".to_string(),
-        };
-
-        let encoded = toml::to_string_pretty(&cache).unwrap();
-        assert!(encoded.contains("generated_at = \"2026-05-16T00:00:00Z\""));
-
-        let decoded: HintsCache = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded.bucket, "bucket");
-        assert_eq!(decoded.region.as_deref(), Some("us-east-1"));
-        assert_eq!(decoded.prefix.as_deref(), Some("logs/"));
-        assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
-    }
-
-    #[test]
-    fn test_hints_cache_ignores_legacy_fields() {
-        // Files written by older versions carry total_objects/scan_mode/
-        // estimate_mode (and older sampled-scan fields); they must still load.
-        let legacy = r#"bucket = "bucket"
-region = "us-east-1"
-total_objects = 100
-boundaries = ["a/", "b/"]
-generated_at = "2026-05-16T00:00:00Z"
-scan_mode = "structural"
-estimate_mode = "structural"
-"#;
-        let decoded: HintsCache = toml::from_str(legacy).unwrap();
-        assert_eq!(decoded.bucket, "bucket");
-        assert_eq!(decoded.boundaries, vec!["a/".to_string(), "b/".to_string()]);
-    }
 
     fn fake_tree(data: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
         data.iter()

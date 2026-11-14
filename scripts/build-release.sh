@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s3-turbo-list — release build and packaging script
+# s3tl — release build and packaging script
 # ---------------------------------------------------------------------------
 # Builds a release binary and packages it into dist/.
 # No network commands, no cloud endpoints, no GitHub release creation.
@@ -12,7 +12,7 @@
 #                       clang    → CC=clang cargo build --release
 #                       gcc10    → CC=gcc-10 cargo build --release
 #                       no-asm   → AWS_LC_SYS_CFLAGS=-DAWS_LC_NO_ASM=1
-#   BINARY_NAME     — output binary name (default: s3-turbo-list)
+#   BINARY_NAME     — output binary name (default: s3tl)
 #   STRIP           — if set to 1, strip the binary after build
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -23,7 +23,7 @@ cd "$REPO_DIR"
 RELEASE_PROFILE="${RELEASE_PROFILE:-release}"
 TARGET="${TARGET:-}"
 BUILD_MODE="${BUILD_MODE:-default}"
-BINARY_NAME="${BINARY_NAME:-s3-turbo-list}"
+BINARY_NAME="${BINARY_NAME:-s3tl}"
 STRIP="${STRIP:-0}"
 
 # ── Determine OS/arch for naming ───────────────────────────
@@ -42,7 +42,7 @@ mkdir -p "$DIST_DIR"
 
 OUTPUT_NAME="${BINARY_NAME}-${VERSION}-${SUFFIX}"
 
-echo "=== s3-turbo-list Release Build ==="
+echo "=== s3tl Release Build ==="
 echo "  Profile:      $RELEASE_PROFILE"
 echo "  Build mode:   $BUILD_MODE"
 echo "  Target:       ${TARGET:-<host>}"

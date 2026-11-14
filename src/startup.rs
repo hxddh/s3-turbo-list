@@ -5,7 +5,7 @@
 //! page each) and races the whole discovery against Ctrl-C.
 
 use crate::auto_hints;
-use crate::config::S3TurboConfig;
+use crate::config::EngineConfig;
 use crate::core;
 use log::info;
 
@@ -29,14 +29,14 @@ pub async fn diff_side_boundaries(
     region: Option<&str>,
     endpoint: Option<&str>,
     prefix: &str,
-    cfg: &S3TurboConfig,
+    cfg: &EngineConfig,
     no_auto_hints: bool,
     delimiter: &str,
     max_keys: Option<i32>,
     sdk_config: &aws_config::SdkConfig,
     g_state: &core::GlobalState,
 ) -> Vec<String> {
-    if no_auto_hints || !delimiter.is_empty() || cfg.s3.start_after.is_some() {
+    if no_auto_hints || !delimiter.is_empty() {
         return Vec::new();
     }
 
@@ -69,7 +69,7 @@ pub async fn startup_boundaries(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
-    cfg: &S3TurboConfig,
+    cfg: &EngineConfig,
     max_keys: Option<i32>,
     g_state: &core::GlobalState,
     structural_target: usize,
@@ -175,25 +175,21 @@ fn single_key_probe(
     start_after: Option<String>,
     timeout_secs: u64,
 ) -> impl std::future::Future<Output = Result<Option<String>, String>> + use<> {
-    let mut req = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .max_keys(1);
-    if let Some(sa) = start_after {
-        req = req.start_after(sa);
-    }
+    let client = client.clone();
+    let bucket = bucket.to_string();
     async move {
-        // Same watchdog the runtime split probes use: startup runs before a
-        // single object is listed, so a stalled endpoint must not hang the
-        // run there.
-        let resp =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), req.send())
-                .await
-            {
-                Ok(result) => result.map_err(|e| crate::error::concise_sdk_error(&e))?,
-                Err(_) => return Err("probe timed out".to_string()),
-            };
+        let resp = crate::probe::send(timeout_secs, || {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(&prefix)
+                .max_keys(1);
+            if let Some(sa) = &start_after {
+                req = req.start_after(sa);
+            }
+            req.send()
+        })
+        .await?;
         Ok(resp
             .contents()
             .first()

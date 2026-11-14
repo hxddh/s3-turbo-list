@@ -1,115 +1,82 @@
-# Installing s3-turbo-list
+# Installing s3tl
 
-1. Download the release binary for your platform and `SHA256SUMS` from the
+1. Download the binary for your platform and `SHA256SUMS` from the
    [GitHub releases page](https://github.com/hxddh/s3-turbo-list/releases).
 2. Verify the checksum.
-3. Install the binary into your `PATH`.
-4. Configure AWS-compatible credentials, then follow the
-   [README quick start](README.md#quick-start) or `s3-turbo-list guide`.
+3. Install the binary into your `PATH` as `s3tl`.
+4. Configure AWS credentials, then run `s3tl check`.
 
-To build from source instead, see [`docs/releasing.md`](docs/releasing.md).
+To build from source instead: `cargo build --release` (see
+[`docs/releasing.md`](docs/releasing.md) for the Ubuntu 20.04 arm64
+workaround).
 
-## Choose the correct binary
+## Choose the binary
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `s3-turbo-list-<version>-linux-x86_64` |
-| Linux ARM64 / aarch64 | `s3-turbo-list-<version>-linux-aarch64` |
-| macOS Apple Silicon | `s3-turbo-list-<version>-macos-aarch64` |
-| macOS Intel | `s3-turbo-list-<version>-macos-x86_64` |
+| Linux x86_64 | `s3tl-<version>-linux-x86_64` |
+| Linux ARM64 / aarch64 | `s3tl-<version>-linux-aarch64` |
+| macOS Apple Silicon | `s3tl-<version>-macos-aarch64` |
+| macOS Intel | `s3tl-<version>-macos-x86_64` |
 
 `uname -s` prints `Linux` or `Darwin`; `uname -m` prints `x86_64` or
 `aarch64` (`arm64` on Apple Silicon).
 
 ## Verify SHA256SUMS
 
-Download the binary and `SHA256SUMS` into the same flat directory —
-`SHA256SUMS` uses bare filenames.
+Download the binary and `SHA256SUMS` into the same directory (`SHA256SUMS`
+uses bare file names):
 
 ```bash
-sha256sum -c SHA256SUMS          # Linux
-shasum -a 256 -c SHA256SUMS      # macOS
+sha256sum -c --ignore-missing SHA256SUMS        # Linux
+shasum -a 256 -c --ignore-missing SHA256SUMS    # macOS
 ```
 
-Expect `OK` next to the binary you downloaded (lines for binaries you did not
-download report missing files).  If it reports `FAILED`, download again; if
-it cannot find your binary, make sure both files are in one directory.
+Expect `OK` next to the binary you downloaded. If it reports `FAILED`,
+download again.
 
-## Install on Linux
-
-```bash
-VERSION=<version>
-ARCH=x86_64        # or aarch64
-chmod +x "s3-turbo-list-${VERSION}-linux-${ARCH}"
-sudo install -m 0755 "s3-turbo-list-${VERSION}-linux-${ARCH}" /usr/local/bin/s3-turbo-list
-s3-turbo-list --version
-```
-
-## Install on macOS
+## Install
 
 ```bash
 VERSION=<version>
-ARCH=aarch64       # Apple Silicon; x86_64 for Intel
-chmod +x "s3-turbo-list-${VERSION}-macos-${ARCH}"
-xattr -d com.apple.quarantine "./s3-turbo-list-${VERSION}-macos-${ARCH}" 2>/dev/null || true
-sudo install -m 0755 "s3-turbo-list-${VERSION}-macos-${ARCH}" /usr/local/bin/s3-turbo-list
-s3-turbo-list --version
+TARGET=linux-x86_64        # linux-aarch64, macos-aarch64, macos-x86_64
+chmod +x "s3tl-${VERSION}-${TARGET}"
+xattr -d com.apple.quarantine "s3tl-${VERSION}-${TARGET}" 2>/dev/null || true   # macOS
+sudo install -m 0755 "s3tl-${VERSION}-${TARGET}" /usr/local/bin/s3tl
+s3tl --version
 ```
 
-macOS applies a quarantine attribute to downloaded binaries; the `xattr`
-command removes it.  If you see *"app cannot be opened because the developer
-cannot be verified"*, run it.
-
-On either platform, if `/usr/local/bin` is not writable, install into
-`~/.local/bin` or another directory on your `PATH`.
-
-## Shell completions and man page
-
-```bash
-s3-turbo-list completions bash > s3-turbo-list.bash
-s3-turbo-list completions zsh > _s3-turbo-list
-s3-turbo-list completions fish > s3-turbo-list.fish
-s3-turbo-list man > s3-turbo-list.1
-```
-
-These write to stdout only and do not contact S3.  The man page covers the
-top-level command and lists the subcommands; each command's options are in
-`s3-turbo-list <command> --help` (clap_mangen writes per-command pages only
-to a directory, which `man` does not take).
+If `/usr/local/bin` is not writable, install into `~/.local/bin` or another
+directory on your `PATH`.
 
 ## Credentials
 
-s3-turbo-list uses the standard AWS SDK credential chain: environment
-variables, `~/.aws/credentials` profiles, or instance roles.
+`s3tl` uses the standard AWS SDK chain: environment variables,
+`~/.aws/credentials` and `~/.aws/config` profiles, web identity, and
+instance or container roles.
 
 ```bash
-aws configure --profile default      # or: aws configure --profile my-profile
-export AWS_PROFILE=my-profile        # select a non-default profile
+export AWS_PROFILE=my-profile
+s3tl check                      # what a run would use; sends nothing
+s3tl check s3://my-bucket/      # a few probe requests
 ```
 
-`--provider` (`aws`, `minio`, `bos`, `r2`, `b2`, `oss`) selects an
-S3-compatible *endpoint* preset; it is not a substitute for `AWS_PROFILE`.
-`s3-turbo-list guide <provider>` prints a quickstart for each, and
-[`docs/providers.md`](docs/providers.md) covers the presets and the config
-file.  Before the first real run, `s3-turbo-list doctor` checks the local
-setup and `--dry-run` previews the run; neither contacts S3.  Automation
-surfaces are in [`docs/agent-usage.md`](docs/agent-usage.md).
+For other S3-compatible endpoints see [`docs/providers.md`](docs/providers.md).
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Permission denied | Binary is not executable | Run `chmod +x` |
-| command not found | Install directory not in `PATH` | Move the binary to `/usr/local/bin` or update `PATH` |
-| macOS says app cannot be opened | Quarantine attribute | Run `xattr -d com.apple.quarantine` |
-| AccessDenied / auth failure (exit 3) | Wrong profile or credentials | Check `AWS_PROFILE` / `aws configure --profile ...` |
-| Wrong region or endpoint (exit 3) | Region/endpoint mismatch | Check `--region`, `--provider` and `--endpoint-url`; run `compat-probe` |
-| SHA256SUMS cannot find the binary | Files not in one flat directory | Download binary and `SHA256SUMS` into one directory |
-| Empty output | Prefix/delimiter/filter mismatch | Re-check `--prefix`, `--delimiter`, and `--filter` |
+| Permission denied | Binary is not executable | `chmod +x` |
+| command not found | Install directory not on `PATH` | Move the binary or update `PATH` |
+| macOS refuses to open it | Quarantine attribute | `xattr -d com.apple.quarantine` |
+| `auth.*` error (exit 3) | Wrong profile or credentials | Check `AWS_PROFILE`; `s3tl check` |
+| `config.wrong_region` / `config.no_such_bucket` (exit 3) | Region or endpoint mismatch | Omit `--region` on AWS; check `--endpoint-url` |
+| `usage.output_not_empty` (exit 2) | `-o` points at a used directory | Use a new directory, or `--resume` an interrupted run |
 
-## Security note
+## Security
 
-- Do not put access keys or secret keys in shell history, docs, issues, PRs,
-  or trace files.
+- Do not put access keys in shell history, docs, issues or trace files.
 - Prefer named profiles or environment-managed credentials.
-- Sanitize bucket names and account identifiers before sharing logs.
+- Results and traces redact credentials in endpoint URLs; bucket names and
+  keys are not redacted, so sanitize them before sharing.

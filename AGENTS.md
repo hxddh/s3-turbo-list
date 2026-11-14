@@ -2,8 +2,9 @@
 
 ## Project Context
 
-`s3-turbo-list` is a Rust CLI for high-performance S3-compatible bucket
-listing, diffing, checkpoint/resume, and Parquet export.  GitHub:
+`s3tl` (repository `s3-turbo-list`) is a Rust CLI for high-performance
+S3-compatible bucket listing and diffing to Parquet, with one
+machine-readable result document per run.  GitHub:
 `https://github.com/hxddh/s3-turbo-list`, main branch `main`.
 The release source of truth is the latest git tag / GitHub Release.
 
@@ -16,15 +17,21 @@ relevant notes in `docs/validation-results/`.
 
 ## Development Rules
 
-- **The CLI surface is frozen** (see CONTRIBUTING.md): no new subcommands,
-  global flags, or config knobs without an exceptional, documented case.
+- **The CLI surface is minimal by design** (see CONTRIBUTING.md): three
+  commands (`list`, `diff`, `check`), a handful of options, no config file.
+  New commands, options or knobs need an exceptional, documented case.
+- **The result contract only grows** (`docs/agent-usage.md`): within major
+  version 1, result fields, error codes, exit codes, the Parquet schemas and
+  the checkpoint format may gain members but never rename, retype or remove
+  one.  New error conditions get a stable `error.code`.
 - Prefer existing architecture and module boundaries; keep changes narrowly
   scoped to the requested task; do not rewrite unrelated code.
 - Provider-specific compatibility handling must be opt-in and must not alter
   or slow the standard S3-compatible hot path.  Prefer documentation and
   guardrails over endpoint-specific pagination rewrites.
 - Do not remove or weaken existing tests unless explicitly requested.
-- Do not change public CLI behavior without updating README and docs.
+- Do not change public CLI behavior without updating README, docs and
+  CHANGELOG.
 - Treat `docs/validation-results/` as historical evidence: if behavior
   changes, add a new dated note instead of editing old conclusions.
 
@@ -35,13 +42,11 @@ incompatibility — BOS restarted listing from `start_after` when a
 `continuation-token` was also present — has been resolved service-side by
 BOS. Consequences:
 
-- BOS is treated like any other S3-compatible endpoint. Single-segment
-  listing, hinted multi-segment listing, startup structural discovery, and
-  runtime splitting all run for the `bos` profile with no special-casing.
-- There is no BOS-specific gating in code. Discovery and the hints resolver
-  no longer exclude the `bos` profile. Runtime splitting is controlled only
-  by mode/flags (`allow_split` keys on diff-mode / `--start-after` /
-  `--continuation-token`, never on the profile).
+- BOS is treated like any other S3-compatible endpoint: startup structural
+  discovery, bisection and runtime splitting all apply, with no
+  special-casing (1.0 has no provider presets at all).
+- There is no BOS-specific gating in code. Runtime splitting is controlled
+  only by the listing shape (`--delimiter` listings are never split).
 - Do not reintroduce BOS-specific pagination workarounds or profile gates;
   the service now behaves per the S3 contract.
 - See `docs/validation-results/` for the dated note recording BOS's fix; the
@@ -49,9 +54,11 @@ BOS. Consequences:
 
 ## Other Design Constraints
 
-- Diff partitions each side automatically and merges the ordered segment
-  streams; `diff --hints-file` and `diff --resume` are intentionally
-  rejected, and any segment failure or ordering violation fails the run.
+- Diff partitions and splits each side like list mode and merges the sides
+  in key order (`src/segment_order.rs`); diff does not checkpoint, and any
+  segment failure or ordering violation fails the run.
+- Output is a dataset directory committed atomically (temp parts renamed on
+  commit); a failed run leaves the directory as it was.
 - `dist/` and `target/` are generated and ignored.
 
 ## Cloud Safety Rules
@@ -62,8 +69,9 @@ non-local endpoints, bucket/object mutations, and endpoint validation
 against real providers.
 
 Allowed without extra confirmation: local source inspection, Rust
-build/test commands, tests that do not contact real cloud endpoints, and
-clearly-local MinIO testing against an already-running local service.
+build/test commands, tests that do not contact real cloud endpoints,
+`scripts/mock-s3.py` on 127.0.0.1, and clearly-local MinIO testing against
+an already-running local service.
 
 ## Secrets
 

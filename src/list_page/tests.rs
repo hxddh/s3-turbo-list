@@ -24,13 +24,15 @@ fn object(key: &str) -> String {
 }
 
 /// Everything `ObjectProps` holds, for exact comparison.
+/// (flags, status, storage class << 8 | pad, ETag parts, last modified,
+/// size, ETag MD5).
 type PropsView = (u8, u8, u16, u32, u64, u64, [u8; 16]);
 
 fn view(p: &ObjectProps) -> PropsView {
     (
         p.flags,
         p.status,
-        p.pad,
+        (u16::from(p.storage_class) << 8) | u16::from(p.pad),
         p.etag_parts,
         p.last_modified,
         p.size,
@@ -79,9 +81,13 @@ fn parses_rows_and_strips_contents() {
     assert_eq!(rows[1].0, "b/c.txt");
     let (flags, status, pad, parts, lm, size, md5) = rows[0].1;
     let template = ObjectProps::from(&aws_sdk_s3::types::Object::builder().build());
-    assert_eq!((flags, status, pad), (template.flags, template.status, 0));
+    // STANDARD (code 1) in the storage-class byte, no padding.
+    assert_eq!(
+        (flags, status, pad),
+        (template.flags, template.status, 1 << 8)
+    );
     assert_eq!(parts, 0);
-    assert_eq!(lm, 1_778_976_000); // 2026-05-17T00:00:00Z
+    assert_eq!(lm, 1_778_976_000_000); // 2026-05-17T00:00:00Z
     assert_eq!(size, 7);
     assert_eq!(md5, md5_of(HEX));
 }
@@ -181,8 +187,9 @@ fn extra_children_are_ignored() {
     );
     let (rows, _) = parse_ok(&page(&contents));
     assert_eq!(rows[0].0, "k");
-    assert_eq!(rows[0].1.4, 1_704_067_200);
+    assert_eq!(rows[0].1.4, 1_704_067_200_000);
     assert_eq!(rows[0].1.5, 5);
+    assert_eq!(rows[0].1.2 >> 8, 3, "StorageClass GLACIER is kept");
 }
 
 #[test]
@@ -330,13 +337,13 @@ fn timestamps_match_the_sdk_parser() {
     for s in &samples {
         let sdk = DateTime::from_str(s, DateTimeFormat::DateTimeWithOffset)
             .ok()
-            .map(|d| d.secs());
-        assert_eq!(parse_timestamp_secs(s), sdk, "{s}");
+            .map(|d| d.to_millis().unwrap_or(0));
+        assert_eq!(parse_timestamp_millis(s), sdk, "{s}");
     }
     // Canonical values really take the fast path.
     assert_eq!(
-        parse_canonical_timestamp(b"2026-05-17T00:00:00.000Z"),
-        Some(1_778_976_000)
+        parse_canonical_timestamp(b"2026-05-17T00:00:00.123Z"),
+        Some(1_778_976_000_123)
     );
 }
 

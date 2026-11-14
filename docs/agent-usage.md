@@ -1,370 +1,183 @@
-# Agent-Friendly Usage
+# The s3tl contract
 
-The machine-readable surfaces for AI agents, CI jobs, and shell automation:
-dry-run plans, `doctor --json`, run manifests, `manifest-summary`, exit
-codes, and traces.  The [README](../README.md) covers the commands
-themselves; this page is the contract.
+Everything an automated caller (a script, CI job or AI agent) can rely on.
+Within major version 1, fields and error codes are only ever added; a field
+is never renamed, retyped or removed, and an exit code never changes
+meaning.
 
-Options follow the command name
-(`s3-turbo-list list --bucket b --region r --output-dir out`).  Only
-`--config`, `--provider`, `--endpoint-url`, and `--addressing-style` are
-global and may appear on either side.  Any other option before the command
-name is a usage error (exit `2`) that names the command it must follow;
-`s3-turbo-list --agent list …` still gets the run-failure JSON below.
+## Streams
 
-## Removed in 0.39
-
-These were deprecated in 0.38 (with a warning on stderr and in the JSON).
-Each spelling is now a usage error, and each config key an unknown key
-(exit `2`), whose message names the replacement:
-
-- Options other than the global ones written before the command name
-  (`s3-turbo-list --output-dir out list …`): write them after it.
-- The config keys `s3.profile` (use `s3.provider`) and
-  `s3.force_path_style` (use `s3.addressing_style = "path"`).
-- `--endpoint` (use `--endpoint-url`), `doctor --agent` and
-  `manifest-summary --agent` (use `--json`), and the no-op
-  `doctor --simple` and `doctor --fix-suggestions`.
-- The JSON fields `inputs.profile` and `inputs.continuation_token` (plans
-  and manifests), `resolved_config.s3.profile_known` and
-  `resolved_config.s3.profile_warnings` (use `provider_known` and
-  `provider_warnings`), and the trace field `profile` (use `provider`).
-
-With nothing left to report, deprecation warnings are gone from stderr, the
-plan and manifest `warnings`, and `doctor`'s checks; `config_source.warnings`
-stays, always empty.  Checkpoints written by 0.37 (identity field `profile`)
-still load and resume.
-
-## No-cloud preflight
-
-None of these contact S3:
-
-```bash
-s3-turbo-list doctor --json
-s3-turbo-list doctor --json --hints-file hints.toml --output-dir out
-s3-turbo-list guide
-s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out --dry-run
-s3-turbo-list list --bucket my-bucket --region us-east-1 --output-format summary --dry-run
-s3-turbo-list diff --bucket left --target-bucket right --region us-east-1 --dry-run
-s3-turbo-list manifest-summary run.json --json
-s3-turbo-list manifest-summary run.json --check
-```
-
-### doctor
-
-`doctor --json` checks the binary version, working directory, config parse
-status and file, `AWS_PROFILE`, the provider preset, the endpoint, the proxy
-that applies to the endpoint, and any outputs, trace file, hints file
-(`--hints-file`, report embedded under `hints`), or filter (`--filter`) you
-pass it; network probing is always `skipped`.  It prints the resolved
-configuration under `resolved_config` (TOML, CLI overrides, provider preset,
-and addressing-style normalization applied) and `config_source`: the
-explicit `--config` path, the file actually loaded, the searched paths, the
-source kind (`explicit`, `workspace`, `home`, or `none`), and CLI overrides.
-
-The `proxy` check is decided from `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`
-exactly as the run's HTTP client decides it, for an explicit path-style
-endpoint.  When the request host depends on the bucket and region
-(virtual-hosted or AWS) it is `skipped`, and the run log names the proxy for
-each side's resolved endpoint before its first request.  Credentials in a
-proxy URL are never printed.
-
-Exit codes: an endpoint problem that stops every real run (a preset that
-needs an explicit endpoint URL, or an endpoint with template placeholders) is
-an `error` check and exits `3`, the code the run would exit with; any other
-`error` check exits `2`.  `doctor --json` always prints JSON on stdout —
-including for a config error (a `config_parse` `error` check), a hints file
-it cannot read (`hints`), and a command-line usage error such as an unknown
-option (`cli`), all exit `2`.  Such an early exit prints a shorter report:
-`schema_version`, `tool_version`, `status: "error"`, `cwd`, and `checks`
-holding the one `error` check, plus `config_source` and `resolved_config`
-once the config file has been read (a usage error or a config file that
-does not parse comes before that).  The message is also printed once on
-stderr.  The human format is one compact list.
-
-An explicit `--config` path that does not exist is an error (exit `2`) for
-every command that loads config, `doctor` and `--dry-run` included.
-
-## Dry-run plans
-
-`--dry-run` resolves inputs, planned output paths, the hints source,
-checkpoint identity, output parent directories, and file conflicts, and
-prints the plan JSON on stdout without creating files or making S3 requests.
-`--output-dir` is safe in a dry run: it plans paths but does not create the
-directory.  To keep the plan in a file, redirect stdout (`--plan-json` was
-removed in 0.38):
-
-```bash
-s3-turbo-list list --bucket my-bucket --region us-east-1 \
-  --output-parquet-file out/list.parquet --dry-run > plan.json
-```
-
-Top-level fields: `schema_version`, `tool_version`, `status`, `command`,
-`cwd` (the working directory relative paths resolve against; since 0.39),
-`network`, `inputs`, `outputs`, `config_source`, `resolved_config`, `hints`,
-`checkpoint`, `file_conflicts`, `warnings`.
-
-`status` is `ok`, or `blocked` when a problem would stop the real run: an
-explicit `--hints-file` it cannot load (exit `2`; `hints.valid: false`, the
-reason in `hints.warnings`), `--agent` with `--output-format tsv` or
-`ndjson` (exit `2`: stdout would hold both rows and the manifest), a
-provider setup problem (exit `3`) or an output the run cannot create — a
-path under an existing file, or in a read-only directory (exit `5`); the
-reason is in `warnings`.  A blocked plan is still
-printed, then the dry run exits with that code and prints
-`s3-turbo-list: run blocked (exit N): <reason>` on stderr, so it predicts
-the run's exit class.  `warnings` is empty in the normal case: it carries
-problems, and notes about options that have no effect (such as an explicit
-`--delimiter ''`, or output paths with `--output-format summary`).  Writability is
-judged with `access(2)`, so it is right for root as well.  Warnings also flag
-an existing output file the run would overwrite, a `--prefix` starting with
-`/`, and a missing region (`blocked` when `AWS_EC2_METADATA_DISABLED=true`
-and nothing names a region; otherwise a warning, because IMDS may still
-supply one).  Local input errors exit `2` as in the real run: a filter that
-does not compile, or two outputs that resolve to the same file, stop before a
-plan is printed (with the run line and, under `--agent`, the minimal JSON
-result below); an explicit `--hints-file` that cannot be loaded exits `2`
-after the plan (`status: blocked`, and the `hints` section carries the
-error).
-
-`network` is authoritative for dry-run behavior; it currently reads
-`none: dry-run only resolves local configuration and planned paths`.
-
-`hints.source` says how the run will partition its key space:
-
-| Value | Meaning |
-|---|---|
-| `explicit` | `--hints-file` boundaries. |
-| `startup_discovery` | The run probes the bucket structure at startup and partitions from it (every run; nothing is cached). |
-| `disabled_single_segment_fallback` | `--no-auto-hints`: one starting segment (list mode fans it out by runtime splitting). |
-| `delimiter_single_segment` | A `--delimiter` run: one hierarchical segment, never split. |
-| `single_chain` | `--start-after`: one sequential chain, never split. |
-| `diff_per_side_automatic` | `diff`: each side partitioned up front and listed in parallel. |
-| `not_applicable` | `compat-probe`: a fixed set of probe requests, no partitioning. |
-
-`hints.note` says in words how that source partitions the run (for
-example, that startup discovery partitions from the bucket's structure); it
-is informational.  `hints.warnings` is empty except for an explicit
-`--hints-file`, where it carries the file's problems.  For `diff`,
-`single_chain`, `delimiter_single_segment`, and
-`disabled_single_segment_fallback` leave each side one serial segment (diff
-never splits at runtime): the note names the option that does it, and the
-plan's `warnings` says that `--concurrency` adds no parallelism.
-
-`checkpoint` describes resumability:
-
-| Field | Meaning |
-|---|---|
-| `enabled` | The run saves a checkpoint at `path` if it is interrupted — `true` for every `list` run except `--start-after`; `false` for `diff`. |
-| `resume` | The run reads the checkpoint at `path` (`--resume`). |
-| `path` | `<region>_<bucket>[_<prefix-hash>]_checkpoint.toml`, in `--output-dir` when given, else the working directory. |
-| `exists`, `valid`, `identity_matches`, `identity_mismatches` | State of the file at `path` and whether its identity matches this run. `valid` is false for a checkpoint the run would discard: unreadable, or with no key ranges left to resume. |
-| `remaining_ranges` | Key ranges a resume would list. |
-| `identity_fields` | The fields that make up the checkpoint identity (`provider` was `profile` up to 0.37; checkpoints written by 0.37 still load, and the preset name compares case-insensitively). |
-| `resumed_segments_skipped` | See [Resumed runs](#resumed-runs). |
-
-`outputs` lists every file the run writes: `parquet_file`, `ks_file`,
-`hints_file`, `trace_compat`, `log_file`, and `report_file` (compat-probe's
-`-o` report; `null` otherwise).  `inputs.provider` and
-`resolved_config.s3.provider` hold the preset's canonical lowercase name.
-
-The `command` array preserves the invoked argument shape with sensitive
-values redacted (`--endpoint-url`, and the removed `--endpoint` and
-`--continuation-token`, and `user:password@` in endpoint URLs;
-`resolved_config` redacts the latter too).
-Use `inputs`, `outputs`, and `config_source` for exact values.
-
-### Deprecated fields
-
-Kept for one release, then removed; do not branch on them:
-
-- `metrics.summary_only` in the manifest, and `summary_only` in
-  `manifest-summary --json` (deprecated in 0.39, removed in 0.40): use
-  `inputs.output_format == "summary"` (`output_format` in
-  `manifest-summary`).  `manifest-summary` derives its `summary_only` from
-  the output format, and falls back to `metrics.summary_only` only for a
-  manifest without one.
-
-Removed in 0.39 (deprecated in 0.38): see [Removed in 0.39](#removed-in-039).
-Removed in 0.38 (deprecated in 0.37): `resolved_config.s3.profile`,
-`resolved_config.s3.force_path_style`, `resolved_config.s3.debug_s3`, and
-`checkpoint.completed_segments` / `checkpoint.total_segments`.
-
-## Run manifests
-
-```bash
-s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out \
-  --run-manifest run.json
-s3-turbo-list list --bucket my-bucket --region us-east-1 --output-dir out --agent
-```
-
-`--run-manifest` writes the manifest to a file; `--agent` prints it on stdout
-at the end and keeps stderr quiet: no warnings, no log lines (the stderr log
-filter is off unless `RUST_LOG` is set; a `--log` file keeps its normal
-level), only the final run line on a non-zero exit.  The manifest includes
-`status`
-(`success`, `failed`, or `interrupted`), `exit_code`, `started_at`,
-`finished_at`, `elapsed_secs`, `command` (redacted as in plans), `cwd`,
-`inputs`, `outputs`, `config_source`, `artifacts`, `metrics`, `checkpoint`,
-and `warnings`
-(using the same wording as dry-run plans).  `inputs.filter` records the
-`--filter` expression, or `null`.
-
-`metrics` holds the data-map counters (received batches and objects,
-streamed rows, unique prefixes, Parquet rows, KS entries, total bytes, top
-prefixes, fatal listing errors, output write errors) plus endpoint pushback:
-`throttled_responses` (keyed on the S3 error codes `SlowDown`,
-`TooManyRequests`, `ThrottlingException`, not the HTTP status) and
-`http_error_statuses` (a `{status, count}` histogram).  Retries are not
-failures: `status: success` with `fatal_errors: 0` and many
-`throttled_responses` means the endpoint was the constraint.
-
-`artifacts` describes each generated file: `kind` (`parquet`, `ks`, `hints`,
-`trace`, or `log`), `path`, `exists`, `size_bytes`, `sha256`, `line_count`
-for line-oriented files (for KS, CSV records), and `parquet.row_count`,
-`parquet.row_group_count`, `parquet.schema_fields` for Parquet.  A pooled
-list run writes several Parquet part-files, one `parquet` entry each;
-`metrics.parquet_rows` is the total across them.
-
-TSV and NDJSON reserve stdout for rows, so they cannot be combined with
-`--agent` in a real run (exit `2`); write `--run-manifest` to a file instead:
-
-```bash
-s3-turbo-list list --bucket my-bucket --region us-east-1 \
-  --output-format ndjson --run-manifest run.json > objects.ndjson
-s3-turbo-list manifest-summary run.json --json
-```
-
-`--output-format summary` returns aggregate counts without Parquet/KS files;
-it still scans the bucket unless combined with `--dry-run`.
-
-### manifest-summary
-
-`manifest-summary` is local-only.  `--check` gives a single validation exit
-code (`6` on a mismatch): it checks the saved status, exit code, fatal and
-output error counters, Parquet row equality where Parquet output applies, and
-each recorded artifact on disk — current size, SHA256, and Parquet
-row/schema metadata.  A Parquet artifact recorded without that metadata
-fails, and `artifact_parquet_rows_total` checks that the Parquet artifacts'
-rows add up to `metrics.parquet_rows`.  For `summary`, `tsv`, and `ndjson`
-manifests, Parquet row equality is reported as not applicable.
-
-Relative artifact paths resolve against the manifest's `cwd`, then the
-current directory, then the manifest's directory.
-
-`manifest-summary --json` prints one object: `schema_version`, `status`
-(`success` once the manifest was read; `check_passed` carries the verdict),
-`manifest_file`, `tool_version` (the run's, from the manifest; `null` if it
-has none), `run_status`, `exit_code`, `elapsed_secs`, `command`,
-`output_format`, `summary_only` (deprecated, above), the counters
-(`received_objects`, `streamed_rows`, `parquet_rows`, `ks_entries`,
-`bytes_total`, `unique_prefixes`), `parquet_rows_match_streamed_rows`
-(`null` when not applicable), `top_prefixes`, `outputs` (`parquet_file`,
-`ks_file`, `hints_file`, `trace_compat`, `log_file`, `report_file`),
-`artifacts`, `warnings`, `check_passed`, `check`, and `checks`.  A manifest
-it cannot read or parse exits `2` with `{schema_version, tool_version,
-status: "error", error}` on stdout.  With `--json`, the
-top-level `check` object gives pass/fail counts, artifact counts, and
-row/schema/exit-code status values; its `parquet_schema_check` is the worst
-status across every Parquet artifact.  Individual checks in `checks` are
-named `<check>:<kind>`; when several artifacts share a kind, the first keeps
-the bare name and the rest get an index suffix (`artifact_sha256:parquet#1`).
-
-## Resumed runs
-
-Every interrupted `list` run (Ctrl-C or SIGTERM, exit `7`) saves a
-checkpoint; `--resume` reads it.  `checkpoint.resumed_segments_skipped` in the
-manifest is the field to branch on afterwards: `null` means the run did not
-resume; a number greater than zero means the checkpoint recorded that many
-key ranges as already written, so **this run's artifacts cover only the rest
-of the key space** and must be combined with the interrupted run's outputs —
-together they hold every key exactly once.  Reusing one output path for both
-runs leaves only the second half, and the run warns about it.  Read this
-field, not the checkpoint file: a run that lists its whole key space removes
-the checkpoint before exiting.
-
-`diff` never checkpoints (`diff --resume` is a usage error): partial paired
-checkpointing could hide left-only or right-only objects.
+- **stdout** carries exactly one JSON document, the *result*, for every
+  invocation: success, failure, usage error, dry run, `check`.
+- With `list -o -`, stdout carries NDJSON rows instead, and the result is the
+  **last line of stderr** (compact JSON).
+- Everything else on stderr is for humans: a one-line summary of a failure
+  (`s3tl: failed (exit 3): auth.expired_token: … (hint: …)`), and with `-v`
+  progress logs. Do not parse it.
+- `s3tl` never prompts.
+- `--help` and `--version` print text and exit 0 (no result document).
 
 ## Exit codes
 
-| Code | Meaning |
-|---:|---|
-| 0 | Success |
-| 1 | Unexpected internal error |
-| 2 | CLI/config/filter validation error (including command-line usage errors) |
-| 3 | Auth/provider/region/endpoint setup error — detected before the scan (e.g. no region resolved) or returned by the endpoint as a permanent error (`AccessDenied`, `NoSuchBucket`, `SignatureDoesNotMatch`, `AuthorizationHeaderMalformed`, `PermanentRedirect`). Re-running unchanged will not help. |
-| 4 | Network timeout, retry exhaustion, or other fatal listing error |
-| 5 | Output filesystem, manifest, Parquet, or KS write error |
-| 6 | Data validation, schema, or checksum error (`manifest-summary --check`) |
-| 7 | Interrupted; a checkpoint is saved for `list` runs |
+| Exit | Class | Error codes | What to do |
+|---|---|---|---|
+| 0 | success | | |
+| 1 | internal | `internal.error`, `internal.panic` | A bug; report it. |
+| 2 | usage | `usage.*` | Fix the command line; rerunning unchanged fails again. |
+| 3 | setup | `auth.*`, `config.*`, `endpoint.*` | Fix credentials, bucket, region or endpoint. |
+| 4 | retryable | `net.*` | Retry later, or with a lower `-c`. |
+| 5 | output | `output.*` | Fix the output location (space, permissions, closed pipe). |
+| 130 | interrupted | `interrupted` | `list -o DIR`: rerun with `--resume`. |
 
-Branch on the exit code first, then read the manifest if it exists.  Every
-non-zero exit of `list`, `diff`, or `compat-probe` — dry runs included —
-prints one `s3-turbo-list: run <status> (exit N): <reason>` line on stderr
-(`<status>` is `failed`, `interrupted`, or `blocked` for a dry run whose plan
-was printed).  A command-line usage error (unknown or misplaced option) is
-reported by the argument parser in its own format; it adds the run line only
-under `--agent`.  A run that stops before listing — a usage error, a filter
-that does not compile, no region, an output it cannot create — still
-prints, under `--agent`, a minimal JSON result on stdout instead of a
-manifest (a dry run whose plan was printed prints no second document):
+`error.retryable` is `true` exactly for exit 4 and 130.
 
-```json
-{
-  "error": "unexpected argument '--bogus' found",
-  "exit_code": 2,
-  "schema_version": "s3-turbo-list.agent.v1",
-  "status": "failed",
-  "tool_version": "…"
-}
+## The result (`s3tl.result/1`)
+
+Every key below is always present; `null` means "does not apply".
+
+| Key | Type | |
+|---|---|---|
+| `schema` | string | `"s3tl.result/1"` |
+| `version` | string | the s3tl version |
+| `command` | string | `list`, `diff`, `check` (`unknown` for an unparsable command line) |
+| `ok` | bool | `exit_code == 0` |
+| `status` | string | `success`, `failed`, `interrupted`, or `planned` (a `--dry-run`) |
+| `exit_code` | int | see above |
+| `error` | object \| null | `{code, message, retryable, hint}`; `hint` may be null |
+| `source` | object \| null | the listed side (left side of a diff) |
+| `target` | object \| null | the right side of a diff |
+| `output` | object \| null | what was written |
+| `stats` | object \| null | what was listed |
+| `diff` | object \| null | diff counts |
+| `resume` | object \| null | checkpoint state (`list -o DIR`) |
+| `plan` | object \| null | `--dry-run` only |
+| `check` | object \| null | `check` only |
+| `warnings` | string[] | non-fatal issues |
+
+`source` / `target`:
+
+| Key | |
+|---|---|
+| `url` | `s3://bucket/prefix` |
+| `bucket`, `prefix` | |
+| `region` | the signing region used (`null` in a plan when it is detected at run time) |
+| `endpoint_url` | the endpoint, credentials and query removed; `null` means AWS S3 |
+| `path_style` | path-style addressing |
+
+`output`:
+
+| Key | |
+|---|---|
+| `format` | `parquet`, `ndjson` or `none` |
+| `path` | the dataset directory, `-`, or `null` |
+| `files` | committed parts of the dataset, including earlier resumed runs': `[{path, rows, bytes}]` |
+| `rows` | rows this run wrote |
+
+`stats`:
+
+| Key | |
+|---|---|
+| `objects` | objects listed (a diff: distinct keys compared) |
+| `folders` | folder rows of a `--delimiter` listing |
+| `bytes` | total object size (a diff: of the differing keys) |
+| `elapsed_secs` | wall time |
+| `throttled` | requests the endpoint rejected for rate (`SlowDown`, 429, …) |
+| `timeouts` | requests that timed out and were retried |
+| `top_prefixes` | the 10 directories (key prefix up to the last `/`) with the most objects: `[{prefix, objects, bytes}]` |
+
+`diff`: `{left_only, right_only, changed, equal}` — key counts.
+
+`resume`: `{resumed, checkpoint, remaining_ranges}` — `resumed` is true when
+this run continued a checkpoint; `checkpoint` is the path of the checkpoint
+left for `--resume` (null when the listing is complete).
+
+`plan` (dry run): `partitioning` (`startup_discovery`, `single_segment`,
+`checkpoint`), `partitioning_reason`, `concurrency`, `max_keys`,
+`resume_ranges`, `first_part`, `region` (how the region will be chosen).
+
+`check`: `credentials` (`{found, expires_at}` or `{found: false, error}`),
+`region`, `endpoint_url`, `path_style`, `request_url` (the URL a listing
+request goes to), `proxy` (the proxy it goes through, or null), and `probe`
+(with an S3 URL): `{endpoint_url, region, bucket, addressing_style,
+overall_status: compatible|partial|incompatible, tests: [...]}`.
+`check` fails (exit 3 or 4) only when the probe is `incompatible`.
+
+## Error codes
+
+| Code | Exit | Meaning |
+|---|---|---|
+| `usage.invalid_argument` | 2 | The command line does not parse. |
+| `usage.invalid_url` | 2 | Not `s3://bucket[/prefix]`. |
+| `usage.invalid_endpoint` | 2 | The endpoint is not an `http(s)://` URL. |
+| `usage.invalid_output` | 2 | `-o` value not allowed here (e.g. `diff -o -`). |
+| `usage.output_not_a_directory` | 2 | `-o` names an existing file. |
+| `usage.output_not_empty` | 2 | `-o DIR` is not empty (the hint says whether it holds a resumable run). |
+| `usage.resume_needs_output` | 2 | `--resume` without `-o DIR`. |
+| `usage.no_checkpoint` | 2 | `--resume` into a directory without a checkpoint. |
+| `usage.checkpoint_mismatch` | 2 | The checkpoint belongs to another run (bucket, prefix, endpoint or options). |
+| `usage.checkpoint_unreadable` | 2 | The checkpoint cannot be read. |
+| `auth.missing_credentials` | 3 | No credentials in the SDK chain. |
+| `auth.expired_token` | 3 | Expired or invalid session token. |
+| `auth.invalid_access_key` | 3 | The access key does not exist on this endpoint. |
+| `auth.access_denied` | 3 | Not allowed to list the bucket. |
+| `auth.signature_mismatch` | 3 | Wrong secret key, region or addressing style. |
+| `config.wrong_region` | 3 | The bucket is in another region. |
+| `config.missing_region` | 3 | No region could be resolved. |
+| `config.no_such_bucket` | 3 | The bucket does not exist on this endpoint. |
+| `endpoint.inconsistent_listing` | 3 | The endpoint returned keys out of order or repeated them. |
+| `net.throttled` | 4 | Rate limited until the retry budget ran out. |
+| `net.timeout` | 4 | Requests kept timing out. |
+| `net.unavailable` | 4 | The endpoint kept failing (5xx). |
+| `net.error` | 4 | Other transport or unclassified service errors. |
+| `output.write_failed` | 5 | Writing the dataset, stdout or the result file failed. |
+| `internal.error`, `internal.panic` | 1 | A bug. |
+| `interrupted` | 130 | SIGINT / SIGTERM. |
+
+## Dataset directory
+
+`-o DIR` must be absent or empty, except with `--resume`. After the run:
+
+| File | |
+|---|---|
+| `part-NNNNN.parquet` | committed parts (zero-padded index) |
+| `_result.json` | the result document |
+| `_checkpoint.json` | present only when an interrupted run can be resumed (`s3tl.checkpoint/1`) |
+| `.part-NNNNN.parquet.tmp` | parts being written; never read these |
+
+A run that fails removes its temporary parts and leaves the directory as it
+was (and removes it if it created it and it is empty). The Parquet schemas
+are in the [README](../README.md#output); each file's key-value metadata has
+`s3tl.schema` = `s3tl.list/1` or `s3tl.diff/1`.
+
+## Recipes
+
+```bash
+# Branch on the class, not the message.
+out=$(s3tl list s3://b/p/ -o run/); code=$?
+case $code in
+  0) jq -r '.output.files[].path' <<<"$out" ;;
+  4) sleep 60; s3tl list s3://b/p/ -o run2/ ;;          # retryable
+  130) s3tl list s3://b/p/ -o run/ --resume ;;           # continue
+  *) jq -r '.error.code, .error.hint' <<<"$out"; exit $code ;;
+esac
+
+# Are two prefixes identical?
+s3tl diff s3://a/p/ s3://b/p/ | jq -e '.ok and .diff.left_only + .diff.right_only + .diff.changed == 0'
+
+# Plan without touching S3.
+s3tl list s3://b/p/ -o run/ --dry-run | jq .plan
 ```
 
-A failed listing records its first fatal error (S3 error code, HTTP status,
-message) in the manifest's `warnings`; a diff side's failure (for example
-`AccessDenied` on the target bucket) exits with that side's class (`3` /
-`4`).  SIGTERM (as sent by `timeout(1)` and most harnesses) is handled like
-Ctrl-C: exit `7`, with the manifest and checkpoint written.
+## Trace events (`--trace`)
 
-A non-zero exit means the outputs are not trustworthy even if they exist and
-parse.  A `list` run that failed mid-listing (exit `4`) leaves a structurally
-valid Parquet file holding only the keys it reached.  A failed `diff` removes
-its outputs, since a partial merge cannot describe both sides.  Only treat
-outputs as complete on exit `0`.
-
-## compat-probe under --agent
-
-`compat-probe --agent` keeps stderr quiet (no log; no trace unless
-`--trace-compat` names a file) and prints the probe report on stdout, or
-writes it to the `-o` file with stdout left empty.  The report carries
-`schema_version`, `tool_version`, `status` (`success` or `failed`),
-`exit_code`, and `warnings` (always present) beside its probe fields; the
-field reference is in [providers.md](providers.md#report).  An
-`incompatible` endpoint exits `3` or `4` with the run line
-`s3-turbo-list: run failed (exit N): compat-probe found the endpoint
-incompatible: …`; a failure before the first request (no endpoint, a bad
-option) prints the minimal JSON result above instead of a report.
-
-## Filters
-
-`--filter` is validated before any request.  In `list`, `SOURCE.size` and
-`SOURCE.last_modified` are available; `diff` adds `TARGET.size` and
-`TARGET.last_modified`.  Function calls, methods, strings, arrays, maps,
-indexing, statements, and large or deeply nested expressions are rejected
-with exit `2` — a local configuration error, not a provider failure.
-`doctor --filter '<expr>'` checks an expression without running anything.
-
-## S3 API trace
-
-`--trace-compat trace.jsonl` records every listing page request as JSONL —
-request IDs, HTTP status, S3 error codes, pagination metadata, retry details
-— plus one summary event per completed segment, and combines with
-`--run-manifest`.  Startup discovery, flat-namespace bisection, and runtime
-split probes are not traced.  `--trace-compat -` writes to stderr.  The
-field reference is in [tuning.md](tuning.md#trace-event-fields).
-
-## Safety expectations
-
-- `doctor`, `guide`, `manifest-summary`, and `--dry-run` are local-only.
-- `list`, `diff`, and `compat-probe` contact S3 unless run with `--dry-run`.
-- `--agent` changes only what is printed, never listing behavior.
+One JSON object per line, per ListObjectsV2 request (startup and split
+probes are not traced): `timestamp`, `operation`, `endpoint_url` (redacted),
+`region`, `addressing_style`, `bucket`, `prefix`, `delimiter` (always
+present; `""` for a recursive listing), `start_after`, `max_keys`,
+`continuation_token`, `http_status`, `s3_error_code`, `s3_error_message`,
+`request_id`, `request_id_2`, `retry_attempt`, `latency_ms`, `retryable`,
+`fatal`, `is_truncated`, `next_continuation_token`, `key_count`,
+`contents_count`, `common_prefixes_count`, `first_key`, `last_key`, and a
+`ListObjectsV2SegmentSummary` event per segment (`segment_index`,
+`end_before`, `segment_pages`, `segment_objects`, `ended_by`). Optional
+fields are omitted when empty. Fields are only ever added.

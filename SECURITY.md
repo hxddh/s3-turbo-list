@@ -10,7 +10,7 @@ establish a private channel.
 
 ## Credential and data hygiene
 
-s3-turbo-list is a client-side tool.  It interacts with S3-compatible
+s3tl is a client-side tool.  It interacts with S3-compatible
 object stores using credentials supplied by the user.  To keep the
 project safe for contributors and users:
 
@@ -30,7 +30,7 @@ latest release.
 
 ## Scope
 
-The security policy covers the s3-turbo-list codebase and published
+The security policy covers the s3tl codebase and published
 artifacts.  It does not cover third-party S3-compatible services or
-the AWS SDK crates that s3-turbo-list depends on — report issues with
+the AWS SDK crates that s3tl depends on — report issues with
 those to their respective maintainers.

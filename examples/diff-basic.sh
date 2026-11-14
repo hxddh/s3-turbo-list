@@ -1,61 +1,22 @@
 #!/usr/bin/env bash
-# s3-turbo-list — bi-directional diff example
-# ---------------------------------------------------------------------------
-# Required env vars:
-#   LEFT_BUCKET   — source (left) bucket name
-#   RIGHT_BUCKET  — target (right) bucket name
-# Optional env vars:
-#   REGION        — left region (default: us-east-1)
-#   TARGET_REGION — right region (default: same as REGION)
-#   AWS_PROFILE   — AWS SDK credentials profile (optional)
-#   ENDPOINT_URL  — custom S3 endpoint for both sides (optional; omit for AWS)
-#   OUTDIR        — output directory (default: ./artifacts/diff-basic)
-#   S3_TURBO_LIST_BIN — path to binary (default: cargo run --)
+# s3tl — compare two prefixes and write the differing keys to Parquet.
 #
-# Parquet DiffFlag legend:
-#   0 — Equal      (same object in both buckets)
-#   1 — Left-only  (only in LEFT_BUCKET)
-#   2 — Right-only (only in RIGHT_BUCKET)
-#   3 — Differs    (both buckets, but size/ETag differ)
+# Keys are compared relative to each side's prefix; the output holds only
+# keys that differ (status left_only / right_only / changed, with both
+# sides' size, last_modified and etag). The result's .diff has the counts,
+# including equal keys.
 #
-# A failed diff removes its outputs: only trust them on exit 0.
-# ---------------------------------------------------------------------------
+# Env: LEFT, RIGHT (required, s3://bucket[/prefix]), ENDPOINT_URL,
+# TARGET_ENDPOINT_URL (right side, for cross-provider diffs), OUTDIR
+# (default ./artifacts/diff-basic), S3TL (default: cargo run --release --).
 set -euo pipefail
 
-: "${LEFT_BUCKET:?set LEFT_BUCKET to the source (left) bucket name}"
-: "${RIGHT_BUCKET:?set RIGHT_BUCKET to the target (right) bucket name}"
-REGION="${REGION:-us-east-1}"
-TARGET_REGION="${TARGET_REGION:-$REGION}"
+: "${LEFT:?set LEFT to s3://bucket[/prefix]}"
+: "${RIGHT:?set RIGHT to s3://bucket[/prefix]}"
 OUTDIR="${OUTDIR:-./artifacts/diff-basic}"
-S3TL="${S3_TURBO_LIST_BIN:-cargo run --}"
+S3TL="${S3TL:-cargo run --release --}"
+set -- diff "$LEFT" "$RIGHT" -o "$OUTDIR"
+if [ -n "${ENDPOINT_URL:-}" ]; then set -- "$@" --endpoint-url "$ENDPOINT_URL"; fi
+if [ -n "${TARGET_ENDPOINT_URL:-}" ]; then set -- "$@" --target-endpoint-url "$TARGET_ENDPOINT_URL"; fi
 
-mkdir -p "$OUTDIR"
-
-echo "==> Diffing buckets"
-echo "    Left:  $LEFT_BUCKET  (region=$REGION)"
-echo "    Right: $RIGHT_BUCKET (region=$TARGET_REGION)"
-echo "    Output: $OUTDIR/diff.parquet (+ diff.ks)"
-
-set -- \
-  diff \
-  --bucket "$LEFT_BUCKET" \
-  --region "$REGION" \
-  --target-bucket "$RIGHT_BUCKET" \
-  --target-region "$TARGET_REGION" \
-  --output-parquet-file "$OUTDIR/diff.parquet"
-
-if [ -n "${ENDPOINT_URL:-}" ]; then
-  set -- "$@" --endpoint-url "$ENDPOINT_URL"
-fi
-
-$S3TL "$@"
-
-echo "==> Done.  Inspect with:"
-echo "    python3 examples/read-parquet.py $OUTDIR/diff.parquet"
-echo ""
-echo "    # Count by DiffFlag:"
-echo "    python3 -c \""
-echo "import pandas as pd"
-echo "df = pd.read_parquet('$OUTDIR/diff.parquet')"
-echo "print(df['DiffFlag'].value_counts().sort_index())"
-echo "\""
+$S3TL "$@" | jq '{status, diff, files: [.output.files[].path]}'

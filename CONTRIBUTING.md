@@ -1,4 +1,4 @@
-# Contributing to s3-turbo-list
+# Contributing to s3tl
 
 ## Local setup
 
@@ -27,9 +27,8 @@ cargo check
 3. **Run the full suite before pushing:**
    ```bash
    cargo fmt --check
-   cargo check
+   cargo clippy --all-targets -- -D warnings
    cargo test
-   cargo build
    ```
 4. **Open a pull request.**  Use the PR template checklist.
 
@@ -47,35 +46,35 @@ cargo check
 
 ## Endpoint compatibility
 
-s3-turbo-list targets the S3 ListObjectsV2 API as implemented by AWS S3.
+s3tl targets the S3 ListObjectsV2 API as implemented by AWS S3.
 It is validated against MinIO and BOS as well, but not every S3-compatible
 provider behaves identically.
 
 - **Do not add endpoint-specific workarounds** without documenting the
   compatibility rationale in `docs/validation-results/`.
-- **Prefer a compat-probe + trace** approach: validate the endpoint first,
+- **Prefer a `s3tl check` + `--trace`** approach: validate the endpoint first,
   document findings, and update the compatibility matrix in `README.md`.
 - If a provider deviates from S3 semantics, open an issue and classify it
   as a provider-side incompatibility — do not silently paper over it in
   the tool.
 
-## Product scope: the CLI surface is frozen
+## Product scope: a minimal surface and a contract that only grows
 
-s3-turbo-list deliberately stays small.  The subcommand list and the global
-flag set are **frozen**: pull requests adding new subcommands, new global
-flags, or new configuration knobs need an exceptional, documented case and
-maintainer sign-off before any implementation work.
+s3tl deliberately stays small: three commands (`list`, `diff`, `check`), a
+handful of options, no config file. 1.0 removed everything that another
+tool does as well (filters, statistics files, manifests, provider presets);
+read the Parquet output with duckdb or pandas instead.
 
-- Prefer making the **default path** faster or smarter over adding an option.
-  (Example: startup structural discovery replaced the need for a "run
-  auto-hints first" step instead of adding a flag for it.)
-- Prefer removing or consolidating options over extending them.  Removals
-  follow hide-one-release-then-remove: the old spelling is hidden from
-  `--help` and keeps working with a deprecation warning for one release (and
-  a CHANGELOG `Deprecated` entry), then it is removed.
-- Performance claims need numbers: a local
-  `cargo run --release --example bench_local` comparison (see
-  [`docs/development.md`](docs/development.md)) or a real endpoint
+- New commands, options or knobs need an exceptional, documented case and
+  maintainer sign-off before any implementation work. Prefer making the
+  default path faster or smarter over adding an option.
+- The result contract (`docs/agent-usage.md`) — result fields, error codes,
+  exit codes, the Parquet schemas, the checkpoint format, trace fields —
+  only grows within a major version: add, never rename, retype or remove.
+  A new failure mode gets a stable `error.code` and a test.
+- Performance claims need numbers: `cargo run --release --example
+  bench_local` and/or an A/B run against `scripts/mock-s3.py` (see
+  [`docs/development.md`](docs/development.md)), or a real endpoint
   measurement in the PR description.
 
 ## Code style
