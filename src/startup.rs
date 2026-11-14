@@ -5,7 +5,7 @@
 //! page each) and races the whole discovery against Ctrl-C.
 
 use crate::auto_hints;
-use crate::config::S3TurboConfig;
+use crate::config::EngineConfig;
 use crate::core;
 use log::info;
 
@@ -29,14 +29,14 @@ pub async fn diff_side_boundaries(
     region: Option<&str>,
     endpoint: Option<&str>,
     prefix: &str,
-    cfg: &S3TurboConfig,
+    cfg: &EngineConfig,
     no_auto_hints: bool,
     delimiter: &str,
     max_keys: Option<i32>,
     sdk_config: &aws_config::SdkConfig,
     g_state: &core::GlobalState,
 ) -> Vec<String> {
-    if no_auto_hints || !delimiter.is_empty() || cfg.s3.start_after.is_some() {
+    if no_auto_hints || !delimiter.is_empty() {
         return Vec::new();
     }
 
@@ -69,7 +69,7 @@ pub async fn startup_boundaries(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
-    cfg: &S3TurboConfig,
+    cfg: &EngineConfig,
     max_keys: Option<i32>,
     g_state: &core::GlobalState,
     structural_target: usize,

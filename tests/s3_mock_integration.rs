@@ -2993,8 +2993,7 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
         "--region".into(),
         "us-east-1".into(),
     ];
-    let (code, stdout, stderr) =
-        run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3_turbo_list=debug")]);
+    let (code, stdout, stderr) = run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3tl=debug")]);
     assert_eq!(code, 0, "stdout: {}\nstderr: {}", stdout, stderr);
 
     let mut listed = parquet_keys(&parquet);
@@ -4199,7 +4198,7 @@ fn local_mock_repeated_resume_runs_stay_complete() {
     for run in 1..=2 {
         // Info level names each accepted runtime split.
         let (code, stdout, stderr) =
-            run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3_turbo_list=info")]);
+            run_cli_with_env(&args, dir.path(), &[("RUST_LOG", "s3tl=info")]);
         assert_eq!(
             code, 0,
             "run {} stdout: {}\nstderr: {}",

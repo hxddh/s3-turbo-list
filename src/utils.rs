@@ -319,3 +319,17 @@ mod tests {
         ));
     }
 }
+
+/// fsync a directory so a rename or removal inside it is durable. A no-op
+/// where directories cannot be opened for syncing (Windows).
+pub fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}

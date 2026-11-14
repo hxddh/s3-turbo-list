@@ -38,7 +38,7 @@ const AWS_LOCATION_ENV_VARS: &[&str] = &[
 /// shared-file and endpoint variables and the proxy variables are removed.
 /// Tests add what they need (credentials, region, cwd) on top.
 pub fn hermetic_command(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-turbo-list"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3tl"));
     command.env("HOME", home);
     for var in AWS_LOCATION_ENV_VARS.iter().chain(PROXY_ENV_VARS) {
         command.env_remove(var);

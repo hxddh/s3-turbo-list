@@ -3,9 +3,9 @@
 //! Every listing page request (and each compat-probe request) produces one
 //! [`S3CompatEvent`] written via a [`S3TraceWriter`]; startup discovery,
 //! flat-namespace bisection and runtime split probes are not traced.  The
-//! trace target (`--trace-compat`) is one of:
-//!   - [`JsonlTraceWriter`]  — a JSONL file (`--trace-compat <file>`)
-//!   - [`StderrTraceWriter`] — stderr       (`--trace-compat -`)
+//! trace target (`--trace`) is one of:
+//!   - [`JsonlTraceWriter`]  — a JSONL file (`--trace <file>`)
+//!   - [`StderrTraceWriter`] — stderr       (`--trace -`)
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -22,13 +22,10 @@ pub struct S3CompatEvent {
     // ── request identity ──────────────────────────────────
     pub timestamp: String, // ISO 8601, wall-clock
     pub operation: String, // "ListObjectsV2", "HeadBucket"
-    /// The provider preset (e.g. "bos").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
     pub endpoint_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    pub addressing_style: String, // "path", "virtual", "auto"
+    pub addressing_style: String, // "path" or "virtual"
     pub bucket: String,
     pub prefix: String,
 
@@ -100,11 +97,10 @@ impl S3CompatEvent {
         Self {
             timestamp: chrono::Utc::now().to_rfc3339(),
             operation: operation.to_string(),
-            provider: None,
             // Trace files get shared for diagnosis: never carry credentials.
-            endpoint_url: crate::agent::redact_url_userinfo(endpoint_url),
+            endpoint_url: crate::redact::redact_url(endpoint_url),
             region: None,
-            addressing_style: "auto".to_string(),
+            addressing_style: "virtual".to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             delimiter: None,
@@ -136,11 +132,6 @@ impl S3CompatEvent {
             ended_by: None,
             truncated_raw_body: None,
         }
-    }
-
-    /// Record the provider preset.
-    pub fn set_provider(&mut self, provider: Option<&str>) {
-        self.provider = provider.map(str::to_string);
     }
 }
 
@@ -185,7 +176,7 @@ impl S3TraceWriter for JsonlTraceWriter {
 
 // ── StderrTraceWriter ──────────────────────────────────────
 
-/// Writes events to stderr (one JSON object per line): `--trace-compat -`.
+/// Writes events to stderr (one JSON object per line): `--trace -`.
 pub struct StderrTraceWriter;
 
 impl S3TraceWriter for StderrTraceWriter {
@@ -198,7 +189,7 @@ impl S3TraceWriter for StderrTraceWriter {
 
 // ── Convenience constructor ────────────────────────────────
 
-/// The trace writer for a `--trace-compat` target: a JSONL file, `-` for
+/// The trace writer for a `--trace` target: a JSONL file, `-` for
 /// stderr, or `None` for no tracing. An unwritable path is an output failure
 /// the caller reports through the documented exit codes, not a panic.
 pub fn trace_writer_for_target(
@@ -209,7 +200,7 @@ pub fn trace_writer_for_target(
         Some("-") => Ok(Some(Box::new(StderrTraceWriter))),
         Some(path) => {
             let writer = JsonlTraceWriter::new(path)
-                .map_err(|e| format!("Failed to create trace-compat file '{}': {}", path, e))?;
+                .map_err(|e| format!("Failed to create trace file '{}': {}", path, e))?;
             Ok(Some(Box::new(writer)))
         }
     }
@@ -259,7 +250,6 @@ mod tests {
         );
         event.region = Some("bj".into());
         event.addressing_style = "path".into();
-        event.set_provider(Some("bos"));
         event.http_status = 404;
         event.s3_error_code = Some("NoSuchBucket".into());
         event.s3_error_message = Some("The specified bucket does not exist".into());
@@ -339,17 +329,7 @@ mod tests {
             Ok(_) => panic!("an unwritable trace path must surface as an error"),
             Err(e) => e,
         };
-        assert!(err.contains("trace-compat"), "{}", err);
-    }
-
-    #[test]
-    fn test_set_provider_fills_only_the_provider_field() {
-        let mut event = S3CompatEvent::new("ListObjectsV2", "http://x", "b", "/");
-        event.set_provider(Some("bos"));
-        let v: serde_json::Value = serde_json::to_value(&event).unwrap();
-        assert_eq!(v["provider"], "bos");
-        // The deprecated `profile` copy was removed in 0.39.
-        assert!(v.get("profile").is_none());
+        assert!(err.contains("trace file"), "{}", err);
     }
 
     #[test]

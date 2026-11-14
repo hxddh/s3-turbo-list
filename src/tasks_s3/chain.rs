@@ -28,8 +28,7 @@ pub(super) async fn flat_list_run_to_complete(
     control: &SegmentControl,
     split_tx: Option<&SplitSender>,
 ) -> bool {
-    // If the CLI provided --start-after, it overrides the segment's start.
-    let mut start_after = ctx.start_after.as_deref().unwrap_or(start).to_string();
+    let mut start_after = start.to_string();
     let mut retry_attempt: u32 = 0;
     loop {
         match flat_list(
@@ -551,7 +550,6 @@ fn emit_segment_summary(
         prefix,
     );
     event.region = ctx.region.clone();
-    event.set_provider(ctx.provider.as_deref());
     event.addressing_style = ctx.addressing_style.clone();
     event.start_after = if start_after.is_empty() {
         None

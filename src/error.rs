@@ -24,6 +24,13 @@ pub const ERROR_SLOW_DOWN: u8 = 0x15;
 pub const ERROR_TOO_MANY_REQUESTS: u8 = 0x16;
 pub const ERROR_INTERNAL_ERROR: u8 = 0x17;
 pub const ERROR_SERVICE_UNAVAILABLE: u8 = 0x18;
+/// Expired or invalid session credentials (`ExpiredToken`, `InvalidToken`,
+/// `TokenRefreshRequired`): refresh the credentials.
+pub const ERROR_EXPIRED_TOKEN: u8 = 0x19;
+/// The access key does not exist (`InvalidAccessKeyId`).
+pub const ERROR_INVALID_ACCESS_KEY: u8 = 0x1a;
+/// A listing that breaks the ListObjectsV2 contract (keys out of order).
+pub const ERROR_INCONSISTENT_LISTING: u8 = 0x1b;
 pub const ERROR_UNKNOWN: u8 = 0xff;
 
 /// Whether a segment should retry after this error rather than fail the run.
@@ -65,6 +72,9 @@ pub fn is_setup_error(errno: u8) -> bool {
             | ERROR_PERMANENT_REDIRECT
             | ERROR_SIGNATURE_DOES_NOT_MATCH
             | ERROR_AUTH_HEADER_MALFORMED
+            | ERROR_EXPIRED_TOKEN
+            | ERROR_INVALID_ACCESS_KEY
+            | ERROR_INCONSISTENT_LISTING
     )
 }
 
@@ -280,6 +290,9 @@ pub fn errno_to_name(errno: u8) -> &'static str {
         ERROR_TOO_MANY_REQUESTS => "TooManyRequests",
         ERROR_INTERNAL_ERROR => "InternalError",
         ERROR_SERVICE_UNAVAILABLE => "ServiceUnavailable",
+        ERROR_EXPIRED_TOKEN => "ExpiredToken",
+        ERROR_INVALID_ACCESS_KEY => "InvalidAccessKeyId",
+        ERROR_INCONSISTENT_LISTING => "InconsistentListing",
         _ => "Unknown",
     }
 }
@@ -288,7 +301,13 @@ pub fn errno_to_name(errno: u8) -> &'static str {
 pub fn s3_error_code_to_errno(code: Option<&str>) -> u8 {
     match code {
         Some("NoSuchBucket") => ERROR_NO_BUCKET,
-        Some("AccessDenied") => ERROR_ACCESS_DENIED,
+        Some("AccessDenied") | Some("AllAccessDisabled") | Some("AccountProblem") => {
+            ERROR_ACCESS_DENIED
+        }
+        Some("ExpiredToken") | Some("InvalidToken") | Some("TokenRefreshRequired") => {
+            ERROR_EXPIRED_TOKEN
+        }
+        Some("InvalidAccessKeyId") => ERROR_INVALID_ACCESS_KEY,
         Some("PermanentRedirect") => ERROR_PERMANENT_REDIRECT,
         Some("SignatureDoesNotMatch") => ERROR_SIGNATURE_DOES_NOT_MATCH,
         Some("AuthorizationHeaderMalformed") => ERROR_AUTH_HEADER_MALFORMED,
@@ -320,6 +339,10 @@ pub fn service_error_errno(code: Option<&str>, http_status: u16) -> u8 {
             // on first sight.
             501 | 505 => ERROR_UNKNOWN,
             500..=599 => ERROR_INTERNAL_ERROR,
+            // A refusal without an S3 code (a HEAD response, a proxy) is
+            // still a refusal: setup, not a network failure.
+            401 | 403 => ERROR_ACCESS_DENIED,
+            404 => ERROR_NO_BUCKET,
             _ => ERROR_UNKNOWN,
         },
         errno => errno,

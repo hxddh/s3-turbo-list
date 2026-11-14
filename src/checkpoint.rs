@@ -1,132 +1,50 @@
-use log::{info, warn};
+//! Resume state of an interrupted `list -o DIR` run: `DIR/_checkpoint.json`.
+//!
+//! The checkpoint lives in the dataset directory it describes, so it can
+//! only ever be resumed into the same output. It records exactly the key
+//! ranges whose rows were not yet committed, and the identity of the run
+//! (source, endpoint, delimiter, page size): a resume under a different
+//! identity is refused rather than splicing two listings together.
+
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
-// ── Checkpoint identity ───────────────────────────────────
+/// File name of the checkpoint inside the output directory.
+pub const CHECKPOINT_FILE: &str = "_checkpoint.json";
 
-/// Immutable identity fields that must match between a checkpoint
-/// and the current run for resume to be valid.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Fields that must match between a checkpoint and the resuming run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointIdentity {
     pub bucket: String,
-    #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
     pub prefix: String,
-    #[serde(default)]
-    pub delimiter: Option<String>,
-    #[serde(default)]
-    pub max_keys: Option<i32>,
-    /// The provider preset. Written as `profile` up to 0.37; those
-    /// checkpoints still load and resume.
-    #[serde(default, alias = "profile")]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub addressing_style: Option<String>,
-    #[serde(default)]
-    pub mode: Option<String>, // "list" or "bidir"
-    /// The `--filter` expression, verbatim, or `None` when the run had no
-    /// filter.  It belongs here for the same reason `prefix` and `max_keys`
-    /// do: it decides which objects reach the output, so resuming under a
-    /// different one splices two populations into a single file that reads
-    /// as one coherent listing.
-    ///
-    /// A checkpoint written before this field existed also deserializes to
-    /// `None`, which is indistinguishable from "no filter". Resuming such a
-    /// checkpoint under a filter is caught (`None` vs `Some`); resuming a
-    /// filtered pre-upgrade checkpoint without one is not. That residual gap
-    /// closes as soon as a checkpoint is written by this version or later.
-    #[serde(default)]
-    pub filter: Option<String>,
-    /// The endpoint the listing ran against (`None`: the SDK's default AWS
-    /// endpoint).  A bucket name is only unique per endpoint: resuming a
-    /// checkpoint against another endpoint's same-named bucket would skip
-    /// segments that were listed somewhere else.  Checkpoints written before
-    /// this field existed read as `None` and are discarded once when resumed
-    /// against a custom endpoint — a relist, never a silent skip.
-    #[serde(default)]
+    /// The endpoint the listing ran against (`None`: AWS S3).
     pub endpoint_url: Option<String>,
+    pub delimiter: String,
+    pub max_keys: Option<i32>,
 }
 
 impl CheckpointIdentity {
-    /// Build the identity for the current run.
-    pub fn new(
-        bucket: &str,
-        region: Option<&str>,
-        prefix: &str,
-        delimiter: Option<&str>,
-        max_keys: Option<i32>,
-        provider: Option<&str>,
-        addressing_style: Option<&str>,
-        mode: Option<&str>,
-        filter: Option<&str>,
-    ) -> Self {
-        Self {
-            bucket: bucket.to_string(),
-            region: region.map(|r| r.to_string()),
-            prefix: prefix.to_string(),
-            delimiter: delimiter.map(|d| d.to_string()),
-            max_keys,
-            provider: provider.map(|p| p.to_string()),
-            addressing_style: addressing_style.map(|a| a.to_string()),
-            mode: mode.map(|m| m.to_string()),
-            filter: filter.map(|f| f.to_string()),
-            endpoint_url: None,
-        }
-    }
-
-    /// Attach the endpoint this run lists against (see `endpoint_url`).
-    pub fn with_endpoint(mut self, endpoint_url: Option<&str>) -> Self {
-        self.endpoint_url = endpoint_url.map(str::to_string);
-        self
-    }
-
-    /// Compare the checkpoint identity against the current run's identity.
-    /// Returns a list of field names that differ (empty means match).
-    pub fn diff(&self, current: &CheckpointIdentity) -> Vec<String> {
-        let mut mismatches: Vec<String> = Vec::new();
-
+    /// Names of the fields that differ (empty: same run).
+    pub fn diff(&self, current: &CheckpointIdentity) -> Vec<&'static str> {
+        let mut out = Vec::new();
         if self.bucket != current.bucket {
-            mismatches.push("bucket".into());
-        }
-        if self.region != current.region {
-            mismatches.push("region".into());
+            out.push("bucket");
         }
         if self.prefix != current.prefix {
-            mismatches.push("prefix".into());
-        }
-        if self.delimiter != current.delimiter {
-            mismatches.push("delimiter".into());
-        }
-        if self.max_keys != current.max_keys {
-            mismatches.push("max_keys".into());
-        }
-        // Case-insensitive: 0.37 stored the preset name as typed (`BOS`);
-        // it is normalized to the canonical lowercase name now.
-        let same_provider = match (&self.provider, &current.provider) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            (a, b) => a == b,
-        };
-        if !same_provider {
-            mismatches.push("provider".into());
-        }
-        if self.addressing_style != current.addressing_style {
-            mismatches.push("addressing_style".into());
-        }
-        if self.mode != current.mode {
-            mismatches.push("mode".into());
-        }
-        if self.filter != current.filter {
-            mismatches.push("filter".into());
+            out.push("prefix");
         }
         if self.endpoint_url != current.endpoint_url {
-            mismatches.push("endpoint_url".into());
+            out.push("endpoint_url");
         }
-
-        mismatches
+        if self.delimiter != current.delimiter {
+            out.push("delimiter");
+        }
+        if self.max_keys != current.max_keys {
+            out.push("max_keys");
+        }
+        out
     }
 }
-
-// ── CheckpointJournal ─────────────────────────────────────
 
 /// A key range still to be listed: keys after `start_after` (exclusive, ""
 /// for the start of the listing prefix) up to and including `end` (`None`:
@@ -149,178 +67,106 @@ pub struct ResumeProgress {
     pub ranges_with_progress: usize,
 }
 
-/// What a graceful interrupt of a list run leaves behind: the key ranges it
-/// did not write, and the identity of the run they belong to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointJournal {
-    pub bucket: String,
-    pub prefix: String,
-    pub last_updated: String,
-    /// Run identity — must match the resuming run.
-    #[serde(default)]
-    pub identity: Option<CheckpointIdentity>,
-    /// Exactly the key ranges not yet written, cut at each segment's last
-    /// durably written key. A resume lists these ranges and nothing else.
-    /// Absent in checkpoints written before 0.36 (which recorded completed
-    /// segment indices instead): those are discarded and the run starts over.
-    #[serde(default)]
-    pub remaining: Option<Vec<ResumeRange>>,
-    /// How many key ranges earlier runs listed in whole or in part, summed
-    /// across a chain of resumes (reported as `resumed_segments_skipped`).
-    #[serde(default)]
-    pub listed_ranges: Option<usize>,
+/// The checkpoint document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub schema: String,
+    pub identity: CheckpointIdentity,
+    /// Exactly the key ranges not yet written.
+    pub remaining: Vec<ResumeRange>,
+    pub updated_at: String,
 }
 
-impl CheckpointJournal {
-    /// Load a checkpoint file if it exists (raw load — no identity check).
-    pub fn load(path: &str) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
-        match toml::from_str(&content) {
-            Ok(journal) => Some(journal),
-            Err(e) => {
-                // Saves are atomic, so this is not a torn write of ours; say
-                // so rather than silently relisting everything.
-                warn!(
-                    "Checkpoint {} could not be parsed ({}) — ignoring it and starting fresh",
-                    path, e
-                );
-                None
+pub const CHECKPOINT_SCHEMA: &str = "s3tl.checkpoint/1";
+
+/// Why a checkpoint cannot be resumed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckpointError {
+    Missing,
+    Unreadable(String),
+    Mismatch(Vec<&'static str>),
+}
+
+impl std::fmt::Display for CheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "no checkpoint in the output directory"),
+            Self::Unreadable(e) => write!(f, "checkpoint is unreadable: {}", e),
+            Self::Mismatch(fields) => write!(
+                f,
+                "checkpoint belongs to a different run (differs in: {})",
+                fields.join(", ")
+            ),
+        }
+    }
+}
+
+impl Checkpoint {
+    pub fn new(identity: CheckpointIdentity, remaining: Vec<ResumeRange>) -> Self {
+        Self {
+            schema: CHECKPOINT_SCHEMA.to_string(),
+            identity,
+            remaining,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn path(dir: &Path) -> std::path::PathBuf {
+        dir.join(CHECKPOINT_FILE)
+    }
+
+    /// Load the checkpoint of `dir` and check it belongs to `identity`.
+    pub fn load(dir: &Path, identity: &CheckpointIdentity) -> Result<Self, CheckpointError> {
+        let path = Self::path(dir);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CheckpointError::Missing);
             }
+            Err(e) => return Err(CheckpointError::Unreadable(e.to_string())),
+        };
+        let cp: Checkpoint = serde_json::from_str(&content)
+            .map_err(|e| CheckpointError::Unreadable(e.to_string()))?;
+        if cp.schema != CHECKPOINT_SCHEMA {
+            return Err(CheckpointError::Unreadable(format!(
+                "unsupported schema '{}'",
+                cp.schema
+            )));
         }
+        let mismatch = cp.identity.diff(identity);
+        if !mismatch.is_empty() {
+            return Err(CheckpointError::Mismatch(mismatch));
+        }
+        Ok(cp)
     }
 
-    /// Load a checkpoint file AND verify that the run identity matches.
-    ///
-    /// Returns `None` when:
-    /// - the file does not exist or is unparseable
-    /// - the checkpoint is from an older version without identity fields
-    /// - any identity field differs from `current_identity`
-    ///
-    /// In all mismatch cases a clear warning is logged so the operator
-    /// knows the checkpoint was discarded and why.
-    pub fn load_and_verify(path: &str, current_identity: &CheckpointIdentity) -> Option<Self> {
-        let journal = Self::load(path)?;
-
-        let Some(stored) = &journal.identity else {
-            warn!(
-                "Checkpoint {} has no identity block (written by an old version) — \
-                 discarding checkpoint and starting fresh",
-                path
-            );
-            return None;
-        };
-
-        let mismatches = stored.diff(current_identity);
-        if !mismatches.is_empty() {
-            warn!(
-                "Checkpoint {} identity mismatch on field(s): {} — \
-                 discarding checkpoint and starting fresh",
-                path,
-                mismatches.join(", ")
-            );
-            return None;
-        }
-
-        let Some(remaining) = &journal.remaining else {
-            warn!(
-                "Checkpoint {} was written before 0.36 (segment indices, not key ranges) — \
-                 discarding checkpoint and starting fresh",
-                path
-            );
-            return None;
-        };
-        // 0.36 saved one of these when Ctrl-C arrived after the listing had
-        // finished; resuming from it lists nothing and reports success.
-        if remaining.is_empty() {
-            warn!(
-                "Checkpoint {} has no key ranges left (the listing it records had \
-                 finished) — discarding checkpoint and starting fresh",
-                path
-            );
-            return None;
-        }
-        info!(
-            "Checkpoint {} identity verified — {} key range(s) left to list",
-            path,
-            remaining.len()
-        );
-        Some(journal)
-    }
-
-    /// Write the current checkpoint state.
-    /// Written to a sibling temp file and renamed into place, so a crash or
-    /// a full disk mid-write leaves the previous checkpoint intact instead of
-    /// a truncated one.
-    ///
-    /// Returns the error so the caller can say so: a run that exits
-    /// "interrupted — a checkpoint may allow resuming" while none was written
-    /// sends the next `--resume` back to the start without a word.
-    pub fn save(&self, path: &str) -> Result<(), String> {
-        let toml_str = toml::to_string_pretty(self).expect("Failed to serialize checkpoint");
-        let tmp = format!("{}.tmp", path);
-        let result = std::fs::write(&tmp, &toml_str).and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = result {
+    /// Write atomically and durably: temp file, fsync, rename, fsync of the
+    /// directory. A crash leaves the previous checkpoint (or none) intact.
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let path = Self::path(dir);
+        let tmp = dir.join(format!("{}.tmp", CHECKPOINT_FILE));
+        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            crate::utils::sync_dir(dir)
+        })();
+        result.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            log::warn!("Failed to write checkpoint {}: {}", path, e);
-            return Err(format!("could not write checkpoint {}: {}", path, e));
-        }
-        Ok(())
+            format!("could not write checkpoint {}: {}", path.display(), e)
+        })
     }
 
-    /// Whether the file at `path` may be replaced or removed by a run with
-    /// `current` identity: it is absent, unreadable, or belongs to this run.
-    /// A checkpoint of another job that shares the file name (same bucket,
-    /// region and prefix but another endpoint, filter or page size) is left
-    /// alone — finishing or interrupting this run used to delete or overwrite
-    /// that job's resume point.
-    pub fn may_replace(path: &str, current: &CheckpointIdentity) -> bool {
-        if !std::path::Path::new(path).exists() {
-            return true;
+    /// Remove the checkpoint of `dir` (a finished run). Missing is fine.
+    pub fn remove(dir: &Path) -> Result<(), String> {
+        match std::fs::remove_file(Self::path(dir)) {
+            Ok(()) => crate::utils::sync_dir(dir).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
-        match Self::load(path) {
-            None => true,
-            Some(journal) => journal
-                .identity
-                .as_ref()
-                .is_none_or(|stored| stored.diff(current).is_empty()),
-        }
-    }
-}
-
-/// Checkpoint file name for a run over `prefix`.  A whole-bucket run keeps
-/// the historical `checkpoint_path` name; a prefixed run gets its own file,
-/// so two jobs on different prefixes of one bucket never overwrite — and on
-/// completion delete — each other's.
-pub fn checkpoint_path_for_prefix(bucket: &str, region: Option<&str>, prefix: &str) -> String {
-    let base = checkpoint_path(bucket, region);
-    if prefix.is_empty() {
-        return base;
-    }
-    format!(
-        "{}_{}_checkpoint.toml",
-        base.trim_end_matches("_checkpoint.toml"),
-        prefix_digest(prefix)
-    )
-}
-
-/// The first 8 hex digits of the prefix's SHA-256: what tells apart the
-/// checkpoint and output names of runs over different prefixes of a bucket.
-pub fn prefix_digest(prefix: &str) -> String {
-    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(prefix.as_bytes()));
-    digest[..8].to_string()
-}
-
-/// Generate the checkpoint file path for a given bucket.
-pub fn checkpoint_path(bucket: &str, region: Option<&str>) -> String {
-    let bucket = crate::agent::sanitize_path_component(bucket);
-    if let Some(r) = region {
-        format!(
-            "{}_{}_checkpoint.toml",
-            crate::agent::sanitize_path_component(r),
-            bucket
-        )
-    } else {
-        format!("{}_checkpoint.toml", bucket)
     }
 }
 
@@ -329,127 +175,80 @@ mod tests {
     use super::*;
 
     fn identity() -> CheckpointIdentity {
-        CheckpointIdentity::new(
-            "test-bucket",
-            Some("us-east-1"),
-            "",
-            Some(""),
-            None,
-            None,
-            Some("path"),
-            Some("list"),
-            None,
-        )
+        CheckpointIdentity {
+            bucket: "b".into(),
+            prefix: "p/".into(),
+            endpoint_url: Some("http://localhost:9000".into()),
+            delimiter: String::new(),
+            max_keys: None,
+        }
     }
 
-    fn journal(identity: CheckpointIdentity) -> CheckpointJournal {
-        CheckpointJournal {
-            bucket: "test-bucket".into(),
-            prefix: "".into(),
-            last_updated: String::new(),
-            identity: Some(identity),
-            remaining: Some(vec![ResumeRange {
-                start_after: "k".into(),
-                end: None,
-            }]),
-            listed_ranges: Some(1),
+    fn range(start: &str, end: Option<&str>) -> ResumeRange {
+        ResumeRange {
+            start_after: start.into(),
+            end: end.map(str::to_string),
         }
     }
 
     #[test]
-    fn test_may_replace_only_absent_or_matching_checkpoints() {
+    fn save_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cp.toml");
-        let path_str = path.to_str().unwrap();
-        let identity = identity();
-        assert!(CheckpointJournal::may_replace(path_str, &identity));
-        journal(identity.clone()).save(path_str).unwrap();
-        assert!(CheckpointJournal::may_replace(path_str, &identity));
-        // Same file name, another job: another endpoint or another filter.
-        let other_endpoint = identity
-            .clone()
-            .with_endpoint(Some("http://127.0.0.1:9000"));
-        assert!(!CheckpointJournal::may_replace(path_str, &other_endpoint));
-        let mut other_filter = identity.clone();
-        other_filter.filter = Some("SOURCE.size > 0".to_string());
-        assert!(!CheckpointJournal::may_replace(path_str, &other_filter));
+        let cp = Checkpoint::new(identity(), vec![range("", Some("m")), range("q", None)]);
+        cp.save(dir.path()).unwrap();
+        assert!(!dir.path().join("_checkpoint.json.tmp").exists());
+        let loaded = Checkpoint::load(dir.path(), &identity()).unwrap();
+        assert_eq!(loaded, cp);
     }
 
     #[test]
-    fn test_ranges_round_trip_and_identity_is_verified() {
+    fn load_reports_missing_and_mismatch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cp.toml");
-        let path_str = path.to_str().unwrap();
-        journal(identity()).save(path_str).unwrap();
-        let loaded = CheckpointJournal::load_and_verify(path_str, &identity()).unwrap();
-        assert_eq!(loaded.remaining.unwrap()[0].start_after, "k");
+        assert_eq!(
+            Checkpoint::load(dir.path(), &identity()),
+            Err(CheckpointError::Missing)
+        );
+        Checkpoint::new(identity(), vec![range("", None)])
+            .save(dir.path())
+            .unwrap();
         let mut other = identity();
-        other.prefix = "logs/".into();
-        assert!(CheckpointJournal::load_and_verify(path_str, &other).is_none());
+        other.endpoint_url = None;
+        other.max_keys = Some(2);
+        assert_eq!(
+            Checkpoint::load(dir.path(), &other),
+            Err(CheckpointError::Mismatch(vec!["endpoint_url", "max_keys"]))
+        );
     }
 
     #[test]
-    fn test_checkpoint_written_by_037_with_profile_field_resumes() {
-        // 0.37 wrote the provider preset as `profile`, as typed on the
-        // command line; 0.38 names it `provider` and normalizes the case.
+    fn load_rejects_garbage_and_foreign_schema() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cp.toml");
+        std::fs::write(Checkpoint::path(dir.path()), "not json").unwrap();
+        assert!(matches!(
+            Checkpoint::load(dir.path(), &identity()),
+            Err(CheckpointError::Unreadable(_))
+        ));
+        let mut cp = Checkpoint::new(identity(), vec![]);
+        cp.schema = "other/9".into();
         std::fs::write(
-            &path,
-            "bucket = \"test-bucket\"\nprefix = \"\"\nlast_updated = \"\"\n\
-             listed_ranges = 1\n\n[identity]\nbucket = \"test-bucket\"\n\
-             region = \"us-east-1\"\nprefix = \"\"\ndelimiter = \"\"\nprofile = \"BOS\"\n\
-             addressing_style = \"path\"\nmode = \"list\"\n\n\
-             [[remaining]]\nstart_after = \"k\"\n",
+            Checkpoint::path(dir.path()),
+            serde_json::to_string(&cp).unwrap(),
         )
         .unwrap();
-        let mut current = identity();
-        current.provider = Some("bos".to_string());
-        let loaded = CheckpointJournal::load_and_verify(path.to_str().unwrap(), &current).unwrap();
-        assert_eq!(
-            loaded.identity.unwrap().provider.as_deref(),
-            Some("BOS"),
-            "the 0.37 `profile` field is read as the provider"
-        );
-        assert!(CheckpointJournal::may_replace(
-            path.to_str().unwrap(),
-            &current
+        assert!(matches!(
+            Checkpoint::load(dir.path(), &identity()),
+            Err(CheckpointError::Unreadable(_))
         ));
-        current.provider = Some("minio".to_string());
-        assert!(CheckpointJournal::load_and_verify(path.to_str().unwrap(), &current).is_none());
-        // Written back under the new name.
-        let mut saved = identity();
-        saved.provider = Some("bos".to_string());
-        let text = toml::to_string(&saved).unwrap();
-        assert!(text.contains("provider = \"bos\""), "{}", text);
-        assert!(!text.contains("profile"), "{}", text);
     }
 
     #[test]
-    fn test_pre_036_index_checkpoint_is_discarded() {
-        // The old format recorded completed segment indices; it parses (the
-        // extra fields are ignored) but has no ranges to resume from.
+    fn remove_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cp.toml");
-        let mut old = toml::to_string(&identity()).unwrap();
-        old = format!(
-            "bucket = \"test-bucket\"\nprefix = \"\"\ntotal_segments = 4\n\
-             completed_indices = [0, 2]\nlast_updated = \"\"\n\n[identity]\n{}",
-            old
-        );
-        std::fs::write(&path, old).unwrap();
-        assert!(CheckpointJournal::load_and_verify(path.to_str().unwrap(), &identity()).is_none());
-    }
-
-    #[test]
-    fn test_checkpoint_with_no_ranges_left_is_discarded() {
-        // Resuming from it would list nothing and report success.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cp.toml");
-        let path_str = path.to_str().unwrap();
-        let mut finished = journal(identity());
-        finished.remaining = Some(Vec::new());
-        finished.save(path_str).unwrap();
-        assert!(CheckpointJournal::load_and_verify(path_str, &identity()).is_none());
+        Checkpoint::remove(dir.path()).unwrap();
+        Checkpoint::new(identity(), vec![])
+            .save(dir.path())
+            .unwrap();
+        Checkpoint::remove(dir.path()).unwrap();
+        assert!(!Checkpoint::path(dir.path()).exists());
     }
 }

@@ -1,11 +1,11 @@
 // Integration tests for the streaming diff merge (data_map::run_diff_merge):
 // classification, ordering guard, KS output, and Parquet DiffFlag content.
 
-use s3_turbo_list::core::{
+use s3tl::core::{
     ObjectKey, ObjectProps, S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
 };
-use s3_turbo_list::data_map::{DiffMergeOutcome, DiffStreamSides, run_diff_merge};
-use s3_turbo_list::utils::AsyncParquetOutput;
+use s3tl::data_map::{DiffMergeOutcome, DiffStreamSides, run_diff_merge};
+use s3tl::utils::AsyncParquetOutput;
 
 type Batch = Vec<(ObjectKey, ObjectProps)>;
 
@@ -195,7 +195,7 @@ async fn test_merge_same_side_duplicate_keeps_latest() {
 /// regression fails loudly instead of hanging.
 #[tokio::test]
 async fn test_merge_many_parallel_segments_does_not_deadlock() {
-    use s3_turbo_list::tasks_s3::DIFF_SEGMENT_CHANNEL_CAP;
+    use s3tl::tasks_s3::DIFF_SEGMENT_CHANNEL_CAP;
 
     const SEGMENTS: usize = 40; // exceeds the 32-way per-side concurrency cap
     const KEYS_PER_SEGMENT: usize = 12;
@@ -286,8 +286,8 @@ async fn test_merge_writes_ks_counts() {
 // batches before finalizing.
 #[tokio::test]
 async fn test_list_streaming_quit_drains_buffered_batches() {
-    use s3_turbo_list::config::OutputConfig;
-    use s3_turbo_list::core::{DataMapContext, GlobalState, S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE};
+    use s3tl::config::OutputConfig;
+    use s3tl::core::{DataMapContext, GlobalState, S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -326,7 +326,7 @@ async fn test_list_streaming_quit_drains_buffered_batches() {
     let parquet_path = dir.path().join("quit.parquet");
     let ks_path = dir.path().join("quit.ks");
     let ctx = DataMapContext::new(rx, g_state.clone());
-    s3_turbo_list::data_map::data_map_task_list_streaming(
+    s3tl::data_map::data_map_task_list_streaming(
         ctx,
         ks_path.to_str().unwrap(),
         parquet_path.to_str().unwrap(),

@@ -50,13 +50,11 @@ async fn flat_reactor_task(
     tokio::task::yield_now().await;
 
     // Adaptive splitting only applies to plain list runs: diff uses a fixed,
-    // key-ordered segment set per side (the merge needs it static), and
-    // --start-after is a single-chain mode. A
+    // key-ordered segment set per side (the merge needs it static). A
     // --delimiter run is excluded for the reason hints are: a page's
     // CommonPrefixes are not range-bounded, so a split parent would keep
     // paging past its cut, re-listing the child's prefixes.
     let allow_split = ctx.dir & core::OBJECT_PROPS_FLAG_DIFF_MODE == 0
-        && ctx.start_after.is_none()
         && ctx.delimiter.as_deref().unwrap_or("").is_empty();
 
     let (split_tx, mut split_rx) = tokio::sync::mpsc::unbounded_channel::<SplitRange>();

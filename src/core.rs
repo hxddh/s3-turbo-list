@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Barrier;
 use tokio::sync::mpsc;
 
@@ -37,9 +36,6 @@ pub const S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE: u8 =
     OBJECT_PROPS_FLAG_DIR_LEFT | OBJECT_PROPS_FLAG_DIFF_MODE;
 pub const S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE: u8 =
     OBJECT_PROPS_FLAG_DIR_RIGHT | OBJECT_PROPS_FLAG_DIFF_MODE;
-
-/// Global filter engine (initialised once from config or CLI).
-pub(crate) static OBJECT_FILTER: OnceLock<ObjectFilter> = OnceLock::new();
 
 // ── RunMode ────────────────────────────────────────────────
 
@@ -255,14 +251,6 @@ impl ObjectProps {
         if self.is_diff_mode() {
             return false;
         }
-        // `--filter` selects objects; a folder row (Size and LastModified 0)
-        // is not one, and a size or date predicate would otherwise drop every
-        // folder — the empty-listing symptom folder rows exist to prevent.
-        if let Some(filter) = OBJECT_FILTER.get().filter(|_| !self.is_common_prefix()) {
-            if filter.evaluate(self, None) == Some(false) {
-                return false;
-            }
-        }
         if self.status != OBJECT_PROPS_STATUS_OPEN {
             return false;
         }
@@ -271,45 +259,18 @@ impl ObjectProps {
         dir == OBJECT_PROPS_FLAG_DIR_LEFT || dir == OBJECT_PROPS_FLAG_DIR_RIGHT
     }
 
-    /// Diff-filter gate for a key present on only one side.
-    ///
-    /// One-sided rows used to bypass the filter entirely, so `--filter` only
-    /// ever narrowed the both-sides rows and the output still carried every
-    /// `+`/`-` row the user had asked to exclude. The present side binds to
-    /// `SOURCE`: for a one-sided row it is the only object there is, and a
-    /// filter that genuinely distinguishes the two sides must name `TARGET`,
-    /// which cannot be evaluated here at all.
-    ///
-    /// That unevaluable case keeps the row. `evaluate` returns `None` for it,
-    /// and only `Some(false)` excludes — the same convention
-    /// `include_in_list_output` uses, so a predicate that cannot be decided
-    /// never silently drops a difference.
-    pub fn include_one_sided(props: &ObjectProps) -> bool {
-        match OBJECT_FILTER.get() {
-            Some(filter) => filter.evaluate(props, None) != Some(false),
-            None => true,
-        }
-    }
-
-    /// Streaming-diff classification of a key present on both sides.
-    /// Returns `None` when the optional diff filter excludes the pair.
-    /// Semantics mirror the legacy match state machine: size mismatch,
-    /// an unavailable ETag on either side, or an ETag mismatch are all
-    /// reported as `Astrisk`; everything else is `Equal`.
-    pub fn classify_pair(left: &ObjectProps, right: &ObjectProps) -> Option<MatchResult> {
-        if let Some(filter) = OBJECT_FILTER.get() {
-            if filter.evaluate(left, Some(right)) == Some(false) {
-                return None;
-            }
-        }
+    /// Streaming-diff classification of a key present on both sides: a
+    /// size mismatch, an unavailable ETag on either side, or an ETag
+    /// mismatch is `Astrisk` (changed); everything else is `Equal`.
+    pub fn classify_pair(left: &ObjectProps, right: &ObjectProps) -> MatchResult {
         if left.size != right.size
             || left.is_etag_not_avail()
             || right.is_etag_not_avail()
             || left.etag() != right.etag()
         {
-            return Some(MatchResult::Astrisk);
+            return MatchResult::Astrisk;
         }
-        Some(MatchResult::Equal)
+        MatchResult::Equal
     }
 }
 
@@ -427,32 +388,6 @@ impl From<&aws_sdk_s3::types::Object> for ObjectProps {
     }
 }
 
-// ── ObjectFilter ───────────────────────────────────────────
-
-pub struct ObjectFilter {
-    /// A compiled predicate that returns `Some(bool)` or `None` on error.
-    predicate: Box<dyn Fn(&ObjectProps, Option<&ObjectProps>) -> Option<bool> + Send + Sync>,
-}
-
-impl std::fmt::Debug for ObjectFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ObjectFilter").finish_non_exhaustive()
-    }
-}
-
-impl ObjectFilter {
-    /// Create a new ObjectFilter from a compiled predicate.
-    pub(crate) fn new(
-        predicate: Box<dyn Fn(&ObjectProps, Option<&ObjectProps>) -> Option<bool> + Send + Sync>,
-    ) -> Self {
-        Self { predicate }
-    }
-
-    pub fn evaluate(&self, source: &ObjectProps, target: Option<&ObjectProps>) -> Option<bool> {
-        (self.predicate)(source, target)
-    }
-}
-
 // ── Task rendezvous ────────────────────────────────────────
 
 #[derive(Clone)]
@@ -502,18 +437,10 @@ pub struct GlobalState {
     /// open for up to a full poll interval).
     pub state_notify: Arc<tokio::sync::Notify>,
     pub output_error_count: Arc<AtomicUsize>,
-    pub data_received_batches: Arc<AtomicUsize>,
-    pub data_received_objects: Arc<AtomicUsize>,
-    pub data_streamed_rows: Arc<AtomicUsize>,
-    pub data_unique_prefixes: Arc<AtomicUsize>,
-    pub data_parquet_rows: Arc<AtomicUsize>,
-    pub data_ks_entries: Arc<AtomicUsize>,
-    pub data_bytes_total: Arc<AtomicU64>,
-    pub data_top_prefixes: Arc<Mutex<Vec<PrefixMetric>>>,
-    pub data_summary_only: Arc<AtomicBool>,
+    /// What the data map wrote, published when it finalizes.
+    pub data: Arc<Mutex<DataSummary>>,
     /// A diff merge consumed both sides to the end and wrote its outputs.
     pub diff_merge_complete: Arc<AtomicBool>,
-    pub data_output_files: Arc<AtomicUsize>,
     pub(crate) task_rendez: TaskRendezvous,
 }
 
@@ -532,6 +459,39 @@ pub struct HttpStatusMetric {
     pub count: usize,
 }
 
+/// One Parquet part file a run wrote (as a temp file; the app commits it).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutputPart {
+    pub index: usize,
+    pub rows: usize,
+}
+
+/// Classification counts of a diff.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DiffCounts {
+    pub left_only: usize,
+    pub right_only: usize,
+    pub changed: usize,
+    pub equal: usize,
+}
+
+/// What the data map saw and wrote.
+#[derive(Debug, Clone, Default)]
+pub struct DataSummary {
+    /// Object rows (folder rows excluded).
+    pub objects: usize,
+    /// CommonPrefix ("folder") rows of a `--delimiter` listing.
+    pub folders: usize,
+    /// Sum of object sizes.
+    pub bytes: u64,
+    /// Rows written to the output (Parquet or NDJSON).
+    pub rows_written: usize,
+    pub top_prefixes: Vec<PrefixMetric>,
+    /// Parquet parts written, in index order.
+    pub parts: Vec<OutputPart>,
+    pub diff: Option<DiffCounts>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunMetricsSnapshot {
     pub fatal_errors: usize,
@@ -546,19 +506,7 @@ pub struct RunMetricsSnapshot {
     /// `--log` and is not machine-readable.
     pub throttled_responses: usize,
     pub http_error_statuses: Vec<HttpStatusMetric>,
-    pub data_received_batches: usize,
-    pub data_received_objects: usize,
-    pub data_streamed_rows: usize,
-    pub data_unique_prefixes: usize,
-    pub data_parquet_rows: usize,
-    pub data_ks_entries: usize,
-    pub data_bytes_total: u64,
-    pub data_top_prefixes: Vec<PrefixMetric>,
-    pub data_summary_only: bool,
-    /// Parquet output files this run wrote: 1 plus one per extra pooled
-    /// writer.  The manifest records exactly these, so a reused output path
-    /// cannot pick up part-files left by an earlier, wider run.
-    pub data_output_files: usize,
+    pub data: DataSummary,
 }
 
 impl GlobalState {
@@ -576,17 +524,8 @@ impl GlobalState {
             first_output_error: Arc::new(Mutex::new(None)),
             state_notify: Arc::new(tokio::sync::Notify::new()),
             output_error_count: Arc::new(AtomicUsize::new(0)),
-            data_received_batches: Arc::new(AtomicUsize::new(0)),
-            data_received_objects: Arc::new(AtomicUsize::new(0)),
-            data_streamed_rows: Arc::new(AtomicUsize::new(0)),
-            data_unique_prefixes: Arc::new(AtomicUsize::new(0)),
-            data_parquet_rows: Arc::new(AtomicUsize::new(0)),
-            data_ks_entries: Arc::new(AtomicUsize::new(0)),
-            data_bytes_total: Arc::new(AtomicU64::new(0)),
-            data_top_prefixes: Arc::new(Mutex::new(Vec::new())),
-            data_summary_only: Arc::new(AtomicBool::new(false)),
+            data: Arc::new(Mutex::new(DataSummary::default())),
             diff_merge_complete: Arc::new(AtomicBool::new(false)),
-            data_output_files: Arc::new(AtomicUsize::new(0)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
     }
@@ -657,37 +596,9 @@ impl GlobalState {
     pub fn read_output_error(&self) -> usize {
         self.output_error_count.load(Ordering::Relaxed)
     }
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_data_metrics(
-        &self,
-        received_batches: usize,
-        received_objects: usize,
-        streamed_rows: usize,
-        unique_prefixes: usize,
-        parquet_rows: usize,
-        ks_entries: usize,
-        bytes_total: u64,
-        top_prefixes: Vec<PrefixMetric>,
-        summary_only: bool,
-        output_files: usize,
-    ) {
-        self.data_output_files
-            .store(output_files, Ordering::Relaxed);
-        self.data_received_batches
-            .store(received_batches, Ordering::Relaxed);
-        self.data_received_objects
-            .store(received_objects, Ordering::Relaxed);
-        self.data_streamed_rows
-            .store(streamed_rows, Ordering::Relaxed);
-        self.data_unique_prefixes
-            .store(unique_prefixes, Ordering::Relaxed);
-        self.data_parquet_rows
-            .store(parquet_rows, Ordering::Relaxed);
-        self.data_ks_entries.store(ks_entries, Ordering::Relaxed);
-        self.data_bytes_total.store(bytes_total, Ordering::Relaxed);
-        *self.data_top_prefixes.lock().unwrap() = top_prefixes;
-        self.data_summary_only
-            .store(summary_only, Ordering::Relaxed);
+    /// Publish what the data map saw and wrote.
+    pub fn record_data(&self, summary: DataSummary) {
+        *self.data.lock().unwrap() = summary;
     }
     pub fn metrics_snapshot(&self) -> RunMetricsSnapshot {
         RunMetricsSnapshot {
@@ -703,16 +614,7 @@ impl GlobalState {
                 .collect(),
             s3_client_timeouts: self.read_s3_client_timeout(),
             s3_client_generic_errors: self.read_s3_client_generic_error(),
-            data_received_batches: self.data_received_batches.load(Ordering::Relaxed),
-            data_received_objects: self.data_received_objects.load(Ordering::Relaxed),
-            data_streamed_rows: self.data_streamed_rows.load(Ordering::Relaxed),
-            data_unique_prefixes: self.data_unique_prefixes.load(Ordering::Relaxed),
-            data_parquet_rows: self.data_parquet_rows.load(Ordering::Relaxed),
-            data_ks_entries: self.data_ks_entries.load(Ordering::Relaxed),
-            data_bytes_total: self.data_bytes_total.load(Ordering::Relaxed),
-            data_top_prefixes: self.data_top_prefixes.lock().unwrap().clone(),
-            data_summary_only: self.data_summary_only.load(Ordering::Relaxed),
-            data_output_files: self.data_output_files.load(Ordering::Relaxed),
+            data: self.data.lock().unwrap().clone(),
         }
     }
     pub fn get_tracker(&self) -> Arc<HttpStatusCodeTracker> {
@@ -827,8 +729,6 @@ pub struct S3TaskContext {
     pub endpoint_url: String,
     pub region: Option<String>,
     pub addressing_style: String,
-    /// The provider preset, for trace events.
-    pub provider: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<i32>,
     pub max_attempts: u32,
@@ -837,10 +737,6 @@ pub struct S3TaskContext {
     /// actually paces a rate-limited endpoint.
     pub initial_backoff_secs: u64,
     pub operation_timeout_secs: u64,
-    /// CLI `--start-after` override — single-chain mode: hints and startup
-    /// discovery are skipped when this is set, so exactly one segment exists
-    /// and it starts after this key.
-    pub start_after: Option<String>,
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
@@ -859,10 +755,8 @@ pub struct TaskContextParams<'a> {
     pub g_state: GlobalState,
     pub trace_writer: Option<Arc<dyn S3TraceWriter>>,
     pub addressing_style: &'a str,
-    pub provider: Option<&'a str>,
     pub delimiter: Option<&'a str>,
     pub max_keys: Option<i32>,
-    pub start_after: Option<&'a str>,
 }
 
 impl S3TaskContext {
@@ -898,7 +792,7 @@ impl S3TaskContext {
                     .build(),
             )
             .app_name(
-                aws_sdk_s3::config::AppName::new("s3-turbo-list")
+                aws_sdk_s3::config::AppName::new("s3tl")
                     .expect("static app name is a valid AppName"),
             )
             .load()
@@ -918,13 +812,11 @@ impl S3TaskContext {
             endpoint_url: p.endpoint.unwrap_or("https://s3.amazonaws.com").to_string(),
             region: p.region.map(str::to_string),
             addressing_style: p.addressing_style.to_string(),
-            provider: p.provider.map(str::to_string),
             delimiter: p.delimiter.map(str::to_string),
             max_keys: p.max_keys,
             max_attempts: p.s3_config.max_attempts.max(1),
             initial_backoff_secs: p.s3_config.initial_backoff_secs,
             operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
-            start_after: p.start_after.map(str::to_string),
             resume_progress: Arc::new(Mutex::new(None)),
         }
     }
@@ -1294,7 +1186,7 @@ mod tests {
         let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 100, [0xab; 16]);
         assert_eq!(
             ObjectProps::classify_pair(&left, &right),
-            Some(MatchResult::Equal)
+            MatchResult::Equal
         );
     }
 
@@ -1304,7 +1196,7 @@ mod tests {
         let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 200, [0xab; 16]);
         assert_eq!(
             ObjectProps::classify_pair(&left, &right),
-            Some(MatchResult::Astrisk)
+            MatchResult::Astrisk
         );
     }
 
@@ -1316,11 +1208,11 @@ mod tests {
         assert!(missing.is_etag_not_avail());
         assert_eq!(
             ObjectProps::classify_pair(&avail, &missing),
-            Some(MatchResult::Astrisk)
+            MatchResult::Astrisk
         );
         assert_eq!(
             ObjectProps::classify_pair(&missing, &missing),
-            Some(MatchResult::Astrisk)
+            MatchResult::Astrisk
         );
     }
 
@@ -1349,41 +1241,12 @@ mod tests {
     }
 
     #[test]
-    fn test_include_one_sided_without_filter_keeps_every_row() {
-        // No filter installed in this test binary — the gate must be inert.
-        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 1, [0xab; 16]);
-        assert!(ObjectProps::include_one_sided(&props));
-    }
-
-    #[test]
-    fn test_target_referencing_filter_cannot_decide_a_one_sided_row() {
-        // The contract that keeps `SOURCE.size != TARGET.size` from silently
-        // dropping every one-sided difference: with no target to bind, the
-        // expression evaluates to `None`, and `include_one_sided` excludes
-        // only on `Some(false)`.
-        let expr = crate::filter_expr::FilterExpr::compile("SOURCE.size != TARGET.size", true)
-            .expect("compiles in diff mode");
-        let props = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
-        assert_eq!(expr.evaluate(&props, None), None);
-    }
-
-    #[test]
-    fn test_target_free_filter_decides_a_one_sided_row() {
-        let expr = crate::filter_expr::FilterExpr::compile("SOURCE.size > 1000", true)
-            .expect("compiles in diff mode");
-        let small = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 999, [0xab; 16]);
-        let big = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 1001, [0xab; 16]);
-        assert_eq!(expr.evaluate(&small, None), Some(false));
-        assert_eq!(expr.evaluate(&big, None), Some(true));
-    }
-
-    #[test]
     fn test_classify_pair_etag_mismatch_is_astrisk() {
         let left = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE, 100, [0xab; 16]);
         let right = ObjectProps::new_open(S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE, 100, [0x42; 16]);
         assert_eq!(
             ObjectProps::classify_pair(&left, &right),
-            Some(MatchResult::Astrisk)
+            MatchResult::Astrisk
         );
     }
 

@@ -31,7 +31,6 @@ impl TracedRequest<'_> {
             self.prefix,
         );
         event.region = ctx.region.clone();
-        event.set_provider(ctx.provider.as_deref());
         event.addressing_style = ctx.addressing_style.clone();
         event.start_after = (!self.start_after.is_empty()).then(|| self.start_after.to_string());
         event.continuation_token = self.continuation_token.map(str::to_string);

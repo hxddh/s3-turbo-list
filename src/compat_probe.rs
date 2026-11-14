@@ -1,5 +1,4 @@
-use crate::config::S3TurboConfig;
-use crate::trace::{S3CompatEvent, S3TraceWriter, StderrTraceWriter};
+use crate::trace::{S3CompatEvent, S3TraceWriter};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_smithy_runtime_api::client::result::SdkError;
 use serde::Serialize;
@@ -7,38 +6,16 @@ use std::time::Instant;
 
 #[derive(Debug, Serialize)]
 pub struct CompatProbeReport {
-    pub schema_version: &'static str,
-    pub tool_version: &'static str,
-    /// `success` (exit 0: `compatible` or `partial`) or `failed`
-    /// (`incompatible`: exit 3 or 4, as `exit_code` says).
-    pub status: String,
-    pub exit_code: i32,
     pub endpoint_url: String,
     pub region: String,
     pub bucket: String,
     pub addressing_style: String,
     pub tests: Vec<ProbeTestResult>,
+    /// `compatible`, `partial` or `incompatible`.
     pub overall_status: String,
-    /// The run's warnings (the ones printed as `WARN` on stderr without
-    /// `--agent`); always present, empty in the normal case.
-    pub warnings: Vec<String>,
 }
 
 impl CompatProbeReport {
-    /// The exit class: `incompatible` (every operation failed) must not
-    /// read as success; `partial` keeps exit 0, since the report says which
-    /// operations failed and an endpoint that lacks one option can still be
-    /// listed.
-    pub fn exit_code_class(&self) -> crate::agent::ExitCode {
-        if self.overall_status != "incompatible" {
-            crate::agent::ExitCode::Success
-        } else if self.failures_are_setup_errors() {
-            crate::agent::ExitCode::ProviderSetup
-        } else {
-            crate::agent::ExitCode::NetworkRetryExhausted
-        }
-    }
-
     /// Whether every failed test failed on a setup problem — the bucket, the
     /// credentials, or the endpoint/region — rather than on transport or the
     /// endpoint's behaviour.  Drives the exit code of an incompatible probe.
@@ -108,87 +85,21 @@ struct ProbeTarget<'a> {
     bucket: &'a str,
     prefix: &'a str,
     addressing_style: &'a str,
-    provider: Option<&'a str>,
 }
 
-/// Discards events: `--agent` without `--trace-compat`.
-struct NoTrace;
-
-impl S3TraceWriter for NoTrace {
-    fn write_event(&self, _event: S3CompatEvent) {}
-}
-
-/// Why a probe produced no report: its setup (the region) or writing it.
-#[derive(Debug)]
-pub enum ProbeFailure {
-    Setup(String),
-    Output(String),
-}
-
+/// Probe an endpoint with a handful of requests: HeadBucket, a one-key
+/// ListObjectsV2, a delimiter listing and a two-page pagination check.
+/// Every request is traced to `trace_writer`.
 pub async fn run_compat_probe(
+    client: &aws_sdk_s3::Client,
     endpoint_url: &str,
-    region: Option<&str>,
+    region: &str,
     bucket: &str,
     prefix: &str,
-    addressing_style: &str,
-    output: Option<&str>,
-    cfg: &S3TurboConfig,
-    quiet: bool,
-    warnings: Vec<String>,
-) -> Result<CompatProbeReport, ProbeFailure> {
-    // --trace-compat as for a listing run; without it, the probe keeps its
-    // historical default of tracing to stderr — except under `--agent`
-    // (`quiet`), which keeps stderr quiet.
-    let trace_writer: Box<dyn S3TraceWriter> =
-        match crate::trace::trace_writer_for_target(cfg.s3.trace_compat.as_deref())
-            .map_err(ProbeFailure::Output)?
-        {
-            Some(writer) => writer,
-            None if quiet => Box::new(NoTrace),
-            None => Box::new(StderrTraceWriter),
-        };
-
-    let loader = aws_config::from_env()
-        .retry_config(
-            aws_config::retry::RetryConfig::standard()
-                .with_max_attempts(cfg.s3.max_attempts)
-                .with_initial_backoff(std::time::Duration::from_secs(cfg.s3.initial_backoff_secs)),
-        )
-        .timeout_config(
-            aws_config::timeout::TimeoutConfigBuilder::new()
-                .connect_timeout(std::time::Duration::from_secs(cfg.s3.connect_timeout_secs))
-                .operation_timeout(std::time::Duration::from_secs(
-                    cfg.s3.operation_timeout_secs,
-                ))
-                .read_timeout(std::time::Duration::from_secs(
-                    cfg.s3.operation_timeout_secs,
-                ))
-                .operation_attempt_timeout(std::time::Duration::from_secs(
-                    cfg.s3.operation_timeout_secs,
-                ))
-                .build(),
-        );
-    let config = loader.load().await;
-    let mut s3_cfg = aws_sdk_s3::config::Builder::from(&config);
-    // Without --region the probe signs for the region the SDK resolves
-    // (AWS_REGION, the AWS config file), as a listing run does.
-    let region = match region {
-        Some(region) => region.to_string(),
-        None => config.region().map(|r| r.to_string()).ok_or_else(|| {
-            ProbeFailure::Setup(
-                "no region: pass --region or set AWS_REGION (compat-probe signs its requests \
-                 for a region)"
-                    .to_string(),
-            )
-        })?,
-    };
-    let region = region.as_str();
-    s3_cfg = s3_cfg.region(aws_sdk_s3::config::Region::new(region.to_owned()));
-    s3_cfg = s3_cfg.endpoint_url(endpoint_url.to_owned());
-    if addressing_style == "path" || cfg.s3.force_path_style() {
-        s3_cfg = s3_cfg.force_path_style(true);
-    }
-    let client = aws_sdk_s3::Client::from_conf(s3_cfg.build());
+    path_style: bool,
+    trace_writer: &dyn S3TraceWriter,
+) -> CompatProbeReport {
+    let addressing_style = if path_style { "path" } else { "virtual" };
     let mut results: Vec<ProbeTestResult> = Vec::new();
     let target = ProbeTarget {
         endpoint_url,
@@ -196,14 +107,13 @@ pub async fn run_compat_probe(
         bucket,
         prefix,
         addressing_style,
-        provider: cfg.s3.provider.as_deref(),
     };
 
     let (res, evt) = timed_s3_call(
         || async { client.head_bucket().bucket(bucket).send().await },
         "HeadBucket",
         &target,
-        trace_writer.as_ref(),
+        trace_writer,
         None,
     )
     .await;
@@ -221,7 +131,7 @@ pub async fn run_compat_probe(
         },
         "ListObjectsV2 (max-keys=1)",
         &target,
-        trace_writer.as_ref(),
+        trace_writer,
         None,
     )
     .await;
@@ -240,7 +150,7 @@ pub async fn run_compat_probe(
         },
         "ListObjectsV2 with delimiter",
         &target,
-        trace_writer.as_ref(),
+        trace_writer,
         None,
     )
     .await;
@@ -264,50 +174,21 @@ pub async fn run_compat_probe(
         },
         "ListObjectsV2 pagination check",
         &target,
-        trace_writer.as_ref(),
+        trace_writer,
         None,
     )
     .await;
-    results.push(
-        pagination_probe_result(&client, &target, trace_writer.as_ref(), res, &mut evt).await,
-    );
+    results.push(pagination_probe_result(&client, &target, trace_writer, res, &mut evt).await);
 
     let overall = CompatProbeReport::overall_status_for(&results);
-
-    let mut report = CompatProbeReport {
-        schema_version: crate::agent::AGENT_SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        status: String::new(),
-        exit_code: 0,
-        endpoint_url: crate::agent::redact_url_userinfo(endpoint_url),
+    CompatProbeReport {
+        endpoint_url: crate::redact::redact_url(endpoint_url),
         region: region.to_string(),
         bucket: bucket.to_string(),
         addressing_style: addressing_style.to_string(),
         tests: results,
         overall_status: overall.to_string(),
-        warnings,
-    };
-    let exit_code = report.exit_code_class();
-    report.exit_code = exit_code.code();
-    report.status = if exit_code == crate::agent::ExitCode::Success {
-        "success"
-    } else {
-        "failed"
     }
-    .to_string();
-
-    let json =
-        serde_json::to_string_pretty(&report).map_err(|e| ProbeFailure::Output(e.to_string()))?;
-    if let Some(out_path) = output {
-        std::fs::write(out_path, &json).map_err(|e| ProbeFailure::Output(e.to_string()))?;
-        // stdout is for the report itself; this note is for humans.
-        if !quiet {
-            eprintln!("Compat-probe report written to {}", out_path);
-        }
-    } else {
-        println!("{}", json);
-    }
-    Ok(report)
 }
 
 async fn pagination_probe_result(
@@ -508,7 +389,6 @@ where
 
     let mut event =
         S3CompatEvent::new(test_name, target.endpoint_url, target.bucket, target.prefix);
-    event.set_provider(target.provider);
     event.region = Some(target.region.to_string());
     event.addressing_style = target.addressing_style.to_string();
     event.latency_ms = latency_ms;
@@ -599,10 +479,7 @@ fn diagnostic_for(
             );
         }
         Some("InvalidAccessKeyId") | Some("AccessDenied") => {
-            return (
-                "access_denied",
-                "Check credentials, bucket permissions, and whether the provider preset fits this endpoint",
-            );
+            return ("access_denied", "Check credentials, bucket permissions");
         }
         Some("NoSuchBucket") => {
             return (
@@ -636,7 +513,7 @@ fn diagnostic_for(
         ),
         Some(401) | Some(403) => (
             "access_denied",
-            "Check credentials (AWS_PROFILE / keys), permissions, bucket policy, and the --provider preset",
+            "Check credentials (AWS_PROFILE / keys), permissions and bucket policy",
         ),
         Some(404) => (
             "not_found",
