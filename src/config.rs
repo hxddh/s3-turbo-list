@@ -61,6 +61,10 @@ pub struct OutputConfig {
     pub row_group_size: usize,
     pub compression: String,
     pub compression_level: u32,
+    /// Write the `s3tl.list-versions/1` schema (`list --versions`).
+    pub versions: bool,
+    /// Multipart upload part size of an S3 output.
+    pub upload_part_bytes: usize,
 }
 
 impl Default for OutputConfig {
@@ -69,6 +73,8 @@ impl Default for OutputConfig {
             row_group_size: 100_000,
             compression: "zstd".to_string(),
             compression_level: 1,
+            versions: false,
+            upload_part_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -95,7 +101,8 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// Defaults plus the undocumented `S3TL_MAX_ATTEMPTS`,
-    /// `S3TL_BACKOFF_SECS` and `S3TL_TIMEOUT_SECS` overrides the test suite
+    /// `S3TL_BACKOFF_SECS`, `S3TL_TIMEOUT_SECS` and `S3TL_UPLOAD_PART_BYTES`
+    /// overrides the test suite
     /// uses to fail fast against a local mock. Unparsable values are
     /// ignored.
     pub fn from_env() -> Self {
@@ -106,6 +113,9 @@ impl EngineConfig {
         }
         if let Some(v) = var("S3TL_BACKOFF_SECS") {
             cfg.s3.initial_backoff_secs = v;
+        }
+        if let Some(v) = var("S3TL_UPLOAD_PART_BYTES") {
+            cfg.output.upload_part_bytes = (v as usize).max(1);
         }
         if let Some(v) = var("S3TL_TIMEOUT_SECS") {
             cfg.s3.operation_timeout_secs = v.max(1);

@@ -30,6 +30,8 @@ struct RecordedRequest {
     query: BTreeMap<String, String>,
     /// Header names lowercased.
     headers: BTreeMap<String, String>,
+    /// The request body (`Content-Length` bytes).
+    body: Vec<u8>,
 }
 
 struct MockResponse {
@@ -272,23 +274,37 @@ fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
         }
     }
 
-    let request = String::from_utf8_lossy(&buf);
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let request = String::from_utf8_lossy(&buf[..header_end]).into_owned();
     let mut lines = request.lines();
     let first_line = lines.next()?;
     let mut parts = first_line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?;
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
-    let headers = lines
+    let headers: BTreeMap<String, String> = lines
         .take_while(|line| !line.is_empty())
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect();
+    let length: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = buf[header_end..buf.len().min(header_end + length)].to_vec();
     Some(RecordedRequest {
         method,
         path: path.to_string(),
         query: parse_query(raw_query),
         headers,
+        body,
     })
 }
 
@@ -3388,6 +3404,7 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
     let bad_etag = format!("\u{65e5}{}", "a".repeat(31));
     assert_eq!(bad_etag.len(), 34);
 
+    let bad = bad_etag.clone();
     let server = MockS3Server::start(move |request, _sequence| {
         match query(&request, "continuation-token") {
             None => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
@@ -3397,7 +3414,7 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
             )),
             Some("token-1") => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
                 "b-bad-etag.txt",
-                &bad_etag,
+                &bad,
                 Some("token-2"),
             )),
             _ => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
@@ -3433,7 +3450,8 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
         etags[0].as_deref(),
         Some("d41d8cd98f00b204e9800998ecf8427e")
     );
-    assert_eq!(etags[1], None, "an unusable ETag is null: {:?}", etags);
+    // Not an MD5: kept verbatim (another vendor's format), never mangled.
+    assert_eq!(etags[1].as_deref(), Some(bad_etag.as_str()), "{:?}", etags);
     assert_eq!(
         etags[2].as_deref(),
         Some("d41d8cd98f00b204e9800998ecf8427e-3")
@@ -4052,7 +4070,7 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     assert_eq!(result["command"], "diff");
     assert_eq!(
         result["diff"],
-        json!({"left_only": 1, "right_only": 1, "changed": 0, "equal": 2})
+        json!({"left_only": 1, "right_only": 1, "changed": 0, "equal": 2, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["target"]["bucket"], "right");
     assert_eq!(result["output"]["rows"], 2);
@@ -4128,7 +4146,7 @@ fn local_mock_diff_identical_sides_write_no_rows() {
     let result = ok_result(code, &stdout, &stderr);
     assert_eq!(
         result["diff"],
-        json!({"left_only": 0, "right_only": 0, "changed": 0, "equal": 3})
+        json!({"left_only": 0, "right_only": 0, "changed": 0, "equal": 3, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["stats"]["objects"], 3, "distinct keys compared");
     assert_eq!(result["output"]["rows"], 0);
@@ -4170,7 +4188,7 @@ fn local_mock_diff_changed_rows_carry_both_sides_across_endpoints() {
     let result = ok_result(code, &stdout, &stderr);
     assert_eq!(
         result["diff"],
-        json!({"left_only": 0, "right_only": 0, "changed": 2, "equal": 1})
+        json!({"left_only": 0, "right_only": 0, "changed": 2, "equal": 1, "verified_equal": 0, "unverified": 0})
     );
     assert_eq!(result["source"]["endpoint_url"], left.endpoint());
     assert_eq!(result["target"]["endpoint_url"], right.endpoint());
@@ -4527,4 +4545,572 @@ fn local_mock_list_routes_through_http_proxy_from_environment() {
     assert_eq!(code, 4, "stderr: {}", stderr);
     assert_eq!(stderr_result(&stderr)["error"]["retryable"], true);
     assert_eq!(server.requests().len(), before);
+}
+
+// ── list --versions (ListObjectVersions) ────────────────────
+
+/// One version or delete marker: `(key, version_id, epoch_secs, latest,
+/// delete_marker)`.
+type MockVersion = (&'static str, &'static str, u64, bool, bool);
+
+/// Versions of a small bucket in ListObjectVersions order (key ascending,
+/// newest first). `b` is deleted (its latest version is a delete marker);
+/// `c d` needs URL encoding.
+const MOCK_VERSIONS: &[MockVersion] = &[
+    ("a", "a-3", 3_000, true, false),
+    ("a", "a-2", 2_000, false, false),
+    ("a", "a-1", 1_000, false, false),
+    ("b", "b-dm", 5_000, true, true),
+    ("b", "b-1", 4_000, false, false),
+    ("c d", "cd-1", 6_000, true, false),
+    ("e", "null", 7_000, true, false),
+];
+
+/// A ListObjectVersions response over `MOCK_VERSIONS` honouring
+/// `prefix`, `key-marker`, `version-id-marker` and `max-keys`; any other
+/// GET is answered as ListObjectsV2 over the current (non-deleted) keys, so
+/// startup discovery probes work.
+fn emulated_versions(q: &BTreeMap<String, String>) -> String {
+    let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
+    let max_keys: usize = q
+        .get("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let key_marker = q.get("key-marker").map(String::as_str).unwrap_or("");
+    let version_marker = q.get("version-id-marker").map(String::as_str);
+    let mut entries: Vec<&MockVersion> = MOCK_VERSIONS
+        .iter()
+        .filter(|v| v.0.starts_with(prefix))
+        .collect();
+    let start = match version_marker {
+        Some(marker) => entries
+            .iter()
+            .position(|v| v.0 == key_marker && v.1 == marker)
+            .map_or(entries.len(), |i| i + 1),
+        None => entries
+            .iter()
+            .position(|v| v.0 > key_marker)
+            .unwrap_or(entries.len()),
+    };
+    entries.drain(..start);
+    let truncated = entries.len() > max_keys;
+    entries.truncate(max_keys);
+    let mut body = String::new();
+    for (key, id, secs, latest, dm) in &entries {
+        let modified = format!(
+            "2026-01-01T{:02}:{:02}:00.000Z",
+            secs / 3600,
+            secs / 60 % 60
+        );
+        if *dm {
+            body.push_str(&format!(
+                "<DeleteMarker><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest>\
+                 <LastModified>{}</LastModified></DeleteMarker>",
+                form_encode(key),
+                id,
+                latest,
+                modified
+            ));
+        } else {
+            body.push_str(&format!(
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest>\
+                 <LastModified>{}</LastModified><ETag>\"{:032x}\"</ETag><Size>{}</Size>\
+                 <StorageClass>STANDARD</StorageClass></Version>",
+                form_encode(key),
+                id,
+                latest,
+                modified,
+                secs,
+                secs / 1000
+            ));
+        }
+    }
+    let next = match (truncated, entries.last()) {
+        (true, Some(last)) => format!(
+            "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>{}</NextVersionIdMarker>",
+            form_encode(last.0),
+            last.1
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult>\
+         <Name>mock-bucket</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys>\
+         <EncodingType>url</EncodingType><IsTruncated>{}</IsTruncated>{}{}</ListVersionsResult>",
+        form_encode(prefix),
+        max_keys,
+        truncated,
+        next,
+        body
+    )
+}
+
+fn versions_server() -> MockS3Server {
+    MockS3Server::start(|request, _sequence| {
+        if request.query.contains_key("versions") {
+            assert_eq!(query(&request, "encoding-type"), Some("url"));
+            return MockResponse::ok_xml(emulated_versions(&request.query));
+        }
+        let mut current: Vec<String> = Vec::new();
+        for (key, _, _, latest, dm) in MOCK_VERSIONS {
+            if *latest && !*dm {
+                current.push(key.to_string());
+            }
+        }
+        MockResponse::ok_xml(emulated_list(&current, &request.query))
+    })
+}
+
+/// `(key, version_id, is_latest, is_delete_marker)` of every expected row.
+fn expected_versions() -> Vec<(String, String, bool, bool)> {
+    MOCK_VERSIONS
+        .iter()
+        .map(|(k, id, _, latest, dm)| (k.to_string(), id.to_string(), *latest, *dm))
+        .collect()
+}
+
+#[test]
+fn local_mock_versions_lists_every_version_across_pages() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    // Two entries a page: `a`'s three versions span pages, and the delete
+    // marker of `b` shares a page with a version of `a`.
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket",
+            "--versions",
+            "--no-auto-hints",
+            "--max-keys",
+            "2",
+            "-o",
+            "-",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    assert_eq!(code, 0, "{}", stderr);
+    let rows = ndjson_rows(&stdout);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["version_id"].as_str().unwrap().to_string(),
+                r["is_latest"].as_bool().unwrap(),
+                r["is_delete_marker"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(got, expected_versions());
+    // A delete marker has no size, ETag or storage class.
+    assert_eq!(rows[3]["size"], 0);
+    assert_eq!(rows[3]["etag"], Value::Null);
+    assert_eq!(rows[4]["etag"], format!("{:032x}", 4_000));
+    let result = stderr_result(&stderr);
+    assert_eq!(result["stats"]["objects"], 7);
+
+    let requests = server.requests();
+    assert!(requests.iter().all(|r| r.query.contains_key("versions")));
+    assert!(requests.iter().all(|r| !r.query.contains_key("list-type")));
+    // Each page continues from the markers of the one before.
+    assert_eq!(query(&requests[1], "key-marker"), Some("a"));
+    assert_eq!(query(&requests[1], "version-id-marker"), Some("a-2"));
+}
+
+#[test]
+fn local_mock_versions_partitioned_dataset_has_the_versions_schema() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket",
+            "--versions",
+            "--max-keys",
+            "1",
+            "-c",
+            "4",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["output"]["rows"], 7);
+    assert_eq!(
+        schema_tag(&part_files(&out)[0]).as_deref(),
+        Some("s3tl.list-versions/1")
+    );
+    let keys = dataset_keys(&out);
+    let ids: Vec<String> = dataset_strings(&out, "version_id")
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    let mut got: Vec<(String, String)> = keys.into_iter().zip(ids).collect();
+    got.sort();
+    let mut want: Vec<(String, String)> = expected_versions()
+        .into_iter()
+        .map(|(k, id, _, _)| (k, id))
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+    let batches = dataset_batches(&out);
+    let deleted: usize = batches
+        .iter()
+        .map(|b| {
+            let col = b
+                .column_by_name("is_delete_marker")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap()
+                .clone();
+            (0..col.len()).filter(|i| col.value(*i)).count()
+        })
+        .sum();
+    assert_eq!(deleted, 1);
+}
+
+#[test]
+fn versions_and_delimiter_are_exclusive() {
+    let server = versions_server();
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &["s3://mock-bucket", "--versions", "--delimiter", "/"],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.invalid_argument");
+    assert!(server.requests().is_empty());
+}
+
+// ── -o s3:// (multipart uploads) ────────────────────────────
+
+/// An in-memory bucket for S3 output: objects, open multipart uploads, and
+/// the source listing (`src/` keys) served from `keys`.
+#[derive(Default)]
+struct MockStore {
+    objects: BTreeMap<String, Vec<u8>>,
+    uploads: BTreeMap<String, (String, BTreeMap<u32, Vec<u8>>)>,
+    next_upload: usize,
+    aborted: usize,
+    /// How `PUT _result.json` behaves: 0 stores it, 1 fails without
+    /// storing it, 2 stores it and still fails (a lost response).
+    result_put: u8,
+}
+
+fn store_server(
+    store: Arc<Mutex<MockStore>>,
+    keys: Vec<String>,
+    fail_complete: bool,
+) -> MockS3Server {
+    MockS3Server::start(move |request, _sequence| {
+        let key = request
+            .path
+            .trim_start_matches('/')
+            .split_once('/')
+            .map(|(_, k)| percent_decode(k))
+            .unwrap_or_default();
+        let mut store = store.lock().unwrap();
+        match request.method.as_str() {
+            "GET" => {
+                let prefix = query(&request, "prefix").unwrap_or("");
+                if prefix.starts_with("src/") {
+                    return MockResponse::ok_xml(emulated_list(&keys, &request.query));
+                }
+                let existing: Vec<String> = store
+                    .objects
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                MockResponse::ok_xml(emulated_list(&existing, &request.query))
+            }
+            "POST" if request.query.contains_key("uploads") => {
+                store.next_upload += 1;
+                let id = format!("upload-{}", store.next_upload);
+                store
+                    .uploads
+                    .insert(id.clone(), (key.clone(), BTreeMap::new()));
+                MockResponse::ok_xml(format!(
+                    "<InitiateMultipartUploadResult><Bucket>out-bucket</Bucket><Key>{}</Key>\
+                     <UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+                    xml_escape(&key),
+                    id
+                ))
+            }
+            "PUT" if request.query.contains_key("partNumber") => {
+                let id = query(&request, "uploadId").unwrap().to_string();
+                let number: u32 = query(&request, "partNumber").unwrap().parse().unwrap();
+                let upload = store.uploads.get_mut(&id).expect("known upload");
+                upload.1.insert(number, request.body.clone());
+                MockResponse::empty_ok()
+            }
+            "POST" if request.query.contains_key("uploadId") => {
+                if fail_complete {
+                    return MockResponse::error(500, "InternalError", "complete failed");
+                }
+                let id = query(&request, "uploadId").unwrap().to_string();
+                let (key, parts) = store.uploads.remove(&id).expect("known upload");
+                let body: Vec<u8> = parts.into_values().flatten().collect();
+                store.objects.insert(key.clone(), body);
+                MockResponse::ok_xml(format!(
+                    "<CompleteMultipartUploadResult><Key>{}</Key><ETag>\"x\"</ETag>\
+                     </CompleteMultipartUploadResult>",
+                    xml_escape(&key)
+                ))
+            }
+            "DELETE" if request.query.contains_key("uploadId") => {
+                let id = query(&request, "uploadId").unwrap().to_string();
+                store.uploads.remove(&id);
+                store.aborted += 1;
+                MockResponse::empty_ok()
+            }
+            "DELETE" => {
+                store.objects.remove(&key);
+                MockResponse::empty_ok()
+            }
+            "HEAD" => match store.objects.contains_key(&key) {
+                true => MockResponse::empty_ok(),
+                false => MockResponse::error(404, "NotFound", "no such key"),
+            },
+            "PUT" => {
+                let marker = key.ends_with("_result.json");
+                if marker && store.result_put == 1 {
+                    return MockResponse::error(500, "InternalError", "put failed");
+                }
+                store.objects.insert(key, request.body.clone());
+                if marker && store.result_put == 2 {
+                    return MockResponse::error(500, "InternalError", "response lost");
+                }
+                MockResponse::empty_ok()
+            }
+            other => panic!("unexpected {} {}", other, request.path),
+        }
+    })
+}
+
+fn parquet_keys(bytes: &[u8]) -> Vec<String> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let col = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        out.extend((0..col.len()).map(|i| col.value(i).to_string()));
+    }
+    out
+}
+
+fn source_keys() -> Vec<String> {
+    (0..50).map(|i| format!("src/k{:03}", i)).collect()
+}
+
+#[test]
+fn local_mock_s3_output_commits_parts_and_result_last() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/run1",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["output"]["format"], "parquet");
+    assert_eq!(result["output"]["path"], "s3://mock-bucket/out/run1/");
+    assert_eq!(result["output"]["rows"], 50);
+    let files = result["output"]["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|f| {
+        f["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("s3://mock-bucket/out/run1/part-")
+    }));
+
+    let store = store.lock().unwrap();
+    assert!(
+        store.uploads.is_empty(),
+        "every upload completed or aborted"
+    );
+    let mut keys = Vec::new();
+    for (name, body) in &store.objects {
+        if name.ends_with(".parquet") {
+            assert!(name.starts_with("out/run1/part-"), "{}", name);
+            keys.extend(parquet_keys(body));
+        }
+    }
+    keys.sort();
+    assert_eq!(keys, source_keys());
+    let stored: Value = serde_json::from_slice(&store.objects["out/run1/_result.json"]).unwrap();
+    assert_eq!(stored["ok"], true);
+    assert_eq!(stored["output"]["rows"], 50);
+    // `_result.json` is written after the last part completed.
+    let requests = server.requests();
+    let last_put = requests
+        .iter()
+        .rposition(|r| r.method == "PUT" && r.path.ends_with("_result.json"))
+        .unwrap();
+    let last_complete = requests
+        .iter()
+        .rposition(|r| r.method == "POST" && r.query.contains_key("uploadId"))
+        .unwrap();
+    assert!(last_complete < last_put);
+}
+
+#[test]
+fn local_mock_s3_output_refuses_a_non_empty_prefix() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    store
+        .lock()
+        .unwrap()
+        .objects
+        .insert("out/old.txt".into(), b"x".to_vec());
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &["s3://mock-bucket/src/", "-o", "s3://mock-bucket/out/"],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.output_not_empty");
+    assert!(server.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn local_mock_s3_output_failed_commit_leaves_nothing() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let server = store_server(Arc::clone(&store), source_keys(), true);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 5, "output.write_failed");
+    let store = store.lock().unwrap();
+    assert!(store.objects.is_empty(), "{:?}", store.objects.keys());
+    assert!(store.uploads.is_empty());
+    assert!(store.aborted >= 1);
+}
+
+#[test]
+fn s3_output_is_not_resumable() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = strings(&["list", "s3://b/p", "-o", "s3://b/out/", "--resume"]);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    failed_result(code, &stdout, &stderr, 2, "usage.resume_needs_output");
+}
+
+#[test]
+fn local_mock_s3_output_assembles_multi_part_uploads_in_order() {
+    let store = Arc::new(Mutex::new(MockStore::default()));
+    let keys: Vec<String> = (0..20_000).map(|i| format!("src/key-{:06}", i)).collect();
+    let server = store_server(Arc::clone(&store), keys.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    // 1 KiB upload parts: every part file is many upload parts.
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("S3TL_UPLOAD_PART_BYTES", "1024")]);
+    ok_result(code, &stdout, &stderr);
+    let uploads = server
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PUT" && r.query.contains_key("partNumber"))
+        .count();
+    assert!(uploads > 4, "{} upload parts", uploads);
+    let store = store.lock().unwrap();
+    let mut got = Vec::new();
+    for (name, body) in &store.objects {
+        if name.ends_with(".parquet") {
+            got.extend(parquet_keys(body));
+        }
+    }
+    got.sort();
+    assert_eq!(got, keys);
+}
+
+#[test]
+fn local_mock_s3_output_failed_result_marker_takes_the_parts_back() {
+    let store = Arc::new(Mutex::new(MockStore {
+        result_put: 1,
+        ..Default::default()
+    }));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = failed_result(code, &stdout, &stderr, 5, "output.write_failed");
+    assert_eq!(result["output"]["files"], json!([]));
+    let store = store.lock().unwrap();
+    assert!(store.objects.is_empty(), "{:?}", store.objects.keys());
+}
+
+#[test]
+fn local_mock_s3_output_stored_result_marker_with_a_lost_response_commits() {
+    let store = Arc::new(Mutex::new(MockStore {
+        result_put: 2,
+        ..Default::default()
+    }));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    ok_result(code, &stdout, &stderr);
+    let store = store.lock().unwrap();
+    assert!(store.objects.contains_key("out/_result.json"));
+    assert!(store.objects.keys().any(|k| k.ends_with(".parquet")));
 }

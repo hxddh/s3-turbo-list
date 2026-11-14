@@ -214,10 +214,10 @@ pub(crate) fn epoch_millis_to_u64(ms: i64) -> u64 {
     crate::core::epoch_millis_u64(ms)
 }
 
-/// ETag text (entity-unescaped) → `(etag_md5, etag_parts)` by the same rules
-/// as `ObjectProps::from(&Object)`.
-fn parse_etag(raw: &str) -> ([u8; 16], u32) {
-    crate::core::parse_etag_bytes(raw)
+/// ETag text (entity-unescaped) → its MD5, part count and verbatim other
+/// form, by the same rules as `ObjectProps::from(&Object)`.
+fn parse_etag(raw: &str) -> ([u8; 16], u32, Option<String>) {
+    crate::core::parse_etag(raw)
 }
 
 /// Epoch milliseconds of an RFC 3339 timestamp, as the SDK parses
@@ -669,7 +669,7 @@ fn parse_contents(
     let b = text.as_bytes();
     let mut key: Option<String> = None;
     let mut last_modified: Option<i64> = None;
-    let mut etag: Option<([u8; 16], u32)> = None;
+    let mut etag: Option<([u8; 16], u32, Option<String>)> = None;
     let mut size: Option<i64> = None;
     let mut storage_class: Option<u8> = None;
 
@@ -761,7 +761,12 @@ fn parse_contents(
                     .and_then(|r| r.strip_suffix("&quot;"))
                     .filter(|inner| memchr(b'&', inner.as_bytes()).is_none());
                 etag = Some(match quoted {
-                    Some(inner) => crate::core::parse_etag_inner(inner.as_bytes()),
+                    Some(inner) => {
+                        let (md5, parts) = crate::core::parse_etag_inner(inner.as_bytes());
+                        let other = (parts == 0 && md5 == [0u8; 16] && !inner.is_empty())
+                            .then(|| inner.to_string());
+                        (md5, parts, other)
+                    }
                     None => parse_etag(value!()),
                 });
             }
@@ -782,9 +787,10 @@ fn parse_contents(
     }
 
     let mut props = template.clone();
-    if let Some((md5, parts)) = etag {
+    if let Some((md5, parts, other)) = etag {
         props.etag_md5 = md5;
         props.etag_parts = parts;
+        props.set_etag_other(other);
     }
     props.last_modified = last_modified.map_or(0, epoch_millis_to_u64);
     props.size = size.map_or(0, |s| s.max(0) as u64);
@@ -845,3 +851,54 @@ fn parse_struct(
 
 #[cfg(test)]
 mod tests;
+
+/// A key as S3 encodes it with `encoding-type=url` (form encoding: `+` is a
+/// space, `%XX` a byte), decoded; `None` when it needs no decoding (the
+/// common case, found with one memchr pass) or does not decode to UTF-8.
+pub(crate) fn url_decode_key(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    memchr::memchr2(b'%', b'+', bytes)?;
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `key` as a request with `encoding-type=url` sent it back: decoded when
+/// the response says it is URL-encoded (`url`), else as-is.
+pub(crate) fn response_key(url: bool, key: &str) -> String {
+    match url {
+        true => url_decode_key(key).unwrap_or_else(|| key.to_string()),
+        false => key.to_string(),
+    }
+}

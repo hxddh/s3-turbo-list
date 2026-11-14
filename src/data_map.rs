@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::OutputConfig;
 use crate::core::{self, DataMapContext, MatchResult, ObjectKey, ObjectProps};
+use crate::s3_output::PartSink;
 use crate::segment_order::SegmentOrder;
 use crate::utils::{DiffRow, DiffStatus};
 
@@ -59,17 +60,6 @@ const OUTPUT_GROW_MIN_BATCHES: usize = 8;
 /// brittle here — the bounded prefetch buffer masks the bottleneck — so the
 /// governor measures the writers' actual CPU-busy time directly.
 const OUTPUT_GROW_BUSY_FRACTION: f64 = 0.85;
-
-/// Per-writer output buffer between the Parquet encoder and the file. The
-/// `AsyncArrowWriter` already buffers and flushes whole row groups, so this only
-/// coalesces those large, sequential writes into fewer syscalls — past a few MB
-/// it stops affecting throughput (the page cache absorbs the writes, and on the
-/// fast-store path the writers are CPU-bound on encode+compress, not on file
-/// I/O). Sized so the pool's *aggregate* buffer stays bounded as the governor
-/// scales out: `MAX_LIST_OUTPUT_WORKERS` × this is ~256 MB, sane on any machine
-/// with enough cores to reach the cap. (Was a fixed 100 MB per writer, i.e. up
-/// to 3.2 GB once the pool fanned out on a many-core host.)
-const LIST_OUTPUT_WRITER_BUF_BYTES: usize = 8 * core::MB;
 
 /// Upper bound on output writers: the machine's parallelism, hard-capped. More
 /// writers than cores only thrash, since each does CPU-bound encode+compress.
@@ -193,7 +183,7 @@ struct ListWorkerResult {
 async fn list_output_worker(
     mut rx: tokio::sync::mpsc::Receiver<Vec<(ObjectKey, ObjectProps)>>,
     index: usize,
-    part_path: PathBuf,
+    sink: PartSink,
     output_config: OutputConfig,
     g_state: core::GlobalState,
     busy_nanos: Arc<AtomicU64>,
@@ -205,12 +195,12 @@ async fn list_output_worker(
         bytes_total: 0,
     };
     let mut output_ok = true;
-    let part_path = part_path.display().to_string();
+    let part_path = sink.describe(index);
 
-    let output_file = match tokio::fs::File::create(&part_path).await {
-        Ok(f) => f,
+    let writer = match sink.open(index).await {
+        Ok(w) => w,
         Err(e) => {
-            g_state.note_output_error(format!("cannot create output file {}: {}", part_path, e));
+            g_state.note_output_error(e);
             g_state.inc_output_error();
             return ListWorkerResult {
                 index,
@@ -220,10 +210,13 @@ async fn list_output_worker(
             };
         }
     };
-    let buf_writer = tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, output_file);
     let mut parquet = crate::utils::AsyncParquetOutput::with_settings(
-        buf_writer,
-        crate::utils::Layout::List,
+        writer,
+        if output_config.versions {
+            crate::utils::Layout::ListVersions
+        } else {
+            crate::utils::Layout::List
+        },
         output_config.row_group_size,
         &output_config.compression,
         output_config.compression_level,
@@ -259,11 +252,11 @@ async fn list_output_worker(
     }
 }
 
-/// Stream a list run into Parquet parts `first_index..` of `out_dir`
-/// (written as temp files; see `tmp_part_path`).
+/// Stream a list run into Parquet parts `first_index..` of `sink`
+/// (uncommitted until the run commits them).
 pub async fn data_map_task_list_streaming(
     mut ctx: DataMapContext,
-    out_dir: PathBuf,
+    sink: PartSink,
     first_index: usize,
     output_config: OutputConfig,
 ) {
@@ -285,7 +278,7 @@ pub async fn data_map_task_list_streaming(
         let handle = tokio::spawn(list_output_worker(
             w_rx,
             first_index + index,
-            tmp_part_path(&out_dir, first_index + index),
+            sink.clone(),
             output_config.clone(),
             ctx.g_state.clone(),
             Arc::clone(&busy_nanos),
@@ -356,7 +349,7 @@ pub async fn data_map_task_list_streaming(
                         handles.push(tokio::spawn(list_output_worker(
                             w_rx,
                             first_index + index,
-                            tmp_part_path(&out_dir, first_index + index),
+                            sink.clone(),
                             output_config.clone(),
                             ctx.g_state.clone(),
                             Arc::clone(&busy_nanos),
@@ -738,7 +731,7 @@ where
     }
 }
 
-async fn ingest_list_streaming_batch<W: tokio::io::AsyncWrite + Unpin + Send>(
+async fn ingest_list_streaming_batch<W: parquet::arrow::async_writer::AsyncFileWriter>(
     parquet: &mut crate::utils::AsyncParquetOutput<W>,
     stats: &mut ListStreamingStats,
     batch: Vec<(ObjectKey, ObjectProps)>,
@@ -842,18 +835,38 @@ fn render_text_row(
         }
     }
     out.extend_from_slice(b",\"etag\":");
-    if props.is_common_prefix() || props.is_etag_not_avail() {
-        out.extend_from_slice(b"null");
-    } else {
-        let mut buf = [0u8; 43];
-        out.push(b'"');
-        out.extend_from_slice(props.write_etag_to_buffer(&mut buf).as_bytes());
-        out.push(b'"');
+    let mut buf = [0u8; 43];
+    match props.etag_text(&mut buf) {
+        None => out.extend_from_slice(b"null"),
+        // Hex is plain ASCII; another vendor's ETag may need escaping.
+        Some(etag) if props.etag_other().is_some() => serde_json::to_writer(&mut *out, etag)?,
+        Some(etag) => {
+            out.push(b'"');
+            out.extend_from_slice(etag.as_bytes());
+            out.push(b'"');
+        }
     }
     out.extend_from_slice(b",\"storage_class\":");
     match props.storage_class_name() {
         None => out.extend_from_slice(b"null"),
         Some(name) => serde_json::to_writer(&mut *out, name)?,
+    }
+    if props.is_versioned() {
+        out.extend_from_slice(b",\"version_id\":");
+        match props.version_id() {
+            None => out.extend_from_slice(b"null"),
+            Some(id) => serde_json::to_writer(&mut *out, id)?,
+        }
+        out.extend_from_slice(if props.is_latest() {
+            b",\"is_latest\":true"
+        } else {
+            b",\"is_latest\":false"
+        });
+        out.extend_from_slice(if props.is_delete_marker() {
+            b",\"is_delete_marker\":true"
+        } else {
+            b",\"is_delete_marker\":false"
+        });
     }
     out.extend_from_slice(b"}\n");
     Ok(())
@@ -1219,14 +1232,7 @@ impl DiffSideStream {
 /// Buffered streaming row sink: differing rows accumulate in merge (key)
 /// order and flush as Parquet batches, so the file stays in key order.
 struct DiffRowSink {
-    /// Whether rows are handed to a writer (`false`: counts only).
-    write: bool,
     buf: Vec<DiffRow>,
-    prefix_stats: PrefixStats,
-    // Merged rows arrive in key order, so consecutive rows share a prefix:
-    // fold runs instead of a hash lookup per row, as the list paths do.
-    prefix_run: PrefixRunFolder,
-    rows: usize,
     plus: usize,
     minus: usize,
     astrisk: usize,
@@ -1246,13 +1252,9 @@ const DIFF_WRITE_PIPELINE_CAP: usize = 4;
 type DiffWriteBatch = Vec<DiffRow>;
 
 impl DiffRowSink {
-    fn new(write: bool) -> Self {
+    fn new() -> Self {
         Self {
-            write,
             buf: Vec::new(),
-            prefix_stats: PrefixStats::default(),
-            prefix_run: PrefixRunFolder::default(),
-            rows: 0,
             plus: 0,
             minus: 0,
             astrisk: 0,
@@ -1276,18 +1278,8 @@ impl DiffRowSink {
             DiffStatus::RightOnly => self.minus += 1,
             DiffStatus::Changed => self.astrisk += 1,
         }
-        // Prefix stats (bytes, top prefixes) describe the differing rows.
-        let size = row
-            .left
-            .as_ref()
-            .or(row.right.as_ref())
-            .map_or(0, |p| p.size());
-        self.prefix_run
-            .add(&mut self.prefix_stats, row.key.prefix(), size);
-        self.rows += 1;
-        if !self.write {
-            return Ok(());
-        }
+        // Rows always go on to the writer stage, which verifies checksums
+        // (`--compare checksum`), keeps the statistics and writes them.
         self.buf.push(row);
         if self.buf.len() >= DIFF_SINK_FLUSH_ROWS {
             let batch = std::mem::replace(&mut self.buf, Vec::with_capacity(DIFF_SINK_FLUSH_ROWS));
@@ -1300,7 +1292,6 @@ impl DiffRowSink {
         &mut self,
         writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     ) -> Result<(), String> {
-        self.prefix_run.flush(&mut self.prefix_stats);
         if !self.buf.is_empty() {
             let batch = std::mem::take(&mut self.buf);
             send_to_writer(writer_tx, batch).await?;
@@ -1343,6 +1334,7 @@ async fn merge_diff_streams(
     right: &mut DiffSideStream,
     // Bytes of each side's listing prefix (keys are compared without it).
     strip: (usize, usize),
+    compare: core::CompareMode,
     writer_tx: &tokio::sync::mpsc::Sender<DiffWriteBatch>,
     sink: &mut DiffRowSink,
     aborted: &(dyn Fn() -> bool + Send + Sync),
@@ -1410,7 +1402,7 @@ async fn merge_diff_streams(
                 let (key, left_props) = left.buf.pop_front().expect("filled");
                 let key = relative_key(key, strip.0);
                 let (_rkey, right_props) = right.buf.pop_front().expect("filled");
-                match core::ObjectProps::classify_pair(&left_props, &right_props) {
+                match core::ObjectProps::classify_pair_with(compare, &left_props, &right_props) {
                     MatchResult::Astrisk => {
                         let row = DiffRow {
                             key,
@@ -1448,6 +1440,10 @@ pub struct DiffMergeOutcome {
     pub minus: usize,
     pub astrisk: usize,
     pub equal: usize,
+    /// Changed pairs proven equal by their checksums (counted in `equal`).
+    pub verified_equal: usize,
+    /// Changed pairs the checksums could not settle.
+    pub unverified: usize,
     pub received_batches: usize,
     pub received_objects: usize,
     pub bytes_total: u64,
@@ -1469,19 +1465,94 @@ impl DiffMergeOutcome {
 /// with it in one loop; the bounded channel between them is the pipeline
 /// depth. The `&mut parquet` contract is unchanged — all rows are written
 /// before this returns.
-pub async fn run_diff_merge<W: tokio::io::AsyncWrite + Unpin + Send>(
+pub async fn run_diff_merge<W: parquet::arrow::async_writer::AsyncFileWriter>(
     sides: DiffStreamSides,
     parquet: Option<&mut crate::utils::AsyncParquetOutput<W>>,
     aborted: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<DiffMergeOutcome, String> {
-    run_diff_merge_with_heads(sides, None, parquet, aborted).await
+    run_diff_merge_with(sides, None, parquet, DiffOptions::default(), aborted).await
 }
 
-/// [`run_diff_merge`] that also publishes the merge's segment position.
-pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
+/// Settles a changed pair by its stored checksums, given the key relative
+/// to both prefixes: `Some(true)` equal, `Some(false)` different, `None`
+/// inconclusive.
+pub type ChecksumVerifier =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<bool>> + Send + Sync>;
+
+/// How the diff compares keys present on both sides.
+#[derive(Clone, Default)]
+pub struct DiffOptions {
+    pub compare: core::CompareMode,
+    /// Required for `CompareMode::Checksum`.
+    pub verifier: Option<ChecksumVerifier>,
+}
+
+/// Concurrent checksum verifications per batch.
+const CHECKSUM_VERIFY_CONCURRENCY: usize = 32;
+
+/// Drop the changed pairs of `batch` whose checksums prove them equal;
+/// returns the kept rows (in order), and the proven-equal and unverified
+/// counts. Only pairs of equal size are candidates. Once `aborted` turns
+/// true no further verification starts (the run is quitting; at most the
+/// requests already in flight finish).
+async fn verify_batch(
+    batch: DiffWriteBatch,
+    verifier: &ChecksumVerifier,
+    aborted: &(dyn Fn() -> bool + Send + Sync),
+) -> (DiffWriteBatch, usize, usize) {
+    use futures::StreamExt;
+    let candidates: Vec<usize> = batch
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.status == DiffStatus::Changed
+                && matches!((&row.left, &row.right), (Some(l), Some(r)) if l.size() == r.size())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        return (batch, 0, 0);
+    }
+    let verdicts: Vec<(usize, Option<bool>)> = futures::stream::iter(candidates)
+        .map(|i| {
+            let fut = (!aborted()).then(|| verifier(batch[i].key.as_str().to_string()));
+            async move {
+                match fut {
+                    Some(fut) => (i, fut.await),
+                    None => (i, None),
+                }
+            }
+        })
+        .buffer_unordered(CHECKSUM_VERIFY_CONCURRENCY)
+        .collect()
+        .await;
+    let mut equal = vec![false; batch.len()];
+    let (mut proven, mut unverified) = (0, 0);
+    for (i, verdict) in verdicts {
+        match verdict {
+            Some(true) => {
+                equal[i] = true;
+                proven += 1;
+            }
+            Some(false) => {}
+            None => unverified += 1,
+        }
+    }
+    let kept = batch
+        .into_iter()
+        .zip(equal)
+        .filter_map(|(row, eq)| (!eq).then_some(row))
+        .collect();
+    (kept, proven, unverified)
+}
+
+/// [`run_diff_merge`] with the merge's segment position published and the
+/// compare mode set.
+pub async fn run_diff_merge_with<W: parquet::arrow::async_writer::AsyncFileWriter>(
     sides: DiffStreamSides,
     heads: Option<DiffMergeHeads>,
     mut parquet: Option<&mut crate::utils::AsyncParquetOutput<W>>,
+    options: DiffOptions,
     aborted: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<DiffMergeOutcome, String> {
     let (left_head, right_head) = match heads {
@@ -1491,42 +1562,56 @@ pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
     let (writer_tx, mut writer_rx) =
         tokio::sync::mpsc::channel::<DiffWriteBatch>(DIFF_WRITE_PIPELINE_CAP);
 
-    let write = parquet.is_some();
     let strip = (sides.left_prefix.len(), sides.right_prefix.len());
+    let compare = options.compare;
+    let aborted: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(aborted);
+    let writer_aborted = Arc::clone(&aborted);
     let merge_task = tokio::spawn(async move {
         let mut left = DiffSideStream::new(sides.left, "left", left_head);
         let mut right = DiffSideStream::new(sides.right, "right", right_head);
-        let mut sink = DiffRowSink::new(write);
+        let mut sink = DiffRowSink::new();
 
         merge_diff_streams(
-            &mut left, &mut right, strip, &writer_tx, &mut sink, &aborted,
+            &mut left, &mut right, strip, compare, &writer_tx, &mut sink, &*aborted,
         )
         .await?;
         sink.flush_all(&writer_tx).await?;
-
-        let bytes_total = sink
-            .prefix_stats
-            .values()
-            .map(|aggregate| aggregate.bytes)
-            .fold(0u64, u64::saturating_add);
-        Ok(DiffMergeOutcome {
-            rows: sink.rows,
-            plus: sink.plus,
-            minus: sink.minus,
-            astrisk: sink.astrisk,
-            equal: sink.equal,
-            received_batches: left.received_batches + right.received_batches,
-            received_objects: left.received_objects + right.received_objects,
-            bytes_total,
-            prefix_stats: sink.prefix_stats,
-        })
+        Ok::<_, String>((
+            sink,
+            left.received_batches + right.received_batches,
+            left.received_objects + right.received_objects,
+        ))
     });
 
-    // Writer loop: drains until the merge task drops its sender (success) or
-    // a write fails (dropping the receiver unblocks the merge, whose sends
-    // then fail fast).
+    // Writer stage: verifies checksums, keeps the statistics of the rows
+    // that remain different, and writes them. Drains until the merge task
+    // drops its sender, or a write fails (dropping the receiver unblocks the
+    // merge, whose sends then fail fast).
     let mut write_error: Option<String> = None;
-    while let Some(batch) = writer_rx.recv().await {
+    let mut prefix_stats = PrefixStats::default();
+    let mut prefix_run = PrefixRunFolder::default();
+    let (mut rows, mut verified_equal, mut unverified) = (0usize, 0usize, 0usize);
+    while let Some(mut batch) = writer_rx.recv().await {
+        if let Some(verifier) = &options.verifier {
+            // A quitting run fails anyway: stop verifying (and writing).
+            if writer_aborted() {
+                write_error = Some("diff aborted".to_string());
+                break;
+            }
+            let (kept, proven, unsettled) = verify_batch(batch, verifier, &*writer_aborted).await;
+            batch = kept;
+            verified_equal += proven;
+            unverified += unsettled;
+        }
+        for row in &batch {
+            let size = row
+                .left
+                .as_ref()
+                .or(row.right.as_ref())
+                .map_or(0, |p| p.size());
+            prefix_run.add(&mut prefix_stats, row.key.prefix(), size);
+        }
+        rows += batch.len();
         let Some(parquet) = parquet.as_deref_mut() else {
             continue;
         };
@@ -1536,50 +1621,64 @@ pub async fn run_diff_merge_with_heads<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     }
     drop(writer_rx);
+    prefix_run.flush(&mut prefix_stats);
 
     let merged = merge_task
         .await
         .map_err(|e| format!("diff merge task failed: {}", e))?;
-    match write_error {
+    if let Some(e) = write_error {
         // The write error is the root cause; the merge error it induced
         // ("writer stopped") is secondary.
-        Some(e) => Err(e),
-        None => merged,
+        return Err(e);
     }
+    let (sink, received_batches, received_objects) = merged?;
+    let bytes_total = prefix_stats
+        .values()
+        .map(|aggregate| aggregate.bytes)
+        .fold(0u64, u64::saturating_add);
+    Ok(DiffMergeOutcome {
+        rows,
+        plus: sink.plus,
+        minus: sink.minus,
+        astrisk: sink.astrisk - verified_equal,
+        equal: sink.equal + verified_equal,
+        verified_equal,
+        unverified,
+        received_batches,
+        received_objects,
+        bytes_total,
+        prefix_stats,
+    })
 }
 
 /// The diff data map: merge both sides and write the differing keys to
-/// Parquet part 0 of `out_dir` (a temp file; see `tmp_part_path`), or only
-/// count them when `out_dir` is `None`.
+/// Parquet part 0 of `sink` (uncommitted until the run commits it), or only
+/// count them when `sink` is `None`.
 pub async fn data_map_task_diff_streaming(
     g_state: core::GlobalState,
     sides: DiffStreamSides,
     heads: Option<DiffMergeHeads>,
-    out_dir: Option<PathBuf>,
+    sink: Option<PartSink>,
     output_config: OutputConfig,
+    options: DiffOptions,
 ) {
     g_state.data_map_task_start();
     g_state.wait_to_start().await;
 
     info!("Data Map Task — diff streaming started");
 
-    let part_path = out_dir.as_deref().map(|dir| tmp_part_path(dir, 0));
-    let mut parquet = match &part_path {
+    let mut parquet = match &sink {
         None => None,
-        Some(path) => match tokio::fs::File::create(path).await {
-            Ok(file) => Some(crate::utils::AsyncParquetOutput::with_settings(
-                tokio::io::BufWriter::with_capacity(LIST_OUTPUT_WRITER_BUF_BYTES, file),
+        Some(sink) => match sink.open(0).await {
+            Ok(writer) => Some(crate::utils::AsyncParquetOutput::with_settings(
+                writer,
                 crate::utils::Layout::Diff,
                 output_config.row_group_size,
                 &output_config.compression,
                 output_config.compression_level,
             )),
             Err(e) => {
-                g_state.note_output_error(format!(
-                    "cannot create output file {}: {}",
-                    path.display(),
-                    e
-                ));
+                g_state.note_output_error(e);
                 g_state.inc_output_error();
                 g_state.data_map_task_complete();
                 g_state.quit();
@@ -1591,7 +1690,7 @@ pub async fn data_map_task_diff_streaming(
     let started_at = Instant::now();
     let mut output_ok = true;
     let abort_state = g_state.clone();
-    let outcome = match run_diff_merge_with_heads(sides, heads, parquet.as_mut(), move || {
+    let outcome = match run_diff_merge_with(sides, heads, parquet.as_mut(), options, move || {
         abort_state.is_quit()
     })
     .await
@@ -1627,11 +1726,11 @@ pub async fn data_map_task_diff_streaming(
         g_state.set_diff_merge_complete();
     }
     if outcome.is_none()
-        && let Some(path) = &part_path
+        && let Some(sink) = &sink
     {
         // A partial merge describes part of one side against an unfinished
         // other side; it parses, which is what makes it dangerous.
-        let _ = tokio::fs::remove_file(path).await;
+        sink.discard(0).await;
     }
 
     if let Some(outcome) = outcome {
@@ -1642,7 +1741,7 @@ pub async fn data_map_task_diff_streaming(
             bytes: outcome.bytes_total,
             rows_written: parquet_rows,
             top_prefixes: top_prefixes(&outcome.prefix_stats, TOP_PREFIXES),
-            parts: if part_path.is_some() {
+            parts: if sink.is_some() {
                 vec![core::OutputPart {
                     index: 0,
                     rows: parquet_rows,
@@ -1655,6 +1754,8 @@ pub async fn data_map_task_diff_streaming(
                 right_only: outcome.minus,
                 changed: outcome.astrisk,
                 equal: outcome.equal,
+                verified_equal: outcome.verified_equal,
+                unverified: outcome.unverified,
             }),
         });
         info!(
@@ -1671,6 +1772,51 @@ pub async fn data_map_task_diff_streaming(
 
     g_state.data_map_task_complete();
     g_state.quit();
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn changed(key: &str) -> DiffRow {
+        let props = ObjectProps::new_open(0, 7, [1; 16]);
+        DiffRow {
+            key: ObjectKey::from(key),
+            status: DiffStatus::Changed,
+            left: Some(props.clone()),
+            right: Some(props),
+        }
+    }
+
+    fn counting_verifier(calls: Arc<AtomicUsize>) -> ChecksumVerifier {
+        Arc::new(move |_key: String| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(true) })
+        })
+    }
+
+    #[tokio::test]
+    async fn verify_batch_proves_equal_pairs() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(Arc::clone(&calls));
+        let (kept, proven, unverified) =
+            verify_batch(vec![changed("a"), changed("b")], &verifier, &|| false).await;
+        assert!(kept.is_empty());
+        assert_eq!((proven, unverified), (2, 0));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_batch_starts_nothing_once_aborted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(Arc::clone(&calls));
+        let (kept, proven, _) =
+            verify_batch(vec![changed("a"), changed("b")], &verifier, &|| true).await;
+        assert_eq!(kept.len(), 2);
+        assert_eq!(proven, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[cfg(test)]

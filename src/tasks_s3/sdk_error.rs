@@ -4,7 +4,6 @@
 use crate::core::S3TaskContext;
 use crate::error::*;
 use crate::trace::S3CompatEvent;
-use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use log::debug;
 
 /// One ListObjectsV2 request of a segment's chain, as the compat trace
@@ -25,7 +24,11 @@ impl TracedRequest<'_> {
     pub(super) fn event(&self, ctx: &S3TaskContext, http_status: u16) -> Option<S3CompatEvent> {
         ctx.trace_writer.as_ref()?;
         let mut event = S3CompatEvent::new(
-            "ListObjectsV2",
+            if ctx.versions {
+                "ListObjectVersions"
+            } else {
+                "ListObjectsV2"
+            },
             &ctx.endpoint_url,
             &ctx.s3_bucket_name,
             self.prefix,
@@ -67,12 +70,15 @@ pub(super) fn write_trace(ctx: &S3TaskContext, event: Option<S3CompatEvent>) {
     }
 }
 
-pub(super) fn handle_sdk_error(
-    err: aws_sdk_s3::error::SdkError<ListObjectsV2Error>,
+pub(super) fn handle_sdk_error<E>(
+    err: aws_sdk_s3::error::SdkError<E>,
     next_start: &str,
     ctx: &S3TaskContext,
     traced: TracedRequest<'_>,
-) -> Result<(), FlatRuntimeError> {
+) -> Result<(), FlatRuntimeError>
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
     let tracker = ctx.get_tracker();
 
     match &err {

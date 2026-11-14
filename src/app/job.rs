@@ -39,6 +39,8 @@ pub enum Output {
     Stdout,
     /// A Parquet dataset directory.
     Dir(PathBuf),
+    /// A Parquet dataset under an S3 prefix (`-o s3://bucket/prefix/`).
+    S3(SideSpec),
 }
 
 impl Output {
@@ -70,11 +72,15 @@ pub struct Job {
     /// Whether this run created the output directory (removed again when a
     /// failed run leaves it empty).
     pub creates_dir: bool,
+    /// `diff --compare`.
+    pub compare: s3tl::core::CompareMode,
+    /// `list --versions`.
+    pub versions: bool,
 }
 
 impl Job {
     pub fn identity(&self) -> CheckpointIdentity {
-        identity_of(&self.source, &self.delimiter, self.max_keys)
+        identity_of(&self.source, &self.delimiter, self.max_keys, self.versions)
     }
 
     /// Whether the run uses startup discovery, and why not if it does not.
@@ -108,6 +114,12 @@ impl Job {
                 files: Vec::new(),
                 rows: 0,
             },
+            Output::S3(spec) => OutputInfo {
+                format: "parquet",
+                path: Some(s3_output_url(&spec.url)),
+                files: Vec::new(),
+                rows: 0,
+            },
             Output::Dir(dir) => OutputInfo {
                 format: "parquet",
                 path: Some(dir.display().to_string()),
@@ -118,13 +130,28 @@ impl Job {
     }
 }
 
-fn identity_of(side: &SideSpec, delimiter: &str, max_keys: Option<i32>) -> CheckpointIdentity {
+fn identity_of(
+    side: &SideSpec,
+    delimiter: &str,
+    max_keys: Option<i32>,
+    versions: bool,
+) -> CheckpointIdentity {
     CheckpointIdentity {
         bucket: side.url.bucket.clone(),
         prefix: side.url.prefix.clone(),
         endpoint_url: side.endpoint.clone(),
         delimiter: delimiter.to_string(),
         max_keys,
+        versions,
+    }
+}
+
+/// `s3://bucket/prefix/` of an S3 output (the prefix is a folder).
+pub fn s3_output_url(url: &S3Url) -> String {
+    if url.prefix.is_empty() || url.prefix.ends_with('/') {
+        url.url()
+    } else {
+        format!("{}/", url.url())
     }
 }
 
@@ -309,26 +336,34 @@ fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
 /// Build the job for a list or diff command.
 pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
     let g = &cli.global;
+    let mut compare_mode = s3tl::core::CompareMode::default();
+    let mut list_versions = false;
     let (mode, source, target, output, delimiter, resume) = match &cli.cmd {
         Command::List {
             source,
             output,
             delimiter,
             resume,
-        } => (
-            RunMode::List,
-            side(source, g.endpoint_url.as_deref(), cli)?,
-            None,
-            output.as_deref(),
-            delimiter.clone().unwrap_or_default(),
-            *resume,
-        ),
+            versions,
+        } => {
+            list_versions = *versions;
+            (
+                RunMode::List,
+                side(source, g.endpoint_url.as_deref(), cli)?,
+                None,
+                output.as_deref(),
+                delimiter.clone().unwrap_or_default(),
+                *resume,
+            )
+        }
         Command::Diff {
             source,
             target,
             output,
             target_endpoint_url,
+            compare,
         } => {
+            compare_mode = (*compare).into();
             if output.as_deref() == Some("-") {
                 return Err(Failure::usage(
                     "usage.invalid_output",
@@ -357,6 +392,9 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
                 "-o needs a directory or '-'",
             ));
         }
+        Some(url) if url.starts_with("s3://") => {
+            Output::S3(side(url, g.endpoint_url.as_deref(), cli)?)
+        }
         Some(dir) => Output::Dir(PathBuf::from(dir)),
     };
 
@@ -373,13 +411,16 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         resume_from: None,
         first_part: 0,
         creates_dir: false,
+        compare: compare_mode,
+        versions: list_versions,
     };
 
     if resume {
         let Some(dir) = job.output.dir().map(Path::to_path_buf) else {
             return Err(Failure::usage(
                 "usage.resume_needs_output",
-                "--resume continues a Parquet dataset: pass -o with the interrupted run's directory",
+                "--resume continues a local Parquet dataset: pass -o with the interrupted \
+                 run's directory (an S3 output is not resumable)",
             ));
         };
         let checkpoint = Checkpoint::load(&dir, &job.identity()).map_err(|e| match e {

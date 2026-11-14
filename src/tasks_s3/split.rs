@@ -221,6 +221,7 @@ async fn probe_split_candidate(
         let response = match crate::probe::send(ctx.operation_timeout_secs, || {
             ctx.s3_client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(&ctx.s3_bucket_name)
                 .prefix(&dir)
                 .start_after(cursor)
@@ -242,12 +243,14 @@ async fn probe_split_candidate(
                 return SplitProbe::Failed;
             }
         };
+        let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+        let dec = |k: &str| crate::list_page::response_key(url, k);
         let mut candidates: Vec<String> = response
             .common_prefixes()
             .iter()
             .filter_map(|cp| cp.prefix())
-            .filter(|c| *c > cursor && end.is_none_or(|e| *c < e))
-            .map(str::to_string)
+            .map(dec)
+            .filter(|c| c.as_str() > cursor && end.is_none_or(|e| c.as_str() < e))
             .collect();
         if !candidates.is_empty() {
             candidates.sort();
@@ -259,7 +262,7 @@ async fn probe_split_candidate(
             match (response.is_truncated(), slot.take()) {
                 (Some(false), Some(rows)) => known.extend(
                     rows.into_iter()
-                        .map(|(key, _)| String::from(key.as_str()))
+                        .map(|(key, _)| dec(key.as_str()))
                         .filter(|k| k.as_str() > cursor && end.is_none_or(|e| k.as_str() < e)),
                 ),
                 _ => complete = false,
@@ -311,6 +314,7 @@ async fn probe_flat_cut(
         let response = crate::probe::send(ctx.operation_timeout_secs, || {
             ctx.s3_client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(&ctx.s3_bucket_name)
                 .prefix(listing_prefix)
                 .start_after(&candidate)
@@ -319,11 +323,12 @@ async fn probe_flat_cut(
         })
         .await
         .map_err(|e| format!("probe at '{}' failed: {}", candidate, e))?;
+        let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         Ok(response
             .contents()
             .first()
             .and_then(|o| o.key())
-            .map(str::to_string))
+            .map(|k| crate::list_page::response_key(url, k)))
     };
     let known_high = flat_high.lock().unwrap().clone();
     match crate::flat_cut::find_flat_cut(listing_prefix, cursor, end, known_high.as_deref(), &probe)

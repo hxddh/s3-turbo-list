@@ -5,7 +5,7 @@ name: Release Tag
 # Two triggers:
 #  - workflow_dispatch: one manual dispatch releases the version prepared
 #    on main (tag defaults to the Cargo.toml version).
-#  - push to main touching Cargo.toml, and a schedule backstop:
+#  - push to main touching Cargo.toml, and a daily schedule backstop:
 #    release-on-version-bump, explicitly authorized by the maintainer.
 #    When Cargo.toml's version has a dated CHANGELOG section but no tag
 #    yet, the tag is created and the asset build is dispatched.
@@ -25,7 +25,7 @@ on:
     branches: [main]
     paths: ['Cargo.toml']
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '17 3 * * *'
 
 permissions:
   contents: write

@@ -21,6 +21,9 @@ pub struct CheckpointIdentity {
     pub endpoint_url: Option<String>,
     pub delimiter: String,
     pub max_keys: Option<i32>,
+    /// `list --versions` (absent in checkpoints written before 1.1).
+    #[serde(default)]
+    pub versions: bool,
 }
 
 impl CheckpointIdentity {
@@ -41,6 +44,9 @@ impl CheckpointIdentity {
         }
         if self.max_keys != current.max_keys {
             out.push("max_keys");
+        }
+        if self.versions != current.versions {
+            out.push("versions");
         }
         out
     }
@@ -181,6 +187,7 @@ mod tests {
             endpoint_url: Some("http://localhost:9000".into()),
             delimiter: String::new(),
             max_keys: None,
+            versions: false,
         }
     }
 

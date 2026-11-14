@@ -67,5 +67,6 @@ async fn wait_for_state_change(ctx: &MonContext) {
     tokio::select! {
         _ = tokio::time::sleep(MON_POLL_INTERVAL) => {}
         _ = ctx.g_state.state_notify.notified() => {}
+        _ = ctx.g_state.quit_signalled() => {}
     }
 }

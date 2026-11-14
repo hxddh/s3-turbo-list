@@ -124,6 +124,19 @@ level 1, 100,000-row row groups, chunk-level statistics, no dictionary for
 the near-unique `key` and `etag` columns. List rows are not sorted across
 parts; diff output is in key order.
 
+With `-o s3://`, each writer streams its part into a multipart upload in
+16 MiB upload parts, four in flight per writer, so memory stays bounded and
+no local disk is used; the uploads complete only at commit.
+
+`--versions` lists each segment with ListObjectVersions instead of
+ListObjectsV2 (partitioning is unchanged: boundaries are keys). A key's
+versions can span pages, so a segment holds the trailing key of a truncated
+page back until the next page: every batch ends on a key boundary, and a
+retry or `--resume` restarts at the next whole key.
+
+`diff --compare checksum` sends one HeadObject per side only for same-size
+pairs whose ETags differ, a few dozen at a time, as the merge reaches them.
+
 ListObjectsV2 pages are parsed by a fast path (`src/list_page.rs`): for an
 HTTP 200 `ListBucketResult`, the engine builds its rows from the response
 bytes in one pass and hands the SDK the document without the `<Contents>`

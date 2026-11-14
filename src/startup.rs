@@ -13,9 +13,7 @@ use log::info;
 /// quit flag). Startup discovery races against it: its probe rounds run
 /// before any segment task exists, so nothing else would notice the signal.
 pub async fn quit_requested(g_state: &core::GlobalState) {
-    while !g_state.is_quit() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    g_state.quit_signalled().await
 }
 
 /// Key-space boundaries for one diff side from startup discovery, as in
@@ -181,6 +179,7 @@ fn single_key_probe(
         let resp = crate::probe::send(timeout_secs, || {
             let mut req = client
                 .list_objects_v2()
+                .encoding_type(aws_sdk_s3::types::EncodingType::Url)
                 .bucket(&bucket)
                 .prefix(&prefix)
                 .max_keys(1);
@@ -190,10 +189,11 @@ fn single_key_probe(
             req.send()
         })
         .await?;
+        let url = resp.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         Ok(resp
             .contents()
             .first()
             .and_then(|o| o.key())
-            .map(str::to_string))
+            .map(|k| crate::list_page::response_key(url, k)))
     }
 }

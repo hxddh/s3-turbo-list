@@ -4,11 +4,12 @@
 
 use super::Outcome;
 use super::job::{Job, Output, SideSpec};
-use super::result::{ExitCode, Failure, ResumeInfo, RunResult, Stats, Status};
+use super::result::{ExitCode, Failure, FileInfo, ResumeInfo, RunResult, Stats, Status};
 use log::info;
 use s3tl::checkpoint::{Checkpoint, ResumeProgress};
 use s3tl::config::EngineConfig;
 use s3tl::core::{self, ObjectKey, ObjectProps, RunMode};
+use s3tl::s3_output::{CommittedObject, PartSink, S3Output};
 use s3tl::segment_order::SegmentOrder;
 use s3tl::{data_map, mon, startup, tasks_s3, trace};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ pub fn plan(job: &Job, result: &mut RunResult) {
         "partitioning": partitioning,
         "partitioning_reason": reason,
         "concurrency": job.concurrency,
+        "compare": job.target.as_ref().map(|_| format!("{:?}", job.compare).to_lowercase()),
+        "versions": job.target.is_none().then_some(job.versions),
         "max_keys": job.max_keys,
         "resume_ranges": job.resume_from.as_ref().map(|c| c.remaining.len()),
         "first_part": job.first_part,
@@ -53,17 +56,17 @@ pub fn plan(job: &Job, result: &mut RunResult) {
     }
 }
 
-/// Ctrl-C / SIGTERM: stop the listing gracefully.
-fn install_interrupt_handler() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), Failure> {
-    let quit = Arc::new(AtomicBool::new(false));
+/// Ctrl-C / SIGTERM: stop the listing gracefully. Quitting through the
+/// global state wakes every task waiting on it at once.
+fn install_interrupt_handler(g_state: &core::GlobalState) -> Result<Arc<AtomicBool>, Failure> {
     let interrupted = Arc::new(AtomicBool::new(false));
-    let (q, i) = (quit.clone(), interrupted.clone());
+    let (g, i) = (g_state.clone(), interrupted.clone());
     ctrlc::set_handler(move || {
-        q.store(true, Ordering::SeqCst);
         i.store(true, Ordering::SeqCst);
+        g.quit();
     })
     .map_err(|e| Failure::internal(format!("cannot install the signal handler: {}", e)))?;
-    Ok((quit, interrupted))
+    Ok(interrupted)
 }
 
 /// What the listing reports back for the commit step.
@@ -71,6 +74,10 @@ struct Listing {
     source_region: String,
     target_region: Option<String>,
     resume_slot: Option<ResumeSlot>,
+    /// The S3 prefix of `-o s3://` (its uploads await commit or abort).
+    s3_output: Option<Arc<S3Output>>,
+    /// The run's runtime, for the S3 commit.
+    rt: tokio::runtime::Handle,
 }
 
 /// Run `job` to the end (or the interrupt) and build its result.
@@ -88,8 +95,10 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         }
     };
 
-    let (quit, interrupted) = match install_interrupt_handler() {
-        Ok(handles) => handles,
+    let tasks = if job.mode == RunMode::BiDir { 4 } else { 3 };
+    let g_state = core::GlobalState::new(Arc::new(AtomicBool::new(false)), tasks);
+    let interrupted = match install_interrupt_handler(&g_state) {
+        Ok(interrupted) => interrupted,
         Err(f) => return fail(result, f),
     };
     let mut cfg = EngineConfig::from_env();
@@ -111,8 +120,6 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         );
     }
 
-    let tasks = if job.mode == RunMode::BiDir { 4 } else { 3 };
-    let g_state = core::GlobalState::new(quit, tasks);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cfg.runtime.worker_threads)
@@ -121,12 +128,10 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         Ok(rt) => rt,
         Err(e) => return fail(result, Failure::internal(format!("tokio runtime: {}", e))),
     };
-    let listing = rt.block_on(run_listing(&job, &cfg, &g_state));
-    rt.shutdown_background();
-
-    let listing = match listing {
+    let listing = match rt.block_on(run_listing(&job, &cfg, &g_state)) {
         Ok(listing) => listing,
         Err(f) => {
+            rt.shutdown_background();
             cleanup_failed_output(&job, &[]);
             return fail(result, f);
         }
@@ -135,7 +140,7 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
     if let (Some(t), Some(region)) = (&job.target, &listing.target_region) {
         result.target = Some(t.describe(Some(region)));
     }
-    finish(
+    let outcome = finish(
         job,
         result,
         &g_state,
@@ -143,7 +148,9 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
         listing,
         started,
         stdout_is_data,
-    )
+    );
+    rt.shutdown_background();
+    outcome
 }
 
 /// The signing region of a side: `--region`; for a custom endpoint the SDK's
@@ -210,6 +217,8 @@ struct Contexts<'a> {
     sdk: &'a aws_config::SdkConfig,
     trace: Option<Arc<dyn trace::S3TraceWriter>>,
     g_state: &'a core::GlobalState,
+    /// Where Parquet parts go (`None`: no Parquet output).
+    sink: Option<PartSink>,
 }
 
 impl Contexts<'_> {
@@ -234,6 +243,7 @@ impl Contexts<'_> {
             addressing_style: if side.path_style { "path" } else { "virtual" },
             delimiter: Some(&self.job.delimiter),
             max_keys: self.job.max_keys,
+            versions: self.job.versions,
         })
     }
 }
@@ -255,12 +265,24 @@ async fn run_listing(
             (s?, Some(t?))
         }
     };
+    let s3_output = match &job.output {
+        Output::S3(spec) => {
+            Some(open_s3_output(&sdk, spec, timeout, cfg.output.upload_part_bytes).await?)
+        }
+        _ => None,
+    };
+    let sink = match &job.output {
+        Output::Dir(dir) => Some(PartSink::Dir(dir.clone())),
+        Output::S3(_) => s3_output.clone().map(PartSink::S3),
+        _ => None,
+    };
     let contexts = Contexts {
         job,
         cfg,
         sdk: &sdk,
         trace: open_trace(job)?,
         g_state,
+        sink,
     };
     info!(
         "s3tl v{}: {} {} (region {}), concurrency {}",
@@ -290,7 +312,42 @@ async fn run_listing(
         source_region,
         target_region,
         resume_slot,
+        s3_output,
+        rt: tokio::runtime::Handle::current(),
     })
+}
+
+/// The S3 prefix of `-o s3://`: it must hold no object yet, so a dataset is
+/// never mixed into another one.
+async fn open_s3_output(
+    sdk: &aws_config::SdkConfig,
+    spec: &SideSpec,
+    timeout: u64,
+    part_bytes: usize,
+) -> Result<Arc<S3Output>, Failure> {
+    let region = resolve_region(sdk, spec, timeout).await?;
+    let client = core::build_s3_client(
+        sdk,
+        Some(&region),
+        spec.endpoint.as_deref(),
+        spec.path_style,
+    );
+    let out = S3Output::new(
+        client,
+        &spec.url.bucket,
+        &spec.url.prefix,
+        timeout,
+        part_bytes,
+    );
+    match out.is_empty().await {
+        Ok(true) => Ok(out),
+        Ok(false) => Err(Failure::usage(
+            "usage.output_not_empty",
+            format!("output '{}' is not empty", out.root_url()),
+        )
+        .hint("write to a new prefix, or delete the objects under this one")),
+        Err(e) => Err(Failure::output(e)),
+    }
 }
 
 /// Startup boundaries of a list run (none when resuming or not splitting).
@@ -357,10 +414,13 @@ async fn spawn_list(
         Output::Stdout => {
             set.spawn(async move { data_map::data_map_task_list_stdout(data_ctx).await });
         }
-        Output::Dir(dir) => {
-            let (dir, first, output) = (dir.clone(), job.first_part, contexts.cfg.output.clone());
+        Output::Dir(_) | Output::S3(_) => {
+            let sink = contexts.sink.clone().expect("a Parquet output has a sink");
+            let first = job.first_part;
+            let mut output = contexts.cfg.output.clone();
+            output.versions = job.versions;
             set.spawn(async move {
-                data_map::data_map_task_list_streaming(data_ctx, dir, first, output).await
+                data_map::data_map_task_list_streaming(data_ctx, sink, first, output).await
             });
         }
     }
@@ -466,10 +526,32 @@ async fn spawn_diff(
         right: right_head_tx,
     };
     let g_state = contexts.g_state.clone();
-    let out_dir = job.output.dir().map(Path::to_path_buf);
+    let sink = contexts.sink.clone();
     let output = contexts.cfg.output.clone();
+    let verifier = (job.compare == core::CompareMode::Checksum).then(|| {
+        let side = |spec: &SideSpec, region: &str| s3tl::checksum::Side {
+            client: core::build_s3_client(
+                contexts.sdk,
+                Some(region),
+                spec.endpoint.as_deref(),
+                spec.path_style,
+            ),
+            bucket: spec.url.bucket.clone(),
+            prefix: spec.url.prefix.clone(),
+        };
+        s3tl::checksum::verifier(
+            side(&job.source, source_region),
+            side(target, target_region),
+            contexts.cfg.s3.operation_timeout_secs,
+        )
+    });
+    let options = data_map::DiffOptions {
+        compare: job.compare,
+        verifier,
+    };
     set.spawn(async move {
-        data_map::data_map_task_diff_streaming(g_state, sides, Some(heads), out_dir, output).await
+        data_map::data_map_task_diff_streaming(g_state, sides, Some(heads), sink, output, options)
+            .await
     });
 }
 
@@ -588,6 +670,7 @@ fn finish(
     started: Instant,
     stdout_is_data: bool,
 ) -> Outcome {
+    let rt = listing.rt.clone();
     let metrics = g_state.metrics_snapshot();
     let data = &metrics.data;
     let interrupted =
@@ -617,12 +700,19 @@ fn finish(
                         if job.mode == RunMode::List
                             && let Err(e) = Checkpoint::remove(dir)
                         {
-                            result.warnings.push(format!(
-                                "the run finished but its checkpoint could not be removed ({}); \
-                             delete {} before reusing the directory",
-                                e,
-                                Checkpoint::path(dir).display()
-                            ));
+                            // A checkpoint left behind would make a later
+                            // --resume list its ranges again: take this run's
+                            // parts back so the dataset still matches it.
+                            unpublish(dir, &published);
+                            failure = Some(
+                                Failure::output(format!(
+                                    "the listing finished but its checkpoint could not be \
+                                     removed ({}); this run's parts were removed so the \
+                                     dataset stays consistent",
+                                    e
+                                ))
+                                .hint("--resume continues from the checkpoint"),
+                            );
                         }
                     } else {
                         let progress = listing
@@ -678,8 +768,31 @@ fn finish(
         }
     }
 
+    // An S3 dataset commits only a fully successful run.
+    let mut s3_committed: Option<Vec<CommittedObject>> = None;
+    if let Some(out) = &listing.s3_output {
+        if failure.is_none() {
+            match rt.block_on(out.commit(&data.parts)) {
+                Ok(objects) => s3_committed = Some(objects),
+                Err(e) => failure = Some(Failure::output(e)),
+            }
+        } else {
+            rt.block_on(out.abort_all());
+        }
+    }
+
     let mut output = job.output_info();
     output.rows = data.rows_written;
+    if let Some(objects) = &s3_committed {
+        output.files = objects
+            .iter()
+            .map(|o| FileInfo {
+                path: o.url.clone(),
+                rows: o.rows,
+                bytes: o.bytes,
+            })
+            .collect();
+    }
     result.output = Some(output);
     result.stats = Some(Stats {
         objects: data.objects,
@@ -717,10 +830,40 @@ fn finish(
                 None if job.mode == RunMode::List && job.output.dir().is_some() => {
                     Failure::interrupted("interrupted; no checkpoint was saved")
                 }
+                None if matches!(job.output, Output::S3(_)) => {
+                    Failure::interrupted("interrupted; nothing was written to the S3 output")
+                        .hint("rerun the command (an S3 output is not resumable)")
+                }
                 None => Failure::interrupted("interrupted; the output is partial"),
             };
         }
         result.fail(f);
+    }
+    // `_result.json` is the last object of a committed S3 dataset; without
+    // it the dataset is taken back.
+    if let (Some(out), Some(objects)) = (&listing.s3_output, &s3_committed) {
+        let body = format!("{}\n", result.to_json()).into_bytes();
+        let stored = match rt.block_on(out.put_result(body)) {
+            Ok(()) => Ok(()),
+            // The write may have landed with its response lost: a stored
+            // marker means the dataset is committed.
+            Err(e) => match rt.block_on(out.result_exists()) {
+                Some(true) => Ok(()),
+                _ => Err(e),
+            },
+        };
+        if let Err(e) = stored {
+            // The marker goes first, so it never names deleted parts.
+            rt.block_on(out.remove_result());
+            rt.block_on(out.unpublish(objects));
+            if let Some(output) = result.output.as_mut() {
+                output.files.clear();
+            }
+            result.fail(Failure::output(format!(
+                "{}; the committed parts were removed",
+                e
+            )));
+        }
     }
     Outcome {
         result,
