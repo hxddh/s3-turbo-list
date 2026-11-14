@@ -1492,10 +1492,13 @@ const CHECKSUM_VERIFY_CONCURRENCY: usize = 32;
 
 /// Drop the changed pairs of `batch` whose checksums prove them equal;
 /// returns the kept rows (in order), and the proven-equal and unverified
-/// counts. Only pairs of equal size are candidates.
+/// counts. Only pairs of equal size are candidates. Once `aborted` turns
+/// true no further verification starts (the run is quitting; at most the
+/// requests already in flight finish).
 async fn verify_batch(
     batch: DiffWriteBatch,
     verifier: &ChecksumVerifier,
+    aborted: &(dyn Fn() -> bool + Send + Sync),
 ) -> (DiffWriteBatch, usize, usize) {
     use futures::StreamExt;
     let candidates: Vec<usize> = batch
@@ -1512,8 +1515,13 @@ async fn verify_batch(
     }
     let verdicts: Vec<(usize, Option<bool>)> = futures::stream::iter(candidates)
         .map(|i| {
-            let fut = verifier(batch[i].key.as_str().to_string());
-            async move { (i, fut.await) }
+            let fut = (!aborted()).then(|| verifier(batch[i].key.as_str().to_string()));
+            async move {
+                match fut {
+                    Some(fut) => (i, fut.await),
+                    None => (i, None),
+                }
+            }
         })
         .buffer_unordered(CHECKSUM_VERIFY_CONCURRENCY)
         .collect()
@@ -1556,13 +1564,15 @@ pub async fn run_diff_merge_with<W: parquet::arrow::async_writer::AsyncFileWrite
 
     let strip = (sides.left_prefix.len(), sides.right_prefix.len());
     let compare = options.compare;
+    let aborted: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(aborted);
+    let writer_aborted = Arc::clone(&aborted);
     let merge_task = tokio::spawn(async move {
         let mut left = DiffSideStream::new(sides.left, "left", left_head);
         let mut right = DiffSideStream::new(sides.right, "right", right_head);
         let mut sink = DiffRowSink::new();
 
         merge_diff_streams(
-            &mut left, &mut right, strip, compare, &writer_tx, &mut sink, &aborted,
+            &mut left, &mut right, strip, compare, &writer_tx, &mut sink, &*aborted,
         )
         .await?;
         sink.flush_all(&writer_tx).await?;
@@ -1583,7 +1593,12 @@ pub async fn run_diff_merge_with<W: parquet::arrow::async_writer::AsyncFileWrite
     let (mut rows, mut verified_equal, mut unverified) = (0usize, 0usize, 0usize);
     while let Some(mut batch) = writer_rx.recv().await {
         if let Some(verifier) = &options.verifier {
-            let (kept, proven, unsettled) = verify_batch(batch, verifier).await;
+            // A quitting run fails anyway: stop verifying (and writing).
+            if writer_aborted() {
+                write_error = Some("diff aborted".to_string());
+                break;
+            }
+            let (kept, proven, unsettled) = verify_batch(batch, verifier, &*writer_aborted).await;
             batch = kept;
             verified_equal += proven;
             unverified += unsettled;
@@ -1757,6 +1772,51 @@ pub async fn data_map_task_diff_streaming(
 
     g_state.data_map_task_complete();
     g_state.quit();
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn changed(key: &str) -> DiffRow {
+        let props = ObjectProps::new_open(0, 7, [1; 16]);
+        DiffRow {
+            key: ObjectKey::from(key),
+            status: DiffStatus::Changed,
+            left: Some(props.clone()),
+            right: Some(props),
+        }
+    }
+
+    fn counting_verifier(calls: Arc<AtomicUsize>) -> ChecksumVerifier {
+        Arc::new(move |_key: String| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(true) })
+        })
+    }
+
+    #[tokio::test]
+    async fn verify_batch_proves_equal_pairs() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(Arc::clone(&calls));
+        let (kept, proven, unverified) =
+            verify_batch(vec![changed("a"), changed("b")], &verifier, &|| false).await;
+        assert!(kept.is_empty());
+        assert_eq!((proven, unverified), (2, 0));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_batch_starts_nothing_once_aborted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(Arc::clone(&calls));
+        let (kept, proven, _) =
+            verify_batch(vec![changed("a"), changed("b")], &verifier, &|| true).await;
+        assert_eq!(kept.len(), 2);
+        assert_eq!(proven, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[cfg(test)]

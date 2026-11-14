@@ -4798,6 +4798,9 @@ struct MockStore {
     uploads: BTreeMap<String, (String, BTreeMap<u32, Vec<u8>>)>,
     next_upload: usize,
     aborted: usize,
+    /// How `PUT _result.json` behaves: 0 stores it, 1 fails without
+    /// storing it, 2 stores it and still fails (a lost response).
+    result_put: u8,
 }
 
 fn store_server(
@@ -4871,8 +4874,19 @@ fn store_server(
                 store.objects.remove(&key);
                 MockResponse::empty_ok()
             }
+            "HEAD" => match store.objects.contains_key(&key) {
+                true => MockResponse::empty_ok(),
+                false => MockResponse::error(404, "NotFound", "no such key"),
+            },
             "PUT" => {
+                let marker = key.ends_with("_result.json");
+                if marker && store.result_put == 1 {
+                    return MockResponse::error(500, "InternalError", "put failed");
+                }
                 store.objects.insert(key, request.body.clone());
+                if marker && store.result_put == 2 {
+                    return MockResponse::error(500, "InternalError", "response lost");
+                }
                 MockResponse::empty_ok()
             }
             other => panic!("unexpected {} {}", other, request.path),
@@ -5049,4 +5063,54 @@ fn local_mock_s3_output_assembles_multi_part_uploads_in_order() {
     }
     got.sort();
     assert_eq!(got, keys);
+}
+
+#[test]
+fn local_mock_s3_output_failed_result_marker_takes_the_parts_back() {
+    let store = Arc::new(Mutex::new(MockStore {
+        result_put: 1,
+        ..Default::default()
+    }));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = failed_result(code, &stdout, &stderr, 5, "output.write_failed");
+    assert_eq!(result["output"]["files"], json!([]));
+    let store = store.lock().unwrap();
+    assert!(store.objects.is_empty(), "{:?}", store.objects.keys());
+}
+
+#[test]
+fn local_mock_s3_output_stored_result_marker_with_a_lost_response_commits() {
+    let store = Arc::new(Mutex::new(MockStore {
+        result_put: 2,
+        ..Default::default()
+    }));
+    let server = store_server(Arc::clone(&store), source_keys(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(
+        &server,
+        "list",
+        &[
+            "s3://mock-bucket/src/",
+            "-o",
+            "s3://mock-bucket/out/",
+            "--no-auto-hints",
+        ],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    ok_result(code, &stdout, &stderr);
+    let store = store.lock().unwrap();
+    assert!(store.objects.contains_key("out/_result.json"));
+    assert!(store.objects.keys().any(|k| k.ends_with(".parquet")));
 }

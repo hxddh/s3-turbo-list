@@ -565,6 +565,19 @@ fn merge_by_key(
 
 // ── ListObjectVersions chain (`list --versions`) ───────────
 
+/// Merge a page's versions and delete markers (two lists, each row with its
+/// LastModified in ms): by key, newest first within a key; on a timestamp
+/// tie the latest version (e.g. a delete marker written in the same
+/// millisecond) goes first.
+fn order_versions(rows: &mut [(ObjectKey, ObjectProps, i64)]) {
+    rows.sort_by(|a, b| {
+        a.0.as_str()
+            .cmp(b.0.as_str())
+            .then(b.2.cmp(&a.2))
+            .then(b.1.is_latest().cmp(&a.1.is_latest()))
+    });
+}
+
 /// One segment of a `--versions` listing: every version and delete marker
 /// of the keys in `(start_after, end]`, newest version of a key first.
 ///
@@ -679,9 +692,7 @@ async fn versions_list(
             );
             rows.push((ObjectKey::from(decode(key)), props, ms));
         }
-        // Versions and delete markers come as two lists: merge them by key,
-        // newest first within a key.
-        rows.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(b.2.cmp(&a.2)));
+        order_versions(&mut rows);
         let mut rows: Vec<(ObjectKey, ObjectProps)> =
             rows.into_iter().map(|(k, p, _)| (k, p)).collect();
 
@@ -905,6 +916,25 @@ mod tests {
         keys.iter()
             .map(|k| (ObjectKey::from(*k), ObjectProps::default()))
             .collect()
+    }
+
+    #[test]
+    fn versions_order_newest_first_and_latest_wins_a_tie() {
+        let row = |key: &str, id: &str, ms: i64, latest: bool, marker: bool| {
+            let mut props = ObjectProps::default();
+            props.set_version(Some(id.to_string()), latest, marker);
+            (ObjectKey::from(key), props, ms)
+        };
+        // As parsed: every version first, then every delete marker.
+        let mut rows = vec![
+            row("a", "a-old", 100, false, false),
+            row("b", "b-1", 50, false, false),
+            row("a", "a-new", 200, false, false),
+            row("a", "a-dm", 200, true, true),
+        ];
+        order_versions(&mut rows);
+        let ids: Vec<_> = rows.iter().map(|r| r.1.version_id().unwrap()).collect();
+        assert_eq!(ids, ["a-dm", "a-new", "a-old", "b-1"]);
     }
 
     fn keys(page: &ShapedPage) -> Vec<&str> {

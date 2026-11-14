@@ -843,7 +843,18 @@ fn finish(
     // it the dataset is taken back.
     if let (Some(out), Some(objects)) = (&listing.s3_output, &s3_committed) {
         let body = format!("{}\n", result.to_json()).into_bytes();
-        if let Err(e) = rt.block_on(out.put_result(body)) {
+        let stored = match rt.block_on(out.put_result(body)) {
+            Ok(()) => Ok(()),
+            // The write may have landed with its response lost: a stored
+            // marker means the dataset is committed.
+            Err(e) => match rt.block_on(out.result_exists()) {
+                Some(true) => Ok(()),
+                _ => Err(e),
+            },
+        };
+        if let Err(e) = stored {
+            // The marker goes first, so it never names deleted parts.
+            rt.block_on(out.remove_result());
             rt.block_on(out.unpublish(objects));
             if let Some(output) = result.output.as_mut() {
                 output.files.clear();

@@ -336,9 +336,33 @@ impl S3Output {
         Ok(published)
     }
 
+    fn result_key(&self) -> String {
+        format!("{}_result.json", self.prefix)
+    }
+
+    /// Whether `_result.json` is stored (`None`: the store did not say).
+    pub async fn result_exists(&self) -> Option<bool> {
+        let request = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.result_key())
+            .send();
+        match tokio::time::timeout(self.timeout, request).await {
+            Ok(Ok(_)) => Some(true),
+            Ok(Err(e)) if e.raw_response().map(|r| r.status().as_u16()) == Some(404) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Remove `_result.json` (best effort).
+    pub async fn remove_result(&self) {
+        self.delete(&self.result_key()).await;
+    }
+
     /// Write `_result.json` (the last object of a committed dataset).
     pub async fn put_result(&self, body: Vec<u8>) -> Result<(), String> {
-        let key = format!("{}_result.json", self.prefix);
+        let key = self.result_key();
         let request = self
             .client
             .put_object()
