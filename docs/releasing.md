@@ -178,13 +178,13 @@ gh workflow run release-tag.yml --repo hxddh/s3-turbo-list -f tag="v${VERSION}"
 ```
 
 The `tag` input is optional and defaults to the Cargo.toml version on main.
-The workflow requires a matching CHANGELOG section, is idempotent (existing
+The workflow requires a dated CHANGELOG section (`## [X.Y.Z] - YYYY-MM-DD`; `- Unreleased` never releases), is idempotent (existing
 tags are a no-op), and dispatches the release-assets build after tagging, so
 one dispatch releases the version prepared on main.
 
 `release-tag.yml` also runs on a schedule as release-on-version-bump
 (maintainer-authorized): once main carries a Cargo.toml version with a
-matching CHANGELOG section and no tag, the next scheduled run creates the tag
+dated CHANGELOG section and no tag, the next scheduled run creates the tag
 and dispatches the asset build.  Pushing a prepared release to main is
 therefore sufficient to release.  **A version bump on main is treated as a
 release instruction — keep unreleased version bumps off main.**

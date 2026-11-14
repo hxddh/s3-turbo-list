@@ -127,6 +127,10 @@ struct StripContentsBody {
     done: bool,
 }
 
+/// Upper bound on the up-front reservation taken from a body's size hint (a
+/// ListObjectsV2 page of 1,000 long keys is a few hundred KiB).
+const MAX_RESERVE_HINT: usize = 16 * 1024 * 1024;
+
 impl StripContentsBody {
     fn push(&mut self, chunk: Bytes) {
         if chunk.is_empty() {
@@ -136,7 +140,10 @@ impl StripContentsBody {
             None if self.rest.is_empty() => self.first = Some(chunk),
             None => self.rest.extend_from_slice(&chunk),
             Some(first) => {
-                let hint = http_body::Body::size_hint(&self.inner).lower() as usize;
+                // The body's declared size, capped: a hostile Content-Length
+                // must not turn into a multi-gigabyte allocation.
+                let hint = (http_body::Body::size_hint(&self.inner).lower() as usize)
+                    .min(MAX_RESERVE_HINT);
                 self.rest
                     .reserve(first.len() + chunk.len() + hint.saturating_sub(chunk.len()));
                 self.rest.extend_from_slice(&first);

@@ -11,6 +11,7 @@ permissions:
   contents: write
 
 env:
+  INPUT_TAG: ${{ inputs.tag }}
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -36,8 +37,8 @@ jobs:
         run: |
           VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
           EXPECTED_TAG="v${VERSION}"
-          if [ "${{ inputs.tag }}" != "$EXPECTED_TAG" ]; then
-            echo "::error::workflow tag input '${{ inputs.tag }}' does not match Cargo.toml version '${VERSION}' (${EXPECTED_TAG})"
+          if [ "$INPUT_TAG" != "$EXPECTED_TAG" ]; then
+            echo "::error::workflow tag input '$INPUT_TAG' does not match Cargo.toml version '${VERSION}' (${EXPECTED_TAG})"
             exit 1
           fi
 
@@ -88,8 +89,8 @@ jobs:
         run: |
           VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
           EXPECTED_TAG="v${VERSION}"
-          if [ "${{ inputs.tag }}" != "$EXPECTED_TAG" ]; then
-            echo "::error::workflow tag input '${{ inputs.tag }}' does not match Cargo.toml version '${VERSION}' (${EXPECTED_TAG})"
+          if [ "$INPUT_TAG" != "$EXPECTED_TAG" ]; then
+            echo "::error::workflow tag input '$INPUT_TAG' does not match Cargo.toml version '${VERSION}' (${EXPECTED_TAG})"
             exit 1
           fi
 
@@ -101,7 +102,7 @@ jobs:
 
       - name: Derive release asset name
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
           ASSET="s3tl-${VERSION}-${{ matrix.platform }}"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
@@ -141,7 +142,7 @@ jobs:
 
       - name: Extract release notes from CHANGELOG
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
           awk -v ver="$VERSION" '
             $0 ~ "^## \\[" ver "\\]" { found=1; next }
@@ -155,7 +156,7 @@ jobs:
 
       - name: Ensure GitHub release exists
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           if gh release view "$TAG" --repo hxddh/s3-turbo-list >/dev/null 2>&1; then
             echo "Release $TAG already exists — refreshing notes"
             gh release edit "$TAG" \
@@ -174,7 +175,7 @@ jobs:
       - name: Assemble flat asset directory
         run: |
           mkdir -p flat
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
 
           # Collect all new binaries from the build matrix
@@ -185,7 +186,7 @@ jobs:
           # unavailable), accept a pre-uploaded release asset built on an
           # external arm64 host.
           if [ ! -s "flat/s3tl-${VERSION}-linux-aarch64" ]; then
-            if ! gh release download "${{ inputs.tag }}" \
+            if ! gh release download "$INPUT_TAG" \
               --repo hxddh/s3-turbo-list \
               --dir flat \
               --pattern "s3tl-${VERSION}-linux-aarch64"; then
@@ -198,7 +199,7 @@ jobs:
 
       - name: Validate complete asset set
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
           expected=(
             "s3tl-${VERSION}-linux-aarch64"
@@ -224,7 +225,7 @@ jobs:
       - name: Generate combined SHA256SUMS
         run: |
           cd flat
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
           expected=(
             "s3tl-${VERSION}-linux-aarch64"
@@ -252,14 +253,14 @@ jobs:
           echo "=== SHA256SUMS content ==="
           cat flat/SHA256SUMS
           echo "=== linux-aarch64 SHA256 content ==="
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
           cat "flat/s3tl-${VERSION}-linux-aarch64.sha256"
 
       - name: Upload new assets to release
         run: |
           cd flat
-          gh release upload "${{ inputs.tag }}" \
+          gh release upload "$INPUT_TAG" \
             s3tl-* \
             SHA256SUMS \
             --repo hxddh/s3-turbo-list \
@@ -269,7 +270,7 @@ jobs:
 
       - name: List release assets for audit
         run: |
-          gh release view "${{ inputs.tag }}" \
+          gh release view "$INPUT_TAG" \
             --repo hxddh/s3-turbo-list \
             --json assets \
             --jq '.assets[].name'

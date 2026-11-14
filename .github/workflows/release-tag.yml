@@ -7,7 +7,7 @@ name: Release Tag
 #    on main (tag defaults to the Cargo.toml version).
 #  - push to main touching Cargo.toml, and a schedule backstop:
 #    release-on-version-bump, explicitly authorized by the maintainer.
-#    When Cargo.toml's version has a matching CHANGELOG section but no tag
+#    When Cargo.toml's version has a dated CHANGELOG section but no tag
 #    yet, the tag is created and the asset build is dispatched.
 #    Idempotent — existing tags are a no-op, so both triggers are normally
 #    no-ops.
@@ -31,6 +31,10 @@ permissions:
   contents: write
   actions: write
 
+env:
+  INPUT_TAG: ${{ inputs.tag }}
+  INPUT_SHA: ${{ inputs.sha }}
+
 jobs:
   tag:
     runs-on: ubuntu-latest
@@ -41,7 +45,7 @@ jobs:
 
       - name: Resolve target commit and tag
         run: |
-          TARGET="${{ inputs.sha }}"
+          TARGET="$INPUT_SHA"
           if [ -z "$TARGET" ]; then
             TARGET="$(git rev-parse HEAD)"
           fi
@@ -50,7 +54,7 @@ jobs:
             exit 1
           }
           VERSION="$(git show "${TARGET}:Cargo.toml" | grep '^version' | head -1 | cut -d'"' -f2)"
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
           if [ -z "$TAG" ]; then
             TAG="v${VERSION}"
           fi
@@ -74,8 +78,9 @@ jobs:
       - name: Require a CHANGELOG section for the version
         if: env.SKIP != '1'
         run: |
-          if ! git show "${TARGET}:CHANGELOG.md" | grep -q "^## \[${VERSION}\]"; then
-            echo "CHANGELOG has no section for ${VERSION} — not releasing"
+          # Only a dated section releases: "## [X.Y.Z] - Unreleased" does not.
+          if ! git show "${TARGET}:CHANGELOG.md" | grep -qE "^## \[${VERSION}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}"; then
+            echo "CHANGELOG has no dated section for ${VERSION} — not releasing"
             echo "SKIP=1" >> "$GITHUB_ENV"
           fi
 
