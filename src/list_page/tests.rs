@@ -46,6 +46,13 @@ fn rows_view(rows: &[(ObjectKey, ObjectProps)]) -> Vec<(String, PropsView)> {
         .collect()
 }
 
+/// The verbatim (non-MD5) ETags of rows, which `PropsView` leaves out.
+fn other_etags(rows: &[(ObjectKey, ObjectProps)]) -> Vec<Option<String>> {
+    rows.iter()
+        .map(|(_, p)| p.etag_other.as_deref().cloned())
+        .collect()
+}
+
 fn parse_ok(body: &str) -> (Vec<(String, PropsView)>, String) {
     let (rows, stripped) = parse_list_page(body.as_bytes()).expect("fast path should accept");
     (rows_view(&rows), String::from_utf8(stripped).unwrap())
@@ -369,7 +376,11 @@ fn etag_rules_match_object_props_from() {
         let expected = ObjectProps::from(&object);
         assert_eq!(
             parse_etag(&etag),
-            (expected.etag_md5, expected.etag_parts),
+            (
+                expected.etag_md5,
+                expected.etag_parts,
+                expected.etag_other.clone()
+            ),
             "{etag}"
         );
     }
@@ -813,6 +824,18 @@ async fn differential_against_sdk_deserializer() {
                 let expected = sdk_rows(&sdk);
                 rows_compared += expected.len();
                 assert_eq!(fast_rows, expected, "page {index}: {body}");
+                let sdk_props: Vec<(ObjectKey, ObjectProps)> = sdk
+                    .contents()
+                    .iter()
+                    .filter_map(|o| Some((ObjectKey::from(o.key()?), ObjectProps::from(o))))
+                    .collect();
+                if let Some(rows) = &parsed {
+                    assert_eq!(
+                        other_etags(rows),
+                        other_etags(&sdk_props),
+                        "page {index}: verbatim ETags: {body}"
+                    );
+                }
                 assert_eq!(page_summary(&fast), page_summary(&sdk), "page {index}");
                 if *expect_fast {
                     assert!(parsed.is_some(), "page {index} fell back: {body}");

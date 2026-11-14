@@ -842,13 +842,16 @@ fn render_text_row(
         }
     }
     out.extend_from_slice(b",\"etag\":");
-    if props.is_common_prefix() || props.is_etag_not_avail() {
-        out.extend_from_slice(b"null");
-    } else {
-        let mut buf = [0u8; 43];
-        out.push(b'"');
-        out.extend_from_slice(props.write_etag_to_buffer(&mut buf).as_bytes());
-        out.push(b'"');
+    let mut buf = [0u8; 43];
+    match props.etag_text(&mut buf) {
+        None => out.extend_from_slice(b"null"),
+        // Hex is plain ASCII; another vendor's ETag may need escaping.
+        Some(etag) if props.etag_other.is_some() => serde_json::to_writer(&mut *out, etag)?,
+        Some(etag) => {
+            out.push(b'"');
+            out.extend_from_slice(etag.as_bytes());
+            out.push(b'"');
+        }
     }
     out.extend_from_slice(b",\"storage_class\":");
     match props.storage_class_name() {

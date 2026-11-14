@@ -117,12 +117,8 @@ impl ObjectColumns {
         };
         self.size.append_value(props.size());
         self.last_modified.append_option(last_modified_of(props));
-        if props.is_common_prefix() || props.is_etag_not_avail() {
-            self.etag.append_null();
-        } else {
-            let mut buf = [0u8; 43];
-            self.etag.append_value(props.write_etag_to_buffer(&mut buf));
-        }
+        let mut buf = [0u8; 43];
+        self.etag.append_option(props.etag_text(&mut buf));
     }
 
     fn finish(mut self, columns: &mut Vec<ArrayRef>) {

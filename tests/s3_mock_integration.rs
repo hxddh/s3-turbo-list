@@ -3388,6 +3388,7 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
     let bad_etag = format!("\u{65e5}{}", "a".repeat(31));
     assert_eq!(bad_etag.len(), 34);
 
+    let bad = bad_etag.clone();
     let server = MockS3Server::start(move |request, _sequence| {
         match query(&request, "continuation-token") {
             None => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
@@ -3397,7 +3398,7 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
             )),
             Some("token-1") => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
                 "b-bad-etag.txt",
-                &bad_etag,
+                &bad,
                 Some("token-2"),
             )),
             _ => MockResponse::ok_xml(list_bucket_xml_with_raw_etag(
@@ -3433,7 +3434,8 @@ fn local_mock_non_ascii_etag_keeps_every_key_and_succeeds() {
         etags[0].as_deref(),
         Some("d41d8cd98f00b204e9800998ecf8427e")
     );
-    assert_eq!(etags[1], None, "an unusable ETag is null: {:?}", etags);
+    // Not an MD5: kept verbatim (another vendor's format), never mangled.
+    assert_eq!(etags[1].as_deref(), Some(bad_etag.as_str()), "{:?}", etags);
     assert_eq!(
         etags[2].as_deref(),
         Some("d41d8cd98f00b204e9800998ecf8427e-3")
