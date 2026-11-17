@@ -5,6 +5,24 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-17
+
+### Performance
+- The listing starts at once instead of after startup partitioning: one
+  segment lists from the start of the range while discovery runs, and the
+  boundaries split it when they arrive (list and both diff sides). A
+  listing that finishes first no longer waits for discovery.
+- Flat runs (a flat namespace, or a flat directory under a few prefixes)
+  are cut in two rounds read off the keys' numeric scale — one sizing round
+  and one round of probes at evenly spread positions — instead of several
+  rounds of high-key search and bisection (still the fallback).
+- A flat namespace starts with one segment per worker up to 256 (was 64).
+- mimalloc is the global allocator: client CPU per page fell 20-28%.
+
+Local Go mock, 30 ms per request, `-c 100`, median of five: 1M keys
+1.23-1.35x, 100k keys 1.28x, 5M flat 1.19x, diff of 1M 1.31x; CPU-bound
+(0 ms, `-c 64`, 5M keys) 1.37x.
+
 ## [1.2.0] - 2026-11-17
 
 ### Performance
