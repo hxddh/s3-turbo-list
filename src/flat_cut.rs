@@ -948,7 +948,9 @@ where
     if target == 0 {
         return Ok(Some(Vec::new()));
     }
-    let n = (target * 4) as u128;
+    // Four candidates per cut, but no more than one round of probe permits
+    // (three per `-c` slot, at most 512) can carry.
+    let n = (target * 4).min(512) as u128;
     let mut candidates: Vec<String> = (1..=n)
         .filter_map(|j| scale.at_fraction(u128::from(upto.max(1)) * j, n + 1))
         .filter(|c| c.as_str() > first)

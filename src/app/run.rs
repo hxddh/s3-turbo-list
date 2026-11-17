@@ -393,7 +393,7 @@ fn list_partition(
             concurrency.saturating_mul(2).clamp(16, 512),
             // One segment per slot (boundaries + 1): one more would wait for
             // a slot and then list its whole range alone at the end.
-            concurrency.saturating_sub(1).clamp(1, 64),
+            concurrency.saturating_sub(1).clamp(1, 255),
         )
         .await
         .unwrap_or_default();
