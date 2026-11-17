@@ -379,7 +379,7 @@ async fn flat_list(
                 // no keys remain in its range, so the child would be an
                 // empty segment (a wasted request).
                 if let (Some(tx), false) = (split_tx, is_ended || ctx.is_quit()) {
-                    if let Some(mut child) = control.try_accept_split() {
+                    for mut child in control.try_accept_split() {
                         child.parent = segment_index;
                         info!(
                             "Segment {} accepted runtime split at '{}'",
@@ -756,7 +756,7 @@ async fn versions_list(
         }
         control.record_page(&seen);
         if let (Some(tx), false) = (split_tx, ended || ctx.is_quit()) {
-            if let Some(mut child) = control.try_accept_split() {
+            for mut child in control.try_accept_split() {
                 child.parent = 0;
                 let _ = tx.send(child);
             }

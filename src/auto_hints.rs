@@ -12,6 +12,11 @@ use std::collections::BTreeSet;
 const STARTUP_DISCOVERY_MAX_DEPTH: usize = 3;
 /// Maximum delimiter probes issued per BFS level.
 const STARTUP_DISCOVERY_MAX_PROBES_PER_LEVEL: usize = 64;
+/// Pages the root probe follows when its CommonPrefixes do not fit in one
+/// page (more than ~1,000 top-level prefixes, or an endpoint with smaller
+/// pages).  Pages are sequential, so this bounds the added startup latency;
+/// whatever remains past them is bisected as a tail run (see `TailRun`).
+const STARTUP_DISCOVERY_ROOT_MAX_PAGES: usize = 8;
 
 /// Outcome of startup structural discovery.
 pub struct StartupDiscovery {
@@ -38,6 +43,19 @@ pub struct StartupDiscovery {
     /// namespace): flat bisection anchors on it instead of spending a
     /// `max-keys=1` round-trip to find it.
     pub root_first_key: Option<String>,
+    /// Probed prefixes whose CommonPrefix listing was cut short (still
+    /// truncated after the pages followed): the key space after the last
+    /// entry seen holds structure discovery never saw, and without these it
+    /// would be one segment however large.
+    pub tails: Vec<TailRun>,
+}
+
+/// The unseen rest of a truncated delimiter probe: every key under `prefix`
+/// after `after` (the last CommonPrefix or key the probe returned).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailRun {
+    pub prefix: String,
+    pub after: String,
 }
 
 /// One page of a flat run of keys, as startup discovery saw it.
@@ -82,58 +100,85 @@ pub async fn discover_startup_boundaries(
     target_boundaries: usize,
     timeout_secs: u64,
 ) -> StartupDiscovery {
-    discover_with_probe(prefix, target_boundaries, |p| {
+    discover_with_paged_probe(prefix, target_boundaries, |p, max_pages| {
         let client = client.clone();
         let bucket = bucket.to_string();
         async move {
-            // A flat directory's page is 1,000 `<Contents>`: the fast parser
-            // takes them, as it does for listing pages (through the SDK's
-            // deserializer, a level of such pages cost ~100 ms of CPU before
-            // the first object was listed).  Only the first and last key and
-            // the count are kept.
-            let slot = crate::list_page::ParsedPageSlot::default();
-            // Startup discovery runs before the first object is listed; the
-            // probe's watchdog keeps a stalled endpoint from hanging it.
-            let response = crate::probe::send(timeout_secs, || {
-                client
-                    .list_objects_v2()
-                    .encoding_type(aws_sdk_s3::types::EncodingType::Url)
-                    .bucket(&bucket)
-                    .prefix(&p)
-                    .delimiter("/")
-                    .customize()
-                    .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
-                    .send()
-            })
-            .await?;
-            let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
-            let dec = |k: &str| crate::list_page::response_key(url, k);
-            // The parser's rows, or the SDK's when it left the page to them.
-            let (keys, first_key, last_key) = match slot.take() {
-                Some(rows) => (
-                    rows.len(),
-                    rows.first().map(|(k, _)| dec(k.as_str())),
-                    rows.last().map(|(k, _)| dec(k.as_str())),
-                ),
-                None => {
-                    let key =
-                        |o: Option<&aws_sdk_s3::types::Object>| o.and_then(|o| o.key()).map(dec);
-                    let contents = response.contents();
-                    (contents.len(), key(contents.first()), key(contents.last()))
+            let mut prefixes: Vec<String> = Vec::new();
+            let mut total_keys = 0usize;
+            let mut first: Option<String> = None;
+            let mut token: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                // A flat directory's page is 1,000 `<Contents>`: the fast parser
+                // takes them, as it does for listing pages (through the SDK's
+                // deserializer, a level of such pages cost ~100 ms of CPU before
+                // the first object was listed).  Only the first and last key and
+                // the count are kept.
+                let slot = crate::list_page::ParsedPageSlot::default();
+                // Startup discovery runs before the first object is listed; the
+                // probe's watchdog keeps a stalled endpoint from hanging it.
+                let response = crate::probe::send(timeout_secs, || {
+                    let mut request = client
+                        .list_objects_v2()
+                        .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+                        .bucket(&bucket)
+                        .prefix(&p)
+                        .delimiter("/");
+                    if let Some(token) = &token {
+                        request = request.continuation_token(token);
+                    }
+                    request
+                        .customize()
+                        .interceptor(crate::list_page::FastContentsInterceptor::new(slot.clone()))
+                        .send()
+                })
+                .await?;
+                pages += 1;
+                let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+                let dec = |k: &str| crate::list_page::response_key(url, k);
+                // The parser's rows, or the SDK's when it left the page to them.
+                let (keys, first_key, last_key) = match slot.take() {
+                    Some(rows) => (
+                        rows.len(),
+                        rows.first().map(|(k, _)| dec(k.as_str())),
+                        rows.last().map(|(k, _)| dec(k.as_str())),
+                    ),
+                    None => {
+                        let key = |o: Option<&aws_sdk_s3::types::Object>| {
+                            o.and_then(|o| o.key()).map(dec)
+                        };
+                        let contents = response.contents();
+                        (contents.len(), key(contents.first()), key(contents.last()))
+                    }
+                };
+                total_keys += keys;
+                if first.is_none() {
+                    first = first_key;
                 }
-            };
-            Ok(ProbePage {
-                prefixes: response
+                let page_prefixes: Vec<String> = response
                     .common_prefixes()
                     .iter()
                     .filter_map(|cp| cp.prefix())
                     .map(dec)
-                    .collect(),
-                truncated: response.is_truncated().unwrap_or(false),
-                keys,
-                first_key,
-                last_key,
-            })
+                    .collect();
+                let truncated = response.is_truncated().unwrap_or(false);
+                let more = !page_prefixes.is_empty();
+                prefixes.extend(page_prefixes);
+                token = response.next_continuation_token().map(str::to_string);
+                // Follow pages only while they bring CommonPrefixes (structure);
+                // a page of plain keys is a flat run, bisected instead.
+                if truncated && more && pages < max_pages && token.is_some() {
+                    continue;
+                }
+                break Ok(ProbePage {
+                    prefixes,
+                    truncated,
+                    keys: total_keys,
+                    first_key: first,
+                    last_key,
+                });
+            }
         }
     })
     .await
@@ -187,6 +232,7 @@ fn flat_run(parent: &str, depth: usize, page: &ProbePage) -> Option<FlatRun> {
 /// BFS over CommonPrefixes via an injected probe (one request per call).
 /// Bounded by depth and per-level probe count, so a worst-case run issues
 /// at most 1 + 2×STARTUP_DISCOVERY_MAX_PROBES_PER_LEVEL requests.
+#[cfg(test)]
 async fn discover_with_probe<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
@@ -194,6 +240,20 @@ async fn discover_with_probe<F, Fut>(
 ) -> StartupDiscovery
 where
     F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<ProbePage, String>>,
+{
+    discover_with_paged_probe(prefix, target_boundaries, |p, _pages| probe(p)).await
+}
+
+/// [`discover_with_probe`] with a page budget per probe: the root probe may
+/// follow up to `STARTUP_DISCOVERY_ROOT_MAX_PAGES` pages, deeper probes one.
+async fn discover_with_paged_probe<F, Fut>(
+    prefix: &str,
+    target_boundaries: usize,
+    probe: F,
+) -> StartupDiscovery
+where
+    F: Fn(String, usize) -> Fut,
     Fut: std::future::Future<Output = Result<ProbePage, String>>,
 {
     let mut boundaries: BTreeSet<String> = BTreeSet::new();
@@ -204,16 +264,25 @@ where
     let mut root_page_keys = 0usize;
     let mut flat_runs: Vec<FlatRun> = Vec::new();
     let mut root_first_key: Option<String> = None;
+    let mut tails: Vec<TailRun> = Vec::new();
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
             break;
         }
-        let level: Vec<String> = frontier
-            .drain(..)
-            .take(STARTUP_DISCOVERY_MAX_PROBES_PER_LEVEL)
-            .collect();
-        let results = futures::future::join_all(level.iter().map(|p| probe(p.clone()))).await;
+        // Probe a spread of the level, not its first prefixes: those all sit
+        // at the start of the key space.
+        let level = spread(
+            std::mem::take(&mut frontier),
+            STARTUP_DISCOVERY_MAX_PROBES_PER_LEVEL,
+        );
+        let pages = if depth == 0 {
+            STARTUP_DISCOVERY_ROOT_MAX_PAGES
+        } else {
+            1
+        };
+        let results =
+            futures::future::join_all(level.iter().map(|p| probe(p.clone(), pages))).await;
         for (parent, result) in level.iter().zip(results) {
             match result {
                 Ok(page) => {
@@ -228,6 +297,23 @@ where
                         }
                     }
                     flat_runs.extend(flat_run(parent, depth, &page));
+                    // A truncated page with structure: what follows its last
+                    // entry was never seen.
+                    if page.truncated && !page.prefixes.is_empty() {
+                        let last_prefix = page.prefixes.iter().max();
+                        let after = match (last_prefix, page.last_key.as_ref()) {
+                            (Some(p), Some(k)) => p.max(k).clone(),
+                            (Some(p), None) => p.clone(),
+                            (None, Some(k)) => k.clone(),
+                            (None, None) => String::new(),
+                        };
+                        if !after.is_empty() {
+                            tails.push(TailRun {
+                                prefix: parent.clone(),
+                                after,
+                            });
+                        }
+                    }
                     for child in &page.prefixes {
                         boundaries.insert(child.clone());
                     }
@@ -251,7 +337,27 @@ where
         root_page_keys,
         flat_runs,
         root_first_key,
+        tails,
     }
+}
+
+/// Up to `n` of `items`, evenly spread (all of them when they fit).
+fn spread<T>(mut items: Vec<T>, n: usize) -> Vec<T> {
+    let len = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if len <= n {
+        return items;
+    }
+    let picks: Vec<usize> = (0..n).map(|i| i * len / n).collect();
+    let mut out = Vec::with_capacity(n);
+    for (i, item) in items.drain(..).enumerate() {
+        if picks.binary_search(&i).is_ok() {
+            out.push(item);
+        }
+    }
+    out
 }
 
 /// A BFS level adds every CommonPrefix it finds, so a wide tree overshoots
@@ -861,6 +967,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_root_probe_gets_pages_and_truncated_probes_leave_tails() {
+        // The root follows pages; a truncated page with prefixes is a tail
+        // after its last entry; deeper probes get one page.
+        let asked = std::sync::Mutex::new(Vec::new());
+        let discovery = discover_with_paged_probe("", 4, |p, pages| {
+            asked.lock().unwrap().push((p.clone(), pages));
+            async move {
+                Ok(ProbePage {
+                    prefixes: if p.is_empty() {
+                        vec!["a/".into(), "b/".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    truncated: p.is_empty(),
+                    keys: 0,
+                    first_key: None,
+                    last_key: None,
+                })
+            }
+        })
+        .await;
+        let asked = asked.into_inner().unwrap();
+        assert_eq!(asked[0], (String::new(), STARTUP_DISCOVERY_ROOT_MAX_PAGES));
+        assert!(asked[1..].iter().all(|(_, pages)| *pages == 1));
+        assert_eq!(
+            discovery.tails,
+            vec![TailRun {
+                prefix: String::new(),
+                after: "b/".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_untruncated_or_flat_pages_leave_no_tail() {
+        let discovery = discover_with_probe("", 4, |_p| async move {
+            Ok(ProbePage {
+                prefixes: Vec::new(),
+                truncated: true,
+                keys: 1000,
+                first_key: Some("k0".into()),
+                last_key: Some("k9".into()),
+            })
+        })
+        .await;
+        assert!(
+            discovery.tails.is_empty(),
+            "a flat page is bisected instead"
+        );
+    }
+
+    #[test]
+    fn test_spread_picks_evenly() {
+        let items: Vec<usize> = (0..10).collect();
+        assert_eq!(spread(items.clone(), 5), vec![0, 2, 4, 6, 8]);
+        assert_eq!(spread(items.clone(), 20), items);
+        assert!(spread(items, 0).is_empty());
+    }
+
+    #[tokio::test]
     async fn test_startup_discovery_caps_an_overshooting_level() {
         // Four prefixes of 250 subdirectories each: the second level alone
         // brings 1,000 boundaries for a target of 16.
@@ -1123,6 +1289,7 @@ mod tests {
             root_page_keys: 500,
             flat_runs: Vec::new(),
             root_first_key: None,
+            tails: Vec::new(),
         };
         // The probe returned the whole listing in one page, and the run's page
         // size can too.
@@ -1143,6 +1310,7 @@ mod tests {
             root_page_keys: 1000,
             flat_runs: Vec::new(),
             root_first_key: None,
+            tails: Vec::new(),
         };
         assert!(!truncated.is_single_page_listing(None));
         // Structure found: partitioned by boundaries, not by this shortcut.
@@ -1152,6 +1320,7 @@ mod tests {
             root_page_keys: 3,
             flat_runs: Vec::new(),
             root_first_key: None,
+            tails: Vec::new(),
         };
         assert!(!structured.is_single_page_listing(None));
     }

@@ -22,6 +22,13 @@ use tokio::time::Instant;
 
 /// Pages a segment must have processed before it is a split candidate.
 const SPLIT_MIN_PAGES: u32 = 5;
+/// Pages a split child must list before it is a candidate itself: it was
+/// cut from a range known to be large, so one page (which gives it a cursor)
+/// is enough.  Waiting `SPLIT_MIN_PAGES` made fan-out double only every
+/// half-second or so, and a straggler finished before it could be split.
+const SPLIT_CHILD_MIN_PAGES: u32 = 1;
+/// Most cuts one split probe proposes (children one segment adds at once).
+const SPLIT_MAX_CUTS: usize = 15;
 /// Reactor split-probe cadence. Sub-second so cold-start fan-out on flat
 /// namespaces — where startup discovery finds no structure and runtime
 /// splitting is the only mechanism that fans out — ramps toward full
@@ -41,6 +48,12 @@ const FANOUT_IMPROVE_RATIO: f64 = 1.05;
 /// Throughput sampling window for the fan-out governor.  The split tick runs
 /// at 200ms, far too jittery to read a trend from; rates are judged over ~1s.
 const FANOUT_SAMPLE: Duration = Duration::from_secs(1);
+/// Windows a lowered cap is held, saturated and flat, before the governor
+/// tries more concurrency.  The cap is only ever lowered by one window's
+/// reading, and only rising throughput reopens it: without these tries a cap
+/// lowered by a noisy window stayed low for the rest of the run whenever the
+/// remaining segments were few and steady (nothing left to raise the rate).
+const FANOUT_EXPLORE_WINDOWS: u32 = 3;
 
 /// Right half of a split, sent from the segment task to the reactor.
 #[derive(Debug, Clone)]
@@ -59,8 +72,9 @@ pub(super) struct SegmentControl {
     cursor: Mutex<String>,
     /// Upper boundary (exclusive start of the next segment); shrunk on split.
     end_before: Mutex<Option<String>>,
-    /// Cut proposed by the reactor's probe, awaiting the segment's decision.
-    pending_split: Mutex<Option<String>>,
+    /// Cuts proposed by the reactor's probe (ascending), awaiting the
+    /// segment's decision.
+    pending_split: Mutex<Option<Vec<String>>>,
     pub(super) pages: AtomicU32,
     /// A probe or pending decision is in flight.
     splitting: AtomicBool,
@@ -80,6 +94,15 @@ pub(super) struct SegmentControl {
 
 impl SegmentControl {
     pub(super) fn new(end: Option<String>) -> Self {
+        Self::with_min_pages(end, SPLIT_MIN_PAGES)
+    }
+
+    /// The control of a runtime-split child (see `SPLIT_CHILD_MIN_PAGES`).
+    pub(super) fn new_child(end: Option<String>) -> Self {
+        Self::with_min_pages(end, SPLIT_CHILD_MIN_PAGES)
+    }
+
+    fn with_min_pages(end: Option<String>, min_pages: u32) -> Self {
         Self {
             cursor: Mutex::new(String::new()),
             end_before: Mutex::new(end),
@@ -87,7 +110,7 @@ impl SegmentControl {
             pages: AtomicU32::new(0),
             splitting: AtomicBool::new(false),
             unsplittable: AtomicBool::new(false),
-            next_probe_page: AtomicU32::new(SPLIT_MIN_PAGES),
+            next_probe_page: AtomicU32::new(min_pages),
             probe_failures: AtomicU32::new(0),
             sent: Mutex::new(None),
         }
@@ -143,25 +166,40 @@ impl SegmentControl {
     }
 
     /// Called at a page boundary by the segment task.  Accepts the pending
-    /// cut only if it is still strictly ahead of the cursor and inside the
-    /// current range; otherwise the proposal is discarded.
-    pub(super) fn try_accept_split(&self) -> Option<SplitRange> {
-        let proposed = self.pending_split.lock().unwrap().take()?;
+    /// cuts that are still strictly ahead of the cursor and inside the
+    /// current range (the rest are discarded): the segment ends at the first,
+    /// and each cut starts a child up to the next cut (the last child takes
+    /// the old end).  The children come back last-first, so linking each
+    /// right after the parent leaves them in key order.
+    pub(super) fn try_accept_split(&self) -> Vec<SplitRange> {
+        let Some(proposed) = self.pending_split.lock().unwrap().take() else {
+            return Vec::new();
+        };
         let cursor = self.cursor.lock().unwrap();
         let mut end = self.end_before.lock().unwrap();
-        let in_range = proposed.as_str() > cursor.as_str()
-            && end.as_deref().is_none_or(|e| proposed.as_str() < e);
-        if !in_range {
-            self.splitting.store(false, Ordering::Relaxed);
-            return None;
-        }
-        let old_end = end.replace(proposed.clone());
+        let mut cuts: Vec<String> = proposed
+            .into_iter()
+            .filter(|c| {
+                c.as_str() > cursor.as_str() && end.as_deref().is_none_or(|e| c.as_str() < e)
+            })
+            .collect();
+        cuts.sort();
+        cuts.dedup();
         self.splitting.store(false, Ordering::Relaxed);
-        Some(SplitRange {
-            start: proposed,
-            end: old_end,
-            parent: 0, // set by the segment that accepts the split
-        })
+        let Some(first) = cuts.first().cloned() else {
+            return Vec::new();
+        };
+        let old_end = end.replace(first);
+        let mut children = Vec::with_capacity(cuts.len());
+        for (i, start) in cuts.iter().enumerate() {
+            children.push(SplitRange {
+                start: start.clone(),
+                end: cuts.get(i + 1).cloned().or_else(|| old_end.clone()),
+                parent: 0, // set by the segment that accepts the split
+            });
+        }
+        children.reverse();
+        children
     }
 }
 
@@ -186,25 +224,26 @@ fn ancestor_dirs(cursor: &str, listing_prefix: &str) -> Vec<String> {
 
 /// What a split probe learned about a segment's remaining range.
 enum SplitProbe {
-    /// A real boundary strictly inside the range.
-    Cut(String),
+    /// Real boundaries strictly inside the range, ascending (at least one).
+    Cut(Vec<String>),
     /// The probes completed and found no boundary to cut at.
     NoBoundary,
     /// A probe request errored or timed out: nothing was learned.
     Failed,
 }
 
-/// One delimiter probe per ancestor rung; returns the middle CommonPrefix
-/// strictly inside `(cursor, end)`. When no rung has one and the rung pages
-/// together hold every remaining key of the range, cuts at their median;
-/// otherwise falls back to a flat-range cut near the middle of the remaining
-/// keys.
+/// One delimiter probe per ancestor rung; returns up to `k` CommonPrefixes
+/// strictly inside `(cursor, end)`, evenly spread. When no rung has one and
+/// the rung pages together hold every remaining key of the range, cuts at
+/// their quantiles; otherwise falls back to flat-range cuts spread over the
+/// remaining keys.
 async fn probe_split_candidate(
     ctx: &S3TaskContext,
     listing_prefix: &str,
     cursor: &str,
     end: Option<&str>,
     flat_high: &FlatHigh,
+    k: usize,
 ) -> SplitProbe {
     let dirs = ancestor_dirs(cursor, listing_prefix);
     // When the ladder reaches the listing prefix, every key left in the range
@@ -254,7 +293,8 @@ async fn probe_split_candidate(
             .collect();
         if !candidates.is_empty() {
             candidates.sort();
-            return SplitProbe::Cut(candidates.swap_remove(candidates.len() / 2));
+            candidates.dedup();
+            return SplitProbe::Cut(spread_picks(candidates, k));
         }
         if complete {
             // A truncated page, or one the fast parser left to the SDK, does
@@ -272,23 +312,50 @@ async fn probe_split_candidate(
     if complete {
         // With fewer than two keys in hand, take the flat cut as before
         // rather than retire the segment on the rung pages' word.
-        if let Some(cut) = median_cut(known) {
-            return SplitProbe::Cut(cut);
+        let cuts = quantile_cuts(known, k);
+        if !cuts.is_empty() {
+            return SplitProbe::Cut(cuts);
         }
     }
 
-    probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high).await
+    probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high, k).await
+}
+
+/// `k` of `sorted` (distinct, ascending), evenly spread; the middle one for
+/// `k == 1`; all of them when they fit.
+fn spread_picks(sorted: Vec<String>, k: usize) -> Vec<String> {
+    let n = sorted.len();
+    let k = k.max(1);
+    if n <= k {
+        return sorted;
+    }
+    if k == 1 {
+        return vec![sorted[n / 2].clone()];
+    }
+    (1..=k).map(|j| sorted[j * n / (k + 1)].clone()).collect()
+}
+
+/// Up to `k` cuts at the quantiles of a range's remaining keys, all of them
+/// in hand: every piece keeps at least one key (the lower median for `k ==
+/// 1`).  Empty below two keys.
+fn quantile_cuts(mut keys: Vec<String>, k: usize) -> Vec<String> {
+    keys.sort_unstable();
+    keys.dedup();
+    let n = keys.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let k = k.max(1);
+    let mut idx: Vec<usize> = (1..=k).map(|j| j * (n - 1) / (k + 1)).collect();
+    idx.dedup();
+    idx.into_iter().map(|i| keys[i].clone()).collect()
 }
 
 /// The median of a range's remaining keys, all of them in hand (the lower
 /// median, so both halves keep at least one key); `None` below two keys.
-fn median_cut(mut keys: Vec<String>) -> Option<String> {
-    keys.sort_unstable();
-    keys.dedup();
-    match keys.len() {
-        0 | 1 => None,
-        n => Some(keys.swap_remove((n - 1) / 2)),
-    }
+#[cfg(test)]
+fn median_cut(keys: Vec<String>) -> Option<String> {
+    quantile_cuts(keys, 1).into_iter().next()
 }
 
 /// Near-maximal real key of the listing, shared by a run's split probes: an
@@ -309,6 +376,7 @@ async fn probe_flat_cut(
     cursor: &str,
     end: Option<&str>,
     flat_high: &FlatHigh,
+    k: usize,
 ) -> SplitProbe {
     let probe = |candidate: String| async move {
         let response = crate::probe::send(ctx.operation_timeout_secs, || {
@@ -331,19 +399,27 @@ async fn probe_flat_cut(
             .map(|k| crate::list_page::response_key(url, k)))
     };
     let known_high = flat_high.lock().unwrap().clone();
-    match crate::flat_cut::find_flat_cut(listing_prefix, cursor, end, known_high.as_deref(), &probe)
-        .await
+    match crate::flat_cut::find_flat_cuts(
+        listing_prefix,
+        cursor,
+        end,
+        known_high.as_deref(),
+        k.max(1),
+        &probe,
+    )
+    .await
     {
-        Ok(found) => {
-            if let Some(high) = found.high {
+        Ok((cuts, high)) => {
+            if let Some(high) = high {
                 let mut shared = flat_high.lock().unwrap();
                 if shared.as_ref().is_none_or(|k| high > *k) {
                     *shared = Some(high);
                 }
             }
-            match found.cut {
-                Some(key) => SplitProbe::Cut(key),
-                None => SplitProbe::NoBoundary,
+            if cuts.is_empty() {
+                SplitProbe::NoBoundary
+            } else {
+                SplitProbe::Cut(cuts)
             }
         }
         Err(e) => {
@@ -373,6 +449,9 @@ pub(super) struct FanOutGovernor {
     /// never fans out past it.  Starts open at `flat_concurrency`.
     cap: usize,
     samples: u32,
+    /// Consecutive windows held at a lowered cap with every slot busy and
+    /// the rate flat (see `FANOUT_EXPLORE_WINDOWS`).
+    held_windows: u32,
 }
 
 impl FanOutGovernor {
@@ -384,6 +463,7 @@ impl FanOutGovernor {
             last_rate: 0.0,
             cap: max,
             samples: 0,
+            held_windows: 0,
         }
     }
 
@@ -426,13 +506,27 @@ impl FanOutGovernor {
             if rate >= self.last_rate * FANOUT_IMPROVE_RATIO {
                 // Throughput still climbing: reopen the ceiling and keep probing.
                 self.cap = max;
+                self.held_windows = 0;
             } else if setlen > self.last_setlen {
                 // Added segments since last window without a throughput gain:
                 // we are at/above useful concurrency.  Cap at the prior level.
                 self.cap = self.last_setlen.max(1);
+                self.held_windows = 0;
+            } else if self.cap < max && setlen >= self.cap {
+                // Saturated at a lowered cap with a flat rate: after a few
+                // windows, try half again as many segments.  If they raise the
+                // rate the ceiling reopens; if not, the branch above puts the
+                // cap back.
+                self.held_windows += 1;
+                if self.held_windows >= FANOUT_EXPLORE_WINDOWS {
+                    self.cap = (self.cap + (self.cap / 2).max(1)).min(max);
+                    self.held_windows = 0;
+                }
+            } else {
+                // No new segments and slots free (long tail): hold the cap so
+                // the split gate refills as segments finish.
+                self.held_windows = 0;
             }
-            // Otherwise (no new segments, flat rate): long-tail region — hold
-            // the cap so the split gate can refill as segments finish.
         }
         self.last_at = now;
         self.last_pages = total;
@@ -493,7 +587,17 @@ pub(super) fn maybe_start_split_probes(
     flat_high: &FlatHigh,
     probes: &mut tokio::task::JoinSet<()>,
 ) {
-    for index in select_split_targets(controls, idle_capacity) {
+    let in_flight = controls
+        .values()
+        .filter(|c| c.splitting.load(Ordering::Relaxed))
+        .count();
+    let targets = select_split_targets(controls, idle_capacity);
+    // Idle slots are shared between the probed segments: one segment alone
+    // with 31 idle slots is cut into up to 16 pieces in one probe, instead
+    // of doubling once per probe and page.
+    let share =
+        (idle_capacity.saturating_sub(in_flight) / targets.len().max(1)).clamp(1, SPLIT_MAX_CUTS);
+    for index in targets {
         let control = Arc::clone(&controls[&index]);
         control.splitting.store(true, Ordering::Relaxed);
         let probe_ctx = ctx.clone();
@@ -511,13 +615,19 @@ pub(super) fn maybe_start_split_probes(
                 &cursor,
                 end.as_deref(),
                 &flat_high,
+                share,
             )
             .await
             {
-                SplitProbe::Cut(mid) => {
-                    debug!("Split probe for segment {}: proposing cut '{}'", index, mid);
+                SplitProbe::Cut(cuts) => {
+                    debug!(
+                        "Split probe for segment {}: proposing {} cut(s) from '{}'",
+                        index,
+                        cuts.len(),
+                        cuts[0]
+                    );
                     control.probe_failures.store(0, Ordering::Relaxed);
-                    *control.pending_split.lock().unwrap() = Some(mid);
+                    *control.pending_split.lock().unwrap() = Some(cuts);
                     // The segment task clears `splitting` when it accepts or
                     // rejects the proposal at its next page boundary.
                 }
@@ -544,6 +654,58 @@ pub(super) fn maybe_start_split_probes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_multi_way_split_yields_contiguous_children_last_first() {
+        let control = SegmentControl::new(Some("z".to_string()));
+        control.record_page("b");
+        control.splitting.store(true, Ordering::Relaxed);
+        // Unordered, with one cut behind the cursor and one past the end.
+        *control.pending_split.lock().unwrap() = Some(vec![
+            "m".into(),
+            "a".into(),
+            "f".into(),
+            "zz".into(),
+            "f".into(),
+        ]);
+        let children = control.try_accept_split();
+        let ranges: Vec<(String, Option<String>)> = children
+            .iter()
+            .map(|c| (c.start.clone(), c.end.clone()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                ("m".to_string(), Some("z".to_string())),
+                ("f".to_string(), Some("m".to_string())),
+            ]
+        );
+        assert_eq!(control.current_end().as_deref(), Some("f"));
+        assert!(!control.splitting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_split_children_are_candidates_after_one_page() {
+        let child = SegmentControl::new_child(None);
+        assert!(!child.is_split_candidate());
+        child.record_page("k");
+        assert!(child.is_split_candidate());
+        let original = SegmentControl::new(None);
+        original.record_page("k");
+        assert!(!original.is_split_candidate());
+    }
+
+    #[test]
+    fn test_quantile_cuts_and_spread_picks() {
+        let keys = |n: usize| (0..n).map(|i| format!("k{i:02}")).collect::<Vec<_>>();
+        // Every piece keeps a key: no cut is the last key.
+        assert_eq!(quantile_cuts(keys(10), 3), vec!["k02", "k04", "k06"]);
+        assert_eq!(quantile_cuts(keys(3), 5), vec!["k00", "k01"]);
+        assert!(quantile_cuts(keys(1), 4).is_empty());
+        assert_eq!(spread_picks(keys(9), 1), vec!["k04"]);
+        assert_eq!(spread_picks(keys(9), 2), vec!["k03", "k06"]);
+        assert_eq!(spread_picks(keys(2), 5), keys(2));
+    }
 
     #[test]
     fn test_median_cut_splits_known_keys_in_half() {
@@ -601,10 +763,10 @@ mod tests {
     fn test_segment_control_accepts_valid_split() {
         let control = SegmentControl::new(Some("small/".to_string()));
         control.record_page("big/a/05");
-        *control.pending_split.lock().unwrap() = Some("big/b/".to_string());
+        *control.pending_split.lock().unwrap() = Some(vec!["big/b/".to_string()]);
         control.splitting.store(true, Ordering::Relaxed);
 
-        let child = control.try_accept_split().expect("split accepted");
+        let child = control.try_accept_split().pop().expect("split accepted");
         assert_eq!(child.start, "big/b/");
         assert_eq!(child.end.as_deref(), Some("small/"));
         assert_eq!(control.current_end().as_deref(), Some("big/b/"));
@@ -616,10 +778,10 @@ mod tests {
         // The cursor has already passed the proposed cut.
         let control = SegmentControl::new(None);
         control.record_page("big/c/99");
-        *control.pending_split.lock().unwrap() = Some("big/b/".to_string());
+        *control.pending_split.lock().unwrap() = Some(vec!["big/b/".to_string()]);
         control.splitting.store(true, Ordering::Relaxed);
 
-        assert!(control.try_accept_split().is_none());
+        assert!(control.try_accept_split().is_empty());
         assert_eq!(control.current_end(), None);
         assert!(!control.splitting.load(Ordering::Relaxed));
     }
@@ -629,14 +791,14 @@ mod tests {
         // The proposed cut is at or beyond the current end boundary.
         let control = SegmentControl::new(Some("d/".to_string()));
         control.record_page("a/1");
-        *control.pending_split.lock().unwrap() = Some("d/".to_string());
-        assert!(control.try_accept_split().is_none());
+        *control.pending_split.lock().unwrap() = Some(vec!["d/".to_string()]);
+        assert!(control.try_accept_split().is_empty());
 
         // Unbounded segment accepts any cut ahead of the cursor.
         let control = SegmentControl::new(None);
         control.record_page("a/1");
-        *control.pending_split.lock().unwrap() = Some("z/".to_string());
-        assert!(control.try_accept_split().is_some());
+        *control.pending_split.lock().unwrap() = Some(vec!["z/".to_string()]);
+        assert!(!control.try_accept_split().is_empty());
     }
 
     #[test]
@@ -722,6 +884,50 @@ mod tests {
         // Long-tail refill raises throughput again: ceiling reopens.
         gov.observe_at(t0 + win * 3, 0, 2000, 12, 32);
         assert_eq!(gov.effective_cap(), 32);
+    }
+
+    /// Pages added and segments in flight per window → cap after each.
+    fn governor_caps(max: usize, windows: &[(u64, usize)]) -> Vec<usize> {
+        let t0 = Instant::now();
+        let win = FANOUT_SAMPLE + Duration::from_millis(10);
+        let mut gov = FanOutGovernor::new(max);
+        let mut pages = 0;
+        windows
+            .iter()
+            .enumerate()
+            .map(|(i, (added, setlen))| {
+                pages += added;
+                gov.observe_at(t0 + win * (i as u32 + 1), 0, pages, *setlen, max);
+                gov.effective_cap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fanout_governor_low_cap_recovers_when_the_rate_stays_flat() {
+        // A child added in a window that gained <5% then finished: the cap
+        // drops to 2 with two long, steady segments left.  It used to stay
+        // at 2 for the rest of the run.
+        let mut windows = vec![(100, 2), (102, 3), (100, 2), (100, 2), (100, 2)];
+        let caps = governor_caps(64, &windows);
+        assert_eq!(caps, [64, 2, 2, 2, 3], "a try after three held windows");
+        // The try adds a segment and the rate rises: the ceiling reopens.
+        windows.push((150, 3));
+        assert_eq!(*governor_caps(64, &windows).last().unwrap(), 64);
+    }
+
+    #[test]
+    fn test_fanout_governor_try_that_does_not_help_is_taken_back() {
+        let windows = [(100, 2), (102, 3), (100, 2), (100, 2), (100, 2), (101, 3)];
+        assert_eq!(governor_caps(64, &windows), [64, 2, 2, 2, 3, 2]);
+    }
+
+    #[test]
+    fn test_fanout_governor_holds_in_the_long_tail() {
+        // Slots free (segments finishing), flat rate: no tries needed, the
+        // split gate refills up to the cap.
+        let windows = [(100, 8), (100, 16), (100, 6), (100, 5), (100, 4), (100, 4)];
+        assert_eq!(governor_caps(64, &windows), [64, 8, 8, 8, 8, 8]);
     }
 
     #[test]

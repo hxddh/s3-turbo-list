@@ -1407,7 +1407,8 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
     ok_result(code, &stdout, &stderr);
     assert_eq!(sorted(dataset_keys(&out)), keys);
 
-    // One boundary per worker...
+    // One segment per worker (boundaries + 1 = -c): a ninth segment would
+    // wait for a slot and list its whole range alone at the end...
     let count: usize = stderr
         .lines()
         .find_map(|line| {
@@ -1415,7 +1416,7 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
                 .and_then(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
         })
         .unwrap_or_else(|| panic!("startup boundary count logged: {}", stderr));
-    assert_eq!(count, 8, "{}", stderr);
+    assert_eq!(count, 7, "{}", stderr);
     // ...each the start of one initial segment (indices 1..=count; runtime
     // split children are numbered after them), every one a real key.
     let mut boundaries: Vec<(u64, String)> = std::fs::read_to_string(&trace)
@@ -5113,4 +5114,92 @@ fn local_mock_s3_output_stored_result_marker_with_a_lost_response_commits() {
     let store = store.lock().unwrap();
     assert!(store.objects.contains_key("out/_result.json"));
     assert!(store.objects.keys().any(|k| k.ends_with(".parquet")));
+}
+
+// ── Wide namespaces: more top-level prefixes than a page ────
+
+/// An endpoint with 100-entry pages over `keys`: startup discovery has to
+/// follow pages, and past its page budget bisect the rest.
+fn small_page_server(keys: Vec<String>) -> MockS3Server {
+    MockS3Server::start(move |request, _sequence| {
+        let mut q = request.query.clone();
+        let asked: usize = q
+            .get("max-keys")
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(1000);
+        q.insert("max-keys".into(), asked.min(100).to_string());
+        MockResponse::ok_xml(emulated_list(&keys, &q))
+    })
+}
+
+fn wide_keys() -> Vec<String> {
+    let mut keys: Vec<String> = (0..2500)
+        .flat_map(|d| (0..3).map(move |i| format!("d{d:05}/f{i}")))
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn local_mock_wide_namespace_is_partitioned_past_the_first_page() {
+    let keys = wide_keys();
+    let server = small_page_server(keys.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let args = cli(
+        &server,
+        "list",
+        &["s3://mock-bucket", "-c", "16", "-o", out.to_str().unwrap()],
+    );
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["stats"]["objects"], keys.len());
+    assert_eq!(sorted(dataset_keys(&out)), keys, "every key exactly once");
+
+    let requests = server.requests();
+    // The root delimiter probe followed its pages...
+    assert!(requests.iter().any(|r| is_delimiter_probe(r)
+        && query(r, "prefix").unwrap_or("").is_empty()
+        && r.query.contains_key("continuation-token")));
+    // ...and the tail past them (8 pages x 100 prefixes) was bisected by
+    // single-key probes instead of being left to one segment.
+    assert!(
+        requests
+            .iter()
+            .any(|r| is_single_key_probe(r)
+                && query(r, "start-after").is_some_and(|s| s > "d00800/"))
+    );
+    // Listing requests start well past the first 800 prefixes too.
+    let starts: Vec<&str> = requests
+        .iter()
+        .filter(|r| !is_delimiter_probe(r) && !is_single_key_probe(r))
+        .filter_map(|r| query(r, "start-after"))
+        .filter(|s| *s > "d00900/")
+        .collect();
+    assert!(starts.len() >= 2, "segments in the tail: {:?}", starts);
+}
+
+#[test]
+fn local_mock_wide_namespace_diff_matches_key_for_key() {
+    let keys = wide_keys();
+    let mut right = keys.clone();
+    right.retain(|k| !k.ends_with("/f1") || !k.starts_with("d02"));
+    let server = small_page_server(keys.clone());
+    let other = small_page_server(right.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = cli(
+        &server,
+        "diff",
+        &["s3://mock-bucket", "s3://mock-bucket", "-c", "16"],
+    );
+    args.extend(strings(&["--target-endpoint-url", &other.endpoint()]));
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["diff"]["left_only"], keys.len() - right.len());
+    assert_eq!(result["diff"]["right_only"], 0);
+    // Every key on both sides was paired (the emulator's size and ETag
+    // depend on a key's position in its page, so pairs may read changed).
+    let paired =
+        result["diff"]["equal"].as_u64().unwrap() + result["diff"]["changed"].as_u64().unwrap();
+    assert_eq!(paired as usize, right.len());
 }

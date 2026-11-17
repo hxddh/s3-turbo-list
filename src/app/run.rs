@@ -377,7 +377,9 @@ async fn list_boundaries(contexts: &Contexts<'_>, region: &str) -> core::KeySpac
         job.max_keys,
         contexts.g_state,
         concurrency.saturating_mul(2).clamp(16, 512),
-        concurrency.clamp(1, 64),
+        // One segment per slot (boundaries + 1): one more would wait for
+        // a slot and then list its whole range alone at the end of the run.
+        concurrency.saturating_sub(1).clamp(1, 64),
     )
     .await
     .unwrap_or_default();

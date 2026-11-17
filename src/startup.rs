@@ -40,9 +40,10 @@ pub async fn diff_side_boundaries(
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style());
     let concurrency = cfg.runtime.max_concurrency;
-    // Only `max_concurrency` segments run at once, so spare flat boundaries
-    // would cost probes without adding parallelism; diff has no runtime
-    // splitting to fall back on, so it keeps a floor of 8.
+    // A side runs at most `DIFF_SIDE_MAX_CONCURRENCY` segments at once: one
+    // flat segment per slot (boundaries + 1), since one more would wait for a
+    // slot and then list its whole range alone at the end.
+    let slots = concurrency.clamp(1, crate::tasks_s3::DIFF_SIDE_MAX_CONCURRENCY);
     startup_boundaries(
         &client,
         bucket,
@@ -51,7 +52,7 @@ pub async fn diff_side_boundaries(
         max_keys,
         g_state,
         concurrency.saturating_mul(2).clamp(16, 512),
-        concurrency.clamp(8, 64),
+        slots.saturating_sub(1).max(1),
     )
     .await
     .unwrap_or_default()
@@ -85,7 +86,17 @@ pub async fn startup_boundaries(
             )
             .await;
             if !discovery.boundaries.is_empty() {
-                refine_flat_leaves(client, bucket, discovery, flat_target, timeout_secs).await
+                let tails = discovery.tails.clone();
+                // Flat runs share the structural budget (about two segments
+                // per slot), not the flat one (one per slot): structure
+                // already used part of that, and 20 equal directories with 11
+                // cuts between them left nine 50-page segments listing
+                // serially while the rest of the run sat idle.
+                let refine_target = structural_target.max(flat_target);
+                let boundaries =
+                    refine_flat_leaves(client, bucket, discovery, refine_target, timeout_secs)
+                        .await;
+                bisect_tails(client, bucket, boundaries, &tails, flat_target, timeout_secs).await
             } else if discovery.is_single_page_listing(max_keys) {
                 // The probe's page was not truncated and held no
                 // CommonPrefixes, and this run's page size returns those keys
@@ -136,6 +147,56 @@ pub async fn refine_flat_leaves(
         })
         .await,
     );
+    boundaries.sort();
+    boundaries.dedup();
+    boundaries
+}
+
+/// Most tail runs bisected at startup (spread over those found).
+const MAX_TAIL_RUNS: usize = 16;
+
+/// Partition the tails of truncated delimiter probes: the key space after
+/// the last CommonPrefix a probe saw would otherwise be one segment however
+/// large (a bucket with 100,000 top-level prefixes listed as 1,000 segments
+/// and one segment for the other 99%).  Each tail is bisected like a flat
+/// namespace, anchored on its last seen entry, with an even share of
+/// `flat_target`; the tails run concurrently.
+pub async fn bisect_tails(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    mut boundaries: Vec<String>,
+    tails: &[auto_hints::TailRun],
+    flat_target: usize,
+    timeout_secs: u64,
+) -> Vec<String> {
+    if tails.is_empty() {
+        return boundaries;
+    }
+    let step = tails.len().div_ceil(MAX_TAIL_RUNS);
+    let tails: Vec<&auto_hints::TailRun> = tails.iter().step_by(step).collect();
+    let share = (flat_target / tails.len()).max(1);
+    info!(
+        "Startup discovery: {} truncated prefix listing(s) — bisecting their tails",
+        tails.len()
+    );
+    let found = futures::future::join_all(tails.iter().map(|tail| {
+        auto_hints::discover_flat_boundaries(
+            &tail.prefix,
+            share,
+            Some(tail.after.clone()),
+            |start_after| {
+                single_key_probe(
+                    client,
+                    bucket,
+                    tail.prefix.clone(),
+                    start_after,
+                    timeout_secs,
+                )
+            },
+        )
+    }))
+    .await;
+    boundaries.extend(found.into_iter().flatten());
     boundaries.sort();
     boundaries.dedup();
     boundaries
