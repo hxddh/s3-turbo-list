@@ -43,6 +43,9 @@ pub struct StartupDiscovery {
     /// namespace): flat bisection anchors on it instead of spending a
     /// `max-keys=1` round-trip to find it.
     pub root_first_key: Option<String>,
+    /// Last key of that page, with `root_page_keys`: the page a flat
+    /// namespace is sized and cut from.
+    pub root_last_key: Option<String>,
     /// Probed prefixes whose CommonPrefix listing was cut short (still
     /// truncated after the pages followed): the key space after the last
     /// entry seen holds structure discovery never saw, and without these it
@@ -264,6 +267,7 @@ where
     let mut root_page_keys = 0usize;
     let mut flat_runs: Vec<FlatRun> = Vec::new();
     let mut root_first_key: Option<String> = None;
+    let mut root_last_key: Option<String> = None;
     let mut tails: Vec<TailRun> = Vec::new();
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
@@ -294,6 +298,7 @@ where
                         // before it).
                         if page.prefixes.is_empty() {
                             root_first_key = page.first_key.clone();
+                            root_last_key = page.last_key.clone();
                         }
                     }
                     flat_runs.extend(flat_run(parent, depth, &page));
@@ -337,6 +342,7 @@ where
         root_page_keys,
         flat_runs,
         root_first_key,
+        root_last_key,
         tails,
     }
 }
@@ -534,59 +540,90 @@ where
     if budget == 0 || runs.is_empty() {
         return Vec::new();
     }
-    let shares = if runs.len() == 1 {
-        vec![budget]
-    } else {
-        let permits = tokio::sync::Semaphore::new(FLAT_SIZING_MAX_IN_FLIGHT);
-        let sizes = futures::future::join_all(runs.iter().map(|run| {
-            let (probe, permits) = (&probe, &permits);
-            let scoped = move |start_after: String| {
-                let request = probe(run.prefix.clone(), Some(start_after));
-                async move {
-                    let _permit = permits.acquire().await.ok();
-                    request.await
-                }
-            };
+    let permits = tokio::sync::Semaphore::new(FLAT_SIZING_MAX_IN_FLIGHT);
+    let scoped = |run: &FlatRun| {
+        let (probe, permits) = (&probe, &permits);
+        let prefix = run.prefix.clone();
+        move |start_after: String| {
+            let request = probe(prefix.clone(), Some(start_after));
             async move {
-                crate::flat_cut::estimate_run_keys(
-                    &run.first_key,
-                    &run.last_key,
-                    run.keys,
-                    &run.prefix,
-                    &scoped,
-                )
+                let _permit = permits.acquire().await.ok();
+                request.await
+            }
+        }
+    };
+    // One concurrent round sizes every run: how far along its number it
+    // reaches. The sizes share the budget, and bound the one-round cuts.
+    let spans = futures::future::join_all(runs.iter().map(|run| {
+        let probe = scoped(run);
+        async move {
+            crate::flat_cut::size_run_pages(&run.first_key, &run.last_key, &run.prefix, &probe)
                 .await
                 .unwrap_or_else(|e| {
                     log::debug!("Sizing flat run '{}' failed: {}", run.prefix, e);
                     None
                 })
-            }
-        }))
-        .await;
-        log::debug!(
-            "Flat run size estimates: {}",
-            runs.iter()
-                .zip(&sizes)
-                .map(|(run, size)| format!("{}={:?}", run.prefix, size))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        let pages: Vec<usize> = runs.iter().map(|run| run.keys).collect();
-        share_budget(&sizes, &pages, budget)
-    };
-    let found =
-        futures::future::join_all(runs.iter().zip(shares).filter(|(_, share)| *share > 0).map(
-            |(run, share)| {
+        }
+    }))
+    .await;
+    let sizes: Vec<Option<u64>> = runs
+        .iter()
+        .zip(&spans)
+        .map(|(run, span)| {
+            span.map(|(reached, next)| {
+                (run.keys.max(1) as f64 * ((reached * next) as f64).sqrt()) as u64
+            })
+        })
+        .collect();
+    log::debug!(
+        "Flat run size estimates: {}",
+        runs.iter()
+            .zip(&sizes)
+            .map(|(run, size)| format!("{}={:?}", run.prefix, size))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let pages: Vec<usize> = runs.iter().map(|run| run.keys).collect();
+    let shares = share_budget(&sizes, &pages, budget);
+    let found = futures::future::join_all(
+        runs.iter()
+            .zip(shares)
+            .zip(spans)
+            .filter(|((_, share), _)| *share > 0)
+            .map(|((run, share), span)| {
                 let probe = &probe;
-                discover_flat_boundaries(
-                    &run.prefix,
-                    share,
-                    Some(run.first_key.clone()),
-                    move |start_after| probe(run.prefix.clone(), start_after),
-                )
-            },
-        ))
-        .await;
+                let scoped = scoped(run);
+                async move {
+                    // Cuts read off the run's scale in one round; bisection
+                    // (several rounds) when the keys have no numeric reading
+                    // or the scale found too few.
+                    if let Some((_, upto)) = span {
+                        let cuts = crate::flat_cut::scale_cuts(
+                            &run.first_key,
+                            &run.last_key,
+                            &run.prefix,
+                            upto,
+                            share,
+                            &scoped,
+                        )
+                        .await;
+                        if let Ok(Some(cuts)) = cuts
+                            && cuts.len() * 2 >= share
+                        {
+                            return cuts;
+                        }
+                    }
+                    discover_flat_boundaries(
+                        &run.prefix,
+                        share,
+                        Some(run.first_key.clone()),
+                        move |start_after| probe(run.prefix.clone(), start_after),
+                    )
+                    .await
+                }
+            }),
+    )
+    .await;
     let mut boundaries: Vec<String> = found.into_iter().flatten().collect();
     boundaries.sort();
     boundaries.dedup();
@@ -1289,6 +1326,7 @@ mod tests {
             root_page_keys: 500,
             flat_runs: Vec::new(),
             root_first_key: None,
+            root_last_key: None,
             tails: Vec::new(),
         };
         // The probe returned the whole listing in one page, and the run's page
@@ -1310,6 +1348,7 @@ mod tests {
             root_page_keys: 1000,
             flat_runs: Vec::new(),
             root_first_key: None,
+            root_last_key: None,
             tails: Vec::new(),
         };
         assert!(!truncated.is_single_page_listing(None));
@@ -1320,6 +1359,7 @@ mod tests {
             root_page_keys: 3,
             flat_runs: Vec::new(),
             root_first_key: None,
+            root_last_key: None,
             tails: Vec::new(),
         };
         assert!(!structured.is_single_page_listing(None));

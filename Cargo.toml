@@ -11,6 +11,8 @@ description = "Fast S3-compatible bucket listing and diffing to Parquet, built f
 license = "Apache-2.0"
 
 [dependencies]
+# Global allocator: the listing allocates per key and per request.
+mimalloc = { version = "0.1", default-features = false }
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 clap = { version = "4", features = ["derive"] }

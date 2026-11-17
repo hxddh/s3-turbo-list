@@ -106,9 +106,28 @@ pub async fn startup_boundaries(
                 Vec::new()
             } else {
                 info!("Startup discovery found no prefix structure — bisecting flat key space");
-                let first = discovery.root_first_key;
-                discover_flat_boundaries_via_client(client, bucket, prefix, flat_target, first, timeout_secs)
-                    .await
+                match (discovery.root_first_key, discovery.root_last_key) {
+                    // The root page is a page of the flat run the whole
+                    // listing is: size and cut it in two rounds.
+                    (Some(first_key), Some(last_key)) if discovery.root_page_keys >= 2 => {
+                        let run = auto_hints::FlatRun {
+                            prefix: prefix.to_string(),
+                            first_key,
+                            last_key,
+                            keys: discovery.root_page_keys,
+                        };
+                        auto_hints::partition_flat_runs(&[run], flat_target, |p, start_after| {
+                            single_key_probe(client, bucket, p, start_after, timeout_secs)
+                        })
+                        .await
+                    }
+                    (first, _) => {
+                        discover_flat_boundaries_via_client(
+                            client, bucket, prefix, flat_target, first, timeout_secs,
+                        )
+                        .await
+                    }
+                }
             }
         } => Some(boundaries),
         _ = quit_requested(g_state) => None,

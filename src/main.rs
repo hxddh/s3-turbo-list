@@ -2,6 +2,9 @@
 // command line, result contract and run orchestration — lives in src/app/.
 mod app;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     std::process::exit(app::main());
 }
