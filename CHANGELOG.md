@@ -5,6 +5,17 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-17
+
+### Changed
+- Dependencies updated to their latest releases within the declared ranges
+  (and Rust 1.94.1): AWS SDK for Rust (aws-sdk-s3 1.150 → 1.159,
+  aws-config 1.12 → 1.13.2, aws-smithy-runtime 1.15 → 1.16.4, aws-sigv4
+  1.6.0 → 1.6.5), hyper 1.12, rustls 0.23.46, aws-lc-rs 1.19 / aws-lc-sys
+  0.47, tokio 1.54.1, parquet/arrow 60.1, zstd 1.5.7 bindings 2.1.3, and
+  134 crates in all. No declared range changed. Performance on the local
+  mock is unchanged (within ±3%).
+
 ## [1.3.0] - 2026-11-17
 
 ### Performance
