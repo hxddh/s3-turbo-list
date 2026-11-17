@@ -83,16 +83,14 @@ request window (below), not `-c`.
 ## The request window
 
 One window, shared by every listing page and every partitioning probe, is
-the run's only concurrency control. It is capped at `-c`:
+the run's only concurrency control. It opens at `-c`, which is also its cap
+(a listing page takes a slot, a probe a third of one):
 
-- it opens at 32 (or `-c`) and doubles with every window's worth of
-  answers until the endpoint first pushes back;
 - a throttle (`SlowDown`, 429, 503) or a timed-out request shrinks it to 70%,
   at most once per round trip;
 - every window's worth of answers without either grows it by one again.
 
-On an endpoint that never pushes back, the window reaches `-c` within a few
-round trips and stays there. On one with a request-rate ceiling it settles
+On an endpoint that never pushes back, the window stays at `-c`. On one with a request-rate ceiling it settles
 just under the ceiling instead of queueing and retrying above it: on the
 local mock limited to 1,000 requests/s, a default run went from 9.4 s to
 about 2 s (`docs/validation-results/request-window-20261117.md`). Segments

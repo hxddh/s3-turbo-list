@@ -230,9 +230,10 @@ pub struct Stats {
     pub probes: u64,
     /// Segments listed: startup partitions and runtime split children.
     pub segments: usize,
-    /// Requests in flight on average over the run (time-weighted).
+    /// Request slots in use on average over the run (time-weighted; a
+    /// listing page takes a slot, a probe a third).
     pub avg_concurrency: f64,
-    /// Most requests in flight at once.
+    /// Most request slots in use at once (at most `-c`).
     pub peak_concurrency: usize,
 }
 

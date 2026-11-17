@@ -87,8 +87,8 @@ Every key below is always present; `null` means "does not apply".
 | `requests` | listing requests sent (pages, retries included) |
 | `probes` | partitioning probes sent (startup discovery and runtime splits) |
 | `segments` | segments listed (startup partitions and split children) |
-| `avg_concurrency` | requests in flight on average over the run |
-| `peak_concurrency` | most requests in flight at once (at most `-c`) |
+| `avg_concurrency` | request slots in use on average over the run (a listing page takes a slot, a probe a third) |
+| `peak_concurrency` | most request slots in use at once (at most `-c`) |
 
 `diff`: `{left_only, right_only, changed, equal, verified_equal,
 unverified}` — key counts. `verified_equal` (included in `equal`) and

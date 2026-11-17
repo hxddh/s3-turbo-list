@@ -3,20 +3,20 @@
 //!
 //! One window, shared by every listing page and every partitioning probe,
 //! is the run's only concurrency control. It is capped at `-c` and follows
-//! additive-increase / multiplicative-decrease:
+//! additive-increase / multiplicative-decrease from `-c`:
 //!
-//! - it opens at 32 (or `-c`) and doubles every window's worth of answers
-//!   until the endpoint first pushes back ("slow start");
 //! - a throttle (`SlowDown`, 429, ...) or a timed-out request shrinks it to
 //!   70%, at most once per round trip, so one burst of rejections counts once;
 //! - every `limit` requests answered without either grow it by one, up to
 //!   `-c` again.
 //!
-//! On an endpoint that never pushes back, the window reaches `-c` within a
-//! few round trips and stays there. On one with a request-rate ceiling it settles just under
+//! On an endpoint that never pushes back, the window stays at `-c`: nothing
+//! changes for it. On one with a request-rate ceiling it settles just under
 //! that ceiling instead of queueing and retrying above it. Segments beyond
 //! the window are cheap: they wait for a permit. Runtime splitting fills the
-//! window, not `-c`.
+//! window, not `-c`. A listing page takes a whole slot and a probe a third:
+//! probes are single-key or single-page requests sent in bursts at startup,
+//! and the window holds three of them for every page.
 //!
 //! The window also times requests: a page may take ten times the run's
 //! typical latency (never less than the configured floor, never more than a
@@ -27,11 +27,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// Where the window starts (or `-c`, if smaller). Until the endpoint first
-/// pushes back it doubles every window's worth of answers ("slow start"),
-/// reaching `-c` in a few round trips; a run that opened at `-c` hit a
-/// rate-limited endpoint with its whole burst before the first rejection.
-const INITIAL_WINDOW: usize = 32;
+/// Share of a slot a probe takes, in thirds: a probe is a single-key or
+/// single-page request, and startup partitioning sends many at once. A
+/// listing page takes a whole slot.
+const PROBE_UNITS: usize = 1;
+const PAGE_UNITS: usize = 3;
 /// Multiplicative decrease on a throttle or timeout.
 const DECREASE: f64 = 0.7;
 /// Longest a request may take before it counts as timed out.
@@ -49,8 +49,10 @@ const RECHECK: Duration = Duration::from_millis(50);
 struct State {
     max: usize,
     limit: f64,
-    /// Doubling until the first push-back.
-    slow_start: bool,
+    /// Slot units in flight (a page 3, a probe 1); the window holds
+    /// `3 x limit`.
+    units: usize,
+    /// Requests in flight.
     in_flight: usize,
     /// Answers since the last change of `limit`.
     answered: usize,
@@ -71,8 +73,8 @@ impl State {
         let now = Instant::now();
         Self {
             max: max.max(1),
-            limit: max.clamp(1, INITIAL_WINDOW) as f64,
-            slow_start: true,
+            limit: max.max(1) as f64,
+            units: 0,
             in_flight: 0,
             answered: 0,
             last_decrease: None,
@@ -86,11 +88,11 @@ impl State {
         }
     }
 
-    /// Account the time spent at the current in-flight count.
+    /// Account the time spent at the current occupancy (in slot units).
     fn tick(&mut self) {
         let now = Instant::now();
         self.in_flight_ms +=
-            self.in_flight as f64 * now.duration_since(self.last_change).as_secs_f64() * 1000.0;
+            self.units as f64 * now.duration_since(self.last_change).as_secs_f64() * 1000.0;
         self.last_change = now;
     }
 }
@@ -126,6 +128,7 @@ pub enum Kind {
 #[must_use]
 pub struct Permit<'a> {
     window: &'a Window,
+    cost: usize,
     done: bool,
 }
 
@@ -133,14 +136,14 @@ impl Permit<'_> {
     /// Release the slot and report how the request went.
     pub fn finish(mut self, outcome: Outcome) {
         self.done = true;
-        self.window.release(Some(outcome));
+        self.window.release(self.cost, Some(outcome));
     }
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         if !self.done {
-            self.window.release(None);
+            self.window.release(self.cost, None);
         }
     }
 }
@@ -150,8 +153,10 @@ impl Drop for Permit<'_> {
 pub struct WindowStats {
     pub list_requests: u64,
     pub probes: u64,
+    /// Most of the window in use at once, in slots (a page one, a probe a
+    /// third): at most `-c`.
     pub peak_concurrency: usize,
-    /// Time-weighted mean of requests in flight.
+    /// Time-weighted mean of the window in use, in slots.
     pub avg_concurrency: f64,
     /// The window at the end of the run.
     pub final_limit: usize,
@@ -170,16 +175,23 @@ impl Window {
         loop {
             {
                 let mut s = self.state.lock().unwrap();
-                if s.in_flight < (s.limit.floor() as usize).max(1) {
+                let cost = match kind {
+                    Kind::List => PAGE_UNITS,
+                    Kind::Probe => PROBE_UNITS,
+                };
+                let capacity = (s.limit.floor() as usize).max(1) * PAGE_UNITS;
+                if s.units + cost <= capacity {
                     s.tick();
+                    s.units += cost;
                     s.in_flight += 1;
-                    s.peak = s.peak.max(s.in_flight);
+                    s.peak = s.peak.max(s.units);
                     match kind {
                         Kind::List => s.list_requests += 1,
                         Kind::Probe => s.probes += 1,
                     }
                     return Permit {
                         window: self,
+                        cost,
                         done: false,
                     };
                 }
@@ -191,10 +203,11 @@ impl Window {
         }
     }
 
-    fn release(&self, outcome: Option<Outcome>) {
+    fn release(&self, cost: usize, outcome: Option<Outcome>) {
         {
             let mut s = self.state.lock().unwrap();
             s.tick();
+            s.units = s.units.saturating_sub(cost);
             s.in_flight = s.in_flight.saturating_sub(1);
             match outcome {
                 Some(Outcome::Answered(latency)) => {
@@ -205,12 +218,7 @@ impl Window {
                     });
                     s.answered += 1;
                     if s.answered >= (s.limit as usize).max(1) && s.limit < s.max as f64 {
-                        let grown = if s.slow_start {
-                            s.limit * 2.0
-                        } else {
-                            s.limit + 1.0
-                        };
-                        s.limit = grown.min(s.max as f64);
+                        s.limit = (s.limit + 1.0).min(s.max as f64);
                         s.answered = 0;
                     }
                 }
@@ -222,7 +230,6 @@ impl Window {
                         (s.latency_ms.unwrap_or(100.0) * 2.0 / 1000.0).max(0.1),
                     );
                     if s.last_decrease.is_none_or(|t| t.elapsed() >= round) {
-                        s.slow_start = false;
                         s.limit = (s.limit * DECREASE).max(1.0);
                         s.last_decrease = Some(Instant::now());
                         s.answered = 0;
@@ -273,9 +280,9 @@ impl Window {
         WindowStats {
             list_requests: s.list_requests,
             probes: s.probes,
-            peak_concurrency: s.peak,
+            peak_concurrency: s.peak.div_ceil(PAGE_UNITS),
             avg_concurrency: if elapsed_ms > 0.0 {
-                s.in_flight_ms / elapsed_ms
+                s.in_flight_ms / elapsed_ms / PAGE_UNITS as f64
             } else {
                 0.0
             },
@@ -304,8 +311,7 @@ mod tests {
     #[tokio::test]
     async fn throttles_shrink_the_window_once_per_round_trip() {
         let w = Window::new(100);
-        assert_eq!(w.limit(), 32, "slow start opens at 32");
-        w.state.lock().unwrap().limit = 100.0;
+        assert_eq!(w.limit(), 100, "opens at -c");
         w.acquire(Kind::List)
             .await
             .finish(Outcome::Answered(Duration::from_millis(30)));
@@ -316,17 +322,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         w.acquire(Kind::List).await.finish(Outcome::TimedOut);
         assert_eq!(w.limit(), 49);
-    }
-
-    #[tokio::test]
-    async fn slow_start_doubles_up_to_the_max() {
-        let w = Window::new(100);
-        for _ in 0..32 + 64 {
-            w.acquire(Kind::List)
-                .await
-                .finish(Outcome::Answered(Duration::from_millis(5)));
-        }
-        assert_eq!(w.limit(), 100, "32 -> 64 -> 100 in two windows of answers");
     }
 
     #[tokio::test]
@@ -344,9 +339,14 @@ mod tests {
 
     #[tokio::test]
     async fn requests_past_the_window_wait() {
+        // Two slots: one page and three probes fill them.
         let w = std::sync::Arc::new(Window::new(2));
         let a = w.acquire(Kind::List).await;
-        let _b = w.acquire(Kind::Probe).await;
+        let _probes = [
+            w.acquire(Kind::Probe).await,
+            w.acquire(Kind::Probe).await,
+            w.acquire(Kind::Probe).await,
+        ];
         let waiting = {
             let w = w.clone();
             tokio::spawn(async move {
@@ -364,7 +364,7 @@ mod tests {
         let stats = w.stats();
         assert_eq!(
             (stats.list_requests, stats.probes, stats.peak_concurrency),
-            (2, 1, 2)
+            (2, 3, 2)
         );
     }
 
