@@ -169,6 +169,25 @@ impl SegmentControl {
             && !self.unsplittable.load(Ordering::Relaxed)
     }
 
+    /// Hand the segment cuts found outside its own probes (startup discovery
+    /// that finished after the segment started): accepted at its next page
+    /// boundary like a probe's, those behind its cursor dropped.  Returns
+    /// whether any cut lies inside the current range.  A segment with a
+    /// probe in flight keeps that probe's proposal.
+    pub(super) fn propose_cuts(&self, cuts: &[String]) -> bool {
+        let end = self.current_end();
+        let inside: Vec<String> = cuts
+            .iter()
+            .filter(|c| end.as_deref().is_none_or(|e| c.as_str() < e))
+            .cloned()
+            .collect();
+        if inside.is_empty() || self.splitting.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        *self.pending_split.lock().unwrap() = Some(inside);
+        true
+    }
+
     /// Called at a page boundary by the segment task.  Accepts the pending
     /// cuts that are still strictly ahead of the cursor and inside the
     /// current range (the rest are discarded): the segment ends at the first,

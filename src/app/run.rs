@@ -350,15 +350,23 @@ async fn open_s3_output(
     }
 }
 
-/// Startup boundaries of a list run (none when resuming or not splitting).
-async fn list_boundaries(contexts: &Contexts<'_>, region: &str) -> core::KeySpaceHints {
+/// The segments a list run starts with, and the startup discovery still to
+/// come: a checkpoint's ranges when resuming; otherwise one segment over
+/// the whole range that lists at once, while discovery runs alongside and
+/// hands its boundaries to the reactor as cuts (`LateBoundaries`). Waiting
+/// for discovery first cost 6 to 17 round trips before the first object —
+/// about half the run for a bucket of a million keys.
+fn list_partition(
+    contexts: &Contexts<'_>,
+    region: &str,
+) -> (core::KeySpaceHints, Option<tasks_s3::LateBoundaries>) {
     let job = contexts.job;
     if let Some(cp) = &job.resume_from {
         info!("Resuming: {} key range(s) left to list", cp.remaining.len());
-        return core::KeySpaceHints::from_ranges(&cp.remaining);
+        return (core::KeySpaceHints::from_ranges(&cp.remaining), None);
     }
     if job.partitioning().0 != "startup_discovery" {
-        return core::KeySpaceHints::new_from(&[]);
+        return (core::KeySpaceHints::new_from(&[]), None);
     }
     let client = core::build_s3_client(
         contexts.sdk,
@@ -366,25 +374,36 @@ async fn list_boundaries(contexts: &Contexts<'_>, region: &str) -> core::KeySpac
         job.source.endpoint.as_deref(),
         job.source.path_style,
     );
+    let bucket = job.source.url.bucket.clone();
+    let prefix = job.source.url.prefix.clone();
+    let cfg = contexts.cfg.clone();
+    let g_state = contexts.g_state.clone();
+    let max_keys = job.max_keys;
     // Runtime splitting covers skew, so one flat boundary per worker is
     // enough; spare boundaries would only cost probes.
     let concurrency = job.concurrency;
-    let boundaries = startup::startup_boundaries(
-        &client,
-        &job.source.url.bucket,
-        &job.source.url.prefix,
-        contexts.cfg,
-        job.max_keys,
-        contexts.g_state,
-        concurrency.saturating_mul(2).clamp(16, 512),
-        // One segment per slot (boundaries + 1): one more would wait for
-        // a slot and then list its whole range alone at the end of the run.
-        concurrency.saturating_sub(1).clamp(1, 64),
+    let discovery = async move {
+        let boundaries = startup::startup_boundaries(
+            &client,
+            &bucket,
+            &prefix,
+            &cfg,
+            max_keys,
+            &g_state,
+            concurrency.saturating_mul(2).clamp(16, 512),
+            // One segment per slot (boundaries + 1): one more would wait for
+            // a slot and then list its whole range alone at the end.
+            concurrency.saturating_sub(1).clamp(1, 255),
+        )
+        .await
+        .unwrap_or_default();
+        info!("Startup discovery: {} boundaries", boundaries.len());
+        boundaries
+    };
+    (
+        core::KeySpaceHints::new_from(&[]),
+        Some(Box::pin(discovery)),
     )
-    .await
-    .unwrap_or_default();
-    info!("Startup discovery: {} boundaries", boundaries.len());
-    core::KeySpaceHints::new_from(&boundaries)
 }
 
 async fn spawn_list(
@@ -393,7 +412,7 @@ async fn spawn_list(
     region: &str,
 ) -> ResumeSlot {
     let job = contexts.job;
-    let hints = list_boundaries(contexts, region).await;
+    let (hints, late) = list_partition(contexts, region);
     let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(contexts.cfg.channel.capacity);
     let task_ctx = contexts.side(
         &job.source,
@@ -405,7 +424,7 @@ async fn spawn_list(
     let prefix = job.source.url.prefix.clone();
     let concurrency = job.concurrency;
     set.spawn(async move {
-        tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints).await
+        tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints, late).await
     });
 
     let data_ctx = core::DataMapContext::new(rx, contexts.g_state.clone());
@@ -437,42 +456,39 @@ async fn spawn_diff(
     target_region: &str,
 ) {
     let job = contexts.job;
-    let side_bounds = |side: &SideSpec, region: &str| {
+    // Each side lists from its first key at once, as one segment; its
+    // startup discovery runs alongside and splits that segment when it
+    // returns (the children are linked in key order, as runtime splits are).
+    let side_discovery = |side: &SideSpec, region: &str, name: &'static str| {
         let side = side.clone();
         let region = region.to_string();
-        async move {
-            startup::diff_side_boundaries(
+        let cfg = contexts.cfg.clone();
+        let sdk = contexts.sdk.clone();
+        let g_state = contexts.g_state.clone();
+        let (no_auto_hints, max_keys) = (job.no_auto_hints, job.max_keys);
+        let discovery: tasks_s3::LateBoundaries = Box::pin(async move {
+            let bounds = startup::diff_side_boundaries(
                 &side.url.bucket,
                 Some(&region),
                 side.endpoint.as_deref(),
                 &side.url.prefix,
-                contexts.cfg,
-                job.no_auto_hints,
+                &cfg,
+                no_auto_hints,
                 "",
-                job.max_keys,
-                contexts.sdk,
-                contexts.g_state,
+                max_keys,
+                &sdk,
+                &g_state,
             )
-            .await
-        }
+            .await;
+            info!("Diff segments: {} {}", name, bounds.len() + 1);
+            bounds
+        });
+        discovery
     };
-    let (left_bounds, right_bounds) = tokio::join!(
-        side_bounds(&job.source, source_region),
-        side_bounds(target, target_region)
-    );
-    info!(
-        "Diff segments: left {}, right {}",
-        left_bounds.len() + 1,
-        right_bounds.len() + 1
-    );
-    let left_order = Arc::new(SegmentOrder::new(
-        left_bounds.len() + 1,
-        tasks_s3::DIFF_SEGMENT_CHANNEL_CAP,
-    ));
-    let right_order = Arc::new(SegmentOrder::new(
-        right_bounds.len() + 1,
-        tasks_s3::DIFF_SEGMENT_CHANNEL_CAP,
-    ));
+    let left_discovery = side_discovery(&job.source, source_region, "left");
+    let right_discovery = side_discovery(target, target_region, "right");
+    let left_order = Arc::new(SegmentOrder::new(1, tasks_s3::DIFF_SEGMENT_CHANNEL_CAP));
+    let right_order = Arc::new(SegmentOrder::new(1, tasks_s3::DIFF_SEGMENT_CHANNEL_CAP));
     // Each segment task takes its own sender from the order.
     let (placeholder, _) = tokio::sync::mpsc::channel(1);
     let left_ctx = contexts.side(
@@ -493,7 +509,7 @@ async fn spawn_diff(
     let (left_prefix, right_prefix) = (job.source.url.prefix.clone(), target.url.prefix.clone());
     let order = left_order.clone();
     set.spawn(async move {
-        let hints = core::KeySpaceHints::new_from(&left_bounds);
+        let hints = core::KeySpaceHints::new_from(&[]);
         tasks_s3::diff_side_task(
             &left_ctx,
             &left_prefix,
@@ -501,12 +517,13 @@ async fn spawn_diff(
             hints,
             order,
             Some(left_head_rx),
+            Some(left_discovery),
         )
         .await
     });
     let order = right_order.clone();
     set.spawn(async move {
-        let hints = core::KeySpaceHints::new_from(&right_bounds);
+        let hints = core::KeySpaceHints::new_from(&[]);
         tasks_s3::diff_side_task(
             &right_ctx,
             &right_prefix,
@@ -514,6 +531,7 @@ async fn spawn_diff(
             hints,
             order,
             Some(right_head_rx),
+            Some(right_discovery),
         )
         .await
     });

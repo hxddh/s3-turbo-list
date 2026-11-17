@@ -830,9 +830,15 @@ impl RunScale {
     /// The key position `m` page spans past the first key, as a `start_after`
     /// candidate; `None` when it lies past the run's number system.
     pub(crate) fn at(&self, m: u64) -> Option<String> {
+        self.at_fraction(u128::from(m), 1)
+    }
+
+    /// The key position `num / den` page spans past the first key.
+    pub(crate) fn at_fraction(&self, num: u128, den: u128) -> Option<String> {
         let radix = self.alphabet.len() as u128;
         let mut v = (self.hi - self.lo)
-            .checked_mul(u128::from(m))?
+            .checked_mul(num)?
+            .checked_div(den.max(1))?
             .checked_add(self.lo)?;
         let mut encoded = vec![0u8; self.width];
         for slot in encoded.iter_mut().rev() {
@@ -856,6 +862,7 @@ impl RunScale {
 /// page spans past `first`; the run reaches the farthest point whose probe
 /// still finds a key under the run's scope, and ends before the next one.
 /// `None` when the keys have no numeric reading to extrapolate along.
+#[cfg(test)]
 pub(crate) async fn estimate_run_keys<F, Fut>(
     first: &str,
     last: &str,
@@ -863,6 +870,30 @@ pub(crate) async fn estimate_run_keys<F, Fut>(
     floor: &str,
     probe: &F,
 ) -> Result<Option<u64>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>, String>>,
+{
+    Ok(size_run_pages(first, last, floor, probe)
+        .await?
+        .map(|(reached, next)| {
+            // The run ends between `reached` and `next`: take the middle,
+            // geometrically.
+            let pages = ((reached * next) as f64).sqrt();
+            (page_keys.max(1) as f64 * pages) as u64
+        }))
+}
+
+/// How many page spans past `first` a flat run reaches: `(reached, next)`,
+/// the farthest point of `SIZE_POINTS` a probe still found the run at and
+/// the first one it did not (the run ends between them).  One concurrent
+/// round of probes; `None` when the keys have no numeric reading.
+pub(crate) async fn size_run_pages<F, Fut>(
+    first: &str,
+    last: &str,
+    floor: &str,
+    probe: &F,
+) -> Result<Option<(u64, u64)>, String>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<Option<String>, String>>,
@@ -883,15 +914,64 @@ where
             reached = reached.max(*m);
         }
     }
-    // The run ends between `reached` and the next point: take the middle,
-    // geometrically.
     let next = SIZE_POINTS
         .iter()
         .copied()
         .find(|&m| m > reached)
         .unwrap_or(reached * 4);
-    let pages = ((reached * next) as f64).sqrt();
-    Ok(Some((page_keys.max(1) as f64 * pages) as u64))
+    Ok(Some((reached, next)))
+}
+
+/// Up to `target` cuts of a flat run in one round, read off its scale:
+/// `4 x target` candidates spread over the `upto` page spans past `first`
+/// the run may reach (sizing's upper bound, at most four times its lower
+/// one, so at least a quarter of them fall inside the run), each probed for
+/// the first real key after it; those still in the run are thinned evenly
+/// to `target`.
+/// Every cut is a real key after `first` under the run's scope.  `None` when
+/// the keys have no numeric reading (bisect instead).
+pub(crate) async fn scale_cuts<F, Fut>(
+    first: &str,
+    last: &str,
+    floor: &str,
+    upto: u64,
+    target: usize,
+    probe: &F,
+) -> Result<Option<Vec<String>>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>, String>>,
+{
+    let Some(scale) = RunScale::new(first, last, floor) else {
+        return Ok(None);
+    };
+    if target == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    // Four candidates per cut, but no more than one round of probe permits
+    // (three per `-c` slot, at most 512) can carry.
+    let n = (target * 4).min(512) as u128;
+    let mut candidates: Vec<String> = (1..=n)
+        .filter_map(|j| scale.at_fraction(u128::from(upto.max(1)) * j, n + 1))
+        .filter(|c| c.as_str() > first)
+        .collect();
+    candidates.dedup();
+    let found = futures::future::join_all(candidates.into_iter().map(probe)).await;
+    let mut cuts: Vec<String> = Vec::new();
+    for key in found {
+        if let Some(key) = key?.filter(|k| k.as_str() > first && k.starts_with(&scale.scope)) {
+            cuts.push(key);
+        }
+    }
+    cuts.sort();
+    cuts.dedup();
+    let len = cuts.len();
+    if len > target {
+        cuts = (1..=target)
+            .map(|i| cuts[i * len / (target + 1)].clone())
+            .collect();
+    }
+    Ok(Some(cuts))
 }
 
 #[cfg(test)]
