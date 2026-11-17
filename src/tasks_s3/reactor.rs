@@ -182,11 +182,14 @@ async fn flat_reactor_task(
                     }
                 }
             }
-            let control = Arc::new(if from_hints {
-                SegmentControl::new(end)
-            } else {
-                SegmentControl::new_child(end)
-            });
+            let control = Arc::new(
+                if from_hints {
+                    SegmentControl::new(end)
+                } else {
+                    SegmentControl::new_child(end)
+                }
+                .starting_at(&start),
+            );
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
             ctx.g_state.inc_segments_started();
@@ -325,7 +328,7 @@ async fn flat_reactor_task(
                 for (index, control) in &controls {
                     if allow_split && control.propose_cuts(&bounds) {
                         cut += 1;
-                        for mut child in control.try_accept_split() {
+                        for mut child in control.accept_split_now() {
                             child.parent = *index;
                             children.push(child);
                         }

@@ -344,6 +344,10 @@ async fn flat_list(
 
                 // The segment boundary is re-read each page so a runtime
                 // split (which shrinks end_before) takes effect immediately.
+                // Reading it, trimming the page to it and advancing the
+                // cursor happen under `shaping`, which a cut accepted from
+                // outside the task waits for.
+                let shaping = control.shaping();
                 let until = control.current_end();
 
                 // Either path moves each key's String into the batch; the
@@ -410,6 +414,7 @@ async fn flat_list(
                         let _ = tx.send(child);
                     }
                 }
+                drop(shaping);
 
                 // Send batch to data_map via bounded channel.
                 if !batch.is_empty() {
@@ -780,6 +785,8 @@ async fn versions_list(
 
         let mut batch = std::mem::take(&mut held);
         batch.append(&mut rows);
+        // See `flat_list`: end, trim and cursor under `shaping`.
+        let shaping = control.shaping();
         let until = control.current_end();
         let mut ended = false;
         if let Some(end) = until.as_deref()
@@ -820,6 +827,7 @@ async fn versions_list(
                 let _ = tx.send(child);
             }
         }
+        drop(shaping);
         if !batch.is_empty() {
             if let Err(e) = ctx.data_map_channel.send(batch).await {
                 return Err(FlatRuntimeError::new(

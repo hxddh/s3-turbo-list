@@ -53,7 +53,14 @@ pub(super) type SplitSender = tokio::sync::mpsc::UnboundedSender<SplitRange>;
 /// Shared state between the reactor and one running segment.
 pub(super) struct SegmentControl {
     /// Last fully processed key; written by the segment task once per page.
+    /// Starts at the segment's start, so a cut can never land before it.
     cursor: Mutex<String>,
+    /// Held by the segment task while it reads its end, trims a page to it
+    /// and advances its cursor, and by anyone accepting a cut from outside
+    /// the task (`accept_split_now`): a cut accepted in between would leave
+    /// the page trimmed at the old end, its rows past the cut listed again
+    /// by the child.
+    shaping: Mutex<()>,
     /// Upper boundary (exclusive start of the next segment); shrunk on split.
     end_before: Mutex<Option<String>>,
     /// Cuts proposed by the reactor's probe (ascending), awaiting the
@@ -84,6 +91,25 @@ impl SegmentControl {
         Self::with_min_pages(end, SPLIT_MIN_PAGES)
     }
 
+    /// The control of a segment whose range starts after `start`: its cursor
+    /// starts there.
+    pub(super) fn starting_at(self, start: &str) -> Self {
+        start.clone_into(&mut self.cursor.lock().unwrap());
+        self
+    }
+
+    /// The segment task's page-shaping section (see `shaping`).
+    pub(super) fn shaping(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.shaping.lock().unwrap()
+    }
+
+    /// `try_accept_split` from outside the segment task: waits while the
+    /// task is shaping a page, so the cut applies to the next one whole.
+    pub(super) fn accept_split_now(&self) -> Vec<SplitRange> {
+        let _shaping = self.shaping();
+        self.try_accept_split()
+    }
+
     /// The control of a runtime-split child (see `SPLIT_CHILD_MIN_PAGES`).
     pub(super) fn new_child(end: Option<String>) -> Self {
         Self::with_min_pages(end, SPLIT_CHILD_MIN_PAGES)
@@ -92,6 +118,7 @@ impl SegmentControl {
     fn with_min_pages(end: Option<String>, min_pages: u32) -> Self {
         Self {
             cursor: Mutex::new(String::new()),
+            shaping: Mutex::new(()),
             end_before: Mutex::new(end),
             pending_split: Mutex::new(None),
             pages: AtomicU32::new(0),
@@ -535,7 +562,7 @@ pub(super) fn maybe_start_split_probes(
                     // trimmed at the new end when it arrives. (If the segment
                     // reaches a page boundary first, it takes the proposal
                     // itself and this finds nothing.)
-                    for mut child in control.try_accept_split() {
+                    for mut child in control.accept_split_now() {
                         child.parent = index;
                         info!(
                             "Segment {} accepted runtime split at '{}'",
@@ -612,6 +639,39 @@ mod tests {
         // A finished probe's reservation no longer counts.
         controls[&0].splitting.store(false, Ordering::Relaxed);
         assert_eq!(unreserved_slots(&controls, 8), 8);
+    }
+
+    #[test]
+    fn test_cuts_before_a_segment_start_are_dropped_before_its_first_page() {
+        // A child (m, z] that has not listed a page yet: startup cuts below
+        // its start would re-list its parent's range.
+        let control = SegmentControl::new_child(Some("z".into())).starting_at("m");
+        control.splitting.store(true, Ordering::Relaxed);
+        *control.pending_split.lock().unwrap() = Some(vec!["b".into(), "f".into(), "p".into()]);
+        let children = control.accept_split_now();
+        let starts: Vec<&str> = children.iter().map(|c| c.start.as_str()).collect();
+        assert_eq!(starts, ["p"]);
+        assert_eq!(control.current_end().as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn test_outside_cuts_wait_for_the_page_being_shaped() {
+        let control = Arc::new(SegmentControl::new(Some("z".into())).starting_at("a"));
+        control.splitting.store(true, Ordering::Relaxed);
+        *control.pending_split.lock().unwrap() = Some(vec!["m".into()]);
+        let shaping = control.shaping();
+        let accepter = {
+            let control = Arc::clone(&control);
+            std::thread::spawn(move || control.accept_split_now().len())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!accepter.is_finished(), "the cut waits for the page");
+        // The page is trimmed at the end it read, and the cursor moves on.
+        assert_eq!(control.current_end().as_deref(), Some("z"));
+        control.record_page("c");
+        drop(shaping);
+        assert_eq!(accepter.join().unwrap(), 1);
+        assert_eq!(control.current_end().as_deref(), Some("m"));
     }
 
     #[test]
