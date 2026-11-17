@@ -1,38 +1,39 @@
 //! Partitioning probes (startup discovery, bisection, runtime split probes):
-//! one bounded, watchdogged ListObjectsV2 request each.
+//! one bounded ListObjectsV2 request each.
 //!
-//! Probes share one process-wide limit, set from the run's concurrency, so a
-//! QPS-limited bucket is not hit with hundreds of probes at startup on top of
-//! the listing. A throttled probe is retried once after a short pause; any
-//! other failure is returned (callers treat a failed probe as "no cut here",
-//! which only costs parallelism, never correctness).
+//! Probes take their slot from the run's request window (`crate::window`),
+//! like listing pages, so they count against the same budget and feed the
+//! same signals. A probe is optional work: it gives up after a few typical
+//! latencies (`Window::probe_deadline`) instead of holding a whole round of
+//! discovery back, and its caller goes on without it. A throttled probe is
+//! retried once after a short pause; any other failure is returned (callers
+//! treat a failed probe as "no cut here", which only costs parallelism,
+//! never correctness).
 
+use crate::window::{Kind, Outcome};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use std::future::Future;
-use std::sync::OnceLock;
-use std::time::Duration;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
-/// Upper bound on concurrent probes (and the limit when the run set none).
-const DEFAULT_PROBE_CONCURRENCY: usize = 512;
 /// Pause before retrying a throttled probe.
 const THROTTLE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-static PROBE_PERMITS: OnceLock<Semaphore> = OnceLock::new();
+static TRACE: OnceLock<Arc<dyn crate::trace::S3TraceWriter>> = OnceLock::new();
 
-/// Set the probe limit from the run's concurrency (once, before the first
-/// probe): three probes per listing slot. Probes are single-key or
-/// single-page requests and startup bisection wants many at once; tying them
-/// to `-c` still keeps a deliberately low `-c` gentle on the endpoint.
-pub fn set_concurrency(concurrency: usize) {
-    let limit = concurrency
-        .saturating_mul(3)
-        .clamp(1, DEFAULT_PROBE_CONCURRENCY);
-    let _ = PROBE_PERMITS.set(Semaphore::new(limit));
+/// Record probes in the run's trace (`--trace`) as `Probe` events.
+pub fn set_trace(writer: Arc<dyn crate::trace::S3TraceWriter>) {
+    let _ = TRACE.set(writer);
 }
 
-fn permits() -> &'static Semaphore {
-    PROBE_PERMITS.get_or_init(|| Semaphore::new(DEFAULT_PROBE_CONCURRENCY))
+fn trace(latency: Duration, status: u16, error: Option<String>) {
+    if let Some(writer) = TRACE.get() {
+        let mut event = crate::trace::S3CompatEvent::new("Probe", "", "", "");
+        event.latency_ms = latency.as_millis() as u64;
+        event.http_status = status;
+        event.s3_error_code = error;
+        writer.write_event(event);
+    }
 }
 
 fn is_throttle<E: ProvideErrorMetadata, R>(
@@ -60,19 +61,46 @@ where
         >,
     >,
 {
-    let watchdog = Duration::from_secs(timeout_secs.max(1));
+    let window = crate::window::global();
+    let floor = Duration::from_secs(timeout_secs.max(1));
     for attempt in 0..2 {
-        let result = {
-            let _permit = permits().acquire().await.map_err(|e| e.to_string())?;
-            tokio::time::timeout(watchdog, make()).await
-        };
+        let permit = window.acquire(Kind::Probe).await;
+        let deadline = window.probe_deadline(floor);
+        let timeout = window.timeout(floor);
+        let started = Instant::now();
+        let result = tokio::time::timeout(deadline, make()).await;
+        let latency = started.elapsed();
         match result {
-            Err(_) => return Err("probe timed out".to_string()),
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(err)) if attempt == 0 && is_throttle(&err) => {
-                tokio::time::sleep(THROTTLE_RETRY_DELAY).await;
+            Err(_) => {
+                // Past the probe deadline: a congestion signal only when it
+                // was the full request timeout too.
+                permit.finish(if deadline >= timeout {
+                    Outcome::TimedOut
+                } else {
+                    Outcome::Abandoned
+                });
+                trace(latency, 0, Some("ProbeDeadline".into()));
+                return Err("probe gave up waiting".to_string());
             }
-            Ok(Err(err)) => return Err(crate::error::concise_sdk_error(&err)),
+            Ok(Ok(value)) => {
+                permit.finish(Outcome::Answered(latency));
+                trace(latency, 200, None);
+                return Ok(value);
+            }
+            Ok(Err(err)) if is_throttle(&err) => {
+                permit.finish(Outcome::Throttled);
+                trace(latency, 503, err.code().map(str::to_string));
+                if attempt == 0 {
+                    tokio::time::sleep(THROTTLE_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(crate::error::concise_sdk_error(&err));
+            }
+            Ok(Err(err)) => {
+                permit.finish(Outcome::Answered(latency));
+                trace(latency, 0, err.code().map(str::to_string));
+                return Err(crate::error::concise_sdk_error(&err));
+            }
         }
     }
     Err("probe throttled".to_string())

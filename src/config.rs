@@ -30,7 +30,7 @@ impl Default for S3Config {
             max_attempts: 10,
             initial_backoff_secs: 1,
             connect_timeout_secs: 60,
-            operation_timeout_secs: 5,
+            operation_timeout_secs: 10,
             endpoint_url: None,
             force_path_style: false,
         }

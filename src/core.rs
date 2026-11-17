@@ -1031,22 +1031,22 @@ impl S3TaskContext {
             // real error reaches the segment loop, which classifies it, counts
             // it, and backs off.
             .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(1))
-            .timeout_config(
+            // The run's own timeouts (`window::Window::timeout`: ten typical
+            // latencies, at least `operation_timeout_secs`, at most a
+            // minute) decide when a request has taken too long; the SDK's
+            // are only a backstop at that ceiling.
+            .timeout_config({
+                let ceiling =
+                    std::time::Duration::from_secs(s3_config.operation_timeout_secs.max(60));
                 aws_config::timeout::TimeoutConfigBuilder::new()
                     .connect_timeout(std::time::Duration::from_secs(
                         s3_config.connect_timeout_secs,
                     ))
-                    .operation_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .read_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .operation_attempt_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .build(),
-            )
+                    .operation_timeout(ceiling)
+                    .read_timeout(ceiling)
+                    .operation_attempt_timeout(ceiling)
+                    .build()
+            })
             .app_name(
                 aws_sdk_s3::config::AppName::new("s3tl")
                     .expect("static app name is a valid AppName"),
