@@ -92,7 +92,11 @@ pub(super) async fn flat_list_run_to_complete(
                     } else {
                         retry_attempt
                     };
-                    let delay = retry_backoff(ctx.initial_backoff_secs, backoff_step);
+                    let delay = if err.is_throttle() {
+                        throttle_backoff(ctx.initial_backoff_secs, backoff_step)
+                    } else {
+                        retry_backoff(ctx.initial_backoff_secs, backoff_step)
+                    };
                     debug!(
                         "Retrying from '{}' (attempt {}{}) after {:?}: {}",
                         start_after,
@@ -158,6 +162,20 @@ fn retry_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
     }
     let factor = 1u64 << attempt.min(RETRY_BACKOFF_MAX_SHIFT);
     Duration::from_secs(initial_backoff_secs.saturating_mul(factor)).min(RETRY_BACKOFF_CAP)
+}
+
+/// Pause before retrying a throttled page: 100 ms, doubling, never longer
+/// than the plain retry schedule. The request window has already shrunk the
+/// run's request rate (`crate::window`); this only spaces the segment's own
+/// retries, and the two-second first step of the plain schedule left
+/// throttled segments idle long after the endpoint had room again.
+fn throttle_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
+    if attempt == 0 || initial_backoff_secs == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 1u64 << (attempt - 1).min(RETRY_BACKOFF_MAX_SHIFT);
+    Duration::from_millis(100u64.saturating_mul(factor))
+        .min(retry_backoff(initial_backoff_secs, attempt))
 }
 
 // ── Single ListObjectsV2 continuation chain ────────────────

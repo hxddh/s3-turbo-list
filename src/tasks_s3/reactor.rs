@@ -189,6 +189,7 @@ async fn flat_reactor_task(
             });
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
+            ctx.g_state.inc_segments_started();
             let start_prefix = start_prefix.to_string();
             let task_split_tx = allow_split.then(|| split_tx.clone());
 
@@ -316,11 +317,23 @@ async fn flat_reactor_task(
                 // The listing started before its partition was known: the
                 // boundaries become cuts of whatever is running (normally
                 // the one segment started at the beginning of the range).
+                // Accepted at once, as runtime cuts are: a segment waiting
+                // on a slow first page hands the rest of the range over now
+                // (its page in flight is trimmed at its new end).
                 let mut cut = 0usize;
-                for control in controls.values() {
+                let mut children = Vec::new();
+                for (index, control) in &controls {
                     if allow_split && control.propose_cuts(&bounds) {
                         cut += 1;
+                        for mut child in control.try_accept_split() {
+                            child.parent = *index;
+                            children.push(child);
+                        }
                     }
+                }
+                for child in children {
+                    split_count += 1;
+                    link_child(child, &mut pending_children);
                 }
                 info!(
                     "Startup discovery: {} boundaries handed to {} running segment(s)",
@@ -377,6 +390,7 @@ async fn flat_reactor_task(
                         &controls,
                         idle,
                         &flat_high,
+                        &split_tx,
                         &mut probes,
                     );
                 }

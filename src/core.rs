@@ -634,6 +634,8 @@ pub struct GlobalState {
     pub quit: Arc<AtomicBool>,
     pub tracker: Arc<HttpStatusCodeTracker>,
     pub task_next_stream_timeout_count: Arc<AtomicUsize>,
+    /// Segments the run listed (startup partitions and split children).
+    pub segments_started: Arc<AtomicUsize>,
     pub s3_client_timeout_count: Arc<AtomicUsize>,
     pub s3_client_generic_error_count: Arc<AtomicUsize>,
     /// Responses the endpoint rejected for rate — `SlowDown`,
@@ -752,6 +754,7 @@ impl GlobalState {
             quit,
             tracker: Arc::new(HttpStatusCodeTracker::new()),
             task_next_stream_timeout_count: Arc::new(AtomicUsize::new(0)),
+            segments_started: Arc::new(AtomicUsize::new(0)),
             s3_client_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_generic_error_count: Arc::new(AtomicUsize::new(0)),
             throttled_count: Arc::new(AtomicUsize::new(0)),
@@ -771,6 +774,12 @@ impl GlobalState {
         self.task_rendez.wait().await;
     }
 
+    pub fn inc_segments_started(&self) {
+        self.segments_started.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn segments_started(&self) -> usize {
+        self.segments_started.load(Ordering::Relaxed)
+    }
     pub fn inc_task_next_stream_timeout(&self) {
         self.task_next_stream_timeout_count
             .fetch_add(1, Ordering::Relaxed);

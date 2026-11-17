@@ -818,6 +818,7 @@ fn finish(
             .collect();
     }
     result.output = Some(output);
+    let window = s3tl::window::global().stats();
     result.stats = Some(Stats {
         objects: data.objects,
         folders: data.folders,
@@ -826,6 +827,11 @@ fn finish(
         throttled: metrics.throttled_responses,
         timeouts: metrics.s3_client_timeouts + metrics.stream_timeouts,
         top_prefixes: data.top_prefixes.clone(),
+        requests: window.list_requests,
+        probes: window.probes,
+        segments: g_state.segments_started(),
+        avg_concurrency: (window.avg_concurrency * 10.0).round() / 10.0,
+        peak_concurrency: window.peak_concurrency,
     });
     result.diff = data.diff.clone();
     if job.mode == RunMode::List && job.output.dir().is_some() {

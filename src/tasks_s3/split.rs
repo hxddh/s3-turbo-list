@@ -2,7 +2,7 @@
 
 use crate::core::S3TaskContext;
 use crate::list_page::{FastContentsInterceptor, ParsedPageSlot};
-use log::debug;
+use log::{debug, info};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -486,6 +486,7 @@ pub(super) fn maybe_start_split_probes(
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
     flat_high: &FlatHigh,
+    split_tx: &SplitSender,
     probes: &mut tokio::task::JoinSet<()>,
 ) {
     let free = unreserved_slots(controls, idle_capacity);
@@ -501,6 +502,7 @@ pub(super) fn maybe_start_split_probes(
         let probe_ctx = ctx.clone();
         let listing_prefix = start_prefix.to_string();
         let flat_high = Arc::clone(flat_high);
+        let split_tx = split_tx.clone();
         probes.spawn(async move {
             let (cursor, end) = control.snapshot();
             if cursor.is_empty() {
@@ -526,8 +528,21 @@ pub(super) fn maybe_start_split_probes(
                     );
                     control.probe_failures.store(0, Ordering::Relaxed);
                     *control.pending_split.lock().unwrap() = Some(cuts);
-                    // The segment task clears `splitting` when it accepts or
-                    // rejects the proposal at its next page boundary.
+                    // Accepted at once, not at the segment's next page
+                    // boundary: a segment waiting on a slow page hands its
+                    // remaining range to the children now. Its page in flight
+                    // started at its cursor, before every accepted cut, and is
+                    // trimmed at the new end when it arrives. (If the segment
+                    // reaches a page boundary first, it takes the proposal
+                    // itself and this finds nothing.)
+                    for mut child in control.try_accept_split() {
+                        child.parent = index;
+                        info!(
+                            "Segment {} accepted runtime split at '{}'",
+                            index, child.start
+                        );
+                        let _ = split_tx.send(child);
+                    }
                 }
                 SplitProbe::Failed => {
                     debug!(

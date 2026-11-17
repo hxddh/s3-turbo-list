@@ -2,16 +2,18 @@
 //! endpoint, adapted to how the endpoint answers.
 //!
 //! One window, shared by every listing page and every partitioning probe,
-//! is the run's only concurrency control. It starts at `-c` and follows
+//! is the run's only concurrency control. It is capped at `-c` and follows
 //! additive-increase / multiplicative-decrease:
 //!
+//! - it opens at 32 (or `-c`) and doubles every window's worth of answers
+//!   until the endpoint first pushes back ("slow start");
 //! - a throttle (`SlowDown`, 429, ...) or a timed-out request shrinks it to
 //!   70%, at most once per round trip, so one burst of rejections counts once;
 //! - every `limit` requests answered without either grow it by one, up to
 //!   `-c` again.
 //!
-//! On an endpoint that never pushes back, the window stays at `-c`: nothing
-//! changes for it. On one with a request-rate ceiling it settles just under
+//! On an endpoint that never pushes back, the window reaches `-c` within a
+//! few round trips and stays there. On one with a request-rate ceiling it settles just under
 //! that ceiling instead of queueing and retrying above it. Segments beyond
 //! the window are cheap: they wait for a permit. Runtime splitting fills the
 //! window, not `-c`.
@@ -25,6 +27,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+/// Where the window starts (or `-c`, if smaller). Until the endpoint first
+/// pushes back it doubles every window's worth of answers ("slow start"),
+/// reaching `-c` in a few round trips; a run that opened at `-c` hit a
+/// rate-limited endpoint with its whole burst before the first rejection.
+const INITIAL_WINDOW: usize = 32;
 /// Multiplicative decrease on a throttle or timeout.
 const DECREASE: f64 = 0.7;
 /// Longest a request may take before it counts as timed out.
@@ -42,6 +49,8 @@ const RECHECK: Duration = Duration::from_millis(50);
 struct State {
     max: usize,
     limit: f64,
+    /// Doubling until the first push-back.
+    slow_start: bool,
     in_flight: usize,
     /// Answers since the last change of `limit`.
     answered: usize,
@@ -62,7 +71,8 @@ impl State {
         let now = Instant::now();
         Self {
             max: max.max(1),
-            limit: max.max(1) as f64,
+            limit: max.clamp(1, INITIAL_WINDOW) as f64,
+            slow_start: true,
             in_flight: 0,
             answered: 0,
             last_decrease: None,
@@ -195,7 +205,12 @@ impl Window {
                     });
                     s.answered += 1;
                     if s.answered >= (s.limit as usize).max(1) && s.limit < s.max as f64 {
-                        s.limit = (s.limit + 1.0).min(s.max as f64);
+                        let grown = if s.slow_start {
+                            s.limit * 2.0
+                        } else {
+                            s.limit + 1.0
+                        };
+                        s.limit = grown.min(s.max as f64);
                         s.answered = 0;
                     }
                 }
@@ -207,6 +222,7 @@ impl Window {
                         (s.latency_ms.unwrap_or(100.0) * 2.0 / 1000.0).max(0.1),
                     );
                     if s.last_decrease.is_none_or(|t| t.elapsed() >= round) {
+                        s.slow_start = false;
                         s.limit = (s.limit * DECREASE).max(1.0);
                         s.last_decrease = Some(Instant::now());
                         s.answered = 0;
@@ -288,7 +304,8 @@ mod tests {
     #[tokio::test]
     async fn throttles_shrink_the_window_once_per_round_trip() {
         let w = Window::new(100);
-        assert_eq!(w.limit(), 100);
+        assert_eq!(w.limit(), 32, "slow start opens at 32");
+        w.state.lock().unwrap().limit = 100.0;
         w.acquire(Kind::List)
             .await
             .finish(Outcome::Answered(Duration::from_millis(30)));
@@ -299,6 +316,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         w.acquire(Kind::List).await.finish(Outcome::TimedOut);
         assert_eq!(w.limit(), 49);
+    }
+
+    #[tokio::test]
+    async fn slow_start_doubles_up_to_the_max() {
+        let w = Window::new(100);
+        for _ in 0..32 + 64 {
+            w.acquire(Kind::List)
+                .await
+                .finish(Outcome::Answered(Duration::from_millis(5)));
+        }
+        assert_eq!(w.limit(), 100, "32 -> 64 -> 100 in two windows of answers");
     }
 
     #[tokio::test]
