@@ -5147,9 +5147,14 @@ fn local_mock_s3_output_stored_result_marker_with_a_lost_response_commits() {
 // ── Wide namespaces: more top-level prefixes than a page ────
 
 /// An endpoint with 100-entry pages over `keys`: startup discovery has to
-/// follow pages, and past its page budget bisect the rest.
+/// follow pages, and past its page budget bisect the rest.  Listing pages
+/// are paced so the listing (which starts before discovery's cuts arrive)
+/// cannot outrun discovery on a slow test runner.
 fn small_page_server(keys: Vec<String>) -> MockS3Server {
     MockS3Server::start(move |request, _sequence| {
+        if !is_delimiter_probe(&request) && !is_single_key_probe(&request) {
+            thread::sleep(Duration::from_millis(20));
+        }
         let mut q = request.query.clone();
         let asked: usize = q
             .get("max-keys")
