@@ -70,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.2.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.3.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
@@ -195,7 +195,7 @@ come from, in order:
 
 1. **Startup discovery**: a few delimiter probes find real prefix
    boundaries, across the whole key space even with thousands of top-level
-   prefixes.
+   prefixes. The listing starts at once and is split when they arrive.
 2. **Startup bisection**: flat namespaces (one segment per worker), large
    flat directories under too few prefixes, and whatever a prefix listing
    could not page through are partitioned by single-key probes.

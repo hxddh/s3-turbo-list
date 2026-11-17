@@ -14,7 +14,11 @@ key belongs to the segment before it and is never dropped. Every boundary is
 a real key or `CommonPrefix` the endpoint returned, never a synthetic guess,
 which is what keeps the partition exact whatever the heuristics choose.
 
-Segments come from, in order:
+A run starts listing at once, as one segment from the start of the range,
+and runs startup partitioning alongside it: when the boundaries arrive they
+become cuts of the running segment (the same path a runtime split takes),
+and a listing that finishes first does not wait for them. Segments come
+from, in order:
 
 1. **Startup structural discovery** (recursive listings). A bounded
    breadth-first set of delimiter probes (at most 3 levels deep, at most 64
@@ -38,7 +42,11 @@ Segments come from, in order:
    to seven candidates per open range per wave, all ranges concurrently).
    A flat namespace gets one segment per worker (`-c` − 1 cuts): one more
    would wait for a free worker and then list its whole range alone at the
-   end of the run. The same bisection runs *inside* prefixes when discovery
+   end of the run. Where the keys read as numbers (`obj-000000123…`, or an
+   alphanumeric run), the cuts take two rounds instead: one round of probes
+   at growing distances along the number finds how far the run reaches, and
+   one round at evenly spread positions returns the cuts. Bisection is the
+   fallback. The same bisection runs *inside* prefixes when discovery
    found large flat directories (`data/part-…` under a single `data/`) or
    files listed next to subdirectories, up to the structural target, shared
    by each run's estimated size (one round of seven probes at growing
@@ -153,6 +161,10 @@ retry or `--resume` restarts at the next whole key.
 
 `diff --compare checksum` sends one HeadObject per side only for same-size
 pairs whose ETags differ, a few dozen at a time, as the merge reaches them.
+
+The binary uses mimalloc as its allocator: a listing allocates per key and
+per request, and on the local mock it cut client CPU per page by 20–28%
+(`docs/validation-results/startup-overlap-and-cpu-20261117.md`).
 
 ListObjectsV2 pages are parsed by a fast path (`src/list_page.rs`): for an
 HTTP 200 `ListBucketResult`, the engine builds its rows from the response
