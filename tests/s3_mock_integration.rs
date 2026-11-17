@@ -542,6 +542,30 @@ fn list_bucket_xml_stable(
     .render()
 }
 
+/// A listing page over `keys` as S3 serves it: `page` keys after the
+/// request's continuation token or start-after, truncated (with the last key
+/// as the token) while more follow. Pages are delayed by `PACE`, probes are
+/// not: startup discovery, which now runs while the first segment lists,
+/// returns before the first page, so its boundaries reach a segment that is
+/// still listing and the test sees the partition it is about.
+const PACE: Duration = Duration::from_millis(120);
+
+fn paced_page(keys: &[&str], request: &RecordedRequest, page: usize, stable: bool) -> String {
+    thread::sleep(PACE);
+    let after = query(request, "continuation-token")
+        .or_else(|| query(request, "start-after"))
+        .unwrap_or("");
+    let rest: Vec<&str> = keys.iter().copied().filter(|k| *k > after).collect();
+    let truncated = rest.len() > page;
+    let contents = &rest[..rest.len().min(page)];
+    let token = contents.last().copied().filter(|_| truncated);
+    if stable {
+        list_bucket_xml_stable(contents, &[], truncated, token)
+    } else {
+        list_bucket_xml("", page as i32, contents, &[], truncated, token)
+    }
+}
+
 fn list_bucket_xml_without_key_count(
     prefix: &str,
     max_keys: i32,
@@ -1109,13 +1133,7 @@ fn local_mock_list_startup_discovery_splits_segments() {
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], children, false, None));
         }
         // Flat listing request from one of the segments.
-        let start_after = query(&request, "start-after").unwrap_or("");
-        let keys: Vec<&str> = all_keys
-            .iter()
-            .copied()
-            .filter(|key| *key > start_after)
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &keys, &[], false, None))
+        MockResponse::ok_xml(paced_page(&all_keys, &request, 1, false))
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -1140,9 +1158,19 @@ fn local_mock_list_startup_discovery_splits_segments() {
         .iter()
         .filter(|r| !r.query.contains_key("delimiter"))
         .collect();
-    // BFS probes: root, a/, b/, a/x/. Boundaries a/, a/x/, b/ → 4 segments.
+    // BFS probes: root, a/, b/, a/x/. Boundaries a/, a/x/, b/: the first
+    // segment, listing from the start meanwhile, is cut at those still ahead
+    // of it (past its first page, "a/1.txt": a/x/ and b/).
     assert_eq!(probes.len(), 4, "{:#?}", probes);
-    assert_eq!(lists.len(), 4, "{:#?}", lists);
+    let starts: Vec<&str> = lists
+        .iter()
+        .filter_map(|r| query(r, "start-after"))
+        .collect();
+    assert!(
+        starts.contains(&"a/x/") && starts.contains(&"b/"),
+        "{:#?}",
+        lists
+    );
     // Nothing but the dataset is written: no cache next to the run.
     let mut names: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -1166,18 +1194,7 @@ fn local_mock_segment_boundary_key_is_not_dropped() {
             };
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], cps, false, None));
         }
-        let contents = match query(&request, "start-after") {
-            None => vec!["a.txt", "m/"],
-            Some("m/") => vec!["z.txt"],
-            Some(other) => {
-                return MockResponse::error(
-                    500,
-                    "UnexpectedStartAfter",
-                    &format!("unexpected start-after {}", other),
-                );
-            }
-        };
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &contents, &[], false, None))
+        MockResponse::ok_xml(paced_page(&["a.txt", "m/", "z.txt"], &request, 1, false))
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -1212,19 +1229,10 @@ fn local_mock_multi_segment_boundaries_include_boundary_keys() {
             };
             return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], cps, false, None));
         }
-        let contents = match query(&request, "start-after") {
-            None => vec!["a.txt", "m/", "n.txt"],
-            Some("m/") => vec!["n.txt", "t/", "u.txt"],
-            Some("t/") => vec!["u.txt", "z.txt"],
-            Some(other) => {
-                return MockResponse::error(
-                    500,
-                    "UnexpectedStartAfter",
-                    &format!("unexpected start-after {}", other),
-                );
-            }
-        };
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &contents, &[], false, None))
+        // Pages run past segment ends (as S3's do): every boundary key
+        // must still be emitted once.
+        let keys = ["a.txt", "m/", "n.txt", "t/", "u.txt", "z.txt"];
+        MockResponse::ok_xml(paced_page(&keys, &request, 2, false))
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -1303,12 +1311,8 @@ fn local_mock_list_flat_namespace_prepartitions_at_startup() {
                 .unwrap_or_default();
             return MockResponse::ok_xml(list_bucket_xml("", 1, &first, &[], false, None));
         }
-        let page: Vec<&str> = all_keys
-            .iter()
-            .filter(|k| k.as_str() > start_after.as_str())
-            .map(String::as_str)
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml("", 1000, &page, &[], false, None))
+        let keys: Vec<&str> = all_keys.iter().map(String::as_str).collect();
+        MockResponse::ok_xml(paced_page(&keys, &request, 10, false))
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -1376,6 +1380,10 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
         let next = start_idx + page.len();
         let truncated = next < all_keys.len() && max_keys > 1;
         let token = format!("off-{}", next);
+        if max_keys > 1 {
+            // Listing pages are paced so startup discovery lands first.
+            thread::sleep(PACE);
+        }
         MockResponse::ok_xml(list_bucket_xml(
             "",
             max_keys as i32,
@@ -1417,9 +1425,11 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
         })
         .unwrap_or_else(|| panic!("startup boundary count logged: {}", stderr));
     assert_eq!(count, 7, "{}", stderr);
-    // ...each the start of one initial segment (indices 1..=count; runtime
-    // split children are numbered after them), every one a real key.
-    let mut boundaries: Vec<(u64, String)> = std::fs::read_to_string(&trace)
+    // ...each the start of one segment cut from the first (listing from the
+    // start meanwhile, it is the only segment discovery's cuts can go to;
+    // its children are numbered 1..=count, last cut first), every one a real
+    // key.
+    let mut boundaries: Vec<(String, u64)> = std::fs::read_to_string(&trace)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -1428,7 +1438,7 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
             let index = e["segment_index"].as_u64()?;
             (1..=count as u64)
                 .contains(&index)
-                .then(|| (index, e["start_after"].as_str().unwrap().to_string()))
+                .then(|| (e["start_after"].as_str().unwrap().to_string(), index))
         })
         .collect();
     boundaries.sort();
@@ -1436,7 +1446,7 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
     assert_eq!(boundaries.len(), count, "{:?}", boundaries);
     let mut positions: Vec<usize> = boundaries
         .iter()
-        .map(|(_, b)| keys.binary_search(b).expect("boundary is a real key"))
+        .map(|(b, _)| keys.binary_search(b).expect("boundary is a real key"))
         .collect();
     assert!(
         positions.windows(2).all(|w| w[0] < w[1]),
@@ -4046,17 +4056,16 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
             // Flat, and more pages to come: a side worth partitioning.
             return MockResponse::ok_xml(list_bucket_xml_stable(&[], &[], true, Some("token")));
         }
-        let contents: Vec<&str> = bucket_keys
-            .iter()
-            .copied()
-            .filter(|k| *k > start_after.as_str())
-            .take(if is_single_key_probe(&request) {
-                1
-            } else {
-                1000
-            })
-            .collect();
-        MockResponse::ok_xml(list_bucket_xml_stable(&contents, &[], false, None))
+        if is_single_key_probe(&request) {
+            let first: Vec<&str> = bucket_keys
+                .iter()
+                .copied()
+                .filter(|k| *k > start_after.as_str())
+                .take(1)
+                .collect();
+            return MockResponse::ok_xml(list_bucket_xml_stable(&first, &[], false, None));
+        }
+        MockResponse::ok_xml(paced_page(bucket_keys, &request, 1, true))
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -4090,7 +4099,8 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
     );
 
     let requests = server.requests();
-    // Left side lists two segments: one chain from the start, one from m/.
+    // Left side lists two segments: one chain from the start (its later
+    // pages follow the continuation token), one cut off at m/.
     let left_lists: Vec<_> = requests
         .iter()
         .filter(|r| {
@@ -4099,7 +4109,12 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
                 && !is_single_key_probe(r)
         })
         .collect();
-    assert_eq!(left_lists.len(), 2, "{:#?}", left_lists);
+    let starts: Vec<Option<&str>> = left_lists
+        .iter()
+        .filter(|r| !r.query.contains_key("continuation-token"))
+        .map(|r| query(r, "start-after"))
+        .collect();
+    assert_eq!(starts.len(), 2, "{:#?}", left_lists);
     assert!(left_lists.iter().any(|r| query(r, "start-after").is_none()));
     assert!(
         left_lists
@@ -5202,4 +5217,30 @@ fn local_mock_wide_namespace_diff_matches_key_for_key() {
     let paired =
         result["diff"]["equal"].as_u64().unwrap() + result["diff"]["changed"].as_u64().unwrap();
     assert_eq!(paired as usize, right.len());
+}
+
+#[test]
+fn local_mock_listing_does_not_wait_for_startup_discovery() {
+    // Startup discovery runs alongside the listing: a slow probe no longer
+    // delays the first object, and a listing that finishes first ends the
+    // run without waiting for it.
+    let server = MockS3Server::start(|request, _sequence| {
+        if is_delimiter_probe(&request) || is_single_key_probe(&request) {
+            thread::sleep(Duration::from_secs(3));
+            return MockResponse::ok_xml(list_bucket_xml("", 1000, &[], &["a/"], false, None));
+        }
+        MockResponse::ok_xml(list_bucket_xml("", 1000, &["a/1", "a/2"], &[], false, None))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let args = cli(&server, "list", &["s3://mock-bucket", "-o", "-"]);
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("S3TL_TIMEOUT_SECS", "10")]);
+    assert_eq!(code, 0, "{}", stderr);
+    assert_eq!(ndjson_keys(&stdout), vec!["a/1", "a/2"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the run waited for discovery: {:?}",
+        started.elapsed()
+    );
 }

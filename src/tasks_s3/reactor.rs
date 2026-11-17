@@ -30,13 +30,18 @@ struct SegmentOutcome {
 
 // ── Public entry point ─────────────────────────────────────
 
+/// Startup boundaries still being discovered while the listing runs: when
+/// they arrive they become cuts of the running segments.
+pub type LateBoundaries = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
+
 pub async fn flat_list_main_task(
     ctx: &S3TaskContext,
     start_prefix: &str,
     flat_concurrency: usize,
     hints: KeySpaceHints,
+    late: Option<LateBoundaries>,
 ) {
-    flat_reactor_task(ctx, start_prefix, flat_concurrency, hints, None, None).await
+    flat_reactor_task(ctx, start_prefix, flat_concurrency, hints, None, None, late).await
 }
 
 /// Upper bound on concurrently listing segments per diff side.
@@ -58,6 +63,7 @@ pub async fn diff_side_task(
     hints: KeySpaceHints,
     order: Arc<SegmentOrder>,
     merge_head: Option<tokio::sync::watch::Receiver<usize>>,
+    late: Option<LateBoundaries>,
 ) {
     flat_reactor_task(
         ctx,
@@ -66,6 +72,7 @@ pub async fn diff_side_task(
         hints,
         Some(order),
         merge_head,
+        late,
     )
     .await
 }
@@ -79,8 +86,11 @@ async fn flat_reactor_task(
     mut hints: KeySpaceHints,
     order: Option<Arc<SegmentOrder>>,
     mut merge_head: Option<tokio::sync::watch::Receiver<usize>>,
+    mut late: Option<LateBoundaries>,
 ) {
     // However the reactor ends, a merge waiting on this side is released.
+    // Startup discovery still running (`late`) is dropped with the reactor:
+    // a listing that finishes first does not wait for it.
     let _seal = order.as_deref().map(SealOnDrop);
     ctx.start();
     ctx.g_state.wait_to_start().await;
@@ -293,6 +303,28 @@ async fn flat_reactor_task(
                     merge_head = None;
                 }
             },
+            bounds = async {
+                match late.as_mut() {
+                    Some(discovery) => discovery.await,
+                    None => std::future::pending().await,
+                }
+            }, if late.is_some() => {
+                late = None;
+                // The listing started before its partition was known: the
+                // boundaries become cuts of whatever is running (normally
+                // the one segment started at the beginning of the range).
+                let mut cut = 0usize;
+                for control in controls.values() {
+                    if allow_split && control.propose_cuts(&bounds) {
+                        cut += 1;
+                    }
+                }
+                info!(
+                    "Startup discovery: {} boundaries handed to {} running segment(s)",
+                    bounds.len(),
+                    cut
+                );
+            },
             _ = split_check.tick() => {
                 let now = core::epoch_secs();
                 if now - last_ts >= core::DEFAULT_TASK_HEARTBEAT_INTERVAL_SECS {
@@ -320,7 +352,10 @@ async fn flat_reactor_task(
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,
                 // and its children list that range in parallel.
+                // While startup discovery runs, its boundaries are the cuts
+                // to wait for: runtime probes would cut the same range blind.
                 if allow_split
+                    && late.is_none()
                     && set.len() < cap
                     && pending_children.is_empty()
                     && (held.is_some() || hints.is_empty())
