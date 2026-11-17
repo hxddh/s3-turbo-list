@@ -25,7 +25,7 @@ meaning.
 | 1 | internal | `internal.error`, `internal.panic` | A bug; report it. |
 | 2 | usage | `usage.*` | Fix the command line; rerunning unchanged fails again. |
 | 3 | setup | `auth.*`, `config.*`, `endpoint.*` | Fix credentials, bucket, region or endpoint. |
-| 4 | retryable | `net.*` | Retry later, or with a lower `-c`. |
+| 4 | retryable | `net.*` | Retry later. |
 | 5 | output | `output.*` | Fix the output location (space, permissions, closed pipe). |
 | 130 | interrupted | `interrupted` | `list -o DIR`: rerun with `--resume` (an `-o s3://` run: rerun). |
 
@@ -84,6 +84,11 @@ Every key below is always present; `null` means "does not apply".
 | `throttled` | requests the endpoint rejected for rate (`SlowDown`, 429, …) |
 | `timeouts` | requests that timed out and were retried |
 | `top_prefixes` | the 10 directories (key prefix up to the last `/`) with the most objects: `[{prefix, objects, bytes}]` |
+| `requests` | listing requests sent (pages, retries included) |
+| `probes` | partitioning probes sent (startup discovery and runtime splits) |
+| `segments` | segments listed (startup partitions and split children) |
+| `avg_concurrency` | requests in flight on average over the run |
+| `peak_concurrency` | most requests in flight at once (at most `-c`) |
 
 `diff`: `{left_only, right_only, changed, equal, verified_equal,
 unverified}` — key counts. `verified_equal` (included in `equal`) and
@@ -185,9 +190,10 @@ s3tl list s3://b/p/ -o run/ --dry-run | jq .plan
 
 ## Trace events (`--trace`)
 
-One JSON object per line, per listing request (startup and split
-probes are not traced): `timestamp`, `operation` (`ListObjectsV2`, or
-`ListObjectVersions` with `--versions`), `endpoint_url` (redacted),
+One JSON object per line, per listing request: `timestamp`, `operation`
+(`ListObjectsV2`, or `ListObjectVersions` with `--versions`; `Probe` for a
+partitioning probe, which carries only `latency_ms`, `http_status` and
+`s3_error_code`), `endpoint_url` (redacted),
 `region`, `addressing_style`, `bucket`, `prefix`, `delimiter` (always
 present; `""` for a recursive listing), `start_after`, `max_keys`,
 `continuation_token`, `http_status`, `s3_error_code`, `s3_error_message`,

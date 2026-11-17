@@ -75,14 +75,29 @@ itself a candidate after its first page.
   (or the listing's estimated highest key), validated by single-key probes.
 
 The segment keeps `(start, cut]` and a new child lists `(cut, end]`,
-recursively. Fan-out is **throughput-aware**: the reactor only keeps
-splitting while added concurrency still raises run-wide page throughput, so
-a bucket at its request-rate ceiling is not oversubscribed. `-c` is the upper
-bound; the effective fan-out settles at the level that saturates the bucket
-and reopens when throughput climbs again. A lowered ceiling held for three
-seconds with every slot busy and the rate flat is raised by half to try
-again (and lowered back if that does not help), so one noisy sample cannot
-pin a run at low concurrency.
+recursively. A cut takes effect as soon as it is found — the segment's page
+in flight is trimmed at its new end when it arrives — so a segment waiting on
+a slow page hands the rest of its range over at once. Splitting fills the
+request window (below), not `-c`.
+
+## The request window
+
+One window, shared by every listing page and every partitioning probe, is
+the run's only concurrency control. It is capped at `-c`:
+
+- it opens at 32 (or `-c`) and doubles with every window's worth of
+  answers until the endpoint first pushes back;
+- a throttle (`SlowDown`, 429, 503) or a timed-out request shrinks it to 70%,
+  at most once per round trip;
+- every window's worth of answers without either grows it by one again.
+
+On an endpoint that never pushes back, the window reaches `-c` within a few
+round trips and stays there. On one with a request-rate ceiling it settles
+just under the ceiling instead of queueing and retrying above it: on the
+local mock limited to 1,000 requests/s, a default run went from 9.4 s to
+about 2 s (`docs/validation-results/request-window-20261117.md`). Segments
+beyond the window are cheap — they wait for a slot. The result reports
+`stats.avg_concurrency` and `stats.peak_concurrency`.
 
 `diff` splits each side the same way. A side's segments are read by the
 merge in key order: a split child is linked right after its parent, and the
@@ -94,20 +109,27 @@ size (at most 32 × 32 pages buffered per side). A side held back by that
 lookahead still splits its running segments, including the one the merge is
 waiting on.
 
-Partitioning probes (discovery, bisection, split probes) share one
-concurrency limit, three per `-c` slot (at most 512), and a throttled probe is
-retried once after a pause. A failed probe only means "no cut there": it
-can cost parallelism, never correctness. Probes are not traced.
+Partitioning probes (discovery, bisection, split probes) take their slots
+from the same window. A probe is optional work: it gives up after four
+typical latencies (at least a second), and a probe that failed or gave up is
+a missing answer, not a failed round, so one slow request does not hold
+discovery back. Runtime splitting waits for startup discovery at most two
+seconds. Runtime probes stay within about one per eight listed pages (plus
+two per slot), and startup cuts give a sized flat run at least four pages
+per segment. A failed probe only means "no cut there": it can cost
+parallelism, never correctness. Probes appear in `--trace` as `Probe`
+events, and the result counts them (`stats.probes`).
 
 ## Requests and retries
 
 | Setting | Value | |
 |---|---:|---|
 | Retry budget | 10 | Per segment, counted in *consecutive* failures: an attempt that advances the segment refunds it. |
-| Backoff | 1 s, doubling, capped at 30 s | A throttle (`SlowDown`, 429) always pauses, even right after progress. |
-| Request timeout | 5 s | Per page; also the SDK's attempt timeout. |
+| Backoff | 1 s, doubling, capped at 30 s | For errors; an attempt that advanced retries at once. |
+| Throttle backoff | 100 ms, doubling | A throttle always pauses; the request window has already slowed the run. |
+| Request timeout | 10× the typical latency, at least 10 s, at most 60 s | Per page. |
 | Connect timeout | 60 s | |
-| Concurrency | `-c`, default 100 | Upper bound. |
+| Concurrency | `-c`, default 100 | The request window's cap. |
 | Worker threads | CPU cores | |
 
 The SDK makes one attempt per call: retries are the segment loop's own, so
@@ -136,8 +158,9 @@ Once enough segments run to saturate that rate, more `-c` only adds waiting
 workers. In third-party testing on Alibaba Cloud OSS, `-c 8` and `-c 64`
 reached the same ~50K objects/sec. AWS S3 scales request rate per key-space
 prefix, so well-distributed prefixes — which segmented listing exploits —
-reach a much higher ceiling. If the result shows `stats.throttled > 0`, a
-lower `-c` usually finishes sooner than retrying harder.
+reach a much higher ceiling. The request window finds the ceiling on its
+own; `stats.throttled > 0` with a low `stats.avg_concurrency` is the sign of
+a rate-limited bucket, and a lower `-c` changes little.
 
 ## Output pipeline
 
