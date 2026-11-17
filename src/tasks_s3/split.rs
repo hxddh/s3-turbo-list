@@ -78,6 +78,9 @@ pub(super) struct SegmentControl {
     pub(super) pages: AtomicU32,
     /// A probe or pending decision is in flight.
     splitting: AtomicBool,
+    /// Child slots that in-flight probe may fill (its cut budget); counts
+    /// against the idle budget while `splitting` is set.
+    reserved: AtomicU32,
     /// No structural boundary exists in the remaining range; do not re-probe.
     unsplittable: AtomicBool,
     /// Page count the segment must reach before its next probe.  Pushed ahead
@@ -109,6 +112,7 @@ impl SegmentControl {
             pending_split: Mutex::new(None),
             pages: AtomicU32::new(0),
             splitting: AtomicBool::new(false),
+            reserved: AtomicU32::new(0),
             unsplittable: AtomicBool::new(false),
             next_probe_page: AtomicU32::new(min_pages),
             probe_failures: AtomicU32::new(0),
@@ -549,15 +553,22 @@ fn live_pages(controls: &HashMap<usize, Arc<SegmentControl>>) -> u64 {
 /// proposal pending acceptance) count against the budget.  This fills all
 /// idle slots in a single pass while keeping probe-request cost bounded on
 /// rate-limited providers.
+/// Idle slots not yet promised to an in-flight probe: each probe holds the
+/// child slots it may fill (its cut budget, at least one).
+fn unreserved_slots(controls: &HashMap<usize, Arc<SegmentControl>>, idle_capacity: usize) -> usize {
+    let reserved: usize = controls
+        .values()
+        .filter(|c| c.splitting.load(Ordering::Relaxed))
+        .map(|c| c.reserved.load(Ordering::Relaxed).max(1) as usize)
+        .sum();
+    idle_capacity.saturating_sub(reserved)
+}
+
 fn select_split_targets(
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
 ) -> Vec<usize> {
-    let in_flight = controls
-        .values()
-        .filter(|c| c.splitting.load(Ordering::Relaxed))
-        .count();
-    let budget = idle_capacity.saturating_sub(in_flight);
+    let budget = unreserved_slots(controls, idle_capacity);
     if budget == 0 {
         return Vec::new();
     }
@@ -587,18 +598,15 @@ pub(super) fn maybe_start_split_probes(
     flat_high: &FlatHigh,
     probes: &mut tokio::task::JoinSet<()>,
 ) {
-    let in_flight = controls
-        .values()
-        .filter(|c| c.splitting.load(Ordering::Relaxed))
-        .count();
+    let free = unreserved_slots(controls, idle_capacity);
     let targets = select_split_targets(controls, idle_capacity);
     // Idle slots are shared between the probed segments: one segment alone
     // with 31 idle slots is cut into up to 16 pieces in one probe, instead
     // of doubling once per probe and page.
-    let share =
-        (idle_capacity.saturating_sub(in_flight) / targets.len().max(1)).clamp(1, SPLIT_MAX_CUTS);
+    let share = (free / targets.len().max(1)).clamp(1, SPLIT_MAX_CUTS);
     for index in targets {
         let control = Arc::clone(&controls[&index]);
+        control.reserved.store(share as u32, Ordering::Relaxed);
         control.splitting.store(true, Ordering::Relaxed);
         let probe_ctx = ctx.clone();
         let listing_prefix = start_prefix.to_string();
@@ -682,6 +690,23 @@ mod tests {
         );
         assert_eq!(control.current_end().as_deref(), Some("f"));
         assert!(!control.splitting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_in_flight_probes_hold_their_whole_cut_budget() {
+        let mut controls = HashMap::new();
+        let busy = control_with_pages(10);
+        busy.reserved.store(6, Ordering::Relaxed);
+        busy.splitting.store(true, Ordering::Relaxed);
+        controls.insert(0, busy);
+        controls.insert(1, control_with_pages(10));
+        // Six of eight idle slots belong to segment 0's probe.
+        assert_eq!(unreserved_slots(&controls, 8), 2);
+        assert_eq!(select_split_targets(&controls, 8), vec![1]);
+        assert!(select_split_targets(&controls, 6).is_empty());
+        // A finished probe's reservation no longer counts.
+        controls[&0].splitting.store(false, Ordering::Relaxed);
+        assert_eq!(unreserved_slots(&controls, 8), 8);
     }
 
     #[test]
