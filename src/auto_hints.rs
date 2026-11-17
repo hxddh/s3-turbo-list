@@ -402,6 +402,8 @@ const FLAT_BISECT_MAX_IN_FLIGHT: usize = 64;
 /// target (at most 64), so this lets twenty runs size in one round-trip
 /// while still bounding the burst.
 const FLAT_SIZING_MAX_IN_FLIGHT: usize = 256;
+/// Fewest pages startup partitioning gives a segment of a sized flat run.
+const MIN_SEGMENT_PAGES: usize = 4;
 /// Cuts one range takes per wave (one probe each, concurrently).
 const FLAT_CUTS_PER_RANGE: usize = 7;
 
@@ -649,7 +651,9 @@ fn share_budget(sizes: &[Option<u64>], page_keys: &[usize], budget: usize) -> Ve
         .iter()
         .zip(page_keys)
         .map(|(size, &page)| match size {
-            Some(size) => usize::try_from(size.div_ceil(page.max(1) as u64))
+            // At least `MIN_SEGMENT_PAGES` per segment: a cut costs probes,
+            // and a segment of a page or two spends a request on its end.
+            Some(size) => usize::try_from(size.div_ceil((page.max(1) * MIN_SEGMENT_PAGES) as u64))
                 .unwrap_or(usize::MAX)
                 .max(1),
             None => budget,
@@ -1183,11 +1187,13 @@ mod tests {
         let share = share_budget(&[Some(64_000), None, Some(64_000), Some(8_000)], &pages, 20);
         assert_eq!(share.iter().sum::<usize>(), 20);
         assert!(share[1] >= 6 && share[3] <= 1, "{share:?}");
-        // Every run capped at its pages: the total stays below the budget.
+        // Every run capped at one cut per `MIN_SEGMENT_PAGES` of its pages
+        // (at least one): the total stays below the budget.
         assert_eq!(
             share_budget(&[Some(2000), Some(3000)], &pages[..2], 64),
-            vec![2, 3]
+            vec![1, 1]
         );
+        assert_eq!(share_budget(&[Some(40_000)], &pages[..1], 64), vec![10]);
         assert_eq!(share_budget(&[Some(8000)], &pages[..1], 0), vec![0]);
     }
 
@@ -1245,7 +1251,9 @@ mod tests {
             .iter()
             .filter(|b| b.starts_with("data/leaf=07/"))
             .collect();
-        assert!(big.len() >= 35, "big leaf got {} of {budget}", big.len());
+        // Nearly all its size allows: sized at ~128 pages, one cut per
+        // `MIN_SEGMENT_PAGES` of them.
+        assert!(big.len() >= 30, "big leaf got {} of {budget}", big.len());
         // Its segments stay near the ideal size (180k / (cuts + 1)).
         let lo = keys.partition_point(|k| k.as_str() < "data/leaf=07/");
         let mut edges = vec![lo];

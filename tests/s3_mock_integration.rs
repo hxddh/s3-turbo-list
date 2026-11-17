@@ -1384,8 +1384,10 @@ fn local_mock_list_flat_suffix_heavy_namespace_partitions_evenly() {
         let truncated = next < all_keys.len() && max_keys > 1;
         let token = format!("off-{}", next);
         if max_keys > 1 {
-            // Listing pages are paced so startup discovery lands first.
-            thread::sleep(PACE);
+            // Listing pages are paced so startup discovery (a few waves of
+            // bisection probes, unpaced) lands before the first segment
+            // passes the first cut.
+            thread::sleep(PACE * 3);
         }
         MockResponse::ok_xml(list_bucket_xml(
             "",
@@ -2827,11 +2829,18 @@ fn local_mock_throttling_backs_off_and_is_reported_as_throttling() {
         !observed.is_empty(),
         "expected retries after the throttled responses"
     );
+    // The request window shrinks the run's rate; the segment's own retries
+    // are spaced from 100 ms, doubling.
     assert!(
         observed
             .iter()
-            .all(|gap| *gap >= Duration::from_millis(500)),
+            .all(|gap| *gap >= Duration::from_millis(100)),
         "a retry followed a SlowDown with no pause; gaps were {:?}",
+        observed
+    );
+    assert!(
+        observed.windows(2).all(|w| w[1] > w[0]),
+        "consecutive throttles back off further: {:?}",
         observed
     );
 }
@@ -5247,4 +5256,29 @@ fn local_mock_listing_does_not_wait_for_startup_discovery() {
         "the run waited for discovery: {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn local_mock_result_reports_requests_probes_segments_and_concurrency() {
+    let keys = wide_keys();
+    let server = small_page_server(keys.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let args = cli(&server, "list", &["s3://mock-bucket", "-c", "8"]);
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    let stats = &result["stats"];
+    let listed = server
+        .requests()
+        .iter()
+        .filter(|r| !r.query.contains_key("delimiter") && !is_single_key_probe(r))
+        .count() as u64;
+    // Every listing request is counted; the pages hold 100 keys.
+    assert_eq!(stats["requests"].as_u64().unwrap(), listed, "{stats}");
+    assert!(listed >= (keys.len() / 100) as u64, "{stats}");
+    assert!(stats["probes"].as_u64().unwrap() >= 1, "{stats}");
+    assert!(stats["segments"].as_u64().unwrap() >= 2, "{stats}");
+    let peak = stats["peak_concurrency"].as_u64().unwrap();
+    assert!((1..=8).contains(&peak), "never past -c: {stats}");
+    let avg = stats["avg_concurrency"].as_f64().unwrap();
+    assert!(avg > 0.0 && avg <= peak as f64, "{stats}");
 }

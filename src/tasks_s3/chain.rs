@@ -92,7 +92,11 @@ pub(super) async fn flat_list_run_to_complete(
                     } else {
                         retry_attempt
                     };
-                    let delay = retry_backoff(ctx.initial_backoff_secs, backoff_step);
+                    let delay = if err.is_throttle() {
+                        throttle_backoff(ctx.initial_backoff_secs, backoff_step)
+                    } else {
+                        retry_backoff(ctx.initial_backoff_secs, backoff_step)
+                    };
                     debug!(
                         "Retrying from '{}' (attempt {}{}) after {:?}: {}",
                         start_after,
@@ -160,6 +164,20 @@ fn retry_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
     Duration::from_secs(initial_backoff_secs.saturating_mul(factor)).min(RETRY_BACKOFF_CAP)
 }
 
+/// Pause before retrying a throttled page: 100 ms, doubling, never longer
+/// than the plain retry schedule. The request window has already shrunk the
+/// run's request rate (`crate::window`); this only spaces the segment's own
+/// retries, and the two-second first step of the plain schedule left
+/// throttled segments idle long after the endpoint had room again.
+fn throttle_backoff(initial_backoff_secs: u64, attempt: u32) -> Duration {
+    if attempt == 0 || initial_backoff_secs == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 1u64 << (attempt - 1).min(RETRY_BACKOFF_MAX_SHIFT);
+    Duration::from_millis(100u64.saturating_mul(factor))
+        .min(retry_backoff(initial_backoff_secs, attempt))
+}
+
 // ── Single ListObjectsV2 continuation chain ────────────────
 
 async fn flat_list(
@@ -222,8 +240,11 @@ async fn flat_list(
     let mut common_prefixes_count: usize = 0;
     let segment_start = Instant::now();
 
+    let window = crate::window::global();
     loop {
-        let timeout_dur = Duration::from_secs(ctx.operation_timeout_secs);
+        // One slot of the run's request window per page (see `window`).
+        let permit = window.acquire(crate::window::Kind::List).await;
+        let timeout_dur = window.timeout(Duration::from_secs(ctx.operation_timeout_secs));
         let page_start = Instant::now();
         let mut page_request = request.clone();
         if let Some(token) = page_token.as_deref() {
@@ -236,6 +257,7 @@ async fn flat_list(
             .send();
         let res = timeout_at(Instant::now() + timeout_dur, send).await;
         let latency_ms = page_start.elapsed().as_millis() as u64;
+        permit.finish(page_outcome(&res, page_start.elapsed()));
         let traced = TracedRequest {
             prefix,
             start_after,
@@ -322,6 +344,10 @@ async fn flat_list(
 
                 // The segment boundary is re-read each page so a runtime
                 // split (which shrinks end_before) takes effect immediately.
+                // Reading it, trimming the page to it and advancing the
+                // cursor happen under `shaping`, which a cut accepted from
+                // outside the task waits for.
+                let shaping = control.shaping();
                 let until = control.current_end();
 
                 // Either path moves each key's String into the batch; the
@@ -388,6 +414,7 @@ async fn flat_list(
                         let _ = tx.send(child);
                     }
                 }
+                drop(shaping);
 
                 // Send batch to data_map via bounded channel.
                 if !batch.is_empty() {
@@ -563,6 +590,43 @@ fn merge_by_key(
     merged
 }
 
+/// What a page request's result tells the request window.
+fn page_outcome<T, E>(
+    res: &Result<Result<T, aws_sdk_s3::error::SdkError<E>>, tokio::time::error::Elapsed>,
+    latency: Duration,
+) -> crate::window::Outcome
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use crate::window::Outcome;
+    match res {
+        Err(_) => Outcome::TimedOut,
+        Ok(Err(err)) => {
+            let status = err.raw_response().map(|r| r.status().as_u16());
+            let code = aws_sdk_s3::error::ProvideErrorMetadata::code(err);
+            if status == Some(429)
+                || status == Some(503)
+                || matches!(
+                    code,
+                    Some(
+                        "SlowDown"
+                            | "TooManyRequests"
+                            | "ThrottlingException"
+                            | "RequestLimitExceeded"
+                    )
+                )
+            {
+                Outcome::Throttled
+            } else if matches!(err, aws_sdk_s3::error::SdkError::TimeoutError(_)) {
+                Outcome::TimedOut
+            } else {
+                Outcome::Answered(latency)
+            }
+        }
+        Ok(Ok(_)) => Outcome::Answered(latency),
+    }
+}
+
 // ── ListObjectVersions chain (`list --versions`) ───────────
 
 /// Merge a page's versions and delete markers (two lists, each row with its
@@ -614,12 +678,12 @@ async fn versions_list(
         if let Some(mk) = ctx.max_keys {
             request = request.max_keys(mk);
         }
+        let window = crate::window::global();
+        let permit = window.acquire(crate::window::Kind::List).await;
+        let timeout_dur = window.timeout(Duration::from_secs(ctx.operation_timeout_secs));
         let page_start = Instant::now();
-        let res = timeout_at(
-            Instant::now() + Duration::from_secs(ctx.operation_timeout_secs),
-            request.send(),
-        )
-        .await;
+        let res = timeout_at(Instant::now() + timeout_dur, request.send()).await;
+        permit.finish(page_outcome(&res, page_start.elapsed()));
         let traced = TracedRequest {
             prefix,
             start_after,
@@ -721,6 +785,8 @@ async fn versions_list(
 
         let mut batch = std::mem::take(&mut held);
         batch.append(&mut rows);
+        // See `flat_list`: end, trim and cursor under `shaping`.
+        let shaping = control.shaping();
         let until = control.current_end();
         let mut ended = false;
         if let Some(end) = until.as_deref()
@@ -761,6 +827,7 @@ async fn versions_list(
                 let _ = tx.send(child);
             }
         }
+        drop(shaping);
         if !batch.is_empty() {
             if let Err(e) = ctx.data_map_channel.send(batch).await {
                 return Err(FlatRuntimeError::new(

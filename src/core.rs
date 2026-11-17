@@ -634,6 +634,8 @@ pub struct GlobalState {
     pub quit: Arc<AtomicBool>,
     pub tracker: Arc<HttpStatusCodeTracker>,
     pub task_next_stream_timeout_count: Arc<AtomicUsize>,
+    /// Segments the run listed (startup partitions and split children).
+    pub segments_started: Arc<AtomicUsize>,
     pub s3_client_timeout_count: Arc<AtomicUsize>,
     pub s3_client_generic_error_count: Arc<AtomicUsize>,
     /// Responses the endpoint rejected for rate — `SlowDown`,
@@ -752,6 +754,7 @@ impl GlobalState {
             quit,
             tracker: Arc::new(HttpStatusCodeTracker::new()),
             task_next_stream_timeout_count: Arc::new(AtomicUsize::new(0)),
+            segments_started: Arc::new(AtomicUsize::new(0)),
             s3_client_timeout_count: Arc::new(AtomicUsize::new(0)),
             s3_client_generic_error_count: Arc::new(AtomicUsize::new(0)),
             throttled_count: Arc::new(AtomicUsize::new(0)),
@@ -771,6 +774,12 @@ impl GlobalState {
         self.task_rendez.wait().await;
     }
 
+    pub fn inc_segments_started(&self) {
+        self.segments_started.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn segments_started(&self) -> usize {
+        self.segments_started.load(Ordering::Relaxed)
+    }
     pub fn inc_task_next_stream_timeout(&self) {
         self.task_next_stream_timeout_count
             .fetch_add(1, Ordering::Relaxed);
@@ -1031,22 +1040,22 @@ impl S3TaskContext {
             // real error reaches the segment loop, which classifies it, counts
             // it, and backs off.
             .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(1))
-            .timeout_config(
+            // The run's own timeouts (`window::Window::timeout`: ten typical
+            // latencies, at least `operation_timeout_secs`, at most a
+            // minute) decide when a request has taken too long; the SDK's
+            // are only a backstop at that ceiling.
+            .timeout_config({
+                let ceiling =
+                    std::time::Duration::from_secs(s3_config.operation_timeout_secs.max(60));
                 aws_config::timeout::TimeoutConfigBuilder::new()
                     .connect_timeout(std::time::Duration::from_secs(
                         s3_config.connect_timeout_secs,
                     ))
-                    .operation_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .read_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .operation_attempt_timeout(std::time::Duration::from_secs(
-                        s3_config.operation_timeout_secs,
-                    ))
-                    .build(),
-            )
+                    .operation_timeout(ceiling)
+                    .read_timeout(ceiling)
+                    .operation_attempt_timeout(ceiling)
+                    .build()
+            })
             .app_name(
                 aws_sdk_s3::config::AppName::new("s3tl")
                     .expect("static app name is a valid AppName"),

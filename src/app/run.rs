@@ -103,7 +103,7 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
     };
     let mut cfg = EngineConfig::from_env();
     cfg.runtime.max_concurrency = job.concurrency;
-    s3tl::probe::set_concurrency(job.concurrency);
+    s3tl::window::configure(job.concurrency);
     cfg.s3.force_path_style = job.source.path_style;
     cfg.s3.endpoint_url = job.source.endpoint.clone();
 
@@ -276,11 +276,15 @@ async fn run_listing(
         Output::S3(_) => s3_output.clone().map(PartSink::S3),
         _ => None,
     };
+    let trace = open_trace(job)?;
+    if let Some(writer) = &trace {
+        s3tl::probe::set_trace(writer.clone());
+    }
     let contexts = Contexts {
         job,
         cfg,
         sdk: &sdk,
-        trace: open_trace(job)?,
+        trace,
         g_state,
         sink,
     };
@@ -814,6 +818,7 @@ fn finish(
             .collect();
     }
     result.output = Some(output);
+    let window = s3tl::window::global().stats();
     result.stats = Some(Stats {
         objects: data.objects,
         folders: data.folders,
@@ -822,6 +827,11 @@ fn finish(
         throttled: metrics.throttled_responses,
         timeouts: metrics.s3_client_timeouts + metrics.stream_timeouts,
         top_prefixes: data.top_prefixes.clone(),
+        requests: window.list_requests,
+        probes: window.probes,
+        segments: g_state.segments_started(),
+        avg_concurrency: (window.avg_concurrency * 10.0).round() / 10.0,
+        peak_concurrency: window.peak_concurrency,
     });
     result.diff = data.diff.clone();
     if job.mode == RunMode::List && job.output.dir().is_some() {

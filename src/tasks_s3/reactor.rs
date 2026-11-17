@@ -6,8 +6,7 @@
 
 use super::chain::flat_list_run_to_complete;
 use super::split::{
-    FanOutGovernor, FlatHigh, SPLIT_CHECK_INTERVAL_MS, SegmentControl, SplitRange,
-    maybe_start_split_probes,
+    FlatHigh, SPLIT_CHECK_INTERVAL_MS, SegmentControl, SplitRange, maybe_start_split_probes,
 };
 use super::{JoinFailure, classify_join_failure};
 use crate::core;
@@ -15,7 +14,6 @@ use crate::core::{KeySpaceHints, S3TaskContext};
 use crate::segment_order::{SealOnDrop, SegmentOrder};
 use log::{error, info};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +41,9 @@ pub async fn flat_list_main_task(
 ) {
     flat_reactor_task(ctx, start_prefix, flat_concurrency, hints, None, None, late).await
 }
+
+/// Longest runtime splitting waits for startup discovery's boundaries.
+const DISCOVERY_SPLIT_GATE: Duration = Duration::from_secs(2);
 
 /// Upper bound on concurrently listing segments per diff side.
 pub const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
@@ -130,8 +131,13 @@ async fn flat_reactor_task(
     };
     let mut split_count = 0usize;
     let flat_high: FlatHigh = Arc::new(Mutex::new(None));
-    let mut retired_pages = 0u64;
-    let mut gov = FanOutGovernor::new(flat_concurrency);
+    let window = crate::window::global();
+    // Startup discovery is waited for (no runtime probes cut the same range
+    // blind) at most this long; past it, runtime splitting starts anyway.
+    let discovery_gate = tokio::time::Instant::now() + DISCOVERY_SPLIT_GATE;
+    // Probe requests the window had seen when runtime splitting began: the
+    // runtime probe budget counts from there.
+    let mut probes_at_start: Option<u64> = None;
     let mut last_ts = core::epoch_secs();
     // A persistent interval — unlike a fresh sleep per loop iteration, it
     // still fires when join/split events keep the select! busy.
@@ -176,13 +182,17 @@ async fn flat_reactor_task(
                     }
                 }
             }
-            let control = Arc::new(if from_hints {
-                SegmentControl::new(end)
-            } else {
-                SegmentControl::new_child(end)
-            });
+            let control = Arc::new(
+                if from_hints {
+                    SegmentControl::new(end)
+                } else {
+                    SegmentControl::new_child(end)
+                }
+                .starting_at(&start),
+            );
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
+            ctx.g_state.inc_segments_started();
             let start_prefix = start_prefix.to_string();
             let task_split_tx = allow_split.then(|| split_tx.clone());
 
@@ -237,9 +247,6 @@ async fn flat_reactor_task(
             joined = set.join_next() => match joined {
                 Some(Ok(outcome)) => {
                     let control = controls.remove(&outcome.index);
-                    retired_pages += control
-                        .as_ref()
-                        .map_or(0, |c| c.pages.load(Ordering::Relaxed) as u64);
                     if !outcome.completed {
                         // An unfinished segment's range is not done; keep its
                         // control for the resume ranges (not in `controls`,
@@ -313,11 +320,23 @@ async fn flat_reactor_task(
                 // The listing started before its partition was known: the
                 // boundaries become cuts of whatever is running (normally
                 // the one segment started at the beginning of the range).
+                // Accepted at once, as runtime cuts are: a segment waiting
+                // on a slow first page hands the rest of the range over now
+                // (its page in flight is trimmed at its new end).
                 let mut cut = 0usize;
-                for control in controls.values() {
+                let mut children = Vec::new();
+                for (index, control) in &controls {
                     if allow_split && control.propose_cuts(&bounds) {
                         cut += 1;
+                        for mut child in control.accept_split_now() {
+                            child.parent = *index;
+                            children.push(child);
+                        }
                     }
+                }
+                for child in children {
+                    split_count += 1;
+                    link_child(child, &mut pending_children);
                 }
                 info!(
                     "Startup discovery: {} boundaries handed to {} running segment(s)",
@@ -339,23 +358,30 @@ async fn flat_reactor_task(
                     last_ts = now;
                 }
 
-                // Track whether added concurrency is still buying throughput;
-                // the governor caps fan-out at the saturating level so a single
-                // QPS-limited bucket is not oversubscribed.
-                gov.observe(retired_pages, &controls, set.len(), flat_concurrency);
-
                 // Idle capacity and nothing queued: probe the longest-running
-                // candidates for structural split points, up to the governor's
-                // proven-useful concurrency cap, in one pass instead of one
-                // segment per tick.
-                let cap = gov.effective_cap();
+                // candidates for split points, up to the request window (the
+                // concurrency the endpoint is currently taking), in one pass.
+                let cap = window.limit().min(flat_concurrency);
+                let discovering = late.is_some() && tokio::time::Instant::now() < discovery_gate;
+                if !discovering && probes_at_start.is_none() {
+                    probes_at_start = Some(window.stats().probes);
+                }
+                // Runtime probes stay a small share of the listing's own
+                // requests: about one per eight pages, past a base of two
+                // per slot.
+                let within_budget = probes_at_start.is_none_or(|start| {
+                    let stats = window.stats();
+                    stats.probes.saturating_sub(start)
+                        <= 2 * flat_concurrency as u64 + stats.list_requests / 8
+                });
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,
                 // and its children list that range in parallel.
                 // While startup discovery runs, its boundaries are the cuts
                 // to wait for: runtime probes would cut the same range blind.
                 if allow_split
-                    && late.is_none()
+                    && !discovering
+                    && within_budget
                     && set.len() < cap
                     && pending_children.is_empty()
                     && (held.is_some() || hints.is_empty())
@@ -367,6 +393,7 @@ async fn flat_reactor_task(
                         &controls,
                         idle,
                         &flat_high,
+                        &split_tx,
                         &mut probes,
                     );
                 }

@@ -910,7 +910,14 @@ where
     let found = futures::future::join_all(points.iter().map(|(_, c)| probe(c.clone()))).await;
     let mut reached = 1u64;
     for ((m, _), key) in points.iter().zip(found) {
-        if key?.is_some_and(|k| k.starts_with(&scale.scope)) {
+        // A probe that failed or gave up says nothing: the run is sized by
+        // the points that answered (a failed probe must not hold back or
+        // void the round).
+        if key
+            .ok()
+            .flatten()
+            .is_some_and(|k| k.starts_with(&scale.scope))
+        {
             reached = reached.max(*m);
         }
     }
@@ -959,7 +966,12 @@ where
     let found = futures::future::join_all(candidates.into_iter().map(probe)).await;
     let mut cuts: Vec<String> = Vec::new();
     for key in found {
-        if let Some(key) = key?.filter(|k| k.as_str() > first && k.starts_with(&scale.scope)) {
+        // A probe that failed or gave up is a cut fewer, not a failed round.
+        if let Some(key) = key
+            .ok()
+            .flatten()
+            .filter(|k| k.as_str() > first && k.starts_with(&scale.scope))
+        {
             cuts.push(key);
         }
     }

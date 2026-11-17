@@ -5,6 +5,35 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-17
+
+### Changed
+- **One adaptive request window** paces every listing page and every
+  partitioning probe. It opens at `-c` (its cap); a throttle (`SlowDown`,
+  429, 503) or a timed-out request shrinks it to 70%, at most once per round
+  trip, and answers grow it back by one per window. It replaces the
+  throughput-sampling fan-out governor and the separate probe limit. A
+  rate-limited endpoint is listed just under its ceiling instead of above
+  it: on a mock limited to 1,000 requests/s, a default run went from 7.6 s
+  to 2.1 s (5.0x at `-c 256`) with a fifth fewer requests.
+- The page timeout is ten typical latencies, at least 10 s (was a fixed
+  5 s), at most 60 s. A throttled page is retried after 100 ms, doubling
+  (was 2 s).
+- A probe gives up after four typical latencies (at least 1 s), and a
+  failed probe is a missing answer instead of a failed round; runtime
+  splitting waits for startup discovery at most 2 s; cuts take effect when
+  found, so a segment waiting on a slow page hands over the rest of its
+  range at once. With 1% of pages taking 6 s, runs went from 20-23 s to
+  8-9 s.
+- Startup cuts give a sized flat run at least 4 pages per segment, and
+  runtime split probes stay within about one per 8 listed pages: a 100k-key
+  listing sends 39% fewer requests.
+
+### Added
+- `stats.requests`, `stats.probes`, `stats.segments`,
+  `stats.avg_concurrency` and `stats.peak_concurrency` in the result.
+- Probes appear in `--trace` as `Probe` events.
+
 ## [1.3.1] - 2026-11-17
 
 ### Changed

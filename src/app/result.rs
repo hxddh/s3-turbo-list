@@ -224,6 +224,17 @@ pub struct Stats {
     /// Requests that timed out (and were retried).
     pub timeouts: usize,
     pub top_prefixes: Vec<PrefixMetric>,
+    /// Listing requests sent (pages, retries included).
+    pub requests: u64,
+    /// Partitioning probes sent (startup discovery and runtime splits).
+    pub probes: u64,
+    /// Segments listed: startup partitions and runtime split children.
+    pub segments: usize,
+    /// Request slots in use on average over the run (time-weighted; a
+    /// listing page takes a slot, a probe a third).
+    pub avg_concurrency: f64,
+    /// Most request slots in use at once (at most `-c`).
+    pub peak_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
