@@ -1150,9 +1150,12 @@ fn local_mock_list_startup_discovery_splits_segments() {
     assert_eq!(sorted(dataset_keys(&out)), all_keys);
 
     let requests = server.requests();
+    // Startup probes carry no start-after; runtime split probes (also
+    // delimiter requests) start after a segment's cursor, and may run too
+    // once the cut segments are idle.
     let probes: Vec<_> = requests
         .iter()
-        .filter(|r| r.query.contains_key("delimiter"))
+        .filter(|r| r.query.contains_key("delimiter") && !r.query.contains_key("start-after"))
         .collect();
     let lists: Vec<_> = requests
         .iter()
@@ -4114,7 +4117,8 @@ fn local_mock_diff_lists_sides_in_parallel_segments() {
         .filter(|r| !r.query.contains_key("continuation-token"))
         .map(|r| query(r, "start-after"))
         .collect();
-    assert_eq!(starts.len(), 2, "{:#?}", left_lists);
+    // (Runtime splits may add more once the cut segments are idle.)
+    assert!(starts.len() >= 2, "{:#?}", left_lists);
     assert!(left_lists.iter().any(|r| query(r, "start-after").is_none()));
     assert!(
         left_lists
