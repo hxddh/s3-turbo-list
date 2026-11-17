@@ -70,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.1.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.2.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
@@ -194,14 +194,16 @@ Parallelism comes from listing key-space segments concurrently. Segments
 come from, in order:
 
 1. **Startup discovery**: a few delimiter probes find real prefix
-   boundaries.
-2. **Startup bisection**: flat namespaces, and large flat directories under
-   too few prefixes, are partitioned by single-key probes.
+   boundaries, across the whole key space even with thousands of top-level
+   prefixes.
+2. **Startup bisection**: flat namespaces (one segment per worker), large
+   flat directories under too few prefixes, and whatever a prefix listing
+   could not page through are partitioned by single-key probes.
 3. **Runtime splitting**: a segment that turns out to hold most of the data
-   is split while it runs, at a prefix boundary where the range has
-   structure and near the middle of its remaining keys where it is flat.
-   `diff` splits each side the same way while reading both sides in key
-   order.
+   is split while it runs — into as many pieces as there are idle workers —
+   at prefix boundaries where the range has structure and spread over its
+   remaining keys where it is flat. `diff` splits each side the same way
+   while reading both sides in key order.
 
 Fan-out is throughput-aware: it stops adding segments once the bucket is at
 its request-rate ceiling. Listings that fit in one page, and `--delimiter`

@@ -40,11 +40,13 @@ pub async fn flat_list_main_task(
 }
 
 /// Upper bound on concurrently listing segments per diff side.
-const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+pub const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
 /// Static segments a diff side may start ahead of the one the merge is
 /// reading. With the channel capacity this bounds a side's buffered batches
-/// whatever the segment count.
-const DIFF_SIDE_LOOKAHEAD_SEGMENTS: usize = 16;
+/// whatever the segment count (32 segments x 32 pages). It used to be half
+/// the side's concurrency, so a diff side ran at most 16 segments at once
+/// whatever `-c` allowed.
+const DIFF_SIDE_LOOKAHEAD_SEGMENTS: usize = DIFF_SIDE_MAX_CONCURRENCY;
 
 /// List one diff side: its static segments (`hints`), split at runtime like
 /// list mode, each segment writing to its channel in `order`. Any segment
@@ -164,7 +166,11 @@ async fn flat_reactor_task(
                     }
                 }
             }
-            let control = Arc::new(SegmentControl::new(end));
+            let control = Arc::new(if from_hints {
+                SegmentControl::new(end)
+            } else {
+                SegmentControl::new_child(end)
+            });
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
             let start_prefix = start_prefix.to_string();
@@ -311,11 +317,13 @@ async fn flat_reactor_task(
                 // proven-useful concurrency cap, in one pass instead of one
                 // segment per tick.
                 let cap = gov.effective_cap();
+                // A diff side held back by the lookahead also splits: the
+                // segments it runs then include the one the merge waits on,
+                // and its children list that range in parallel.
                 if allow_split
                     && set.len() < cap
                     && pending_children.is_empty()
-                    && held.is_none()
-                    && hints.is_empty()
+                    && (held.is_some() || hints.is_empty())
                 {
                     let idle = cap - set.len();
                     maybe_start_split_probes(

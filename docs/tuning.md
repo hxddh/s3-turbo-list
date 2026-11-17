@@ -17,11 +17,17 @@ which is what keeps the partition exact whatever the heuristics choose.
 Segments come from, in order:
 
 1. **Startup structural discovery** (recursive listings). A bounded
-   breadth-first set of delimiter probes (one page each, at most 3 levels
-   deep, at most 64 per level) finds real `CommonPrefixes` boundaries. A
-   wide tree can find far more boundaries than useful, so the set is thinned
-   to the target (two per worker), evenly spaced: every segment costs at
-   least one request, and its last page is mostly keys past its end.
+   breadth-first set of delimiter probes (at most 3 levels deep, at most 64
+   per level, spread over the level's prefixes) finds real `CommonPrefixes`
+   boundaries. The root probe follows up to 8 pages, so a bucket with
+   thousands of top-level prefixes is partitioned past the first 1,000;
+   deeper probes read one page. Whatever a probe could not page through —
+   the rest of a listing still truncated after its pages — is bisected like
+   a flat namespace (below), anchored on the last entry seen, instead of
+   being left to one segment. A wide tree can find far more boundaries than
+   useful, so the set is thinned to the target (two per worker), evenly
+   spaced: every segment costs at least one request, and its last page is
+   mostly keys past its end.
 2. **Startup bisection.** When discovery finds no structure and the listing
    spans more than one page, the key range is partitioned by `max-keys=1`
    probes. Each cut aims at the middle of its range: the candidate comes from
@@ -30,9 +36,11 @@ Segments come from, in order:
    the keys use), so long constant suffixes such as
    `obj-000000123.snappy.parquet` do not skew it. Bisection runs in waves (up
    to seven candidates per open range per wave, all ranges concurrently).
-   The same bisection runs *inside* prefixes when discovery found too little
-   structure — a flat directory (`data/part-…` under a single `data/`) or
-   files listed next to subdirectories — and the remaining budget is shared
+   A flat namespace gets one segment per worker (`-c` − 1 cuts): one more
+   would wait for a free worker and then list its whole range alone at the
+   end of the run. The same bisection runs *inside* prefixes when discovery
+   found large flat directories (`data/part-…` under a single `data/`) or
+   files listed next to subdirectories, up to the structural target, shared
    by each run's estimated size (one round of seven probes at growing
    distances along the keys' number), so a directory holding 90% of the
    keys gets most of the cuts.
@@ -46,7 +54,10 @@ Segments come from, in order:
 
 While a run lists, the reactor watches for segments that turn out to hold
 most of the remaining data. When workers are idle and nothing is queued, it
-probes the busiest segments for a split point, several at once:
+probes the busiest segments for split points, several segments at once, and
+shares the idle workers between them: a segment alone with 31 idle workers is
+cut into up to 16 pieces by one probe, not halved once per probe. A child is
+itself a candidate after its first page.
 
 - where the remaining range has structure, at a `CommonPrefix` found by a
   delimiter probe up the cursor's directory ladder;
@@ -60,14 +71,20 @@ recursively. Fan-out is **throughput-aware**: the reactor only keeps
 splitting while added concurrency still raises run-wide page throughput, so
 a bucket at its request-rate ceiling is not oversubscribed. `-c` is the upper
 bound; the effective fan-out settles at the level that saturates the bucket
-and reopens when throughput climbs again.
+and reopens when throughput climbs again. A lowered ceiling held for three
+seconds with every slot busy and the rate flat is raised by half to try
+again (and lowered back if that does not help), so one noisy sample cannot
+pin a run at low concurrency.
 
 `diff` splits each side the same way. A side's segments are read by the
 merge in key order: a split child is linked right after its parent, and the
 merge moves past a segment only once it can no longer gain children (see
 `src/segment_order.rs`). Each segment buffers at most 32 pages ahead of the
-merge, and a side starts at most 16 static segments ahead of the one being
-merged, so memory stays bounded whatever the bucket size.
+merge, and a side starts at most 32 static segments ahead of the one being
+merged (its concurrency limit), so memory stays bounded whatever the bucket
+size (at most 32 × 32 pages buffered per side). A side held back by that
+lookahead still splits its running segments, including the one the merge is
+waiting on.
 
 Partitioning probes (discovery, bisection, split probes) share one
 concurrency limit, three per `-c` slot (at most 512), and a throttled probe is

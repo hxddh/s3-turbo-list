@@ -5,5 +5,7 @@
 /// Per-segment channel capacity (batches): how far one segment may list
 /// ahead of the merge. At 4, a segment behind the merge head stalled after
 /// four pages, so a side with a few large segments listed nearly serially
-/// (one page per round trip).
+/// (one page per round trip). 16 pages ahead keeps a segment busy while the
+/// side's buffer (lookahead x capacity) stays at 512 pages with twice the
+/// lookahead (`reactor::DIFF_SIDE_LOOKAHEAD_SEGMENTS`).
 pub const DIFF_SEGMENT_CHANNEL_CAP: usize = 32;

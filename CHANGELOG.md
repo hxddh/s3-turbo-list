@@ -5,6 +5,30 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-17
+
+### Performance
+- Startup discovery covers the whole key space: the root probe follows up
+  to 8 pages of CommonPrefixes, and the rest of any listing still truncated
+  is bisected instead of becoming one segment. With 5,000 top-level
+  directories a listing went from 11.6 s to 5.4 s (local mock, 100 ms per
+  request, `-c 32`; 3.1x at `-c 100`).
+- A flat namespace is bisected into one segment per worker; the extra
+  segment used to start late and list alone at the end (7.2 s → 4.9 s).
+- Large flat directories under a few prefixes share the structural budget,
+  so each is cut into several segments.
+- Runtime splitting cuts a segment into as many pieces as there are idle
+  workers (up to 16 per probe), and split children are candidates after
+  one page.
+- `diff` runs each side at its full concurrency (32 segments): the merge
+  lookahead used to stop a side at 16, and a held side did not split
+  (diff of two 1M-key buckets: 70.4 s → 12.9 s).
+
+### Fixed
+- The fan-out governor could keep a cap lowered by one noisy window for the
+  rest of the run when the remaining segments were few and steady; it now
+  tries more concurrency after three saturated, flat windows.
+
 ## [1.1.0] - 2026-11-14
 
 ### Added
