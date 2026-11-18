@@ -1,7 +1,7 @@
 //! Partitioning probes (startup discovery, bisection, runtime split probes):
 //! one bounded ListObjectsV2 request each.
 //!
-//! Probes take their slot from the run's request window (`crate::window`),
+//! Probes take their slot from their side's request window (`crate::window`),
 //! like listing pages, so they count against the same budget and feed the
 //! same signals. A probe is optional work: it gives up after a few typical
 //! latencies (`Window::probe_deadline`) instead of holding a whole round of
@@ -16,8 +16,10 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Pause before retrying a throttled probe.
-const THROTTLE_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Pause before retrying a throttled probe: as short as a throttled page's
+/// first retry, so a round of discovery does not stall on its throttled
+/// probes (the window has already shrunk for them).
+const THROTTLE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 static TRACE: OnceLock<Arc<dyn crate::trace::S3TraceWriter>> = OnceLock::new();
 
@@ -47,7 +49,11 @@ fn is_throttle<E: ProvideErrorMetadata, R>(
 
 /// Send one probe request (`make` builds and sends it) under the shared
 /// limit, with a `timeout_secs` watchdog and one retry when throttled.
-pub async fn send<T, E, F, Fut>(timeout_secs: u64, mut make: F) -> Result<T, String>
+pub async fn send<T, E, F, Fut>(
+    window: &crate::window::Window,
+    timeout_secs: u64,
+    mut make: F,
+) -> Result<T, String>
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
     F: FnMut() -> Fut,
@@ -61,7 +67,6 @@ where
         >,
     >,
 {
-    let window = crate::window::global();
     let floor = Duration::from_secs(timeout_secs.max(1));
     for attempt in 0..2 {
         let permit = window.acquire(Kind::Probe).await;

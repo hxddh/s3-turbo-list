@@ -57,7 +57,7 @@ Options:
 | `--target-endpoint-url URL` | `diff`: the right side's endpoint, for cross-provider diffs. |
 | `--path-style` | Path-style addressing (automatic for IP and `localhost` endpoints). |
 | `--region REGION` | Signing region; defaults to the bucket's region on AWS, else `AWS_REGION`, else `us-east-1`. |
-| `-c N` | Maximum concurrent requests (default 100). An upper bound: the run backs off on its own when the endpoint throttles or slows down. |
+| `-c N` | Maximum concurrent requests per side (default 100). An upper bound: the run backs off on its own when the endpoint throttles or slows down. |
 | `--dry-run` | Print the plan as the result, without contacting S3. |
 | `--trace FILE` | Record every listing request as JSONL (`-` for stderr). |
 | `-v`, `-vv` | Progress and diagnostics on stderr. |
@@ -70,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.4.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.5.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
@@ -207,12 +207,14 @@ come from, in order:
    remaining keys where it is flat. `diff` splits each side the same way
    while reading both sides in key order.
 
-One adaptive request window, capped at `-c`, paces every request: it backs
-off when the endpoint throttles or times out and grows back when it does not,
-so a rate-limited bucket is listed just under its ceiling instead of above
-it. Listings that fit in one page, and `--delimiter` listings, are a single
-request chain. Details in
-[docs/tuning.md](docs/tuning.md).
+One adaptive request window per side, capped at `-c`, paces every request:
+it backs off when the endpoint throttles or times out and grows back when it
+does not, so a rate-limited bucket is listed just under its ceiling instead
+of above it. Partitioning takes few probes (two candidates per cut, runtime
+splits scoped to the directory they cut), and its boundaries reach the
+listing round by round. Listings that
+fit in one page, and `--delimiter` listings, are a single request chain.
+Details in [docs/tuning.md](docs/tuning.md).
 
 ## Providers
 

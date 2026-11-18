@@ -827,6 +827,27 @@ impl RunScale {
         })
     }
 
+    /// How many page spans past the first key `key` lies, along the run's
+    /// number; `None` when it is not a key of the run's scope or precedes
+    /// the first key.
+    pub(crate) fn spans_to(&self, key: &str) -> Option<f64> {
+        let tail = key.strip_prefix(self.scope.as_str())?;
+        let run = if self.alphabet.len() == 10 && self.alphabet[0] == b'0' {
+            digit_run(tail, 0)
+        } else {
+            alnum_run(tail)
+        };
+        let radix = self.alphabet.len() as u128;
+        let mut digits = run
+            .bytes()
+            .map(|b| self.alphabet.binary_search(&b).map_or(0, |i| i as u128))
+            .chain(std::iter::repeat(0));
+        let v = (0..self.width).try_fold(0u128, |acc, _| {
+            acc.checked_mul(radix)?.checked_add(digits.next()?)
+        })?;
+        (v >= self.lo).then(|| (v - self.lo) as f64 / (self.hi - self.lo) as f64)
+    }
+
     /// The key position `m` page spans past the first key, as a `start_after`
     /// candidate; `None` when it lies past the run's number system.
     pub(crate) fn at(&self, m: u64) -> Option<String> {
@@ -930,11 +951,11 @@ where
 }
 
 /// Up to `target` cuts of a flat run in one round, read off its scale:
-/// `4 x target` candidates spread over the `upto` page spans past `first`
+/// `2 x target` candidates spread over the `upto` page spans past `first`
 /// the run may reach (sizing's upper bound, at most four times its lower
-/// one, so at least a quarter of them fall inside the run), each probed for
-/// the first real key after it; those still in the run are thinned evenly
-/// to `target`.
+/// one, so at least half of `target` fall inside the run; runtime splitting
+/// covers the rest), each probed for the first real key after it; those
+/// still in the run are thinned evenly to `target`.
 /// Every cut is a real key after `first` under the run's scope.  `None` when
 /// the keys have no numeric reading (bisect instead).
 pub(crate) async fn scale_cuts<F, Fut>(
@@ -955,9 +976,9 @@ where
     if target == 0 {
         return Ok(Some(Vec::new()));
     }
-    // Four candidates per cut, but no more than one round of probe permits
-    // (three per `-c` slot, at most 512) can carry.
-    let n = (target * 4).min(512) as u128;
+    // Two candidates per cut: one round of probes, a fraction of the
+    // window's probe slots (three per slot).
+    let n = (target * 2).min(512) as u128;
     let mut candidates: Vec<String> = (1..=n)
         .filter_map(|j| scale.at_fraction(u128::from(upto.max(1)) * j, n + 1))
         .filter(|c| c.as_str() > first)
@@ -1251,6 +1272,10 @@ mod tests {
         .unwrap();
         assert_eq!(s.scope, "data/part-");
         assert_eq!(s.at(1).as_deref(), Some("data/part-000000999"));
+        // And the other way: how far along a key lies, in page spans.
+        let spans = s.spans_to("data/part-000009990").unwrap();
+        assert!((spans - 10.0).abs() < 0.01, "{spans}");
+        assert_eq!(s.spans_to("logs/part-000000001"), None);
         assert_eq!(s.at(64).as_deref(), Some("data/part-000063936"));
         // Past the digit run's width: no candidate.
         assert_eq!(s.at(10_000_000), None);

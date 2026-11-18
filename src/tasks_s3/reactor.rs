@@ -28,9 +28,54 @@ struct SegmentOutcome {
 
 // ── Public entry point ─────────────────────────────────────
 
-/// Startup boundaries still being discovered while the listing runs: when
-/// they arrive they become cuts of the running segments.
-pub type LateBoundaries = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
+/// Startup boundaries still being discovered while the listing runs. Each
+/// round of discovery hands what it found so far to `early` (the root
+/// probe's CommonPrefixes arrive a round trip in, long before the flat runs
+/// under them are cut); `done` resolves to all of them. Every batch becomes
+/// cuts of the running segments as it arrives.
+pub struct LateBoundaries {
+    early: tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+    done: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>,
+}
+
+/// Where a discovery hands its batches (see `LateBoundaries`).
+pub type EarlyBoundaries = tokio::sync::mpsc::UnboundedSender<Vec<String>>;
+
+/// What a running discovery produced next.
+enum Discovered {
+    /// A round's boundaries so far.
+    Round(Vec<String>),
+    /// Every boundary: the discovery is over.
+    Done(Vec<String>),
+}
+
+impl LateBoundaries {
+    /// The next round's boundaries, or all of them once discovery is done.
+    async fn next(&mut self) -> Discovered {
+        if !self.early.is_closed() || !self.early.is_empty() {
+            tokio::select! {
+                biased;
+                Some(bounds) = self.early.recv() => return Discovered::Round(bounds),
+                bounds = &mut self.done => return Discovered::Done(bounds),
+            }
+        }
+        Discovered::Done((&mut self.done).await)
+    }
+
+    /// A discovery that sends its batches to the sender it is given and
+    /// resolves to every boundary.
+    pub fn new<F, Fut>(discovery: F) -> Self
+    where
+        F: FnOnce(EarlyBoundaries) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>> + Send + 'static,
+    {
+        let (tx, early) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            early,
+            done: Box::pin(discovery(tx)),
+        }
+    }
+}
 
 pub async fn flat_list_main_task(
     ctx: &S3TaskContext,
@@ -131,7 +176,7 @@ async fn flat_reactor_task(
     };
     let mut split_count = 0usize;
     let flat_high: FlatHigh = Arc::new(Mutex::new(None));
-    let window = crate::window::global();
+    let window = &ctx.window;
     // Startup discovery is waited for (no runtime probes cut the same range
     // blind) at most this long; past it, runtime splitting starts anyway.
     let discovery_gate = tokio::time::Instant::now() + DISCOVERY_SPLIT_GATE;
@@ -156,7 +201,7 @@ async fn flat_reactor_task(
         // during startup discovery used to be followed by a full first fill.
         while set.len() < flat_concurrency && !ctx.is_quit() {
             let (index, start, end, from_hints) =
-                if let Some((index, child)) = pending_children.pop() {
+                if let Some((index, child)) = next_child(&mut pending_children, order.is_some()) {
                     (index, child.start, child.end, false)
                 } else if let Some(pair) = held.take().or_else(|| hints.next()) {
                     if let Some(head) = &merge_head
@@ -310,39 +355,23 @@ async fn flat_reactor_task(
                     merge_head = None;
                 }
             },
-            bounds = async {
+            event = async {
                 match late.as_mut() {
-                    Some(discovery) => discovery.await,
+                    Some(discovery) => discovery.next().await,
                     None => std::future::pending().await,
                 }
             }, if late.is_some() => {
-                late = None;
-                // The listing started before its partition was known: the
-                // boundaries become cuts of whatever is running (normally
-                // the one segment started at the beginning of the range).
-                // Accepted at once, as runtime cuts are: a segment waiting
-                // on a slow first page hands the rest of the range over now
-                // (its page in flight is trimmed at its new end).
-                let mut cut = 0usize;
-                let mut children = Vec::new();
-                for (index, control) in &controls {
-                    if allow_split && control.propose_cuts(&bounds) {
-                        cut += 1;
-                        for mut child in control.accept_split_now() {
-                            child.parent = *index;
-                            children.push(child);
-                        }
+                let bounds = match event {
+                    Discovered::Round(bounds) => bounds,
+                    Discovered::Done(bounds) => {
+                        late = None;
+                        bounds
                     }
-                }
-                for child in children {
+                };
+                for child in hand_over(&bounds, &controls, allow_split) {
                     split_count += 1;
                     link_child(child, &mut pending_children);
                 }
-                info!(
-                    "Startup discovery: {} boundaries handed to {} running segment(s)",
-                    bounds.len(),
-                    cut
-                );
             },
             _ = split_check.tick() => {
                 let now = core::epoch_secs();
@@ -367,12 +396,11 @@ async fn flat_reactor_task(
                     probes_at_start = Some(window.stats().probes);
                 }
                 // Runtime probes stay a small share of the listing's own
-                // requests: about one per eight pages, past a base of two
-                // per slot.
+                // requests: about one per eight pages, past a base of one
+                // per slot of the window.
                 let within_budget = probes_at_start.is_none_or(|start| {
                     let stats = window.stats();
-                    stats.probes.saturating_sub(start)
-                        <= 2 * flat_concurrency as u64 + stats.list_requests / 8
+                    stats.probes.saturating_sub(start) <= cap as u64 + stats.list_requests / 8
                 });
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,
@@ -444,6 +472,59 @@ async fn flat_reactor_task(
         completed_pieces,
     ));
     info!("Flat List S3 Task — {} — quit", ctx.s3_bucket_name);
+}
+
+/// The waiting split child to start next. A diff merges each side in key
+/// order, so it starts the lowest: when one round of cuts splits many
+/// segments at once, starting their children in any other order let
+/// segments far ahead of the merge fill their buffers and stall while the
+/// one the merge waited for queued. A listing starts the latest split's
+/// first child (the straggler just cut).
+fn next_child(
+    pending: &mut Vec<(usize, SplitRange)>,
+    in_key_order: bool,
+) -> Option<(usize, SplitRange)> {
+    if !in_key_order {
+        return pending.pop();
+    }
+    let lowest = pending
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.1.start.cmp(&b.1.start))?
+        .0;
+    Some(pending.remove(lowest))
+}
+
+/// Startup boundaries become cuts of whatever is running (at first the one
+/// segment started at the beginning of the range; later batches cut the
+/// segments earlier batches made). Accepted at once, as runtime cuts are: a
+/// segment waiting on a slow first page hands the rest of its range over
+/// now (its page in flight is trimmed at its new end). A boundary already
+/// cut, or outside every running segment, changes nothing.
+fn hand_over(
+    bounds: &[String],
+    controls: &HashMap<usize, Arc<SegmentControl>>,
+    allow_split: bool,
+) -> Vec<SplitRange> {
+    let mut cut = 0usize;
+    let mut children = Vec::new();
+    if allow_split {
+        for (index, control) in controls {
+            if control.propose_cuts(bounds) {
+                cut += 1;
+                for mut child in control.accept_split_now() {
+                    child.parent = *index;
+                    children.push(child);
+                }
+            }
+        }
+    }
+    info!(
+        "Startup discovery: {} boundaries handed to {} running segment(s)",
+        bounds.len(),
+        cut
+    );
+    children
 }
 
 /// The key ranges an exiting reactor leaves unwritten: in-flight or

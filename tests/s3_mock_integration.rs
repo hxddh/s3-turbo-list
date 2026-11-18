@@ -5264,6 +5264,53 @@ fn local_mock_listing_does_not_wait_for_startup_discovery() {
 }
 
 #[test]
+fn local_mock_root_prefixes_reach_the_listing_before_discovery_ends() {
+    // Twenty directories of 300 keys in 100-key pages. The root probe
+    // answers at once; every probe below it takes 3 s. Discovery hands the
+    // root's CommonPrefixes over as soon as that page is in, so the
+    // directories list in parallel and the run ends long before the deeper
+    // probes answer (one segment alone would take 60 paced pages).
+    let mut keys: Vec<String> = (0..20)
+        .flat_map(|d| (0..300).map(move |i| format!("d{d:02}/f{i:04}")))
+        .collect();
+    keys.sort();
+    let listed = keys.clone();
+    let server = MockS3Server::start(move |request, _sequence| {
+        let root_probe =
+            is_delimiter_probe(&request) && query(&request, "prefix").unwrap_or("").is_empty();
+        if is_single_key_probe(&request) || (is_delimiter_probe(&request) && !root_probe) {
+            thread::sleep(Duration::from_secs(3));
+        } else if !root_probe {
+            thread::sleep(Duration::from_millis(30));
+        }
+        let mut q = request.query.clone();
+        let asked: usize = q
+            .get("max-keys")
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(1000);
+        q.insert("max-keys".into(), asked.min(100).to_string());
+        MockResponse::ok_xml(emulated_list(&listed, &q))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let args = cli(&server, "list", &["s3://mock-bucket", "-o", "-"]);
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("S3TL_TIMEOUT_SECS", "10")]);
+    assert_eq!(code, 0, "{}", stderr);
+    assert_eq!(sorted(ndjson_keys(&stdout)), keys, "every key exactly once");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the directories waited for the whole discovery: {:?}",
+        started.elapsed()
+    );
+    // Segments started at the root's directories.
+    let requests = server.requests();
+    assert!(requests.iter().any(|r| !is_delimiter_probe(r)
+        && !is_single_key_probe(r)
+        && query(r, "start-after").is_some_and(|s| s.len() == 4 && s.ends_with('/'))));
+}
+
+#[test]
 fn local_mock_result_reports_requests_probes_segments_and_concurrency() {
     let keys = wide_keys();
     let server = small_page_server(keys.clone());

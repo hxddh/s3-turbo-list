@@ -7,7 +7,21 @@
 use crate::auto_hints;
 use crate::config::EngineConfig;
 use crate::core;
+use crate::window::Window;
 use log::info;
+use std::sync::Arc;
+
+/// Startup discovery's targets for a side with `slots` concurrent segments:
+/// structural boundaries (about two segments per slot: CommonPrefixes come
+/// with the probed pages, and uneven directories leave some short), and flat
+/// boundaries (one segment per slot: one more would wait for a slot and then
+/// list its whole range alone at the end; runtime splitting covers skew).
+pub fn startup_targets(slots: usize) -> (usize, usize) {
+    (
+        slots.saturating_mul(2).clamp(16, 512),
+        slots.saturating_sub(1).clamp(1, 255),
+    )
+}
 
 /// Resolves once the run has been asked to stop (Ctrl-C / SIGTERM set the
 /// quit flag). Startup discovery races against it: its probe rounds run
@@ -33,17 +47,20 @@ pub async fn diff_side_boundaries(
     max_keys: Option<i32>,
     sdk_config: &aws_config::SdkConfig,
     g_state: &core::GlobalState,
+    window: &Arc<Window>,
+    early: &crate::tasks_s3::EarlyBoundaries,
 ) -> Vec<String> {
     if no_auto_hints || !delimiter.is_empty() {
         return Vec::new();
     }
 
     let client = core::build_s3_client(sdk_config, region, endpoint, cfg.s3.force_path_style());
-    let concurrency = cfg.runtime.max_concurrency;
-    // A side runs at most `DIFF_SIDE_MAX_CONCURRENCY` segments at once: one
-    // flat segment per slot (boundaries + 1), since one more would wait for a
-    // slot and then list its whole range alone at the end.
-    let slots = concurrency.clamp(1, crate::tasks_s3::DIFF_SIDE_MAX_CONCURRENCY);
+    // A side runs at most `DIFF_SIDE_MAX_CONCURRENCY` segments at once.
+    let (structural, flat) = startup_targets(
+        cfg.runtime
+            .max_concurrency
+            .clamp(1, crate::tasks_s3::DIFF_SIDE_MAX_CONCURRENCY),
+    );
     startup_boundaries(
         &client,
         bucket,
@@ -51,8 +68,10 @@ pub async fn diff_side_boundaries(
         cfg,
         max_keys,
         g_state,
-        concurrency.saturating_mul(2).clamp(16, 512),
-        slots.saturating_sub(1).max(1),
+        window,
+        Some(early),
+        structural,
+        flat,
     )
     .await
     .unwrap_or_default()
@@ -71,10 +90,21 @@ pub async fn startup_boundaries(
     cfg: &EngineConfig,
     max_keys: Option<i32>,
     g_state: &core::GlobalState,
+    window: &Arc<Window>,
+    early: Option<&crate::tasks_s3::EarlyBoundaries>,
     structural_target: usize,
     flat_target: usize,
 ) -> Option<Vec<String>> {
     let timeout_secs = cfg.s3.operation_timeout_secs;
+    // Each round's boundaries so far go to the listing at once (see
+    // `LateBoundaries`); the full set is the return value.
+    let emit = |bounds: &[String]| {
+        if let Some(tx) = early
+            && !bounds.is_empty()
+        {
+            let _ = tx.send(bounds.to_vec());
+        }
+    };
     tokio::select! {
         boundaries = async {
             let discovery = auto_hints::discover_startup_boundaries(
@@ -83,6 +113,8 @@ pub async fn startup_boundaries(
                 prefix,
                 structural_target,
                 timeout_secs,
+                window,
+                &emit,
             )
             .await;
             if !discovery.boundaries.is_empty() {
@@ -91,12 +123,20 @@ pub async fn startup_boundaries(
                 // per slot), not the flat one (one per slot): structure
                 // already used part of that, and 20 equal directories with 11
                 // cuts between them left nine 50-page segments listing
-                // serially while the rest of the run sat idle.
-                let refine_target = structural_target.max(flat_target);
+                // serially while the rest of the run sat idle. Every run gets
+                // at least one cut for the same reason. (One segment per slot
+                // was measured: a diff, which runs at most 32 segments a side,
+                // took twice as long on its larger, later segments.)
+                let refine_target = structural_target
+                    .max(flat_target)
+                    .max(discovery.boundaries.len() + discovery.flat_runs.len());
                 let boundaries =
-                    refine_flat_leaves(client, bucket, discovery, refine_target, timeout_secs)
+                    refine_flat_leaves(client, bucket, window, discovery, refine_target, timeout_secs)
                         .await;
-                bisect_tails(client, bucket, boundaries, &tails, flat_target, timeout_secs).await
+                if !tails.is_empty() {
+                    emit(&boundaries);
+                }
+                bisect_tails(client, bucket, window, boundaries, &tails, flat_target, timeout_secs).await
             } else if discovery.is_single_page_listing(max_keys) {
                 // The probe's page was not truncated and held no
                 // CommonPrefixes, and this run's page size returns those keys
@@ -117,13 +157,13 @@ pub async fn startup_boundaries(
                             keys: discovery.root_page_keys,
                         };
                         auto_hints::partition_flat_runs(&[run], flat_target, |p, start_after| {
-                            single_key_probe(client, bucket, p, start_after, timeout_secs)
+                            single_key_probe(client, bucket, window, p, start_after, timeout_secs)
                         })
                         .await
                     }
                     (first, _) => {
                         discover_flat_boundaries_via_client(
-                            client, bucket, prefix, flat_target, first, timeout_secs,
+                            client, bucket, window, prefix, flat_target, first, timeout_secs,
                         )
                         .await
                     }
@@ -145,6 +185,7 @@ pub async fn startup_boundaries(
 pub async fn refine_flat_leaves(
     client: &aws_sdk_s3::Client,
     bucket: &str,
+    window: &Arc<Window>,
     discovery: auto_hints::StartupDiscovery,
     flat_target: usize,
     timeout_secs: u64,
@@ -162,7 +203,7 @@ pub async fn refine_flat_leaves(
     let budget = flat_target - boundaries.len();
     boundaries.extend(
         auto_hints::partition_flat_runs(&runs, budget, |prefix, start_after| {
-            single_key_probe(client, bucket, prefix, start_after, timeout_secs)
+            single_key_probe(client, bucket, window, prefix, start_after, timeout_secs)
         })
         .await,
     );
@@ -183,6 +224,7 @@ const MAX_TAIL_RUNS: usize = 16;
 pub async fn bisect_tails(
     client: &aws_sdk_s3::Client,
     bucket: &str,
+    window: &Arc<Window>,
     mut boundaries: Vec<String>,
     tails: &[auto_hints::TailRun],
     flat_target: usize,
@@ -207,6 +249,7 @@ pub async fn bisect_tails(
                 single_key_probe(
                     client,
                     bucket,
+                    window,
                     tail.prefix.clone(),
                     start_after,
                     timeout_secs,
@@ -227,6 +270,7 @@ pub async fn bisect_tails(
 pub async fn discover_flat_boundaries_via_client(
     client: &aws_sdk_s3::Client,
     bucket: &str,
+    window: &Arc<Window>,
     prefix: &str,
     target: usize,
     first_key: Option<String>,
@@ -236,6 +280,7 @@ pub async fn discover_flat_boundaries_via_client(
         single_key_probe(
             client,
             bucket,
+            window,
             prefix.to_string(),
             start_after,
             timeout_secs,
@@ -249,14 +294,16 @@ pub async fn discover_flat_boundaries_via_client(
 fn single_key_probe(
     client: &aws_sdk_s3::Client,
     bucket: &str,
+    window: &Arc<Window>,
     prefix: String,
     start_after: Option<String>,
     timeout_secs: u64,
 ) -> impl std::future::Future<Output = Result<Option<String>, String>> + use<> {
     let client = client.clone();
     let bucket = bucket.to_string();
+    let window = Arc::clone(window);
     async move {
-        let resp = crate::probe::send(timeout_secs, || {
+        let resp = crate::probe::send(&window, timeout_secs, || {
             let mut req = client
                 .list_objects_v2()
                 .encoding_type(aws_sdk_s3::types::EncodingType::Url)

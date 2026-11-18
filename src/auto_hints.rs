@@ -102,9 +102,12 @@ pub async fn discover_startup_boundaries(
     prefix: &str,
     target_boundaries: usize,
     timeout_secs: u64,
+    window: &std::sync::Arc<crate::window::Window>,
+    emit: &(dyn Fn(&[String]) + Sync),
 ) -> StartupDiscovery {
-    discover_with_paged_probe(prefix, target_boundaries, |p, max_pages| {
+    discover_with_paged_probe(prefix, target_boundaries, emit, |p, max_pages| {
         let client = client.clone();
+        let window = std::sync::Arc::clone(window);
         let bucket = bucket.to_string();
         async move {
             let mut prefixes: Vec<String> = Vec::new();
@@ -121,7 +124,7 @@ pub async fn discover_startup_boundaries(
                 let slot = crate::list_page::ParsedPageSlot::default();
                 // Startup discovery runs before the first object is listed; the
                 // probe's watchdog keeps a stalled endpoint from hanging it.
-                let response = crate::probe::send(timeout_secs, || {
+                let response = crate::probe::send(&window, timeout_secs, || {
                     let mut request = client
                         .list_objects_v2()
                         .encoding_type(aws_sdk_s3::types::EncodingType::Url)
@@ -245,14 +248,17 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<ProbePage, String>>,
 {
-    discover_with_paged_probe(prefix, target_boundaries, |p, _pages| probe(p)).await
+    discover_with_paged_probe(prefix, target_boundaries, &|_| {}, |p, _pages| probe(p)).await
 }
 
 /// [`discover_with_probe`] with a page budget per probe: the root probe may
 /// follow up to `STARTUP_DISCOVERY_ROOT_MAX_PAGES` pages, deeper probes one.
+/// The boundaries found so far are handed to `emit` after each level, so the
+/// listing can fan out a round trip in instead of after the whole discovery.
 async fn discover_with_paged_probe<F, Fut>(
     prefix: &str,
     target_boundaries: usize,
+    emit: &(dyn Fn(&[String]) + Sync),
     probe: F,
 ) -> StartupDiscovery
 where
@@ -269,6 +275,7 @@ where
     let mut root_first_key: Option<String> = None;
     let mut root_last_key: Option<String> = None;
     let mut tails: Vec<TailRun> = Vec::new();
+    let mut emitted = 0usize;
 
     for depth in 0..STARTUP_DISCOVERY_MAX_DEPTH {
         if frontier.is_empty() || boundaries.len() >= target_boundaries {
@@ -333,6 +340,13 @@ where
                     );
                 }
             }
+        }
+        if boundaries.len() > emitted {
+            emitted = boundaries.len();
+            emit(&cap_boundaries(
+                boundaries.iter().cloned().collect(),
+                target_boundaries,
+            ));
         }
     }
 
@@ -1012,7 +1026,7 @@ mod tests {
         // The root follows pages; a truncated page with prefixes is a tail
         // after its last entry; deeper probes get one page.
         let asked = std::sync::Mutex::new(Vec::new());
-        let discovery = discover_with_paged_probe("", 4, |p, pages| {
+        let discovery = discover_with_paged_probe("", 4, &|_| {}, |p: String, pages: usize| {
             asked.lock().unwrap().push((p.clone(), pages));
             async move {
                 Ok(ProbePage {
@@ -1282,7 +1296,9 @@ mod tests {
             ..page_of(&keys, "obj-")
         };
         let boundaries = run_partition(&keys, &[run], 16).await;
-        assert_eq!(boundaries.len(), 16);
+        // One round of two candidates per cut lands at least half the budget
+        // inside the run (runtime splitting covers the rest).
+        assert!((8..=16).contains(&boundaries.len()), "{}", boundaries.len());
         assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
         assert!(
             boundaries
