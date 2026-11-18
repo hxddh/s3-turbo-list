@@ -953,9 +953,10 @@ where
 /// Up to `target` cuts of a flat run in one round, read off its scale:
 /// `2 x target` candidates spread over the `upto` page spans past `first`
 /// the run may reach (sizing's upper bound, at most four times its lower
-/// one, so at least half of `target` fall inside the run; runtime splitting
-/// covers the rest), each probed for the first real key after it; those
-/// still in the run are thinned evenly to `target`.
+/// one, so at least half of `target` fall inside the run; the caller makes
+/// up a shortfall with a second round over the extent the first one found),
+/// each probed for the first real key after it; those still in the run are
+/// thinned evenly to `target`.
 /// Every cut is a real key after `first` under the run's scope.  `None` when
 /// the keys have no numeric reading (bisect instead).
 pub(crate) async fn scale_cuts<F, Fut>(

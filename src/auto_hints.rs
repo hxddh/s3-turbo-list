@@ -613,16 +613,37 @@ where
                     // Cuts read off the run's scale in one round; bisection
                     // (several rounds) when the keys have no numeric reading
                     // or the scale found too few.
-                    if let Some((_, upto)) = span {
-                        let cuts = crate::flat_cut::scale_cuts(
-                            &run.first_key,
-                            &run.last_key,
-                            &run.prefix,
-                            upto,
-                            share,
-                            &scoped,
-                        )
-                        .await;
+                    if let Some((reached, upto)) = span {
+                        let scale_round = |upto: u64| {
+                            crate::flat_cut::scale_cuts(
+                                &run.first_key,
+                                &run.last_key,
+                                &run.prefix,
+                                upto,
+                                share,
+                                &scoped,
+                            )
+                        };
+                        let mut cuts = scale_round(upto).await;
+                        // Short of the share: the run ends before sizing's
+                        // upper bound, and the candidates that found it say
+                        // where. A second round spread over that extent
+                        // lands nearly all inside.
+                        if let Ok(Some(found)) = &cuts
+                            && !found.is_empty()
+                            && found.len() < share
+                        {
+                            let n = (share * 2) as u64;
+                            let extent = (upto * (found.len() as u64 + 1))
+                                .div_ceil(n + 1)
+                                .max(reached);
+                            if extent < upto
+                                && let Ok(Some(more)) = scale_round(extent).await
+                                && more.len() > found.len()
+                            {
+                                cuts = Ok(Some(more));
+                            }
+                        }
                         if let Ok(Some(cuts)) = cuts
                             && cuts.len() * 2 >= share
                         {
@@ -1296,9 +1317,7 @@ mod tests {
             ..page_of(&keys, "obj-")
         };
         let boundaries = run_partition(&keys, &[run], 16).await;
-        // One round of two candidates per cut lands at least half the budget
-        // inside the run (runtime splitting covers the rest).
-        assert!((8..=16).contains(&boundaries.len()), "{}", boundaries.len());
+        assert_eq!(boundaries.len(), 16);
         assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
         assert!(
             boundaries
