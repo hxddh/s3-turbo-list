@@ -138,7 +138,7 @@ typical latencies (at least a second), and a probe that failed or gave up is
 a missing answer, not a failed round, so one slow request does not hold
 discovery back. Runtime splitting waits for startup discovery at most two
 seconds. Runtime probes stay within about one per eight listed pages (plus
-one per slot of the window). A throttled probe is retried once after 100 ms.
+two per slot). A throttled probe is retried once after 100 ms.
 A failed probe only means "no cut there": it can cost
 parallelism, never correctness. Probes appear in `--trace` as `Probe`
 events, and the result counts them (`stats.probes`).

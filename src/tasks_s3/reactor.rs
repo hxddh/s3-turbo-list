@@ -396,11 +396,13 @@ async fn flat_reactor_task(
                     probes_at_start = Some(window.stats().probes);
                 }
                 // Runtime probes stay a small share of the listing's own
-                // requests: about one per eight pages, past a base of one
-                // per slot of the window.
+                // requests: about one per eight pages, past a base of two
+                // per slot (a segment stuck on a slow page must still be
+                // cut late in a run).
                 let within_budget = probes_at_start.is_none_or(|start| {
                     let stats = window.stats();
-                    stats.probes.saturating_sub(start) <= cap as u64 + stats.list_requests / 8
+                    stats.probes.saturating_sub(start)
+                        <= 2 * flat_concurrency as u64 + stats.list_requests / 8
                 });
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,
