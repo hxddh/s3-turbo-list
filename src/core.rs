@@ -1004,6 +1004,8 @@ pub struct S3TaskContext {
     /// Filled by the list reactor as it exits: the key ranges left unwritten,
     /// for the checkpoint a graceful interrupt saves.
     pub resume_progress: Arc<Mutex<Option<crate::checkpoint::ResumeProgress>>>,
+    /// This side's request window: every page and probe takes a slot.
+    pub window: Arc<crate::window::Window>,
 }
 
 /// What `S3TaskContext::new` builds a list side's context from.
@@ -1022,6 +1024,7 @@ pub struct TaskContextParams<'a> {
     pub delimiter: Option<&'a str>,
     pub max_keys: Option<i32>,
     pub versions: bool,
+    pub window: Arc<crate::window::Window>,
 }
 
 impl S3TaskContext {
@@ -1084,6 +1087,7 @@ impl S3TaskContext {
             initial_backoff_secs: p.s3_config.initial_backoff_secs,
             operation_timeout_secs: p.s3_config.operation_timeout_secs.max(1),
             resume_progress: Arc::new(Mutex::new(None)),
+            window: p.window,
         }
     }
 

@@ -103,7 +103,6 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
     };
     let mut cfg = EngineConfig::from_env();
     cfg.runtime.max_concurrency = job.concurrency;
-    s3tl::window::configure(job.concurrency);
     cfg.s3.force_path_style = job.source.path_style;
     cfg.s3.endpoint_url = job.source.endpoint.clone();
 
@@ -228,6 +227,7 @@ impl Contexts<'_> {
         region: &str,
         channel: tokio::sync::mpsc::Sender<Batch>,
         dir: u8,
+        window: &Arc<s3tl::window::Window>,
     ) -> core::S3TaskContext {
         core::S3TaskContext::new(core::TaskContextParams {
             bucket: &side.url.bucket,
@@ -244,6 +244,7 @@ impl Contexts<'_> {
             delimiter: Some(&self.job.delimiter),
             max_keys: self.job.max_keys,
             versions: self.job.versions,
+            window: Arc::clone(window),
         })
     }
 }
@@ -363,6 +364,7 @@ async fn open_s3_output(
 fn list_partition(
     contexts: &Contexts<'_>,
     region: &str,
+    window: &Arc<s3tl::window::Window>,
 ) -> (core::KeySpaceHints, Option<tasks_s3::LateBoundaries>) {
     let job = contexts.job;
     if let Some(cp) = &job.resume_from {
@@ -383,10 +385,9 @@ fn list_partition(
     let cfg = contexts.cfg.clone();
     let g_state = contexts.g_state.clone();
     let max_keys = job.max_keys;
-    // Runtime splitting covers skew, so one flat boundary per worker is
-    // enough; spare boundaries would only cost probes.
-    let concurrency = job.concurrency;
-    let discovery = async move {
+    let window = Arc::clone(window);
+    let (structural, flat) = startup::startup_targets(job.concurrency);
+    let discovery = tasks_s3::LateBoundaries::new(|early| async move {
         let boundaries = startup::startup_boundaries(
             &client,
             &bucket,
@@ -394,20 +395,17 @@ fn list_partition(
             &cfg,
             max_keys,
             &g_state,
-            concurrency.saturating_mul(2).clamp(16, 512),
-            // One segment per slot (boundaries + 1): one more would wait for
-            // a slot and then list its whole range alone at the end.
-            concurrency.saturating_sub(1).clamp(1, 255),
+            &window,
+            Some(&early),
+            structural,
+            flat,
         )
         .await
         .unwrap_or_default();
         info!("Startup discovery: {} boundaries", boundaries.len());
         boundaries
-    };
-    (
-        core::KeySpaceHints::new_from(&[]),
-        Some(Box::pin(discovery)),
-    )
+    });
+    (core::KeySpaceHints::new_from(&[]), Some(discovery))
 }
 
 async fn spawn_list(
@@ -416,13 +414,15 @@ async fn spawn_list(
     region: &str,
 ) -> ResumeSlot {
     let job = contexts.job;
-    let (hints, late) = list_partition(contexts, region);
+    let window = s3tl::window::open(job.concurrency);
+    let (hints, late) = list_partition(contexts, region, &window);
     let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(contexts.cfg.channel.capacity);
     let task_ctx = contexts.side(
         &job.source,
         region,
         tx,
         core::S3_TASK_CONTEXT_DIR_LEFT_LIST_MODE,
+        &window,
     );
     let resume_slot = task_ctx.resume_progress.clone();
     let prefix = job.source.url.prefix.clone();
@@ -463,34 +463,41 @@ async fn spawn_diff(
     // Each side lists from its first key at once, as one segment; its
     // startup discovery runs alongside and splits that segment when it
     // returns (the children are linked in key order, as runtime splits are).
-    let side_discovery = |side: &SideSpec, region: &str, name: &'static str| {
-        let side = side.clone();
-        let region = region.to_string();
-        let cfg = contexts.cfg.clone();
-        let sdk = contexts.sdk.clone();
-        let g_state = contexts.g_state.clone();
-        let (no_auto_hints, max_keys) = (job.no_auto_hints, job.max_keys);
-        let discovery: tasks_s3::LateBoundaries = Box::pin(async move {
-            let bounds = startup::diff_side_boundaries(
-                &side.url.bucket,
-                Some(&region),
-                side.endpoint.as_deref(),
-                &side.url.prefix,
-                &cfg,
-                no_auto_hints,
-                "",
-                max_keys,
-                &sdk,
-                &g_state,
-            )
-            .await;
-            info!("Diff segments: {} {}", name, bounds.len() + 1);
-            bounds
-        });
-        discovery
-    };
-    let left_discovery = side_discovery(&job.source, source_region, "left");
-    let right_discovery = side_discovery(target, target_region, "right");
+    // Each side has its own request window: one endpoint throttling (a
+    // diff may compare two providers) does not slow the other.
+    let left_window = s3tl::window::open(job.concurrency);
+    let right_window = s3tl::window::open(job.concurrency);
+    let side_discovery =
+        |side: &SideSpec, region: &str, name: &'static str, window: &Arc<s3tl::window::Window>| {
+            let window = Arc::clone(window);
+            let side = side.clone();
+            let region = region.to_string();
+            let cfg = contexts.cfg.clone();
+            let sdk = contexts.sdk.clone();
+            let g_state = contexts.g_state.clone();
+            let (no_auto_hints, max_keys) = (job.no_auto_hints, job.max_keys);
+            tasks_s3::LateBoundaries::new(|early| async move {
+                let bounds = startup::diff_side_boundaries(
+                    &side.url.bucket,
+                    Some(&region),
+                    side.endpoint.as_deref(),
+                    &side.url.prefix,
+                    &cfg,
+                    no_auto_hints,
+                    "",
+                    max_keys,
+                    &sdk,
+                    &g_state,
+                    &window,
+                    &early,
+                )
+                .await;
+                info!("Diff segments: {} {}", name, bounds.len() + 1);
+                bounds
+            })
+        };
+    let left_discovery = side_discovery(&job.source, source_region, "left", &left_window);
+    let right_discovery = side_discovery(target, target_region, "right", &right_window);
     let left_order = Arc::new(SegmentOrder::new(1, tasks_s3::DIFF_SEGMENT_CHANNEL_CAP));
     let right_order = Arc::new(SegmentOrder::new(1, tasks_s3::DIFF_SEGMENT_CHANNEL_CAP));
     // Each segment task takes its own sender from the order.
@@ -500,12 +507,14 @@ async fn spawn_diff(
         source_region,
         placeholder.clone(),
         core::S3_TASK_CONTEXT_DIR_LEFT_DIFF_MODE,
+        &left_window,
     );
     let right_ctx = contexts.side(
         target,
         target_region,
         placeholder,
         core::S3_TASK_CONTEXT_DIR_RIGHT_DIFF_MODE,
+        &right_window,
     );
     let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
     let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
@@ -818,7 +827,7 @@ fn finish(
             .collect();
     }
     result.output = Some(output);
-    let window = s3tl::window::global().stats();
+    let window = s3tl::window::run_stats();
     result.stats = Some(Stats {
         objects: data.objects,
         folders: data.folders,

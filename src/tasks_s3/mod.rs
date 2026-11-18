@@ -16,7 +16,9 @@ mod sdk_error;
 mod split;
 
 pub use diff::DIFF_SEGMENT_CHANNEL_CAP;
-pub use reactor::{DIFF_SIDE_MAX_CONCURRENCY, LateBoundaries, diff_side_task, flat_list_main_task};
+pub use reactor::{
+    DIFF_SIDE_MAX_CONCURRENCY, EarlyBoundaries, LateBoundaries, diff_side_task, flat_list_main_task,
+};
 
 /// What a segment task's `JoinError` means for the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

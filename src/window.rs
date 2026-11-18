@@ -1,9 +1,10 @@
-//! The request window: how many requests a run keeps in flight against the
-//! endpoint, adapted to how the endpoint answers.
+//! The request window: how many requests a side of a run keeps in flight
+//! against its endpoint, adapted to how the endpoint answers.
 //!
-//! One window, shared by every listing page and every partitioning probe,
-//! is the run's only concurrency control. It is capped at `-c` and follows
-//! additive-increase / multiplicative-decrease from `-c`:
+//! One window per listing side (a list run has one, a diff one per side, so
+//! an endpoint that throttles never slows the other side), shared by every
+//! listing page and every partitioning probe of that side. It is capped at
+//! `-c` and follows additive-increase / multiplicative-decrease from `-c`:
 //!
 //! - a throttle (`SlowDown`, 429, ...) or a timed-out request shrinks it to
 //!   70%, at most once per round trip, so one burst of rejections counts once;
@@ -18,12 +19,20 @@
 //! probes are single-key or single-page requests sent in bursts at startup,
 //! and the window holds three of them for every page.
 //!
-//! The window also times requests: a page may take ten times the run's
+//! Latency alone does not move the window. An endpoint that queues instead
+//! of throttling serves the same throughput whatever the queue (Little's
+//! law); what such a queue cost was the probes partitioning sized to `-c`,
+//! which partitioning no longer does. Reading latency as a queue was tried
+//! and measured: latency also rises with jitter, with the client's own CPU
+//! and at the end of a run, and shrinking for those made runs slower
+//! (`docs/validation-results/capacity-sizing-20261118.md`).
+//!
+//! The window also times requests: a page may take ten times the side's
 //! typical latency (never less than the configured floor, never more than a
 //! minute) before it counts as timed out, so a slow but healthy endpoint is
 //! not retried into the ground.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -97,7 +106,7 @@ impl State {
     }
 }
 
-/// The window. One per process (`global`).
+/// The window of one listing side (see `open`).
 #[derive(Debug)]
 pub struct Window {
     state: Mutex<State>,
@@ -154,7 +163,7 @@ pub struct WindowStats {
     pub list_requests: u64,
     pub probes: u64,
     /// Most of the window in use at once, in slots (a page one, a probe a
-    /// third): at most `-c`.
+    /// third): at most `-c` per side (a diff adds its sides' peaks).
     pub peak_concurrency: usize,
     /// Time-weighted mean of the window in use, in slots.
     pub avg_concurrency: f64,
@@ -291,17 +300,29 @@ impl Window {
     }
 }
 
-static GLOBAL: OnceLock<Window> = OnceLock::new();
+static OPENED: Mutex<Vec<Arc<Window>>> = Mutex::new(Vec::new());
 
-/// Set the run's window to `max` (`-c`). The first call wins; a library
-/// user that never calls it gets a window of 512.
-pub fn configure(max: usize) {
-    let _ = GLOBAL.set(Window::new(max));
+/// A new window capped at `max` (`-c`), for one listing side. Every window
+/// opened in the process counts in `run_stats`.
+pub fn open(max: usize) -> Arc<Window> {
+    let window = Arc::new(Window::new(max));
+    OPENED.lock().unwrap().push(Arc::clone(&window));
+    window
 }
 
-/// The run's window.
-pub fn global() -> &'static Window {
-    GLOBAL.get_or_init(|| Window::new(512))
+/// The run's statistics: every window's, added (a diff's two sides).
+pub fn run_stats() -> WindowStats {
+    let opened = OPENED.lock().unwrap();
+    let mut total = WindowStats::default();
+    for w in opened.iter() {
+        let s = w.stats();
+        total.list_requests += s.list_requests;
+        total.probes += s.probes;
+        total.peak_concurrency += s.peak_concurrency;
+        total.avg_concurrency += s.avg_concurrency;
+        total.final_limit += s.final_limit;
+    }
+    total
 }
 
 #[cfg(test)]
@@ -379,5 +400,23 @@ mod tests {
         assert_eq!(w.timeout(floor), MAX_TIMEOUT);
         w.state.lock().unwrap().latency_ms = Some(30.0);
         assert_eq!(w.probe_deadline(floor), MIN_PROBE_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn each_side_has_its_own_window() {
+        let (left, right) = (open(10), open(10));
+        left.acquire(Kind::List).await.finish(Outcome::Throttled);
+        assert_eq!(left.limit(), 7);
+        assert_eq!(
+            right.limit(),
+            10,
+            "a throttled side does not slow the other"
+        );
+        right
+            .acquire(Kind::List)
+            .await
+            .finish(Outcome::Answered(Duration::from_millis(5)));
+        let total = run_stats();
+        assert!(total.list_requests >= 2 && total.final_limit >= 17);
     }
 }

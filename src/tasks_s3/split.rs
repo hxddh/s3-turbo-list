@@ -1,5 +1,6 @@
 //! Adaptive long-tail splitting of list-mode segments.
 
+use crate::auto_hints::FlatRun;
 use crate::core::S3TaskContext;
 use crate::list_page::{FastContentsInterceptor, ParsedPageSlot};
 use log::{debug, info};
@@ -25,12 +26,17 @@ const SPLIT_MIN_PAGES: u32 = 5;
 /// is enough.  Waiting `SPLIT_MIN_PAGES` made fan-out double only every
 /// half-second or so, and a straggler finished before it could be split.
 const SPLIT_CHILD_MIN_PAGES: u32 = 1;
+/// Least a runtime-split child of a flat run gets, in pages: a range of a
+/// page or so is finished by its own next page as soon as by children.
+const SPLIT_CHILD_MIN_SPAN_PAGES: f64 = 2.0;
 /// Most cuts one split probe proposes (children one segment adds at once).
 const SPLIT_MAX_CUTS: usize = 15;
 /// Reactor split-probe cadence. Sub-second so cold-start fan-out on flat
 /// namespaces — where startup discovery finds no structure and runtime
 /// splitting is the only mechanism that fans out — ramps toward full
 /// concurrency in a few page-latencies instead of one segment per second.
+/// (Checking every 50 ms was measured: it probed segments that were about
+/// to finish, multiplying probes for no gain.)
 pub(super) const SPLIT_CHECK_INTERVAL_MS: u64 = 200;
 /// Maximum ancestor-directory probe rungs per split attempt.
 const SPLIT_PROBE_MAX_RUNGS: usize = 4;
@@ -289,9 +295,12 @@ async fn probe_split_candidate(
     // are all of them — no flat-cut probes needed.
     let mut complete = dirs.len() <= SPLIT_PROBE_MAX_RUNGS;
     let mut known: Vec<String> = Vec::new();
-    for dir in dirs.into_iter().take(SPLIT_PROBE_MAX_RUNGS) {
+    // The deepest rung's page, when it is a full page of keys inside the
+    // range with more to follow: a sample of the flat run the range lists.
+    let mut leaf: Option<FlatRun> = None;
+    for (rung, dir) in dirs.into_iter().take(SPLIT_PROBE_MAX_RUNGS).enumerate() {
         let slot = ParsedPageSlot::default();
-        let response = match crate::probe::send(ctx.operation_timeout_secs, || {
+        let response = match crate::probe::send(&ctx.window, ctx.operation_timeout_secs, || {
             ctx.s3_client
                 .list_objects_v2()
                 .encoding_type(aws_sdk_s3::types::EncodingType::Url)
@@ -330,29 +339,152 @@ async fn probe_split_candidate(
             candidates.dedup();
             return SplitProbe::Cut(spread_picks(candidates, k));
         }
+        let rows: Option<Vec<String>> = slot
+            .take()
+            .map(|rows| rows.into_iter().map(|(key, _)| dec(key.as_str())).collect());
+        let in_range = |k: &String| k.as_str() > cursor && end.is_none_or(|e| k.as_str() < e);
+        // The deepest rung's page reaches past the segment's end: it holds
+        // every key left in the range (no CommonPrefix of it is inside), so
+        // the segment's own next page finishes the range.
+        if rung == 0
+            && let (Some(rows), Some(e)) = (&rows, end)
+            && rows.iter().any(|k| k.as_str() >= e)
+        {
+            return SplitProbe::NoBoundary;
+        }
+        if rung == 0
+            && response.is_truncated() == Some(true)
+            && let Some(rows) = &rows
+            && rows.len() >= 2
+            && rows.iter().all(in_range)
+        {
+            leaf = Some(FlatRun {
+                prefix: dir.clone(),
+                first_key: rows[0].clone(),
+                last_key: rows[rows.len() - 1].clone(),
+                keys: rows.len(),
+            });
+        }
         if complete {
             // A truncated page, or one the fast parser left to the SDK, does
             // not show every key: fall back to the flat cut.
-            match (response.is_truncated(), slot.take()) {
-                (Some(false), Some(rows)) => known.extend(
-                    rows.into_iter()
-                        .map(|(key, _)| dec(key.as_str()))
-                        .filter(|k| k.as_str() > cursor && end.is_none_or(|e| k.as_str() < e)),
-                ),
+            match (response.is_truncated(), rows) {
+                (Some(false), Some(rows)) => known.extend(rows.into_iter().filter(in_range)),
                 _ => complete = false,
             }
         }
     }
     if complete {
-        // With fewer than two keys in hand, take the flat cut as before
-        // rather than retire the segment on the rung pages' word.
+        // Every remaining key is in hand. When one page holds them, the
+        // segment's next page finishes the range: cutting it would only add
+        // requests (a child per sliver). Otherwise each child gets at least
+        // a page. With fewer than two keys in hand, take the flat cut as
+        // before rather than retire the segment on the rung pages' word.
+        let page = ctx.max_keys.filter(|m| *m > 0).map_or(1000, |m| m as usize);
+        if known.len() >= 2 && known.len() <= page {
+            return SplitProbe::NoBoundary;
+        }
+        let k = k.min(known.len() / page).max(1);
         let cuts = quantile_cuts(known, k);
         if !cuts.is_empty() {
             return SplitProbe::Cut(cuts);
         }
     }
 
+    if let Some(run) = leaf {
+        return cut_flat_run(ctx, run, cursor, end, k).await;
+    }
     probe_flat_cut(ctx, listing_prefix, cursor, end, flat_high, k).await
+}
+
+/// Cut the rest of a flat run the segment lists, from a page of it (`run`,
+/// the keys right after the cursor), the way startup cuts flat runs: along
+/// the keys' number, scoped to the run's directory. (Cutting across the
+/// listing prefix put the candidates of a directory's run in the key space
+/// past the directory, where the probes found nothing in range.)
+///
+/// A range that ends inside the run is measured off the run's number: it is
+/// cut so each child gets at least `SPLIT_CHILD_MIN_SPAN_PAGES` pages, and
+/// not now when it measures shorter than two of them (its own pages finish
+/// it as fast as children would; it is measured again after more pages, as
+/// one page is only a sample of the run). An open-ended range, or one past
+/// the run, is sized by probing, and each child gets at least four pages.
+async fn cut_flat_run(
+    ctx: &S3TaskContext,
+    run: FlatRun,
+    cursor: &str,
+    end: Option<&str>,
+    k: usize,
+) -> SplitProbe {
+    let in_range = |c: &str| c > cursor && end.is_none_or(|e| c < e);
+    let probe =
+        |prefix: String, start_after: Option<String>| first_key_after(ctx, prefix, start_after);
+    let scale = crate::flat_cut::RunScale::new(&run.first_key, &run.last_key, &run.prefix);
+    let bounded = scale
+        .as_ref()
+        .zip(end)
+        .and_then(|(scale, end)| scale.spans_to(end).map(|spans| (scale, spans)));
+    let cuts: Vec<String> = match bounded {
+        Some((scale, spans)) => {
+            let children = (spans / SPLIT_CHILD_MIN_SPAN_PAGES).floor() as usize;
+            if children < 2 {
+                return SplitProbe::Failed;
+            }
+            let k = k.min(children - 1);
+            // Positions in thousandths of a page span, evenly over the range.
+            let span = (spans * 1000.0) as u128;
+            let candidates: Vec<String> = (1..=k as u128)
+                .filter_map(|j| scale.at_fraction(span * j, 1000 * (k as u128 + 1)))
+                .collect();
+            let found = futures::future::join_all(
+                candidates
+                    .into_iter()
+                    .map(|c| probe(run.prefix.clone(), Some(c))),
+            )
+            .await;
+            found
+                .into_iter()
+                .filter_map(|key| key.ok().flatten())
+                .collect()
+        }
+        None => crate::auto_hints::partition_flat_runs(std::slice::from_ref(&run), k, probe).await,
+    };
+    let mut cuts: Vec<String> = cuts.into_iter().filter(|c| in_range(c)).collect();
+    cuts.sort();
+    cuts.dedup();
+    if cuts.is_empty() {
+        SplitProbe::Failed
+    } else {
+        SplitProbe::Cut(cuts)
+    }
+}
+
+/// The first key under `prefix` after `start_after`: one `max-keys=1` probe.
+async fn first_key_after(
+    ctx: &S3TaskContext,
+    prefix: String,
+    start_after: Option<String>,
+) -> Result<Option<String>, String> {
+    let response = crate::probe::send(&ctx.window, ctx.operation_timeout_secs, || {
+        let mut request = ctx
+            .s3_client
+            .list_objects_v2()
+            .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+            .bucket(&ctx.s3_bucket_name)
+            .prefix(&prefix)
+            .max_keys(1);
+        if let Some(after) = &start_after {
+            request = request.start_after(after);
+        }
+        request.send()
+    })
+    .await?;
+    let url = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
+    Ok(response
+        .contents()
+        .first()
+        .and_then(|o| o.key())
+        .map(|k| crate::list_page::response_key(url, k)))
 }
 
 /// `k` of `sorted` (distinct, ascending), evenly spread; the middle one for
@@ -413,7 +545,7 @@ async fn probe_flat_cut(
     k: usize,
 ) -> SplitProbe {
     let probe = |candidate: String| async move {
-        let response = crate::probe::send(ctx.operation_timeout_secs, || {
+        let response = crate::probe::send(&ctx.window, ctx.operation_timeout_secs, || {
             ctx.s3_client
                 .list_objects_v2()
                 .encoding_type(aws_sdk_s3::types::EncodingType::Url)

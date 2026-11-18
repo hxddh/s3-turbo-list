@@ -240,7 +240,7 @@ async fn flat_list(
     let mut common_prefixes_count: usize = 0;
     let segment_start = Instant::now();
 
-    let window = crate::window::global();
+    let window = &ctx.window;
     loop {
         // One slot of the run's request window per page (see `window`).
         let permit = window.acquire(crate::window::Kind::List).await;
@@ -678,7 +678,7 @@ async fn versions_list(
         if let Some(mk) = ctx.max_keys {
             request = request.max_keys(mk);
         }
-        let window = crate::window::global();
+        let window = &ctx.window;
         let permit = window.acquire(crate::window::Kind::List).await;
         let timeout_dur = window.timeout(Duration::from_secs(ctx.operation_timeout_secs));
         let page_start = Instant::now();

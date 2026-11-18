@@ -15,10 +15,12 @@ a real key or `CommonPrefix` the endpoint returned, never a synthetic guess,
 which is what keeps the partition exact whatever the heuristics choose.
 
 A run starts listing at once, as one segment from the start of the range,
-and runs startup partitioning alongside it: when the boundaries arrive they
-become cuts of the running segment (the same path a runtime split takes),
-and a listing that finishes first does not wait for them. Segments come
-from, in order:
+and runs startup partitioning alongside it. Partitioning hands its
+boundaries over round by round — the root probe's `CommonPrefixes` a round
+trip in, the cuts of the flat runs under them once those are sized — and
+each batch becomes cuts of the running segments (the same path a runtime
+split takes). A listing that finishes first does not wait for the rest.
+Segments come from, in order:
 
 1. **Startup structural discovery** (recursive listings). A bounded
    breadth-first set of delimiter probes (at most 3 levels deep, at most 64
@@ -45,13 +47,14 @@ from, in order:
    end of the run. Where the keys read as numbers (`obj-000000123…`, or an
    alphanumeric run), the cuts take two rounds instead: one round of probes
    at growing distances along the number finds how far the run reaches, and
-   one round at evenly spread positions returns the cuts. Bisection is the
-   fallback. The same bisection runs *inside* prefixes when discovery
-   found large flat directories (`data/part-…` under a single `data/`) or
-   files listed next to subdirectories, up to the structural target, shared
-   by each run's estimated size (one round of seven probes at growing
-   distances along the keys' number), so a directory holding 90% of the
-   keys gets most of the cuts.
+   one round at evenly spread positions (two candidates per cut) returns the
+   cuts. Bisection is the fallback. The same bisection runs *inside*
+   prefixes when discovery found large flat directories (`data/part-…`
+   under a single `data/`) or files listed next to subdirectories: up to one
+   segment per worker and at least one cut per run, shared by each run's
+   estimated size (one round of seven probes at growing distances along the
+   keys' number), so a directory holding 90% of the keys gets most of the
+   cuts. A sized run gets at least four pages per segment.
 3. **One segment** for listings that fit in one page (probing would cost
    more than listing) and for `--delimiter` listings (a page's
    `CommonPrefixes` are not range-bounded, so a split would re-list them).
@@ -70,36 +73,58 @@ itself a candidate after its first page.
 - where the remaining range has structure, at a `CommonPrefix` found by a
   delimiter probe up the cursor's directory ladder;
 - when those probe pages together hold every key left in the range (the tail
-  of a leaf directory), at the median of those keys, with no more probes;
-- in a flat range, near the middle between the cursor and the segment's end
-  (or the listing's estimated highest key), validated by single-key probes.
+  of a leaf directory), at their quantiles, each child at least a page — and
+  not at all when one page holds them, or when the deepest page already
+  reaches past the segment's end (the segment's own next page finishes the
+  range);
+- when the deepest of those pages is a full page of the range's keys (a flat
+  run, in a directory or a flat namespace), along the run's number, scoped to
+  its directory, as startup cuts runs: a range ending inside the run is
+  measured off the number and cut so each child gets at least two pages (not
+  yet below four: it is measured again after more pages); an open-ended one
+  is sized first, each child at least four pages;
+- otherwise near the middle between the cursor and the segment's end (or the
+  listing's estimated highest key), validated by single-key probes.
 
 The segment keeps `(start, cut]` and a new child lists `(cut, end]`,
 recursively. A cut takes effect as soon as it is found — the segment's page
 in flight is trimmed at its new end when it arrives — so a segment waiting on
 a slow page hands the rest of its range over at once. Splitting fills the
-request window (below), not `-c`.
+side's request window (below), not `-c`.
 
 ## The request window
 
-One window, shared by every listing page and every partitioning probe, is
-the run's only concurrency control. It opens at `-c`, which is also its cap
-(a listing page takes a slot, a probe a third of one):
+Each listing side has one window — a list run one, a diff one per side, so
+an endpoint that throttles never slows the other side — shared by every
+listing page and partitioning probe of that side. It is the only
+concurrency control. It opens at `-c`, which is also its cap (a listing
+page takes a slot, a probe a third of one):
 
 - a throttle (`SlowDown`, 429, 503) or a timed-out request shrinks it to 70%,
   at most once per round trip;
 - every window's worth of answers without either grows it by one again.
 
-On an endpoint that never pushes back, the window stays at `-c`. On one with a request-rate ceiling it settles
-just under the ceiling instead of queueing and retrying above it: on the
-local mock limited to 1,000 requests/s, a default run went from 9.4 s to
-about 2 s (`docs/validation-results/request-window-20261117.md`). Segments
-beyond the window are cheap — they wait for a slot. The result reports
-`stats.avg_concurrency` and `stats.peak_concurrency`.
+Latency alone does not move the window. An endpoint that queues instead of
+throttling serves the same throughput whatever the queue; what such a queue
+used to cost was partitioning probes — four candidates per cut, and runtime
+split probes cutting a directory's run across the whole listing's key space
+— and those now take two candidates per cut and stay inside the run they
+cut. (Reading rising latency as a queue
+was tried and measured: latency also rises with jitter, with the client's
+own CPU and at the end of a run, and shrinking for those made runs slower —
+`docs/validation-results/capacity-sizing-20261118.md`.)
 
-`diff` splits each side the same way. A side's segments are read by the
-merge in key order: a split child is linked right after its parent, and the
-merge moves past a segment only once it can no longer gain children (see
+On an endpoint that never pushes back, the window stays at `-c`. On one with
+a request-rate ceiling it settles just under the ceiling instead of queueing
+and retrying above it (`docs/validation-results/request-window-20261117.md`).
+Segments beyond the window are cheap — they wait for a slot. The result
+reports `stats.avg_concurrency` and `stats.peak_concurrency` (a diff adds
+its sides').
+
+`diff` splits each side the same way, each side with its own window capped
+at `-c`. A side's segments are read by the merge in key order: a split child
+is linked right after its parent, and the merge moves past a segment only
+once it can no longer gain children (see
 `src/segment_order.rs`). Each segment buffers at most 32 pages ahead of the
 merge, and a side starts at most 32 static segments ahead of the one being
 merged (its concurrency limit), so memory stays bounded whatever the bucket
@@ -113,8 +138,8 @@ typical latencies (at least a second), and a probe that failed or gave up is
 a missing answer, not a failed round, so one slow request does not hold
 discovery back. Runtime splitting waits for startup discovery at most two
 seconds. Runtime probes stay within about one per eight listed pages (plus
-two per slot), and startup cuts give a sized flat run at least four pages
-per segment. A failed probe only means "no cut there": it can cost
+two per slot). A throttled probe is retried once after 100 ms.
+A failed probe only means "no cut there": it can cost
 parallelism, never correctness. Probes appear in `--trace` as `Probe`
 events, and the result counts them (`stats.probes`).
 
@@ -127,7 +152,7 @@ events, and the result counts them (`stats.probes`).
 | Throttle backoff | 100 ms, doubling | A throttle always pauses; the request window has already slowed the run. |
 | Request timeout | 10× the typical latency, at least 10 s, at most 60 s | Per page. |
 | Connect timeout | 60 s | |
-| Concurrency | `-c`, default 100 | The request window's cap. |
+| Concurrency | `-c`, default 100 | The cap of each side's request window. |
 | Worker threads | CPU cores | |
 
 The SDK makes one attempt per call: retries are the segment loop's own, so

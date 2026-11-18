@@ -5,6 +5,40 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-18
+
+### Changed
+- **One request window per side.** A diff's two sides no longer share one
+  window: an endpoint that throttles slows only its own side (a diff whose
+  right side is rate-limited went from 2.6 s to 1.55 s on the local mock).
+  `-c` caps each side's window.
+- **Startup partitioning reaches the listing round by round.** The root
+  probe's CommonPrefixes become segments a round trip in, instead of after
+  the flat runs under them are sized and cut.
+- **Fewer partitioning probes.** Startup cuts take two candidates per cut
+  (was four), with a second round over the run's measured extent only when
+  the first falls short; a throttled probe is retried after 100 ms (was
+  500 ms). A rate-limited endpoint (1,000 requests/s) is listed in about
+  1.5 s (was 2.0-2.1 s) at the default and at `-c 256`; one that queues
+  instead of throttling, in 1.4-1.9 s (was 1.6-2.2 s).
+- **Runtime splits stay inside the run they cut.** A flat run (a directory,
+  or a flat namespace) is cut along its keys' number scoped to its
+  directory, each child at least two pages; split probes cut a directory
+  across the whole listing's key space before, and mostly found nothing in
+  range. A range one page holds is no longer cut. Every flat run also gets
+  a startup cut. 1M keys in 20 directories at `-c 16`: 2.9 s → 2.6 s; with
+  1% of pages taking 6 s, 20 directories: 10.8 s → 8.3 s.
+- A diff side starts waiting split children lowest-key first, so the merge
+  never waits on a segment queued behind ones far ahead of it.
+- The window does not read latency as a queue: tried, it shrank on jitter,
+  on the client's own CPU and at the end of runs, and made those slower
+  (`docs/validation-results/capacity-sizing-20261118.md`).
+- For a diff, `stats.avg_concurrency` and `stats.peak_concurrency` add the
+  two sides' windows (each side's peak is at most `-c`). No field was
+  added, renamed or removed.
+
+No scenario of the local benchmark is slower (three within ±1%).
+
 ## [1.4.0] - 2026-11-17
 
 ### Changed
