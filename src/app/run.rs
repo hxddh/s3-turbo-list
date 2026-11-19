@@ -408,13 +408,33 @@ fn list_partition(
     (core::KeySpaceHints::new_from(&[]), Some(discovery))
 }
 
+/// A side's request window: capped at `-c`, or, without it, raised to the
+/// endpoint's latency (`window::open_auto`).
+fn open_window(job: &Job) -> Arc<s3tl::window::Window> {
+    if job.auto_concurrency {
+        s3tl::window::open_auto(s3tl::window::AUTO_CEILING)
+    } else {
+        s3tl::window::open(job.concurrency)
+    }
+}
+
+/// Most segments a side runs at once: `-c`, or the automatic ceiling (the
+/// window decides how many of them send requests).
+fn concurrency_ceiling(job: &Job) -> usize {
+    if job.auto_concurrency {
+        s3tl::window::AUTO_CEILING
+    } else {
+        job.concurrency
+    }
+}
+
 async fn spawn_list(
     set: &mut tokio::task::JoinSet<()>,
     contexts: &Contexts<'_>,
     region: &str,
 ) -> ResumeSlot {
     let job = contexts.job;
-    let window = s3tl::window::open(job.concurrency);
+    let window = open_window(job);
     let (hints, late) = list_partition(contexts, region, &window);
     let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(contexts.cfg.channel.capacity);
     let task_ctx = contexts.side(
@@ -426,7 +446,7 @@ async fn spawn_list(
     );
     let resume_slot = task_ctx.resume_progress.clone();
     let prefix = job.source.url.prefix.clone();
-    let concurrency = job.concurrency;
+    let concurrency = concurrency_ceiling(job);
     set.spawn(async move {
         tasks_s3::flat_list_main_task(&task_ctx, &prefix, concurrency, hints, late).await
     });
@@ -465,8 +485,8 @@ async fn spawn_diff(
     // returns (the children are linked in key order, as runtime splits are).
     // Each side has its own request window: one endpoint throttling (a
     // diff may compare two providers) does not slow the other.
-    let left_window = s3tl::window::open(job.concurrency);
-    let right_window = s3tl::window::open(job.concurrency);
+    let left_window = open_window(job);
+    let right_window = open_window(job);
     let side_discovery =
         |side: &SideSpec, region: &str, name: &'static str, window: &Arc<s3tl::window::Window>| {
             let window = Arc::clone(window);
@@ -518,7 +538,7 @@ async fn spawn_diff(
     );
     let (left_head_tx, left_head_rx) = tokio::sync::watch::channel(0usize);
     let (right_head_tx, right_head_rx) = tokio::sync::watch::channel(0usize);
-    let concurrency = job.concurrency;
+    let concurrency = concurrency_ceiling(job);
     let (left_prefix, right_prefix) = (job.source.url.prefix.clone(), target.url.prefix.clone());
     let order = left_order.clone();
     set.spawn(async move {

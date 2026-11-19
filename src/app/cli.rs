@@ -100,10 +100,11 @@ pub struct GlobalOpts {
     /// Signing region (default: detected from the bucket on AWS, else AWS_REGION, else us-east-1)
     #[arg(long, global = true, value_name = "REGION")]
     pub region: Option<String>,
-    /// Maximum concurrent requests
-    #[arg(short = 'c', long, global = true, value_name = "N", default_value_t = 100,
+    /// Maximum concurrent requests per side (default: 100, raised up to 1024
+    /// on a high-latency endpoint)
+    #[arg(short = 'c', long, global = true, value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=4096))]
-    pub concurrency: u16,
+    pub concurrency: Option<u16>,
     /// Print the plan as the result and exit without contacting S3
     #[arg(long, global = true)]
     pub dry_run: bool,
@@ -217,7 +218,7 @@ mod tests {
             "out",
         ])
         .unwrap();
-        assert_eq!(cli.global.concurrency, 8);
+        assert_eq!(cli.global.concurrency, Some(8));
         assert_eq!(cli.global.endpoint_url.as_deref(), Some("http://h"));
         assert!(matches!(cli.cmd, Command::List { output: Some(ref o), .. } if o == "out"));
     }

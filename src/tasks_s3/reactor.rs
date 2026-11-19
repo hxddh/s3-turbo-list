@@ -444,8 +444,7 @@ async fn flat_reactor_task(
                 // cut late in a run).
                 let within_budget = probes_at_start.is_none_or(|start| {
                     let stats = window.stats();
-                    stats.probes.saturating_sub(start)
-                        <= 2 * flat_concurrency as u64 + stats.list_requests / 8
+                    stats.probes.saturating_sub(start) <= 2 * cap as u64 + stats.list_requests / 8
                 });
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,

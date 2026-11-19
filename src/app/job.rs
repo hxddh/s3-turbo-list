@@ -61,7 +61,11 @@ pub struct Job {
     pub output: Output,
     /// `--delimiter` ("" for a recursive listing).
     pub delimiter: String,
+    /// Concurrency the run starts with: `-c`, else `window::AUTO_START`.
     pub concurrency: usize,
+    /// No `-c`: the request window raises its cap to the endpoint's latency
+    /// (see `window::open_auto`).
+    pub auto_concurrency: bool,
     pub max_keys: Option<i32>,
     pub no_auto_hints: bool,
     pub trace: Option<String>,
@@ -404,7 +408,10 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         target,
         output,
         delimiter,
-        concurrency: g.concurrency as usize,
+        concurrency: g
+            .concurrency
+            .map_or(s3tl::window::AUTO_START, |c| c as usize),
+        auto_concurrency: g.concurrency.is_none(),
         max_keys: g.max_keys,
         no_auto_hints: g.no_auto_hints,
         trace: g.trace.clone(),
