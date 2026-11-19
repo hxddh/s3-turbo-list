@@ -489,6 +489,11 @@ async fn flat_reactor_task(
                     completed_pieces += 1;
                 }
             }
+            // A split probe answered on another thread may still be
+            // accepting its cut: wait for every probe to stop before the
+            // last read of the children, or a child sent after it would be
+            // in no resume range.
+            probes.shutdown().await;
             // Children split off before or during the abort are unlisted
             // ranges: they belong in the resume ranges.
             while let Ok(range) = split_rx.try_recv() {

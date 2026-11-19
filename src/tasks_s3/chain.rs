@@ -46,7 +46,10 @@ pub(super) async fn flat_list_run_to_complete(
             .await
         };
         match attempt {
-            Ok(()) => return true,
+            Ok(()) => {
+                control.mark_finished();
+                return true;
+            }
             Err(err) => {
                 // Errors induced by shutdown (aborted siblings, the data-map
                 // channel closing) are not segment failures: counting or

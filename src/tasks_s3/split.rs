@@ -101,6 +101,10 @@ pub(super) struct SegmentControl {
     /// A diff segment: about to wait for the merge, it hands the rest of its
     /// range to a child (see `hand_off_rest`).
     hands_off: bool,
+    /// The segment listed its range to the end: no cut is accepted any
+    /// more (a probe answering after that would add an empty child, and in
+    /// a diff link it after a parent the merge already moved past).
+    finished: AtomicBool,
 }
 
 impl SegmentControl {
@@ -148,7 +152,15 @@ impl SegmentControl {
             waiting: AtomicBool::new(false),
             sample: Mutex::new(None),
             hands_off: false,
+            finished: AtomicBool::new(false),
         }
+    }
+
+    /// The segment listed its range to the end (taken under `shaping`, so a
+    /// cut accepted from outside lands before or not at all).
+    pub(super) fn mark_finished(&self) {
+        let _shaping = self.shaping();
+        self.finished.store(true, Ordering::Relaxed);
     }
 
     /// The segment of a diff side (see `hand_off_rest`).
@@ -286,6 +298,10 @@ impl SegmentControl {
         let Some(proposed) = self.pending_split.lock().unwrap().take() else {
             return Vec::new();
         };
+        if self.finished.load(Ordering::Relaxed) {
+            self.splitting.store(false, Ordering::Relaxed);
+            return Vec::new();
+        }
         let cursor = self.cursor.lock().unwrap();
         let mut end = self.end_before.lock().unwrap();
         let mut cuts: Vec<String> = proposed
@@ -421,9 +437,13 @@ async fn probe_split_candidate(
         // The deepest rung's page reaches past the segment's end: it holds
         // every key left in the range (no CommonPrefix of it is inside), so
         // the segment's own next page finishes the range.
+        // (Only when that is one of the segment's own pages: with a smaller
+        // --max-keys, the probe's 1,000 rows are several of them.)
+        let page = ctx.max_keys.filter(|m| *m > 0).map_or(1000, |m| m as usize);
         if rung == 0
             && let (Some(rows), Some(e)) = (&rows, end)
             && rows.iter().any(|k| k.as_str() >= e)
+            && rows.iter().filter(|k| in_range(k)).count() <= page
         {
             return SplitProbe::NoBoundary;
         }
@@ -841,6 +861,10 @@ pub(super) fn maybe_start_split_probes(
                 }
             };
             match found {
+                SplitProbe::Cut(_) if probe_ctx.is_quit() => {
+                    // The run is stopping: its resume ranges are being taken.
+                    control.splitting.store(false, Ordering::Relaxed);
+                }
                 SplitProbe::Cut(cuts) => {
                     debug!(
                         "Split probe for segment {}: proposing {} cut(s) from '{}'",
@@ -892,6 +916,17 @@ pub(super) fn maybe_start_split_probes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_finished_segment_accepts_no_cut() {
+        let control = SegmentControl::new_child(Some("b/x/".to_string())).starting_at("a/1");
+        control.record_page("a/9");
+        control.mark_finished();
+        // A probe answering late proposes a cut still above the cursor.
+        assert!(control.propose_cuts(&["b/".to_string()]));
+        assert!(control.accept_split_now().is_empty());
+        assert_eq!(control.current_end().as_deref(), Some("b/x/"));
+    }
 
     #[test]
     fn test_a_waiting_diff_segment_hands_the_rest_of_its_range_off() {
