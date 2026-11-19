@@ -70,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.5.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.6.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
