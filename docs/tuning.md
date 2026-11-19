@@ -86,6 +86,14 @@ itself a candidate after its first page.
 - otherwise near the middle between the cursor and the segment's end (or the
   listing's estimated highest key), validated by single-key probes.
 
+Before any probe, a segment whose range ends inside the flat run it is
+listing is cut from its own latest page: the page's first and last key give
+the run's number scale, the range is measured along it, and the cuts are
+evenly spread positions on it (at least two pages a child). These cuts cost
+no request and no round trip; a cut need not be a key (a segment is a
+contiguous range either way), and one in a gap costs its child one empty
+request, what validating it would have cost.
+
 The segment keeps `(start, cut]` and a new child lists `(cut, end]`,
 recursively. A cut takes effect as soon as it is found — the segment's page
 in flight is trimmed at its new end when it arrives — so a segment waiting on
@@ -97,8 +105,14 @@ side's request window (below), not `-c`.
 Each listing side has one window — a list run one, a diff one per side, so
 an endpoint that throttles never slows the other side — shared by every
 listing page and partitioning probe of that side. It is the only
-concurrency control. It opens at `-c`, which is also its cap (a listing
-page takes a slot, a probe a third of one):
+concurrency control. With `-c` it opens at `-c`, which is also its cap.
+Without `-c` it opens at 100 and, once the side's first *quiet* pages (sent
+while at most four pages were in flight, such as the first segment's pages
+while discovery runs) give the endpoint's latency, its cap rises to what
+keeps the client's cores busy at that latency — 1,000 pages a second a core
+times the latency, up to 1,024: about 130 at 30 ms on four cores, 800 at
+200 ms, and 100 on a fast local endpoint. A listing page takes a slot, a
+probe a third of one:
 
 - a throttle (`SlowDown`, 429, 503) or a timed-out request shrinks it to 70%,
   at most once per round trip;
@@ -121,16 +135,25 @@ Segments beyond the window are cheap — they wait for a slot. The result
 reports `stats.avg_concurrency` and `stats.peak_concurrency` (a diff adds
 its sides').
 
-`diff` splits each side the same way, each side with its own window capped
-at `-c`. A side's segments are read by the merge in key order: a split child
-is linked right after its parent, and the merge moves past a segment only
-once it can no longer gain children (see
-`src/segment_order.rs`). Each segment buffers at most 32 pages ahead of the
-merge, and a side starts at most 32 static segments ahead of the one being
-merged (its concurrency limit), so memory stays bounded whatever the bucket
-size (at most 32 × 32 pages buffered per side). A side held back by that
-lookahead still splits its running segments, including the one the merge is
-waiting on.
+`diff` splits each side the same way, each side with its own window (and at
+most 64 segments listing at once). A side's segments are read by the merge
+in key order: a split child is linked right after its parent, and the merge
+moves past a segment only once it can no longer gain children (see
+`src/segment_order.rs`). The side keeps listing ahead of the merge:
+
+- each segment buffers at most 8 pages; one whose buffer is full hands the
+  rest of its range to a child and ends there, so no segment waits for the
+  merge with part of its range unlisted;
+- a segment waiting for the merge sends no requests and does not count
+  against the side's concurrency;
+- a side starts segments only within 128 of where the merge reads, so it
+  buffers at most 1,024 pages whatever the bucket size;
+- runtime cuts go to the segments lowest in key order (the ones the merge
+  reads next), checked every 50 ms.
+
+(Before 1.6, segments with full buffers kept their slots and their unlisted
+ranges, and a large diff listed one page per round trip: 5M keys took 56 s at
+30 ms.)
 
 Partitioning probes (discovery, bisection, split probes) take their slots
 from the same window. A probe is optional work: it gives up after four
@@ -152,7 +175,7 @@ events, and the result counts them (`stats.probes`).
 | Throttle backoff | 100 ms, doubling | A throttle always pauses; the request window has already slowed the run. |
 | Request timeout | 10× the typical latency, at least 10 s, at most 60 s | Per page. |
 | Connect timeout | 60 s | |
-| Concurrency | `-c`, default 100 | The cap of each side's request window. |
+| Concurrency | `-c`; default 100, raised up to 1,024 by latency | The cap of each side's request window. |
 | Worker threads | CPU cores | |
 
 The SDK makes one attempt per call: retries are the segment loop's own, so
