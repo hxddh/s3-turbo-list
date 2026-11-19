@@ -375,11 +375,45 @@ fn check_trace_path(path: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The `_result.json` of a dataset that finished (`ok: true`).
-fn completed_result(dir: &Path) -> Option<String> {
+/// The `_result.json` of a dataset that finished (`ok: true`) as a listing
+/// of this run's source: same bucket, prefix and endpoint (normalized, as a
+/// checkpoint compares them). A finished dataset of another source is not
+/// this run's, and is not reported as if it were.
+fn completed_result(dir: &Path, job: &Job) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("_result.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    (value["ok"] == true).then(|| text.trim_end().to_string())
+    let source = &value["source"];
+    let stored_endpoint = source["endpoint_url"].as_str().map(str::to_string);
+    let endpoint = job.source.endpoint.as_deref().map(s3tl::redact::redact_url);
+    let same = value["ok"] == true
+        && value["command"] == "list"
+        && source["bucket"] == job.source.url.bucket.as_str()
+        && source["prefix"] == job.source.url.prefix.as_str()
+        && s3tl::checkpoint::normalized_endpoint(&stored_endpoint)
+            == s3tl::checkpoint::normalized_endpoint(&endpoint)
+        && dataset_lists_versions(dir) == Some(job.versions);
+    same.then(|| text.trim_end().to_string())
+}
+
+/// Whether a dataset's parts hold versions (`--versions`), read off a part's
+/// Parquet metadata (`s3tl.schema`); `None` when no part can be read.
+fn dataset_lists_versions(dir: &Path) -> Option<bool> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let part = std::fs::read_dir(dir).ok()?.flatten().find(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("part-") && name.ends_with(".parquet")
+    })?;
+    let reader = SerializedFileReader::new(std::fs::File::open(part.path()).ok()?).ok()?;
+    let schema = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()?
+        .iter()
+        .find(|kv| kv.key == s3tl::utils::SCHEMA_METADATA_KEY)?
+        .value
+        .clone()?;
+    Some(schema == s3tl::utils::LIST_VERSIONS_SCHEMA)
 }
 
 pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
@@ -485,7 +519,7 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         // left) has nothing to resume: report its result again, so a retry
         // of `--resume` after a lost exit status succeeds.
         if !Checkpoint::path(&dir).exists()
-            && let Some(stored) = completed_result(&dir)
+            && let Some(stored) = completed_result(&dir, &job)
         {
             job.already_complete = Some(stored);
             return Ok(job);

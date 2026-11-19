@@ -85,7 +85,7 @@ impl CheckpointIdentity {
 
 /// An endpoint URL as compared for a resume: scheme and host lower-cased,
 /// the scheme's default port and a trailing slash dropped.
-fn normalized_endpoint(endpoint: &Option<String>) -> Option<String> {
+pub fn normalized_endpoint(endpoint: &Option<String>) -> Option<String> {
     let url = endpoint.as_deref()?.trim().trim_end_matches('/');
     let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
     let scheme = scheme.to_ascii_lowercase();

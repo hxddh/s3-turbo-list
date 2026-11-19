@@ -745,7 +745,10 @@ async fn versions_list(
             Ok(Err(sdk_err)) => {
                 return handle_sdk_error(sdk_err, &next_start, ctx, traced);
             }
-            Ok(Ok(page)) => page,
+            Ok(Ok(page)) => {
+                ctx.g_state.mark_answered();
+                page
+            }
         };
         let url = page.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         let decode = |k: &str| crate::list_page::response_key(url, k);

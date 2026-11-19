@@ -3832,6 +3832,39 @@ fn local_mock_completed_run_with_runtime_splits_leaves_no_checkpoint() {
     assert_eq!(again["stats"]["objects"], result["stats"]["objects"]);
     assert_eq!(server.requests().len(), requests, "nothing listed");
     assert_eq!(sorted(dataset_keys(&out)), keys);
+    // A finished dataset of another source is not this run's to report:
+    // another bucket, or --versions, finds nothing to resume.
+    for other in [
+        cli(
+            &server,
+            "list",
+            &[
+                "s3://other-bucket",
+                "-c",
+                "8",
+                "-o",
+                out.to_str().unwrap(),
+                "--resume",
+            ],
+        ),
+        cli(
+            &server,
+            "list",
+            &[
+                "s3://mock-bucket",
+                "--versions",
+                "-c",
+                "8",
+                "-o",
+                out.to_str().unwrap(),
+                "--resume",
+            ],
+        ),
+    ] {
+        let (code, stdout, stderr) = run_cli(&other, dir.path());
+        failed_result(code, &stdout, &stderr, 2, "usage.no_checkpoint");
+    }
+    assert_eq!(server.requests().len(), requests, "nothing listed");
     // And a fresh run refuses to mix into the finished dataset.
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     failed_result(code, &stdout, &stderr, 2, "usage.output_not_empty");
