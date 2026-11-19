@@ -92,6 +92,7 @@ pub fn execute(job: Job, mut result: RunResult) -> Outcome {
             result,
             stdout_is_data,
             result_dir: None,
+            stored: None,
         }
     };
 
@@ -734,9 +735,19 @@ fn finish(
     // Commit (or discard) the dataset and the checkpoint.
     let mut checkpoint_saved: Option<(String, usize)> = None;
     if let Some(dir) = job.output.dir() {
+        // A list run that stops part-way keeps what it wrote and saves a
+        // checkpoint, so `--resume` continues: interrupted, or failed on the
+        // network or on its setup (an expired token, a revoked permission)
+        // after listing something. A run that failed before listing
+        // anything, or on its output, leaves the directory as it was.
         let keep = match &failure {
             None => true,
-            Some(f) => f.exit == ExitCode::Interrupted && job.mode == RunMode::List,
+            Some(f) => {
+                job.mode == RunMode::List
+                    && (f.exit == ExitCode::Interrupted
+                        || (matches!(f.exit, ExitCode::Retryable | ExitCode::Setup)
+                            && data.objects > 0))
+            }
         };
         if keep {
             match commit_parts(dir, &data.parts) {
@@ -798,8 +809,8 @@ fn finish(
                                     cleanup_failed_output(&job, &[]);
                                 }
                                 let f = Failure::output(format!(
-                                    "interrupted, and the checkpoint could not be saved ({}); this \
-                                 run's parts were removed so the dataset stays consistent",
+                                    "the run stopped, and the checkpoint could not be saved ({}); \
+                                     this run's parts were removed so the dataset stays consistent",
                                     e
                                 ));
                                 failure = Some(if resumable {
@@ -879,6 +890,20 @@ fn finish(
         });
     }
     if let Some(mut f) = failure {
+        if f.exit != ExitCode::Interrupted
+            && let Some((_, remaining)) = &checkpoint_saved
+        {
+            // A failed run that kept its progress: fix the cause, then resume.
+            let then = format!(
+                "then rerun the same command with --resume ({} key range(s) left)",
+                remaining
+            );
+            let hint = match f.error.hint.take() {
+                Some(fix) => format!("{}; {}", fix, then),
+                None => then,
+            };
+            f = f.hint(hint);
+        }
         if f.exit == ExitCode::Interrupted {
             f = match &checkpoint_saved {
                 Some((_, remaining)) => Failure::interrupted(format!(
@@ -928,6 +953,7 @@ fn finish(
         result,
         stdout_is_data,
         result_dir,
+        stored: None,
     }
 }
 

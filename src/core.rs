@@ -660,6 +660,9 @@ pub struct GlobalState {
     pub data: Arc<Mutex<DataSummary>>,
     /// A diff merge consumed both sides to the end and wrote its outputs.
     pub diff_merge_complete: Arc<AtomicBool>,
+    /// An endpoint has answered a listing request (with any status): a
+    /// connection failure after that is a transient, before it the setup.
+    answered: Arc<AtomicBool>,
     pub(crate) task_rendez: TaskRendezvous,
 }
 
@@ -766,6 +769,7 @@ impl GlobalState {
             output_error_count: Arc::new(AtomicUsize::new(0)),
             data: Arc::new(Mutex::new(DataSummary::default())),
             diff_merge_complete: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             task_rendez: TaskRendezvous::new(tasks_count),
         }
     }
@@ -806,6 +810,16 @@ impl GlobalState {
     pub fn read_throttled(&self) -> usize {
         self.throttled_count.load(Ordering::Relaxed)
     }
+    /// An endpoint answered a request.
+    pub fn mark_answered(&self) {
+        self.answered.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an endpoint has answered a request yet.
+    pub fn has_answered(&self) -> bool {
+        self.answered.load(Ordering::Relaxed)
+    }
+
     pub fn inc_fatal_error(&self) {
         self.fatal_error_count.fetch_add(1, Ordering::Relaxed);
     }

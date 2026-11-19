@@ -153,18 +153,33 @@ impl Failure {
                     "the endpoint broke the ListObjectsV2 ordering contract; run `s3tl check` against it",
                 ),
             ),
+            e::ERROR_ENDPOINT_UNREACHABLE => (
+                ExitCode::Setup,
+                "endpoint.unreachable",
+                Some(
+                    "check --endpoint-url, DNS and any proxy (HTTPS_PROXY); `s3tl check s3://BUCKET` tests the connection",
+                ),
+            ),
             e::ERROR_SLOW_DOWN | e::ERROR_TOO_MANY_REQUESTS => (
                 ExitCode::Retryable,
                 "net.throttled",
                 Some("the endpoint is rate limiting; retry later or lower -c"),
             ),
-            e::ERROR_S3_CLIENT_CONNECTION_TIMEOUT | e::ERROR_S3_NEXT_STREAM_TIMEOUT => {
-                (ExitCode::Retryable, "net.timeout", None)
-            }
-            e::ERROR_INTERNAL_ERROR | e::ERROR_SERVICE_UNAVAILABLE => {
-                (ExitCode::Retryable, "net.unavailable", None)
-            }
-            _ => (ExitCode::Retryable, "net.error", None),
+            e::ERROR_S3_CLIENT_CONNECTION_TIMEOUT | e::ERROR_S3_NEXT_STREAM_TIMEOUT => (
+                ExitCode::Retryable,
+                "net.timeout",
+                Some("retry later; `s3tl check s3://BUCKET` measures the endpoint"),
+            ),
+            e::ERROR_INTERNAL_ERROR | e::ERROR_SERVICE_UNAVAILABLE => (
+                ExitCode::Retryable,
+                "net.unavailable",
+                Some("the endpoint reported a server error; retry later"),
+            ),
+            _ => (
+                ExitCode::Retryable,
+                "net.error",
+                Some("retry later; `s3tl check s3://BUCKET` diagnoses the connection"),
+            ),
         };
         let failure = Self::new(exit, code, message);
         match hint {

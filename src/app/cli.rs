@@ -31,7 +31,7 @@ pub enum Command {
         source: String,
         /// Output: a directory (Parquet dataset) or `-` (NDJSON on stdout).
         /// Without it, only the result's statistics are produced.
-        #[arg(short, long, value_name = "DIR|-")]
+        #[arg(short, long, value_name = "DIR|-|s3://BUCKET/PREFIX/")]
         output: Option<String>,
         /// List one level: objects plus one row per folder (e.g. '/')
         #[arg(long, value_name = "CHAR")]
@@ -52,7 +52,7 @@ pub enum Command {
         #[arg(value_name = "S3_URL")]
         target: String,
         /// Output directory (Parquet dataset). Without it, only counts.
-        #[arg(short, long, value_name = "DIR")]
+        #[arg(short, long, value_name = "DIR|s3://BUCKET/PREFIX/")]
         output: Option<String>,
         /// Endpoint of the right side (default: --endpoint-url)
         #[arg(long, value_name = "URL")]

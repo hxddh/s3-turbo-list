@@ -71,6 +71,9 @@ pub struct Job {
     pub trace: Option<String>,
     /// The checkpoint a `--resume` continues.
     pub resume_from: Option<Checkpoint>,
+    /// `--resume` into a dataset that already finished: its `_result.json`,
+    /// reported again instead of listing (a retried resume is idempotent).
+    pub already_complete: Option<String>,
     /// Index of the first part file this run writes.
     pub first_part: usize,
     /// Whether this run created the output directory (removed again when a
@@ -177,7 +180,8 @@ fn resolve_endpoint(explicit: Option<&str>) -> Result<Option<String>, Failure> {
                 "endpoint '{}' must start with http:// or https://",
                 s3tl::redact::redact_url(e)
             ),
-        ));
+        )
+        .hint("e.g. --endpoint-url https://s3.example.com"));
     }
     Ok(endpoint)
 }
@@ -205,7 +209,9 @@ fn needs_path_style(endpoint: Option<&str>) -> bool {
 }
 
 fn side(url: &str, endpoint: Option<&str>, cli: &Cli) -> Result<SideSpec, Failure> {
-    let url = S3Url::parse(url).map_err(|m| Failure::usage("usage.invalid_url", m))?;
+    let url = S3Url::parse(url).map_err(|m| {
+        Failure::usage("usage.invalid_url", m).hint("pass s3://BUCKET or s3://BUCKET/PREFIX/")
+    })?;
     let endpoint = resolve_endpoint(endpoint)?;
     Ok(SideSpec {
         path_style: cli.global.path_style || needs_path_style(endpoint.as_deref()),
@@ -305,14 +311,16 @@ fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
         Err(_) if dir.is_file() => Err(Failure::usage(
             "usage.output_not_a_directory",
             format!("output '{}' exists and is not a directory", dir.display()),
-        )),
+        )
+        .hint("pass a new directory (or '-' for NDJSON on stdout)")),
         Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Err(Failure::usage(
             "usage.output_not_a_directory",
             format!(
                 "output '{}' cannot be created: a parent path is not a directory",
                 dir.display()
             ),
-        )),
+        )
+        .hint("pass a directory whose parents are directories")),
         Err(e) => Err(Failure::output(format!(
             "cannot read output directory '{}': {}",
             dir.display(),
@@ -338,6 +346,42 @@ fn check_fresh_dir(dir: &Path) -> Result<bool, Failure> {
 }
 
 /// Build the job for a list or diff command.
+/// A `--trace` path that cannot work, refused before anything runs (and in
+/// `--dry-run`): stdout carries the result document, and a file needs an
+/// existing directory.
+fn check_trace_path(path: &str) -> Result<(), Failure> {
+    if path == "-" {
+        return Ok(());
+    }
+    if matches!(path, "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1") {
+        return Err(Failure::usage(
+            "usage.invalid_trace",
+            "--trace cannot write to stdout, which carries the result document",
+        )
+        .hint("use --trace - for stderr, or a file path"));
+    }
+    let file = Path::new(path);
+    let dir = file
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if file.is_dir() || !dir.is_dir() {
+        return Err(Failure::output(format!(
+            "Failed to create trace file '{}': its directory does not exist or it is a directory",
+            path
+        ))
+        .hint("pass a file path in an existing directory, or - for stderr"));
+    }
+    Ok(())
+}
+
+/// The `_result.json` of a dataset that finished (`ok: true`).
+fn completed_result(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("_result.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (value["ok"] == true).then(|| text.trim_end().to_string())
+}
+
 pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
     let g = &cli.global;
     let mut compare_mode = s3tl::core::CompareMode::default();
@@ -372,7 +416,8 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
                 return Err(Failure::usage(
                     "usage.invalid_output",
                     "diff writes a Parquet dataset: -o takes a directory, not '-'",
-                ));
+                )
+                .hint("pass a new directory or an s3:// URL"));
             }
             let target_endpoint = target_endpoint_url.as_deref().or(g.endpoint_url.as_deref());
             (
@@ -393,8 +438,9 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         Some("") => {
             return Err(Failure::usage(
                 "usage.invalid_output",
-                "-o needs a directory or '-'",
-            ));
+                "-o needs a directory, '-' or an s3:// URL",
+            )
+            .hint("e.g. -o ./listing, -o - (NDJSON) or -o s3://BUCKET/PREFIX/"));
         }
         Some(url) if url.starts_with("s3://") => {
             Output::S3(side(url, g.endpoint_url.as_deref(), cli)?)
@@ -416,11 +462,15 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
         no_auto_hints: g.no_auto_hints,
         trace: g.trace.clone(),
         resume_from: None,
+        already_complete: None,
         first_part: 0,
         creates_dir: false,
         compare: compare_mode,
         versions: list_versions,
     };
+    if let Some(path) = &job.trace {
+        check_trace_path(path)?;
+    }
 
     if resume {
         let Some(dir) = job.output.dir().map(Path::to_path_buf) else {
@@ -428,14 +478,24 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
                 "usage.resume_needs_output",
                 "--resume continues a local Parquet dataset: pass -o with the interrupted \
                  run's directory (an S3 output is not resumable)",
-            ));
+            )
+            .hint("add -o DIR, the directory of the run to continue"));
         };
+        // A dataset that finished (its result says so, and no checkpoint is
+        // left) has nothing to resume: report its result again, so a retry
+        // of `--resume` after a lost exit status succeeds.
+        if !Checkpoint::path(&dir).exists()
+            && let Some(stored) = completed_result(&dir)
+        {
+            job.already_complete = Some(stored);
+            return Ok(job);
+        }
         let checkpoint = Checkpoint::load(&dir, &job.identity()).map_err(|e| match e {
             CheckpointError::Missing => Failure::usage(
                 "usage.no_checkpoint",
                 format!("'{}' has no checkpoint to resume", dir.display()),
             )
-            .hint("the run there finished or never started; drop --resume and use a new directory"),
+            .hint("the run there never wrote a checkpoint; drop --resume and use a new directory"),
             CheckpointError::Mismatch(_) => Failure::usage(
                 "usage.checkpoint_mismatch",
                 format!("'{}': {}", dir.display(), e),
@@ -444,7 +504,8 @@ pub fn prepare(cli: &Cli) -> Result<Job, Failure> {
             CheckpointError::Unreadable(_) => Failure::usage(
                 "usage.checkpoint_unreadable",
                 format!("'{}': {}", dir.display(), e),
-            ),
+            )
+            .hint("the checkpoint is damaged: list again into a new directory"),
         })?;
         if !cli.global.dry_run {
             remove_stale_temp_parts(&dir);

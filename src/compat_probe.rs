@@ -336,7 +336,7 @@ async fn pagination_second_page_result(
                         latency_ms: evt.latency_ms + second_evt.latency_ms,
                         http_status,
                         s3_error_code: second_evt.s3_error_code,
-                        error_message: Some(format!("page_2_error: {:?}", e)),
+                        error_message: Some(format!("page 2: {}", probe_error_message(&e))),
                         error_kind: error_kind.map(str::to_string),
                         diagnostic_code: Some(diagnostic_code.to_string()),
                         recommendation: Some(recommendation.to_string()),
@@ -451,7 +451,7 @@ fn probe_result_from<T, E: ProbeErrorMetadata + std::fmt::Debug>(
                 latency_ms: event.latency_ms,
                 http_status,
                 s3_error_code: event.s3_error_code,
-                error_message: Some(format!("{:?}", e)),
+                error_message: Some(e.concise()),
                 error_kind: error_kind.map(str::to_string),
                 diagnostic_code: Some(diagnostic_code.to_string()),
                 recommendation: Some(recommendation.to_string()),
@@ -560,9 +560,35 @@ fn diagnostic_for(
     }
 }
 
+/// One line for a failed probe request: the S3 error code and message, or
+/// the innermost transport cause ("Connection refused"), not the Debug dump
+/// of the SDK error with every header and the raw body.
+fn probe_error_message<E: ProvideErrorMetadata>(
+    e: &SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
+) -> String {
+    let message = crate::error::concise_sdk_error(e);
+    let status = match e {
+        SdkError::ServiceError(err) => Some(err.raw().status().as_u16()),
+        _ => None,
+    };
+    let message = match status {
+        Some(status) => format!("{} (HTTP {})", message, status),
+        None => message,
+    };
+    match e {
+        SdkError::DispatchFailure(d) => match d.as_connector_error() {
+            Some(c) => format!("{}: {}", message, crate::error::root_cause(c)),
+            None => message,
+        },
+        _ => message,
+    }
+}
+
 trait ProbeErrorMetadata {
     fn apply_to_event(&self, event: &mut S3CompatEvent);
     fn error_kind(&self) -> Option<&'static str>;
+    /// One line for the error (`probe_error_message`).
+    fn concise(&self) -> String;
 }
 
 impl<E> ProbeErrorMetadata
@@ -570,6 +596,10 @@ impl<E> ProbeErrorMetadata
 where
     E: ProvideErrorMetadata,
 {
+    fn concise(&self) -> String {
+        probe_error_message(self)
+    }
+
     fn apply_to_event(&self, event: &mut S3CompatEvent) {
         event.s3_error_code = self.code().map(str::to_string);
         event.s3_error_message = self.message().map(str::to_string);

@@ -31,6 +31,9 @@ pub const ERROR_EXPIRED_TOKEN: u8 = 0x19;
 pub const ERROR_INVALID_ACCESS_KEY: u8 = 0x1a;
 /// A listing that breaks the ListObjectsV2 contract (keys out of order).
 pub const ERROR_INCONSISTENT_LISTING: u8 = 0x1b;
+/// The endpoint could not be reached (connection refused, unknown host)
+/// before it ever answered: the run's setup, not a transient.
+pub const ERROR_ENDPOINT_UNREACHABLE: u8 = 0x1c;
 pub const ERROR_UNKNOWN: u8 = 0xff;
 
 /// Whether a segment should retry after this error rather than fail the run.
@@ -75,6 +78,7 @@ pub fn is_setup_error(errno: u8) -> bool {
             | ERROR_EXPIRED_TOKEN
             | ERROR_INVALID_ACCESS_KEY
             | ERROR_INCONSISTENT_LISTING
+            | ERROR_ENDPOINT_UNREACHABLE
     )
 }
 
@@ -115,6 +119,17 @@ where
         (None, Some(message)) => format!("{}: {}", kind, message),
         (None, None) => kind.to_string(),
     }
+}
+
+/// The innermost cause of an error, one line: "Connection refused (os error
+/// 111)", "dns error: failed to lookup address information: ...", instead of
+/// the Debug dump of every layer.
+pub fn root_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut cause = err;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause.to_string()
 }
 
 // ── FlatRuntimeError ──────────────────────────────────────
@@ -293,6 +308,7 @@ pub fn errno_to_name(errno: u8) -> &'static str {
         ERROR_EXPIRED_TOKEN => "ExpiredToken",
         ERROR_INVALID_ACCESS_KEY => "InvalidAccessKeyId",
         ERROR_INCONSISTENT_LISTING => "InconsistentListing",
+        ERROR_ENDPOINT_UNREACHABLE => "EndpointUnreachable",
         _ => "Unknown",
     }
 }

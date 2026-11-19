@@ -21,11 +21,16 @@ use std::sync::Mutex;
 pub struct S3CompatEvent {
     // ── request identity ──────────────────────────────────
     pub timestamp: String, // ISO 8601, wall-clock
-    pub operation: String, // "ListObjectsV2", "HeadBucket"
+    pub operation: String, // "ListObjectsV2", "HeadBucket", "Probe"
+    // Empty (and omitted) for `Probe` events, which carry only their
+    // outcome and latency.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub endpoint_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub addressing_style: String, // "path" or "virtual"
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub bucket: String,
     pub prefix: String,
 

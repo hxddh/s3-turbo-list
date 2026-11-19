@@ -28,28 +28,79 @@ pub struct CheckpointIdentity {
 
 impl CheckpointIdentity {
     /// Names of the fields that differ (empty: same run).
-    pub fn diff(&self, current: &CheckpointIdentity) -> Vec<&'static str> {
+    /// Each field that differs, with "checkpoint: X, this run: Y" (an
+    /// endpoint redacted). Endpoints compare normalized: scheme and host
+    /// case, a default port and a trailing slash do not count.
+    pub fn differences(&self, current: &CheckpointIdentity) -> Vec<(&'static str, String)> {
+        let show = |v: &dyn std::fmt::Debug| format!("{:?}", v);
+        let endpoint = |e: &Option<String>| {
+            e.as_deref()
+                .map_or("AWS S3".to_string(), crate::redact::redact_url)
+        };
         let mut out = Vec::new();
-        if self.bucket != current.bucket {
-            out.push("bucket");
-        }
-        if self.prefix != current.prefix {
-            out.push("prefix");
-        }
-        if self.endpoint_url != current.endpoint_url {
-            out.push("endpoint_url");
-        }
-        if self.delimiter != current.delimiter {
-            out.push("delimiter");
-        }
-        if self.max_keys != current.max_keys {
-            out.push("max_keys");
-        }
-        if self.versions != current.versions {
-            out.push("versions");
-        }
+        let mut differ = |field, same: bool, was: String, now: String| {
+            if !same {
+                out.push((field, format!("checkpoint: {}, this run: {}", was, now)));
+            }
+        };
+        differ(
+            "bucket",
+            self.bucket == current.bucket,
+            show(&self.bucket),
+            show(&current.bucket),
+        );
+        differ(
+            "prefix",
+            self.prefix == current.prefix,
+            show(&self.prefix),
+            show(&current.prefix),
+        );
+        differ(
+            "endpoint_url",
+            normalized_endpoint(&self.endpoint_url) == normalized_endpoint(&current.endpoint_url),
+            endpoint(&self.endpoint_url),
+            endpoint(&current.endpoint_url),
+        );
+        differ(
+            "delimiter",
+            self.delimiter == current.delimiter,
+            show(&self.delimiter),
+            show(&current.delimiter),
+        );
+        differ(
+            "max_keys",
+            self.max_keys == current.max_keys,
+            show(&self.max_keys),
+            show(&current.max_keys),
+        );
+        differ(
+            "versions",
+            self.versions == current.versions,
+            show(&self.versions),
+            show(&current.versions),
+        );
         out
     }
+}
+
+/// An endpoint URL as compared for a resume: scheme and host lower-cased,
+/// the scheme's default port and a trailing slash dropped.
+fn normalized_endpoint(endpoint: &Option<String>) -> Option<String> {
+    let url = endpoint.as_deref()?.trim().trim_end_matches('/');
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let mut authority = authority.to_ascii_lowercase();
+    for default in [("http", ":80"), ("https", ":443")] {
+        if scheme == default.0 && authority.ends_with(default.1) {
+            authority.truncate(authority.len() - default.1.len());
+        }
+    }
+    Some(if path.is_empty() {
+        format!("{}://{}", scheme, authority)
+    } else {
+        format!("{}://{}/{}", scheme, authority, path)
+    })
 }
 
 /// A key range still to be listed: keys after `start_after` (exclusive, ""
@@ -90,7 +141,8 @@ pub const CHECKPOINT_SCHEMA: &str = "s3tl.checkpoint/1";
 pub enum CheckpointError {
     Missing,
     Unreadable(String),
-    Mismatch(Vec<&'static str>),
+    /// The fields that differ, each "field (checkpoint: X, this run: Y)".
+    Mismatch(Vec<String>),
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -100,8 +152,8 @@ impl std::fmt::Display for CheckpointError {
             Self::Unreadable(e) => write!(f, "checkpoint is unreadable: {}", e),
             Self::Mismatch(fields) => write!(
                 f,
-                "checkpoint belongs to a different run (differs in: {})",
-                fields.join(", ")
+                "checkpoint belongs to a different run (differs in {})",
+                fields.join("; ")
             ),
         }
     }
@@ -139,9 +191,14 @@ impl Checkpoint {
                 cp.schema
             )));
         }
-        let mismatch = cp.identity.diff(identity);
+        let mismatch = cp.identity.differences(identity);
         if !mismatch.is_empty() {
-            return Err(CheckpointError::Mismatch(mismatch));
+            return Err(CheckpointError::Mismatch(
+                mismatch
+                    .into_iter()
+                    .map(|(field, values)| format!("{} ({})", field, values))
+                    .collect(),
+            ));
         }
         Ok(cp)
     }
@@ -221,10 +278,21 @@ mod tests {
         let mut other = identity();
         other.endpoint_url = None;
         other.max_keys = Some(2);
-        assert_eq!(
-            Checkpoint::load(dir.path(), &other),
-            Err(CheckpointError::Mismatch(vec!["endpoint_url", "max_keys"]))
-        );
+        match Checkpoint::load(dir.path(), &other) {
+            Err(CheckpointError::Mismatch(fields)) => {
+                assert_eq!(fields.len(), 2, "{fields:?}");
+                assert!(
+                    fields[0].starts_with("endpoint_url (checkpoint: "),
+                    "{fields:?}"
+                );
+                assert!(fields[1].starts_with("max_keys (checkpoint: None, this run: Some(2))"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The same endpoint written differently is the same endpoint.
+        let mut same = identity();
+        same.endpoint_url = same.endpoint_url.map(|e| format!("{}/", e.to_uppercase()));
+        assert!(Checkpoint::load(dir.path(), &same).is_ok());
     }
 
     #[test]

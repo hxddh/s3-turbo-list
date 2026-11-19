@@ -293,6 +293,7 @@ async fn flat_list(
                 return handle_sdk_error(sdk_err, &next_start, ctx, traced);
             }
             Ok(Ok(response)) => {
+                ctx.g_state.mark_answered();
                 let mut objects = response;
                 // Rows the fast path parsed; `None` means this page fell back
                 // to the SDK's own `Contents`.
