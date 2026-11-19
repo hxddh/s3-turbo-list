@@ -5238,6 +5238,45 @@ fn local_mock_wide_namespace_diff_matches_key_for_key() {
 }
 
 #[test]
+fn local_mock_diff_against_a_slow_side_hands_ranges_off_and_matches_key_for_key() {
+    // A fast left side and a slow right side, 100-key pages: the left
+    // side's segments fill their buffers long before the merge reads them,
+    // so they wait and hand the rest of their ranges to children. Every key
+    // is still paired exactly once, in order.
+    let keys: Vec<String> = (0..40_000).map(|i| format!("obj-{i:06}")).collect();
+    let mut right = keys.clone();
+    right.retain(|k| !k.ends_with('7'));
+    let server = small_page_server(keys.clone());
+    let slow: Vec<String> = right.clone();
+    let other = MockS3Server::start(move |request, _sequence| {
+        if !is_delimiter_probe(&request) && !is_single_key_probe(&request) {
+            thread::sleep(Duration::from_millis(60));
+        }
+        let mut q = request.query.clone();
+        let asked: usize = q
+            .get("max-keys")
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(1000);
+        q.insert("max-keys".into(), asked.min(100).to_string());
+        MockResponse::ok_xml(emulated_list(&slow, &q))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = cli(
+        &server,
+        "diff",
+        &["s3://mock-bucket", "s3://mock-bucket", "-c", "8"],
+    );
+    args.extend(strings(&["--target-endpoint-url", &other.endpoint()]));
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["diff"]["left_only"], keys.len() - right.len());
+    assert_eq!(result["diff"]["right_only"], 0);
+    let paired =
+        result["diff"]["equal"].as_u64().unwrap() + result["diff"]["changed"].as_u64().unwrap();
+    assert_eq!(paired as usize, right.len());
+}
+
+#[test]
 fn local_mock_listing_does_not_wait_for_startup_discovery() {
     // Startup discovery runs alongside the listing: a slow probe no longer
     // delays the first object, and a listing that finishes first ends the

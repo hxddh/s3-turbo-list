@@ -90,6 +90,17 @@ pub(super) struct SegmentControl {
     /// only ever covers rows the data map will write, so an interrupted run
     /// can checkpoint "resume after this key" without losing a page.
     pub(super) sent: Mutex<Option<String>>,
+    /// Waiting for room in its output channel: a diff segment ahead of the
+    /// merge, its buffer full. It sends no requests meanwhile, so it takes
+    /// no concurrency slot; it handed the rest of its range off before it
+    /// waited (`hand_off_rest`), so there is nothing left to cut.
+    waiting: AtomicBool,
+    /// The first and last key of the segment's latest page, and how many it
+    /// held: where the keys run, read off for cuts without a probe.
+    sample: Mutex<Option<(String, String, usize)>>,
+    /// A diff segment: about to wait for the merge, it hands the rest of its
+    /// range to a child (see `hand_off_rest`).
+    hands_off: bool,
 }
 
 impl SegmentControl {
@@ -134,7 +145,66 @@ impl SegmentControl {
             next_probe_page: AtomicU32::new(min_pages),
             probe_failures: AtomicU32::new(0),
             sent: Mutex::new(None),
+            waiting: AtomicBool::new(false),
+            sample: Mutex::new(None),
+            hands_off: false,
         }
+    }
+
+    /// The segment of a diff side (see `hand_off_rest`).
+    pub(super) fn handing_off(mut self, hands_off: bool) -> Self {
+        self.hands_off = hands_off;
+        self
+    }
+
+    pub(super) fn hands_off(&self) -> bool {
+        self.hands_off
+    }
+
+    /// End the segment at its cursor and hand the rest of its range to a
+    /// child. A diff segment whose output buffer is full would otherwise wait
+    /// for the merge with part of its range unlisted, and list that part one
+    /// page per round trip once the merge reached it — every segment of a
+    /// side in turn. The child lists the rest at once, into its own buffer.
+    /// The caller holds `shaping`. `None` when nothing is left.
+    pub(super) fn hand_off_rest(&self) -> Option<SplitRange> {
+        let cursor = self.cursor.lock().unwrap();
+        let mut end = self.end_before.lock().unwrap();
+        if cursor.is_empty() || end.as_deref().is_some_and(|e| e <= cursor.as_str()) {
+            return None;
+        }
+        let old_end = end.replace(cursor.clone());
+        Some(SplitRange {
+            start: cursor.clone(),
+            end: old_end,
+            parent: 0,
+        })
+    }
+
+    /// Keep the segment's latest page (two keys or more) as its sample.
+    pub(super) fn record_sample(
+        &self,
+        rows: &[(crate::core::ObjectKey, crate::core::ObjectProps)],
+    ) {
+        if let (Some((first, _)), Some((last, _)), true) =
+            (rows.first(), rows.last(), rows.len() >= 2)
+        {
+            *self.sample.lock().unwrap() = Some((
+                first.as_str().to_string(),
+                last.as_str().to_string(),
+                rows.len(),
+            ));
+        }
+    }
+
+    /// Mark the segment as waiting for its output channel (or done waiting).
+    pub(super) fn set_waiting(&self, waiting: bool) {
+        self.waiting.store(waiting, Ordering::Relaxed);
+    }
+
+    /// Whether the segment is waiting for its output channel.
+    pub(super) fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed)
     }
 
     /// Every key up to `cursor` in this segment has been handed to the data
@@ -184,6 +254,7 @@ impl SegmentControl {
         self.pages.load(Ordering::Relaxed) >= self.next_probe_page.load(Ordering::Relaxed)
             && !self.splitting.load(Ordering::Relaxed)
             && !self.unsplittable.load(Ordering::Relaxed)
+            && !self.is_waiting()
     }
 
     /// Hand the segment cuts found outside its own probes (startup discovery
@@ -270,6 +341,10 @@ enum SplitProbe {
     NoBoundary,
     /// A probe request errored or timed out: nothing was learned.
     Failed,
+    /// The range is too short to cut now; asked again later at no cost
+    /// (no back-off: a segment waiting for the merge lists no pages, and
+    /// backing off by pages left it uncut until the merge reached it).
+    TooShort,
 }
 
 /// One delimiter probe per ancestor rung; returns up to `k` CommonPrefixes
@@ -459,6 +534,54 @@ async fn cut_flat_run(
     }
 }
 
+/// Cuts of a segment's remaining range `(cursor, end)` read off its own
+/// latest page (`sample`: first key, last key, keys), with no request: the
+/// page's keys give the run's number scale (as startup sizes flat runs), the
+/// range is measured along it, and the cuts are evenly spread positions on
+/// it, each child at least `SPLIT_CHILD_MIN_SPAN_PAGES` pages. A cut need
+/// not be a key: segments are contiguous ranges, so any cut keeps the
+/// listing exact, and one that lands in a gap costs its child one empty
+/// request — what a probe validating it would have cost, without the round
+/// trip. `None` when the keys have no number to read or the range ends past
+/// the run (the probes decide then); empty when the range is too short to
+/// cut now.
+fn local_cuts(
+    sample: &(String, String, usize),
+    listing_prefix: &str,
+    cursor: &str,
+    end: &str,
+    k: usize,
+    page: usize,
+) -> Option<Vec<String>> {
+    let (first, last, keys) = sample;
+    let scale = crate::flat_cut::RunScale::new(first, last, listing_prefix)?;
+    if !end.starts_with(&scale.scope) {
+        return None;
+    }
+    let (from, to) = (scale.spans_to(cursor)?, scale.spans_to(end)?);
+    if to <= from {
+        return None;
+    }
+    // The sample's span held `keys` keys: the range holds about this many
+    // pages.
+    let pages = (to - from) * *keys as f64 / page.max(1) as f64;
+    let children = (pages / SPLIT_CHILD_MIN_SPAN_PAGES).floor() as usize;
+    if children < 2 {
+        return Some(Vec::new());
+    }
+    let k = k.min(children - 1);
+    let mut cuts: Vec<String> = (1..=k)
+        .filter_map(|j| {
+            let at = from + (to - from) * j as f64 / (k + 1) as f64;
+            scale.at_fraction((at * 1000.0) as u128, 1000)
+        })
+        .filter(|c| c.as_str() > cursor && c.as_str() < end)
+        .collect();
+    cuts.sort();
+    cuts.dedup();
+    Some(cuts)
+}
+
 /// The first key under `prefix` after `start_after`: one `max-keys=1` probe.
 async fn first_key_after(
     ctx: &S3TaskContext,
@@ -613,43 +736,62 @@ fn unreserved_slots(controls: &HashMap<usize, Arc<SegmentControl>>, idle_capacit
     idle_capacity.saturating_sub(reserved)
 }
 
+/// The segments to probe for cuts. A listing probes the busiest. A diff
+/// side (`in_key_order`) probes the lowest in key order, a few at a time so
+/// each gets up to `SPLIT_MAX_CUTS` cuts: the merge reads the side in key
+/// order, so the segment it waits on is the one to cut, and cuts far ahead
+/// of it only fill buffers that then wait. (Busiest first spent the probe
+/// budget in a diff's first seconds on segments about to wait, and the
+/// merge's segment listed one page per round trip for the rest of the run.)
 fn select_split_targets(
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
+    in_key_order: bool,
 ) -> Vec<usize> {
     let budget = unreserved_slots(controls, idle_capacity);
     if budget == 0 {
         return Vec::new();
     }
-
-    let mut candidates: Vec<(usize, u32)> = controls
-        .iter()
-        .filter(|(_, c)| c.is_split_candidate())
+    let candidates = controls.iter().filter(|(_, c)| c.is_split_candidate());
+    if in_key_order {
+        let mut lowest: Vec<(usize, String)> = candidates
+            .map(|(index, c)| (*index, c.snapshot().0))
+            .collect();
+        lowest.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        return lowest
+            .into_iter()
+            .take(budget.div_ceil(SPLIT_MAX_CUTS))
+            .map(|(index, _)| index)
+            .collect();
+    }
+    let mut busiest: Vec<(usize, u32)> = candidates
         .map(|(index, c)| (*index, c.pages.load(Ordering::Relaxed)))
         .collect();
     // Busiest first; index breaks ties for deterministic selection.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    candidates
+    busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    busiest
         .into_iter()
         .take(budget)
         .map(|(index, _)| index)
         .collect()
 }
 
-/// Probe the busiest splittable in-flight segments in the background, up to
-/// the idle-slot budget.  Each probe only proposes a cut; the segment task
-/// decides at its next page boundary.
+/// Probe splittable in-flight segments in the background (see
+/// `select_split_targets`), up to the idle-slot budget.  Each probe only
+/// proposes a cut; the segment task decides at its next page boundary.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn maybe_start_split_probes(
     ctx: &S3TaskContext,
     start_prefix: &str,
     controls: &HashMap<usize, Arc<SegmentControl>>,
     idle_capacity: usize,
+    in_key_order: bool,
     flat_high: &FlatHigh,
     split_tx: &SplitSender,
     probes: &mut tokio::task::JoinSet<()>,
 ) {
     let free = unreserved_slots(controls, idle_capacity);
-    let targets = select_split_targets(controls, idle_capacity);
+    let targets = select_split_targets(controls, idle_capacity, in_key_order);
     // Idle slots are shared between the probed segments: one segment alone
     // with 31 idle slots is cut into up to 16 pieces in one probe, instead
     // of doubling once per probe and page.
@@ -668,16 +810,37 @@ pub(super) fn maybe_start_split_probes(
                 control.splitting.store(false, Ordering::Relaxed);
                 return;
             }
-            match probe_split_candidate(
-                &probe_ctx,
-                &listing_prefix,
-                &cursor,
-                end.as_deref(),
-                &flat_high,
-                share,
-            )
-            .await
-            {
+            let sample = control.sample.lock().unwrap().clone();
+            let page = probe_ctx
+                .max_keys
+                .filter(|m| *m > 0)
+                .map_or(1000, |m| m as usize);
+            let local = sample.and_then(|sample| {
+                local_cuts(
+                    &sample,
+                    &listing_prefix,
+                    &cursor,
+                    end.as_deref()?,
+                    share,
+                    page,
+                )
+            });
+            let found = match local {
+                Some(cuts) if cuts.is_empty() => SplitProbe::TooShort,
+                Some(cuts) => SplitProbe::Cut(cuts),
+                None => {
+                    probe_split_candidate(
+                        &probe_ctx,
+                        &listing_prefix,
+                        &cursor,
+                        end.as_deref(),
+                        &flat_high,
+                        share,
+                    )
+                    .await
+                }
+            };
+            match found {
                 SplitProbe::Cut(cuts) => {
                     debug!(
                         "Split probe for segment {}: proposing {} cut(s) from '{}'",
@@ -710,6 +873,9 @@ pub(super) fn maybe_start_split_probes(
                     );
                     control.record_probe_failure();
                 }
+                SplitProbe::TooShort => {
+                    control.splitting.store(false, Ordering::Relaxed);
+                }
                 SplitProbe::NoBoundary => {
                     debug!(
                         "Split probe for segment {}: no structural boundary in remaining range",
@@ -726,6 +892,52 @@ pub(super) fn maybe_start_split_probes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_waiting_diff_segment_hands_the_rest_of_its_range_off() {
+        let control = SegmentControl::new_child(Some("k9".to_string()))
+            .starting_at("k0")
+            .handing_off(true);
+        control.record_page("k4");
+        let child = control.hand_off_rest().unwrap();
+        assert_eq!(
+            (child.start.as_str(), child.end.as_deref()),
+            ("k4", Some("k9"))
+        );
+        assert_eq!(
+            control.current_end().as_deref(),
+            Some("k4"),
+            "ends at its cursor"
+        );
+        assert!(
+            control.hand_off_rest().is_none(),
+            "nothing left the second time"
+        );
+    }
+
+    #[test]
+    fn test_local_cuts_read_the_range_off_the_latest_page() {
+        // A page of 1000 keys spans obj-000001000..obj-000001999; the range
+        // (obj-000001999, obj-000011000) holds about nine pages.
+        let sample = (
+            "obj-000001000".to_string(),
+            "obj-000001999".to_string(),
+            1000,
+        );
+        let cuts = local_cuts(&sample, "", "obj-000001999", "obj-000011000", 15, 1000).unwrap();
+        // At least two pages a child: four cuts, evenly spread, inside.
+        assert_eq!(cuts.len(), 3, "{cuts:?}");
+        assert!(cuts.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            cuts.iter()
+                .all(|c| c.as_str() > "obj-000001999" && c.as_str() < "obj-000011000")
+        );
+        // Too short to cut now: empty, not a failure.
+        let short = local_cuts(&sample, "", "obj-000001999", "obj-000004000", 15, 1000).unwrap();
+        assert!(short.is_empty());
+        // The end past the run (outside its scope): the probes decide.
+        assert!(local_cuts(&sample, "", "obj-000001999", "zzz", 15, 1000).is_none());
+    }
 
     #[test]
     fn test_multi_way_split_yields_contiguous_children_last_first() {
@@ -766,8 +978,8 @@ mod tests {
         controls.insert(1, control_with_pages(10));
         // Six of eight idle slots belong to segment 0's probe.
         assert_eq!(unreserved_slots(&controls, 8), 2);
-        assert_eq!(select_split_targets(&controls, 8), vec![1]);
-        assert!(select_split_targets(&controls, 6).is_empty());
+        assert_eq!(select_split_targets(&controls, 8, false), vec![1]);
+        assert!(select_split_targets(&controls, 6, false).is_empty());
         // A finished probe's reservation no longer counts.
         controls[&0].splitting.store(false, Ordering::Relaxed);
         assert_eq!(unreserved_slots(&controls, 8), 8);
@@ -953,11 +1165,11 @@ mod tests {
 
         // Two idle slots, nothing in flight: the two busiest candidates,
         // busiest first. The sub-threshold segment is never selected.
-        assert_eq!(select_split_targets(&controls, 2), vec![0, 1]);
+        assert_eq!(select_split_targets(&controls, 2, false), vec![0, 1]);
         // Ample idle capacity: every eligible candidate, still ordered.
-        assert_eq!(select_split_targets(&controls, 10), vec![0, 1, 2]);
+        assert_eq!(select_split_targets(&controls, 10, false), vec![0, 1, 2]);
         // No idle capacity: no probes.
-        assert!(select_split_targets(&controls, 0).is_empty());
+        assert!(select_split_targets(&controls, 0, false).is_empty());
     }
 
     #[test]
@@ -969,7 +1181,7 @@ mod tests {
         // one unit of the idle budget so total outstanding probes stay bounded.
         controls[&0].splitting.store(true, Ordering::Relaxed);
 
-        assert_eq!(select_split_targets(&controls, 2), vec![1]);
-        assert!(select_split_targets(&controls, 1).is_empty());
+        assert_eq!(select_split_targets(&controls, 2, false), vec![1]);
+        assert!(select_split_targets(&controls, 1, false).is_empty());
     }
 }

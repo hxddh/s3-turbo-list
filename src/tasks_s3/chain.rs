@@ -398,6 +398,7 @@ async fn flat_list(
                 is_ended = shaped.ended;
                 object_count = object_count.saturating_add(shaped.objects);
                 control.record_page(&next_start);
+                control.record_sample(&batch);
 
                 // A split proposal is decided here, at a page boundary,
                 // against the authoritative cursor. A segment that already
@@ -414,11 +415,28 @@ async fn flat_list(
                         let _ = tx.send(child);
                     }
                 }
+                // A diff segment about to wait for the merge (its buffer
+                // full) hands the rest of its range to a child and ends
+                // here: the child lists on while this one waits.
+                let mut handed_off = false;
+                if let (Some(tx), false) = (split_tx, is_ended || ctx.is_quit())
+                    && control.hands_off()
+                    && !batch.is_empty()
+                    && ctx.data_map_channel.capacity() == 0
+                    && let Some(mut child) = control.hand_off_rest()
+                {
+                    child.parent = segment_index;
+                    debug!(
+                        "Segment {} waits for the merge; handed '{}' onwards to a child",
+                        segment_index, child.start
+                    );
+                    handed_off = tx.send(child).is_ok();
+                }
                 drop(shaping);
 
                 // Send batch to data_map via bounded channel.
                 if !batch.is_empty() {
-                    if let Err(e) = ctx.data_map_channel.send(batch).await {
+                    if let Err(e) = send_batch(ctx, control, batch).await {
                         if !ctx.is_quit() {
                             error!("Failed to send data to data_map channel: {}", e);
                         }
@@ -435,7 +453,7 @@ async fn flat_list(
 
                 page_count = page_count.saturating_add(1);
 
-                if is_ended {
+                if is_ended || handed_off {
                     break;
                 }
 
@@ -591,6 +609,26 @@ fn merge_by_key(
 }
 
 /// What a page request's result tells the request window.
+/// Hand a page's rows to the output channel. A segment that has to wait
+/// for room (a diff segment ahead of the merge) is marked waiting meanwhile:
+/// it sends no requests, so the reactor does not count it against the
+/// concurrency it fans out to.
+async fn send_batch(
+    ctx: &S3TaskContext,
+    control: &SegmentControl,
+    batch: Vec<(ObjectKey, ObjectProps)>,
+) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<(ObjectKey, ObjectProps)>>> {
+    let full = ctx.data_map_channel.capacity() == 0;
+    if full {
+        control.set_waiting(true);
+    }
+    let sent = ctx.data_map_channel.send(batch).await;
+    if full {
+        control.set_waiting(false);
+    }
+    sent
+}
+
 fn page_outcome<T, E>(
     res: &Result<Result<T, aws_sdk_s3::error::SdkError<E>>, tokio::time::error::Elapsed>,
     latency: Duration,
@@ -829,7 +867,7 @@ async fn versions_list(
         }
         drop(shaping);
         if !batch.is_empty() {
-            if let Err(e) = ctx.data_map_channel.send(batch).await {
+            if let Err(e) = send_batch(ctx, control, batch).await {
                 return Err(FlatRuntimeError::new(
                     ERROR_S3_CLIENT_GENERIC,
                     format!("Data map channel closed: {}", e),
