@@ -58,7 +58,10 @@ BOS. Consequences:
   in key order (`src/segment_order.rs`); diff does not checkpoint, and any
   segment failure or ordering violation fails the run.
 - Output is a dataset directory committed atomically (temp parts renamed on
-  commit); a failed run leaves the directory as it was.
+  commit). A list run that is interrupted, or fails on the network or its
+  setup after listing something, commits what it listed with a checkpoint
+  for `--resume` (since 1.6); any other failed run leaves the directory as it
+  was.
 - `dist/` and `target/` are generated and ignored.
 
 ## Cloud Safety Rules

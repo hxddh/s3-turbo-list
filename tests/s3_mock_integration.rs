@@ -2615,10 +2615,11 @@ fn local_mock_retry_budget_is_refunded_by_progress() {
 /// The refund must require real progress, or a stuck segment retries forever.
 #[test]
 fn local_mock_retry_budget_still_exhausts_without_progress() {
-    // Page 2 never answers, so every retry after the first resumes from the
-    // same key and buys no ground.
+    // Page 2 does not answer for the whole first run, so every retry after
+    // the first resumes from the same key and buys no ground.
     const FAILING: &[usize] = &[2];
-    let (server, _attempts) = paged_mock_with_failing_pages(10, FAILING, usize::MAX);
+    // S3TL_MAX_ATTEMPTS=3: four attempts, then the run fails.
+    let (server, attempts) = paged_mock_with_failing_pages(10, FAILING, 4);
 
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
@@ -2626,8 +2627,21 @@ fn local_mock_retry_budget_still_exhausts_without_progress() {
     let result = failed_result(code, &stdout, &stderr, 4, "net.error");
     assert_eq!(result["status"], "failed");
     assert_eq!(result["error"]["retryable"], true);
-    // The failed run leaves no partial dataset (and no directory it made).
-    assert!(!out.exists());
+    assert_eq!(attempts.lock().unwrap()[&2], 4, "the budget ran out");
+    // Since 1.6 a list run that failed part-way keeps what it listed and a
+    // checkpoint (it used to leave nothing), and says how to continue.
+    assert!(result["resume"]["checkpoint"].is_string(), "{result}");
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("--resume"), "{hint}");
+    assert_eq!(dataset_keys(&out), vec!["key-00", "key-01"]);
+
+    // The endpoint recovers: --resume lists the rest, every key once.
+    let mut args = paged_run_args(&server, &out);
+    args.push("--resume".into());
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    ok_result(code, &stdout, &stderr);
+    let expected: Vec<String> = (0..10).map(|i| format!("key-{i:02}")).collect();
+    assert_eq!(sorted(dataset_keys(&out)), expected);
 }
 
 // A page that says IsTruncated=true but gives no usable NextContinuationToken,
@@ -2742,7 +2756,10 @@ fn local_mock_truncated_page_that_never_advances_fails_the_run() {
     assert_eq!(result_of(&stdout)["ok"], false);
     // One advancing attempt, then max_attempts (3) that make no progress.
     assert_eq!(requests_served.load(Ordering::SeqCst), 4);
-    assert!(!out.exists());
+    // What was listed is kept with a checkpoint to resume from (since 1.6;
+    // a failed run used to leave nothing).
+    assert_eq!(dataset_keys(&out), vec!["k1", "k2"]);
+    assert!(checkpoint_path(&out).exists());
 }
 
 // ── Throttling must be visible and must be backed off ──────
@@ -3560,8 +3577,10 @@ fn local_mock_resume_lists_only_the_checkpoint_ranges_into_the_same_dataset() {
     // Nothing is left to resume: a completed resume must not leave a
     // checkpoint that a later --resume would trust and skip ranges by.
     assert!(!checkpoint_path(&out).exists());
+    // Resuming again reports the finished dataset's result and lists
+    // nothing (since 1.6; it used to fail with usage.no_checkpoint).
     let (code, stdout, stderr) = run_cli(&args, dir.path());
-    failed_result(code, &stdout, &stderr, 2, "usage.no_checkpoint");
+    assert_eq!(ok_result(code, &stdout, &stderr)["resume"]["resumed"], true);
     assert_eq!(server.requests().len(), 1);
 }
 
@@ -3802,12 +3821,50 @@ fn local_mock_completed_run_with_runtime_splits_leaves_no_checkpoint() {
     assert_eq!(result["resume"]["checkpoint"], Value::Null);
     assert_eq!(result["resume"]["remaining_ranges"], 0);
 
-    // An unattended job that always passes --resume is told there is
-    // nothing to resume, instead of silently listing a remainder.
+    // An unattended job that always passes --resume gets the finished
+    // dataset's own result back, and lists nothing (no remainder is
+    // listed silently; since 1.6 this is a success, not usage.no_checkpoint).
     let mut resume = args.clone();
     resume.push("--resume".into());
+    let requests = server.requests().len();
     let (code, stdout, stderr) = run_cli(&resume, dir.path());
-    failed_result(code, &stdout, &stderr, 2, "usage.no_checkpoint");
+    let again = ok_result(code, &stdout, &stderr);
+    assert_eq!(again["stats"]["objects"], result["stats"]["objects"]);
+    assert_eq!(server.requests().len(), requests, "nothing listed");
+    assert_eq!(sorted(dataset_keys(&out)), keys);
+    // A finished dataset of another source is not this run's to report:
+    // another bucket, or --versions, finds nothing to resume.
+    for other in [
+        cli(
+            &server,
+            "list",
+            &[
+                "s3://other-bucket",
+                "-c",
+                "8",
+                "-o",
+                out.to_str().unwrap(),
+                "--resume",
+            ],
+        ),
+        cli(
+            &server,
+            "list",
+            &[
+                "s3://mock-bucket",
+                "--versions",
+                "-c",
+                "8",
+                "-o",
+                out.to_str().unwrap(),
+                "--resume",
+            ],
+        ),
+    ] {
+        let (code, stdout, stderr) = run_cli(&other, dir.path());
+        failed_result(code, &stdout, &stderr, 2, "usage.no_checkpoint");
+    }
+    assert_eq!(server.requests().len(), requests, "nothing listed");
     // And a fresh run refuses to mix into the finished dataset.
     let (code, stdout, stderr) = run_cli(&args, dir.path());
     failed_result(code, &stdout, &stderr, 2, "usage.output_not_empty");
@@ -4571,8 +4628,12 @@ fn local_mock_list_routes_through_http_proxy_from_environment() {
         dir.path(),
         &[("HTTP_PROXY", proxy.as_str()), ("NO_PROXY", ".invalid")],
     );
-    assert_eq!(code, 4, "stderr: {}", stderr);
-    assert_eq!(stderr_result(&stderr)["error"]["retryable"], true);
+    // A host that does not resolve before anything answered is a wrong
+    // endpoint, reported at once (since 1.6; it used to retry as net.error).
+    assert_eq!(code, 3, "stderr: {}", stderr);
+    let failed = stderr_result(&stderr);
+    assert_eq!(failed["error"]["code"], "endpoint.unreachable");
+    assert_eq!(failed["error"]["retryable"], false);
     assert_eq!(server.requests().len(), before);
 }
 
@@ -5235,6 +5296,80 @@ fn local_mock_wide_namespace_diff_matches_key_for_key() {
     let paired =
         result["diff"]["equal"].as_u64().unwrap() + result["diff"]["changed"].as_u64().unwrap();
     assert_eq!(paired as usize, right.len());
+}
+
+#[test]
+fn local_mock_diff_against_a_slow_side_hands_ranges_off_and_matches_key_for_key() {
+    // A fast left side and a slow right side, 100-key pages: the left
+    // side's segments fill their buffers long before the merge reads them,
+    // so they wait and hand the rest of their ranges to children. Every key
+    // is still paired exactly once, in order.
+    let keys: Vec<String> = (0..40_000).map(|i| format!("obj-{i:06}")).collect();
+    let mut right = keys.clone();
+    right.retain(|k| !k.ends_with('7'));
+    let server = small_page_server(keys.clone());
+    let slow: Vec<String> = right.clone();
+    let other = MockS3Server::start(move |request, _sequence| {
+        if !is_delimiter_probe(&request) && !is_single_key_probe(&request) {
+            thread::sleep(Duration::from_millis(60));
+        }
+        let mut q = request.query.clone();
+        let asked: usize = q
+            .get("max-keys")
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(1000);
+        q.insert("max-keys".into(), asked.min(100).to_string());
+        MockResponse::ok_xml(emulated_list(&slow, &q))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = cli(
+        &server,
+        "diff",
+        &["s3://mock-bucket", "s3://mock-bucket", "-c", "8"],
+    );
+    args.extend(strings(&["--target-endpoint-url", &other.endpoint()]));
+    let (code, stdout, stderr) = run_cli(&args, dir.path());
+    let result = ok_result(code, &stdout, &stderr);
+    assert_eq!(result["diff"]["left_only"], keys.len() - right.len());
+    assert_eq!(result["diff"]["right_only"], 0);
+    let paired =
+        result["diff"]["equal"].as_u64().unwrap() + result["diff"]["changed"].as_u64().unwrap();
+    assert_eq!(paired as usize, right.len());
+}
+
+#[test]
+fn local_mock_refused_endpoint_fails_at_once_as_unreachable() {
+    // A port nothing listens on: the endpoint never answered, so a refused
+    // connection is a wrong endpoint, not a transient to retry for minutes.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let args = strings(&["--endpoint-url", &endpoint, "list", "s3://mock-bucket"]);
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) =
+        run_cli_with_env(&args, dir.path(), &[("S3TL_MAX_ATTEMPTS", "10")]);
+    let result = failed_result(code, &stdout, &stderr, 3, "endpoint.unreachable");
+    assert_eq!(result["error"]["retryable"], false);
+    assert!(
+        result["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("s3tl check")
+    );
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("DispatchFailure {"),
+        "no Debug dump: {message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

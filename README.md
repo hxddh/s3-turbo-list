@@ -57,7 +57,7 @@ Options:
 | `--target-endpoint-url URL` | `diff`: the right side's endpoint, for cross-provider diffs. |
 | `--path-style` | Path-style addressing (automatic for IP and `localhost` endpoints). |
 | `--region REGION` | Signing region; defaults to the bucket's region on AWS, else `AWS_REGION`, else `us-east-1`. |
-| `-c N` | Maximum concurrent requests per side (default 100). An upper bound: the run backs off on its own when the endpoint throttles or slows down. |
+| `-c N` | Maximum concurrent requests per side. An upper bound: the run backs off on its own when the endpoint throttles or slows down. Without `-c`, a side starts at 100 and raises it, up to 1,024, when the endpoint's latency calls for it (a remote endpoint). |
 | `--dry-run` | Print the plan as the result, without contacting S3. |
 | `--trace FILE` | Record every listing request as JSONL (`-` for stderr). |
 | `-v`, `-vv` | Progress and diagnostics on stderr. |
@@ -70,7 +70,7 @@ apply:
 
 ```json
 {
-  "schema": "s3tl.result/1", "version": "1.5.0", "command": "list",
+  "schema": "s3tl.result/1", "version": "1.6.0", "command": "list",
   "ok": true, "status": "success", "exit_code": 0, "error": null,
   "source": {"url": "s3://my-bucket/logs/", "bucket": "my-bucket", "prefix": "logs/",
              "region": "us-east-2", "endpoint_url": null, "path_style": false},
@@ -100,7 +100,7 @@ of stderr. A failed run sets `ok: false` and explains itself:
 | 1 | Internal error (a bug) | `internal.*` |
 | 2 | Usage error: fix the command line | `usage.*` |
 | 3 | Credentials, bucket, region or endpoint are wrong | `auth.*`, `config.*`, `endpoint.*` |
-| 4 | Network, throttling or server fault: retrying may succeed | `net.*` |
+| 4 | Network, throttling or server fault: retrying may succeed (with `--resume` when the result has a checkpoint) | `net.*` |
 | 5 | Writing the output failed | `output.*` |
 | 130 | Interrupted; `list --resume` continues | `interrupted` |
 
@@ -176,9 +176,13 @@ uploads covers a run that is killed outright.
 
 Ctrl-C or SIGTERM stops a `list -o DIR` run gracefully: the parts written so
 far are committed, the key ranges not yet written are saved in
-`DIR/_checkpoint.json`, and the run exits 130. Rerunning the same command
-with `--resume` lists exactly those ranges, adds its parts after the existing
-ones, and leaves `DIR` holding the complete listing:
+`DIR/_checkpoint.json`, and the run exits 130. A run that fails on the
+network or on its setup (exit 4 or 3: throttled until the retry budget ran
+out, an expired token) after listing something keeps its progress the same
+way. Rerunning the same command with `--resume` lists exactly those ranges,
+adds its parts after the existing ones, and leaves `DIR` holding the
+complete listing; resuming a dataset that already finished reports its
+result again (exit 0):
 
 ```bash
 s3tl list s3://my-bucket/ -o out/            # interrupted: exit 130
@@ -186,8 +190,10 @@ s3tl list s3://my-bucket/ -o out/ --resume   # out/ now holds every key once
 ```
 
 A checkpoint is only accepted by the run it belongs to (same bucket, prefix,
-endpoint and options, `--versions` included). A run that fails leaves the
-directory as it was before it started. `diff` and outputs other than a local
+endpoint and options, `--versions` included). Any other failed run — before
+it listed anything, or on its output — leaves the directory as it was before
+it started. The dataset is complete when `_result.json` says `ok: true` and
+there is no `_checkpoint.json`. `diff` and outputs other than a local
 directory do not checkpoint.
 
 ## Performance

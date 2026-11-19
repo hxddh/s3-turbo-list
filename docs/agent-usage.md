@@ -10,7 +10,9 @@ meaning.
 - **stdout** carries exactly one JSON document, the *result*, for every
   invocation: success, failure, usage error, dry run, `check`.
 - With `list -o -`, stdout carries NDJSON rows instead, and the result is the
-  **last line of stderr** (compact JSON).
+  **last line of stderr** (compact JSON). Rows are in no particular order. A
+  reader that closes the pipe early (`| head`) stops the run with exit 5
+  (`output.write_failed`).
 - Everything else on stderr is for humans: a one-line summary of a failure
   (`s3tl: failed (exit 3): auth.expired_token: … (hint: …)`), and with `-v`
   progress logs. Do not parse it.
@@ -25,11 +27,17 @@ meaning.
 | 1 | internal | `internal.error`, `internal.panic` | A bug; report it. |
 | 2 | usage | `usage.*` | Fix the command line; rerunning unchanged fails again. |
 | 3 | setup | `auth.*`, `config.*`, `endpoint.*` | Fix credentials, bucket, region or endpoint. |
-| 4 | retryable | `net.*` | Retry later. |
+| 4 | retryable | `net.*` | Retry later (with `--resume` when `resume.checkpoint` is set). |
 | 5 | output | `output.*` | Fix the output location (space, permissions, closed pipe). |
 | 130 | interrupted | `interrupted` | `list -o DIR`: rerun with `--resume` (an `-o s3://` run: rerun). |
 
 `error.retryable` is `true` exactly for exit 4 and 130.
+
+**Continuing a run.** Whenever `resume.checkpoint` is a path, the same
+command plus `--resume` continues where the run stopped: after an interrupt,
+and (since 1.6) after a `list -o DIR` that failed with exit 3 or 4 once it had
+listed something. `--resume` of a dataset that already finished reports that
+dataset's `_result.json` again and exits 0, so retrying a resume is safe.
 
 ## The result (`s3tl.result/1`)
 
@@ -98,10 +106,15 @@ in the other modes.
 
 `resume`: `{resumed, checkpoint, remaining_ranges}` — `resumed` is true when
 this run continued a checkpoint; `checkpoint` is the path of the checkpoint
-left for `--resume` (null when the listing is complete).
+left for `--resume` (null when the listing is complete). After a resume,
+`stats` describe the last run; the dataset's rows are the sum of
+`output.files[].rows`.
 
 `plan` (dry run): `partitioning` (`startup_discovery`, `single_segment`,
-`checkpoint`), `partitioning_reason`, `concurrency`, `compare` (`etag`,
+`checkpoint`), `partitioning_reason`, `concurrency` (what each side starts
+with: `-c`, or 100; without `-c` a side raises it, up to 1,024, when the
+endpoint's latency calls for it, and `stats.peak_concurrency` shows what it
+reached), `compare` (`etag`,
 `size`, `checksum`; null for `list`), `versions` (bool; null for `diff`),
 `max_keys`,
 `resume_ranges`, `first_part`, `region` (how the region will be chosen).
@@ -111,7 +124,9 @@ left for `--resume` (null when the listing is complete).
 request goes to), `proxy` (the proxy it goes through, or null), and `probe`
 (with an S3 URL): `{endpoint_url, region, bucket, addressing_style,
 overall_status: compatible|partial|incompatible, tests: [...]}`.
-`check` fails (exit 3 or 4) only when the probe is `incompatible`.
+`check` fails (exit 3 or 4) when no credentials are found, when the probe is
+`incompatible`, or when every ListObjectsV2 test fails (even if HeadBucket
+answered); `source` describes the URL it checked.
 
 ## Error codes
 
@@ -124,8 +139,9 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 | `usage.output_not_a_directory` | 2 | `-o` names an existing file. |
 | `usage.output_not_empty` | 2 | `-o DIR` is not empty (the hint says whether it holds a resumable run), or `-o s3://…` already holds objects. |
 | `usage.resume_needs_output` | 2 | `--resume` without a local `-o DIR` (an S3 output is not resumable). |
-| `usage.no_checkpoint` | 2 | `--resume` into a directory without a checkpoint. |
-| `usage.checkpoint_mismatch` | 2 | The checkpoint belongs to another run (bucket, prefix, endpoint or options). |
+| `usage.no_checkpoint` | 2 | `--resume` into a directory without a checkpoint that did not finish either (a finished one is reported, exit 0). |
+| `usage.checkpoint_mismatch` | 2 | The checkpoint belongs to another run (bucket, prefix, endpoint or options); the message names both values. Endpoints compare without case, default port or trailing slash. |
+| `usage.invalid_trace` | 2 | `--trace` names stdout, which carries the result. |
 | `usage.checkpoint_unreadable` | 2 | The checkpoint cannot be read. |
 | `auth.missing_credentials` | 3 | No credentials in the SDK chain. |
 | `auth.expired_token` | 3 | Expired or invalid session token. |
@@ -136,6 +152,7 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 | `config.missing_region` | 3 | No region could be resolved. |
 | `config.no_such_bucket` | 3 | The bucket does not exist on this endpoint. |
 | `endpoint.inconsistent_listing` | 3 | The endpoint returned keys out of order or repeated them. |
+| `endpoint.unreachable` | 3 | The connection was refused or the host did not resolve before the endpoint ever answered (wrong `--endpoint-url`, DNS or proxy). Reported at once. |
 | `net.throttled` | 4 | Rate limited until the retry budget ran out. |
 | `net.timeout` | 4 | Requests kept timing out. |
 | `net.unavailable` | 4 | The endpoint kept failing (5xx). |
@@ -152,11 +169,17 @@ overall_status: compatible|partial|incompatible, tests: [...]}`.
 |---|---|
 | `part-NNNNN.parquet` | committed parts (zero-padded index) |
 | `_result.json` | the result document |
-| `_checkpoint.json` | present only when an interrupted run can be resumed (`s3tl.checkpoint/1`) |
+| `_checkpoint.json` | present only when a stopped run can be resumed (`s3tl.checkpoint/1`) |
 | `.part-NNNNN.parquet.tmp` | parts being written; never read these |
 
-A run that fails removes its temporary parts and leaves the directory as it
-was (and removes it if it created it and it is empty). The Parquet schemas
+A `list` run that is interrupted, or that fails on the network or on its
+setup (exit 3 or 4) after listing something, commits what it listed and
+leaves `_checkpoint.json` for `--resume`. Any other failed run removes its
+temporary parts and leaves the directory as it was (and removes it if it
+created it and it is empty). **The dataset is complete exactly when
+`_result.json` says `ok: true` and there is no `_checkpoint.json`.** List
+rows are in no particular order (segments are written as they finish); a
+diff dataset is in key order. The Parquet schemas
 are in the [README](../README.md#output); each file's key-value metadata has
 `s3tl.schema` = `s3tl.list/1`, `s3tl.list-versions/1` or `s3tl.diff/1`.
 
@@ -176,8 +199,12 @@ checkpoint and no `--resume`.
 out=$(s3tl list s3://b/p/ -o run/); code=$?
 case $code in
   0) jq -r '.output.files[].path' <<<"$out" ;;
-  4) sleep 60; s3tl list s3://b/p/ -o run2/ ;;          # retryable
-  130) s3tl list s3://b/p/ -o run/ --resume ;;           # continue
+  4|130)                                                 # retryable, or interrupted
+    if jq -e '.resume.checkpoint' <<<"$out" >/dev/null; then
+      s3tl list s3://b/p/ -o run/ --resume              # continue where it stopped
+    else
+      sleep 60; s3tl list s3://b/p/ -o run/             # nothing was kept: start over
+    fi ;;
   *) jq -r '.error.code, .error.hint' <<<"$out"; exit $code ;;
 esac
 
@@ -192,8 +219,9 @@ s3tl list s3://b/p/ -o run/ --dry-run | jq .plan
 
 One JSON object per line, per listing request: `timestamp`, `operation`
 (`ListObjectsV2`, or `ListObjectVersions` with `--versions`; `Probe` for a
-partitioning probe, which carries only `latency_ms`, `http_status` and
-`s3_error_code`), `endpoint_url` (redacted),
+partitioning probe, which names no request: it omits `endpoint_url`,
+`bucket` and `addressing_style`, has an empty `prefix`, and reports its
+outcome in `latency_ms`, `http_status` and `s3_error_code`), `endpoint_url` (redacted),
 `region`, `addressing_style`, `bucket`, `prefix`, `delimiter` (always
 present; `""` for a recursive listing), `start_after`, `max_keys`,
 `continuation_token`, `http_status`, `s3_error_code`, `s3_error_message`,

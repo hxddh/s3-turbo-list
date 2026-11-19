@@ -91,7 +91,13 @@ pub async fn flat_list_main_task(
 const DISCOVERY_SPLIT_GATE: Duration = Duration::from_secs(2);
 
 /// Upper bound on concurrently listing segments per diff side.
-pub const DIFF_SIDE_MAX_CONCURRENCY: usize = 32;
+pub const DIFF_SIDE_MAX_CONCURRENCY: usize = 64;
+/// How far ahead of the merge, in segments of the side's key order, a diff
+/// side starts segments: with `DIFF_SEGMENT_CHANNEL_CAP` pages each, it
+/// buffers at most 128 x 8 = 1,024 pages (as 32 x 32 did). Segments near
+/// the merge are short (cut as it reaches them), so the reach is counted in
+/// many of them: 64 left cut ranges waiting while slots sat idle.
+const DIFF_SIDE_AHEAD_SEGMENTS: usize = 128;
 /// Static segments a diff side may start ahead of the one the merge is
 /// reading. With the channel capacity this bounds a side's buffered batches
 /// whatever the segment count (32 segments x 32 pages). It used to be half
@@ -192,28 +198,64 @@ async fn flat_reactor_task(
     // are aborted when the reactor exits.
     let mut probes = tokio::task::JoinSet::new();
     let mut remaining_held: Vec<core::KeySpacePair> = Vec::new();
-    let mut split_check = tokio::time::interval(Duration::from_millis(SPLIT_CHECK_INTERVAL_MS));
+    // A diff side checks four times as often: the segment the merge waits on
+    // is cut as soon as it is reached, and its cuts are read off its own
+    // pages, without probes.
+    let check_every = if order.is_some() {
+        SPLIT_CHECK_INTERVAL_MS / 4
+    } else {
+        SPLIT_CHECK_INTERVAL_MS
+    };
+    let mut split_check = tokio::time::interval(Duration::from_millis(check_every));
     split_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Segments that send requests. A diff segment waiting for room in its
+    // output channel (ahead of the merge, its buffer full) sends none: it
+    // does not count, so the segments the merge waits on are started and
+    // cut while those ahead wait. (Counted, they held every slot while the
+    // merge's own segment listed one page per round trip: a 5M-key diff
+    // took 56 s at 30 ms.) A diff side starts only segments within
+    // `DIFF_SIDE_AHEAD_SEGMENTS` of where the merge reads, which bounds what
+    // it buffers.
+    let in_key_order = order.is_some();
+    let busy = |set_len: usize, controls: &HashMap<usize, Arc<SegmentControl>>| {
+        if in_key_order {
+            set_len
+                - controls
+                    .values()
+                    .filter(|c| c.is_waiting())
+                    .count()
+                    .min(set_len)
+        } else {
+            set_len
+        }
+    };
+    let admit = |index: usize| {
+        order
+            .as_ref()
+            .is_none_or(|order| order.within_reach(index, DIFF_SIDE_AHEAD_SEGMENTS))
+    };
 
     loop {
         // Fill up to the concurrency limit: split children first, then hints.
         // Nothing new starts once the run is asked to stop — an interrupt
         // during startup discovery used to be followed by a full first fill.
-        while set.len() < flat_concurrency && !ctx.is_quit() {
-            let (index, start, end, from_hints) =
-                if let Some((index, child)) = next_child(&mut pending_children, order.is_some()) {
-                    (index, child.start, child.end, false)
-                } else if let Some(pair) = held.take().or_else(|| hints.next()) {
-                    if let Some(head) = &merge_head
-                        && pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS
-                    {
-                        held = Some(pair);
-                        break;
-                    }
-                    (pair.index, pair.start, pair.end, true)
-                } else {
+        while busy(set.len(), &controls) < flat_concurrency && !ctx.is_quit() {
+            let (index, start, end, from_hints) = if let Some((index, child)) =
+                next_child(&mut pending_children, in_key_order, admit)
+            {
+                (index, child.start, child.end, false)
+            } else if let Some(pair) = held.take().or_else(|| hints.next()) {
+                if let Some(head) = &merge_head
+                    && pair.index >= *head.borrow() + DIFF_SIDE_LOOKAHEAD_SEGMENTS
+                {
+                    held = Some(pair);
                     break;
-                };
+                }
+                (pair.index, pair.start, pair.end, true)
+            } else {
+                break;
+            };
 
             let mut task_ctx = ctx.clone();
             if let Some(order) = &order {
@@ -233,7 +275,8 @@ async fn flat_reactor_task(
                 } else {
                     SegmentControl::new_child(end)
                 }
-                .starting_at(&start),
+                .starting_at(&start)
+                .handing_off(in_key_order),
             );
             controls.insert(index, Arc::clone(&control));
             starts.insert(index, start.clone());
@@ -401,27 +444,28 @@ async fn flat_reactor_task(
                 // cut late in a run).
                 let within_budget = probes_at_start.is_none_or(|start| {
                     let stats = window.stats();
-                    stats.probes.saturating_sub(start)
-                        <= 2 * flat_concurrency as u64 + stats.list_requests / 8
+                    stats.probes.saturating_sub(start) <= 2 * cap as u64 + stats.list_requests / 8
                 });
                 // A diff side held back by the lookahead also splits: the
                 // segments it runs then include the one the merge waits on,
                 // and its children list that range in parallel.
                 // While startup discovery runs, its boundaries are the cuts
                 // to wait for: runtime probes would cut the same range blind.
+                let busy = busy(set.len(), &controls);
                 if allow_split
                     && !discovering
                     && within_budget
-                    && set.len() < cap
+                    && busy < cap
                     && pending_children.is_empty()
                     && (held.is_some() || hints.is_empty())
                 {
-                    let idle = cap - set.len();
+                    let idle = cap - busy;
                     maybe_start_split_probes(
                         ctx,
                         start_prefix,
                         &controls,
                         idle,
+                        in_key_order,
                         &flat_high,
                         &split_tx,
                         &mut probes,
@@ -445,6 +489,11 @@ async fn flat_reactor_task(
                     completed_pieces += 1;
                 }
             }
+            // A split probe answered on another thread may still be
+            // accepting its cut: wait for every probe to stop before the
+            // last read of the children, or a child sent after it would be
+            // in no resume range.
+            probes.shutdown().await;
             // Children split off before or during the abort are unlisted
             // ranges: they belong in the resume ranges.
             while let Ok(range) = split_rx.try_recv() {
@@ -480,11 +529,13 @@ async fn flat_reactor_task(
 /// order, so it starts the lowest: when one round of cuts splits many
 /// segments at once, starting their children in any other order let
 /// segments far ahead of the merge fill their buffers and stall while the
-/// one the merge waited for queued. A listing starts the latest split's
-/// first child (the straggler just cut).
+/// one the merge waited for queued; and only when `admit` lets it (within
+/// reach of the merge). A listing starts the latest split's first child
+/// (the straggler just cut).
 fn next_child(
     pending: &mut Vec<(usize, SplitRange)>,
     in_key_order: bool,
+    admit: impl Fn(usize) -> bool,
 ) -> Option<(usize, SplitRange)> {
     if !in_key_order {
         return pending.pop();
@@ -494,7 +545,7 @@ fn next_child(
         .enumerate()
         .min_by(|(_, a), (_, b)| a.1.start.cmp(&b.1.start))?
         .0;
-    Some(pending.remove(lowest))
+    admit(pending[lowest].0).then(|| pending.remove(lowest))
 }
 
 /// Startup boundaries become cuts of whatever is running (at first the one

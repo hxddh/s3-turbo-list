@@ -83,6 +83,7 @@ where
 
     match &err {
         aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
+            ctx.g_state.mark_answered();
             let raw = service_err.raw();
             let http_code = raw.status().as_u16();
             let s3_err = service_err.err();
@@ -147,6 +148,11 @@ where
                     ERROR_S3_MISSING_REGION
                 } else if crate::error::is_missing_credentials(conn_err) {
                     ERROR_S3_MISSING_CREDENTIALS
+                } else if conn_err.is_io() && !ctx.g_state.has_answered() {
+                    // Refused, or the host does not resolve, before the
+                    // endpoint ever answered: a wrong endpoint, not a blip
+                    // (retrying it took three minutes to say so).
+                    ERROR_ENDPOINT_UNREACHABLE
                 } else {
                     ctx.g_state.inc_s3_client_generic_error();
                     ERROR_S3_CLIENT_GENERIC
@@ -157,13 +163,24 @@ where
             };
 
             let retryable = is_retryable(errno);
+            let cause = dispatch_err
+                .as_connector_error()
+                .map(|e| crate::error::root_cause(e))
+                .unwrap_or_else(|| format!("{:?}", dispatch_err));
             let (code, message) = match errno {
                 ERROR_S3_MISSING_CREDENTIALS => (
                     "MissingCredentials",
                     MISSING_CREDENTIALS_MESSAGE.to_string(),
                 ),
-                _ if is_timeout => ("ConnectionTimeout", format!("{:?}", dispatch_err)),
-                _ => ("DispatchFailure", format!("{:?}", dispatch_err)),
+                ERROR_ENDPOINT_UNREACHABLE => (
+                    "EndpointUnreachable",
+                    format!("cannot connect to {}: {}", ctx.endpoint_url, cause),
+                ),
+                _ if is_timeout => (
+                    "ConnectionTimeout",
+                    format!("connection timed out: {}", cause),
+                ),
+                _ => ("DispatchFailure", cause),
             };
 
             write_trace(
@@ -205,14 +222,14 @@ where
                     ctx,
                     0,
                     Some("Unknown".into()),
-                    Some(format!("{:?}", other)),
+                    Some(crate::error::root_cause(other)),
                     is_retryable(ERROR_S3_CLIENT_GENERIC),
                 ),
             );
 
             Err(FlatRuntimeError::new(
                 ERROR_S3_CLIENT_GENERIC,
-                format!("{:?}", other),
+                crate::error::root_cause(other),
                 next_start.into(),
             ))
         }

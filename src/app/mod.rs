@@ -21,6 +21,9 @@ pub struct Outcome {
     pub stdout_is_data: bool,
     /// The dataset directory that also receives the result as `_result.json`.
     pub result_dir: Option<PathBuf>,
+    /// A finished dataset's own result, reported as is (`--resume` of a
+    /// dataset that is already complete).
+    pub stored: Option<String>,
 }
 
 impl Outcome {
@@ -29,6 +32,7 @@ impl Outcome {
             result,
             stdout_is_data: false,
             result_dir: None,
+            stored: None,
         }
     }
 }
@@ -73,6 +77,13 @@ fn dispatch(cli: &cli::Cli) -> Outcome {
             };
         }
     };
+    if let Some(stored) = job.already_complete.clone() {
+        return Outcome {
+            stdout_is_data,
+            stored: Some(stored),
+            ..Outcome::plain(result)
+        };
+    }
     if cli.global.dry_run {
         run::plan(&job, &mut result);
         return Outcome {
@@ -131,6 +142,15 @@ fn usage_error(err: clap::Error) -> i32 {
 /// Print the result, keep a copy in the dataset directory, and return the
 /// exit code.
 fn emit(mut outcome: Outcome) -> i32 {
+    if let Some(stored) = &outcome.stored {
+        eprintln!("s3tl: the dataset is already complete; its result follows");
+        if outcome.stdout_is_data {
+            eprintln!("{}", stored);
+        } else {
+            println!("{}", stored);
+        }
+        return 0;
+    }
     if let Some(dir) = &outcome.result_dir
         && let Err(e) = write_result_file(dir, &outcome.result)
     {

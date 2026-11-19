@@ -31,6 +31,7 @@ pub fn set_trace(writer: Arc<dyn crate::trace::S3TraceWriter>) {
 fn trace(latency: Duration, status: u16, error: Option<String>) {
     if let Some(writer) = TRACE.get() {
         let mut event = crate::trace::S3CompatEvent::new("Probe", "", "", "");
+        event.addressing_style.clear();
         event.latency_ms = latency.as_millis() as u64;
         event.http_status = status;
         event.s3_error_code = error;

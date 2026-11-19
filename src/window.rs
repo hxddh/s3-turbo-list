@@ -53,6 +53,22 @@ const PROBE_LATENCIES: f64 = 4.0;
 const MIN_PROBE_DEADLINE: Duration = Duration::from_secs(1);
 /// How often a waiter re-checks without a wake-up (belt and braces).
 const RECHECK: Duration = Duration::from_millis(50);
+/// Without `-c`: the window starts here and its cap rises to keep the
+/// client busy at the endpoint's latency (see `open_auto`), up to
+/// `AUTO_CEILING`.
+pub const AUTO_START: usize = 100;
+pub const AUTO_CEILING: usize = 1024;
+/// Listing pages a core decodes and writes per second, with room to spare
+/// (measured: about 1,500 of 1,000 keys).
+const PAGES_PER_CORE_SECOND: f64 = 1000.0;
+/// A listing page sent with at most this many pages in flight is quiet:
+/// its latency is the endpoint's, not a queue's (the listing starts as one
+/// segment while discovery runs, so its first pages are quiet).
+const QUIET_PAGES: usize = 4;
+/// Quiet pages the automatic cap is read off (their median latency).
+const AUTO_SAMPLES: usize = 3;
+/// Pages after which the cap is set from whatever pages there were.
+const AUTO_FALLBACK_PAGES: usize = 32;
 
 #[derive(Debug)]
 struct State {
@@ -68,6 +84,13 @@ struct State {
     last_decrease: Option<Instant>,
     /// Smoothed latency of answered requests, ms (`None`: none yet).
     latency_ms: Option<f64>,
+    /// Listing pages in flight.
+    pages_in_flight: usize,
+    /// Automatic cap still to set (no `-c`): up to this ceiling.
+    auto_ceiling: Option<usize>,
+    /// Latencies of quiet pages, and of all pages, until it is set, ms.
+    quiet_ms: Vec<f64>,
+    pages_ms: Vec<f64>,
     // Statistics.
     peak: usize,
     started: Instant,
@@ -88,12 +111,57 @@ impl State {
             answered: 0,
             last_decrease: None,
             latency_ms: None,
+            pages_in_flight: 0,
+            auto_ceiling: None,
+            quiet_ms: Vec::new(),
+            pages_ms: Vec::new(),
             peak: 0,
             started: now,
             last_change: now,
             in_flight_ms: 0.0,
             list_requests: 0,
             probes: 0,
+        }
+    }
+
+    /// A listing page's latency, while the automatic cap is still to set.
+    fn record_page(&mut self, ms: f64, quiet: bool) {
+        let Some(ceiling) = self.auto_ceiling else {
+            return;
+        };
+        if quiet {
+            self.quiet_ms.push(ms);
+        }
+        self.pages_ms.push(ms);
+        let samples = if self.quiet_ms.len() >= AUTO_SAMPLES {
+            std::mem::take(&mut self.quiet_ms)
+        } else if self.pages_ms.len() >= AUTO_FALLBACK_PAGES {
+            std::mem::take(&mut self.pages_ms)
+        } else {
+            return;
+        };
+        self.auto_ceiling = None;
+        self.quiet_ms = Vec::new();
+        self.pages_ms = Vec::new();
+        let mut samples = samples;
+        samples.sort_by(f64::total_cmp);
+        let latency_ms = samples[samples.len() / 2];
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()) as f64;
+        // Enough pages in flight to keep the client's cores busy at this
+        // latency (Little's law), never below the start.
+        let target = (cores * PAGES_PER_CORE_SECOND * latency_ms / 1000.0).round() as usize;
+        let target = target.clamp(self.max, ceiling);
+        if target > self.max {
+            self.max = target;
+            // Unless the endpoint already pushed back, open to it at once.
+            if self.last_decrease.is_none() {
+                self.limit = target as f64;
+            }
+            log::info!(
+                "Request window: {:.0} ms a page, concurrency up to {}",
+                latency_ms,
+                target
+            );
         }
     }
 
@@ -138,6 +206,8 @@ pub enum Kind {
 pub struct Permit<'a> {
     window: &'a Window,
     cost: usize,
+    /// A listing page sent with few pages in flight (see `QUIET_PAGES`).
+    quiet: bool,
     done: bool,
 }
 
@@ -145,14 +215,14 @@ impl Permit<'_> {
     /// Release the slot and report how the request went.
     pub fn finish(mut self, outcome: Outcome) {
         self.done = true;
-        self.window.release(self.cost, Some(outcome));
+        self.window.release(self.cost, self.quiet, Some(outcome));
     }
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         if !self.done {
-            self.window.release(self.cost, None);
+            self.window.release(self.cost, self.quiet, None);
         }
     }
 }
@@ -191,8 +261,12 @@ impl Window {
                 let capacity = (s.limit.floor() as usize).max(1) * PAGE_UNITS;
                 if s.units + cost <= capacity {
                     s.tick();
+                    let quiet = s.pages_in_flight <= QUIET_PAGES;
                     s.units += cost;
                     s.in_flight += 1;
+                    if kind == Kind::List {
+                        s.pages_in_flight += 1;
+                    }
                     s.peak = s.peak.max(s.units);
                     match kind {
                         Kind::List => s.list_requests += 1,
@@ -201,6 +275,7 @@ impl Window {
                     return Permit {
                         window: self,
                         cost,
+                        quiet,
                         done: false,
                     };
                 }
@@ -212,15 +287,21 @@ impl Window {
         }
     }
 
-    fn release(&self, cost: usize, outcome: Option<Outcome>) {
+    fn release(&self, cost: usize, quiet: bool, outcome: Option<Outcome>) {
         {
             let mut s = self.state.lock().unwrap();
             s.tick();
             s.units = s.units.saturating_sub(cost);
             s.in_flight = s.in_flight.saturating_sub(1);
+            if cost == PAGE_UNITS {
+                s.pages_in_flight = s.pages_in_flight.saturating_sub(1);
+            }
             match outcome {
                 Some(Outcome::Answered(latency)) => {
                     let ms = latency.as_secs_f64() * 1000.0;
+                    if cost == PAGE_UNITS {
+                        s.record_page(ms, quiet);
+                    }
                     s.latency_ms = Some(match s.latency_ms {
                         Some(avg) => avg * 0.9 + ms * 0.1,
                         None => ms,
@@ -306,6 +387,19 @@ static OPENED: Mutex<Vec<Arc<Window>>> = Mutex::new(Vec::new());
 /// opened in the process counts in `run_stats`.
 pub fn open(max: usize) -> Arc<Window> {
     let window = Arc::new(Window::new(max));
+    OPENED.lock().unwrap().push(Arc::clone(&window));
+    window
+}
+
+/// A window for a run without `-c`: it opens at `AUTO_START`, and once the
+/// side's first quiet pages give the endpoint's latency, its cap rises to
+/// what keeps the client's cores busy at that latency, up to `ceiling`. A
+/// 30 ms endpoint stays near the start; at 200 ms, 100 requests in flight
+/// listed half as fast as 256.
+pub fn open_auto(ceiling: usize) -> Arc<Window> {
+    let window = Window::new(AUTO_START.min(ceiling));
+    window.state.lock().unwrap().auto_ceiling = Some(ceiling.max(AUTO_START));
+    let window = Arc::new(window);
     OPENED.lock().unwrap().push(Arc::clone(&window));
     window
 }
@@ -418,5 +512,29 @@ mod tests {
             .finish(Outcome::Answered(Duration::from_millis(5)));
         let total = run_stats();
         assert!(total.list_requests >= 2 && total.final_limit >= 17);
+    }
+
+    #[tokio::test]
+    async fn without_c_the_cap_rises_to_the_endpoint_latency() {
+        let w = open_auto(AUTO_CEILING);
+        assert_eq!(w.limit(), AUTO_START);
+        // Three quiet pages at 200 ms: enough in flight to keep every core
+        // busy (1,000 pages a second each), within the ceiling.
+        for _ in 0..AUTO_SAMPLES {
+            w.acquire(Kind::List)
+                .await
+                .finish(Outcome::Answered(Duration::from_millis(200)));
+        }
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let expected = (cores * 200).clamp(AUTO_START, AUTO_CEILING);
+        assert_eq!(w.limit(), expected);
+        // A fast endpoint keeps the start.
+        let fast = open_auto(AUTO_CEILING);
+        for _ in 0..AUTO_SAMPLES {
+            fast.acquire(Kind::List)
+                .await
+                .finish(Outcome::Answered(Duration::from_millis(5)));
+        }
+        assert_eq!(fast.limit(), AUTO_START);
     }
 }

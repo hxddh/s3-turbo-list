@@ -5,6 +5,51 @@ All notable changes to s3tl (formerly s3-turbo-list) are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-19
+
+### Performance
+- **A large diff no longer degrades to one page per round trip.** A
+  segment whose buffer is full hands the rest of its range to a child and
+  ends; segments waiting for the merge free their concurrency slot; a side
+  starts segments within 128 of the merge (1,024 pages buffered, as before)
+  and cuts the lowest first. 5M keys per side: 57 s → 6.4 s at 30 ms,
+  391 s → 35 s at 200 ms; 1M at 200 ms: 7.5 s → 4.3 s.
+- **The default concurrency follows the endpoint's latency.** Without `-c`,
+  a side starts at 100 and raises its cap to what keeps the client busy at
+  the latency of its first quiet pages (1,000 pages a second a core times
+  the latency, up to 1,024). 5M keys at 200 ms: 11.3 s → 3.3 s; at 30 ms and
+  below it stays near 100-130. `-c` still sets a fixed cap.
+- **Runtime cuts of a flat run are read off the segment's own pages**, with
+  no probe and no round trip, when its range ends inside the run.
+
+### Changed
+- `endpoint.unreachable` (exit 3): a refused connection or a host that does
+  not resolve before the endpoint ever answered fails at once (it retried
+  for three minutes as `net.error`). Error messages carry the innermost
+  cause, not the SDK's Debug dump, and every `net.*` and `usage.*` error has
+  a hint.
+- A `list -o DIR` run that fails on the network or its setup (exit 4 or 3)
+  after listing something keeps its parts and a checkpoint, like an
+  interrupt; rerun with `--resume`. (A failed run used to leave nothing.)
+- `--resume` of a dataset that already finished reports its `_result.json`
+  and exits 0 (was `usage.no_checkpoint`).
+- Checkpoint endpoints compare without case, default port or trailing
+  slash; a mismatch names both values.
+- `check` fails without credentials (`auth.missing_credentials`) and when
+  every ListObjectsV2 test fails; its result fills `source`.
+- `--trace` is checked before the run and in `--dry-run`; stdout is refused
+  (`usage.invalid_trace`). Probe trace events omit placeholder fields.
+- A diff side runs up to 64 segments at once (was 32). A diff whose right
+  side is rate-limited now lists that side as a listing would (2.0 s for the
+  benchmark's, was 1.5 s, when 32 happened to sit just under its limit).
+
+### Fixed
+- A split probe answering while a run quit could leave a child range out
+  of the checkpoint; a probe answering after its segment finished could add
+  an empty child (in a diff, after a segment the merge had passed).
+- With `--max-keys`, the "one page holds the rest" rule used the probe's
+  page size and left segments unsplit.
+
 ## [1.5.0] - 2026-11-18
 
 ### Changed

@@ -61,7 +61,13 @@ pub fn run(cli: &Cli) -> Outcome {
     };
     let url = match source.as_deref().map(S3Url::parse).transpose() {
         Ok(url) => url,
-        Err(m) => return fail(result, Failure::usage("usage.invalid_url", m)),
+        Err(m) => {
+            return fail(
+                result,
+                Failure::usage("usage.invalid_url", m)
+                    .hint("pass s3://BUCKET or s3://BUCKET/PREFIX/"),
+            );
+        }
     };
     // Reuse the job rules for endpoint and path style.
     let side = match super::job::side_for_check(url.clone(), cli) {
@@ -124,76 +130,102 @@ pub fn run(cli: &Cli) -> Outcome {
             "probe": null,
         });
         let mut probe_failure = None;
-        if let (Some(u), false) = (&url, dry_run) {
-            if !found {
-                probe_failure = Some(Failure::from_errno(
-                    s3tl::error::ERROR_S3_MISSING_CREDENTIALS,
-                    s3tl::error::MISSING_CREDENTIALS_MESSAGE,
-                ));
-            } else {
-                let client = core::build_s3_client(
-                    &sdk,
-                    Some(&region),
-                    side.endpoint.as_deref(),
-                    side.path_style,
-                );
-                let writer: Box<dyn s3tl::trace::S3TraceWriter> =
-                    match s3tl::trace::trace_writer_for_target(cli.global.trace.as_deref()) {
-                        Ok(Some(w)) => w,
-                        Ok(None) => Box::new(NoTrace),
-                        Err(e) => return Err((Failure::output(e), report["credentials"].clone())),
-                    };
-                let endpoint = side
-                    .endpoint
-                    .clone()
-                    .or_else(|| target_url.clone())
-                    .unwrap_or_default();
-                let probe = s3tl::compat_probe::run_compat_probe(
-                    &client,
-                    &endpoint,
-                    &region,
-                    &u.bucket,
-                    &u.prefix,
-                    side.path_style,
-                    writer.as_ref(),
-                )
-                .await;
-                if probe.overall_status == "incompatible" {
-                    let message = probe
+        // Nothing lists without credentials: `check` fails then, with or
+        // without a URL (it used to pass, and `check && list` then failed).
+        if !found && !dry_run {
+            probe_failure = Some(Failure::from_errno(
+                s3tl::error::ERROR_S3_MISSING_CREDENTIALS,
+                s3tl::error::MISSING_CREDENTIALS_MESSAGE,
+            ));
+        }
+        if let (Some(u), false, true) = (&url, dry_run, found) {
+            let client = core::build_s3_client(
+                &sdk,
+                Some(&region),
+                side.endpoint.as_deref(),
+                side.path_style,
+            );
+            let writer: Box<dyn s3tl::trace::S3TraceWriter> =
+                match s3tl::trace::trace_writer_for_target(cli.global.trace.as_deref()) {
+                    Ok(Some(w)) => w,
+                    Ok(None) => Box::new(NoTrace),
+                    Err(e) => return Err((Failure::output(e), report["credentials"].clone())),
+                };
+            let endpoint = side
+                .endpoint
+                .clone()
+                .or_else(|| target_url.clone())
+                .unwrap_or_default();
+            let probe = s3tl::compat_probe::run_compat_probe(
+                &client,
+                &endpoint,
+                &region,
+                &u.bucket,
+                &u.prefix,
+                side.path_style,
+                writer.as_ref(),
+            )
+            .await;
+            // s3tl needs ListObjectsV2: every listing test failing is a
+            // failure even when HeadBucket answered.
+            let listing_failed = probe
+                .tests
+                .iter()
+                .filter(|t| t.test.starts_with("ListObjectsV2"))
+                .all(|t| t.status == "error");
+            if probe.overall_status == "incompatible" || listing_failed {
+                let failed = probe
+                    .tests
+                    .iter()
+                    .find(|t| t.status == "error" && t.error_message.is_some());
+                let message = failed
+                    .and_then(|t| t.error_message.clone())
+                    .unwrap_or_else(|| "every probe request failed".to_string());
+                let unreachable = probe
+                    .tests
+                    .iter()
+                    .filter(|t| t.status == "error")
+                    .all(|t| t.diagnostic_code.as_deref() == Some("transport_failure"));
+                let failure = if unreachable {
+                    Failure::from_errno(s3tl::error::ERROR_ENDPOINT_UNREACHABLE, message)
+                } else if probe.failures_are_setup_errors() {
+                    let errno = probe
                         .tests
                         .iter()
-                        .find_map(|t| t.error_message.clone())
-                        .unwrap_or_else(|| "every probe request failed".to_string());
-                    probe_failure = Some(if probe.failures_are_setup_errors() {
-                        let errno = probe
-                            .tests
-                            .iter()
-                            .find_map(|t| {
-                                t.s3_error_code.as_deref().map(|c| {
-                                    s3tl::error::service_error_errno(
-                                        Some(c),
-                                        t.http_status.unwrap_or(0),
-                                    )
-                                })
+                        .find_map(|t| {
+                            t.s3_error_code.as_deref().map(|c| {
+                                s3tl::error::service_error_errno(
+                                    Some(c),
+                                    t.http_status.unwrap_or(0),
+                                )
                             })
-                            .unwrap_or(s3tl::error::ERROR_ACCESS_DENIED);
-                        let f = Failure::from_errno(errno, message.clone());
-                        if f.exit == ExitCode::Setup {
-                            f
-                        } else {
-                            Failure::setup("auth.access_denied", message)
-                        }
+                        })
+                        .unwrap_or(s3tl::error::ERROR_ACCESS_DENIED);
+                    let f = Failure::from_errno(errno, message.clone());
+                    if f.exit == ExitCode::Setup {
+                        f
                     } else {
-                        Failure::new(ExitCode::Retryable, "net.error", message)
-                    });
-                }
-                report["probe"] = serde_json::to_value(&probe).unwrap_or_default();
+                        Failure::setup("auth.access_denied", message)
+                    }
+                } else {
+                    Failure::new(ExitCode::Retryable, "net.error", message)
+                };
+                // The probe's own advice when the code has none.
+                let failure = match (failure.error.hint.is_none(), failed.and_then(|t| t.recommendation.clone())) {
+                    (true, Some(advice)) => failure.hint(advice),
+                    _ => failure,
+                };
+                probe_failure = Some(failure);
             }
+            report["probe"] = serde_json::to_value(&probe).unwrap_or_default();
         }
         Ok((report, probe_failure))
     });
     match report {
         Ok((report, failure)) => {
+            if url.is_some() {
+                result.source = Some(side.describe(report["region"].as_str()));
+            }
             result.check = Some(report);
             if dry_run {
                 result.status = super::result::Status::Planned;

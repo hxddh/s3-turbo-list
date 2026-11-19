@@ -33,6 +33,8 @@ struct Inner {
     root: HashMap<usize, usize>,
     /// Everything is sealed (the listing ended or was aborted).
     all_sealed: bool,
+    /// The segment the merge reached last (took the receiver of).
+    reached: Option<usize>,
 }
 
 /// One side's segment order and channels.
@@ -137,9 +139,28 @@ impl SegmentOrder {
             .unwrap_or(id)
     }
 
+    /// Whether `id` is among the first `n` segments from where the merge
+    /// reads (the segment it reached last, or the first). A diff side
+    /// starts only those: the segments the merge reads next, whatever was
+    /// cut or started before them, and never more than `n` ahead of it.
+    pub fn within_reach(&self, id: usize, n: usize) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let mut at = inner.reached.or(inner.first);
+        for _ in 0..n {
+            match at {
+                Some(seg) if seg == id => return true,
+                Some(seg) => at = inner.next.get(&seg).copied(),
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// The receiver of `id` (once).
     pub fn take_receiver(&self, id: usize) -> Option<Receiver<Batch>> {
-        self.inner.lock().unwrap().receivers.remove(&id)
+        let mut inner = self.inner.lock().unwrap();
+        inner.reached = Some(id);
+        inner.receivers.remove(&id)
     }
 
     /// The segment after `id`, once `id` is sealed.
@@ -222,5 +243,19 @@ mod tests {
             rx1.recv().await.is_none(),
             "unstarted segment reads as closed"
         );
+    }
+
+    #[tokio::test]
+    async fn reach_counts_from_where_the_merge_reads() {
+        let order = SegmentOrder::new(3, 4);
+        // 0 -> 5 -> 1 -> 2: a child cut from 0 comes right after it.
+        order.insert_after(0, 5);
+        assert!(order.within_reach(0, 1));
+        assert!(order.within_reach(5, 2) && !order.within_reach(1, 2));
+        // The merge moves on to 5: reach now counts from there.
+        let _ = order.take_receiver(0);
+        let _ = order.take_receiver(5);
+        assert!(order.within_reach(2, 3));
+        assert!(!order.within_reach(0, 3), "behind the merge");
     }
 }
